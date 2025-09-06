@@ -1,0 +1,24 @@
+{
+  "name": "vm-trading-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "node --watch app.js",
+    "pm2:start": "pm2 start ecosystem.config.cjs",
+    "pm2:stop": "pm2 stop trading-bot",
+    "pm2:restart": "pm2 restart trading-bot",
+    "pm2:logs": "pm2 logs trading-bot"
+  },
+  "dependencies": {
+    "@google-cloud/firestore": "^7.1.0",
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2",
+    "ws": "^8.14.2",
+    "cors": "^2.8.5"
+  },
+  "devDependencies": {
+    "pm2": "^5.3.0"
+  }
+}
