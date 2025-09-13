@@ -16,8 +16,8 @@ class TradingStrategy {
     // Initialize Firestore project ID and database ID
     this.firestore = new Firestore({
       ignoreUndefinedProperties: true,
-      projectId: 'atos-fac0d',
-      databaseId: 'ycbot-firestore',
+      projectId: 'ycbot-6f336',
+      databaseId: '(default)',
     });
     this.tradesCollectionRef = null; // Initialized here, set in start() and loadState()
     this.logsCollectionRef = null; // NEW: Firestore collection for logs
