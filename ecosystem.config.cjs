@@ -15,6 +15,7 @@ module.exports = {
     log_file: './logs/combined.log',
     time: true,
     mode: 'fork',
+    exec_mode: 'fork',
     cwd: '/opt/vm-trading-bot'
   }]
 };
