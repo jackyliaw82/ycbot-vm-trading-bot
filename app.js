@@ -5,22 +5,20 @@ import http from 'http';
 import { Firestore } from '@google-cloud/firestore';
 
 const app = express();
-const PORT = process.env.PORT;
-const GCF_PROXY_URL = process.env.GCF_PROXY_URL || 'https://asia-southeast1-atos-fac0d.cloudfunctions.net/binance-proxy';
+const PORT = process.env.PORT || 3000; // Default to 3000 if PORT is not set
 
 // Initialize Firestore globally
 const firestore = new Firestore({
-  projectId: 'atos-fac0d', // Hardcode Firestore project ID
-  databaseId: 'ycbot-firestore', // Hardcode Firestore database ID
+  projectId: 'ycbot-6f336', // Hardcode Firestore project ID
+  databaseId: '(default)', // Hardcode Firestore database ID
 });
 
 // Middleware
 app.use(cors({
   origin: [
-    'https://ycbotv41.netlify.app',
-    "https://zp1v56uxy8rdx5ypatb0ockcb9tr6a-oci3--5173--96435430.local-credentialless.webcontainer-api.io",
-    'https://youngflock.com',
-    'https://www.youngflock.com',
+    'https://ycbot.trade',
+    'https://www.ycbot.trade',
+    "https://https://zp1v56uxy8rdx5ypatb0ockcb9tr6a-oci3--5173--96435430.local-credentialless.webcontainer-api.io/",
     'http://localhost:5173',
     'https://localhost:5173',
     'http://localhost:3000'
@@ -32,38 +30,50 @@ app.use(cors({
 
 app.use(express.json());
 
-// Global strategy instance
-let globalStrategy = null;
+// Global map to store active strategy instances, keyed by strategyId (profileId)
+const activeStrategies = new Map();
 
 // Create HTTP server
 const server = http.createServer(app);
 
 // Health check endpoint
 app.get('/health', (req, res) => {
+  const strategiesStatus = {};
+  activeStrategies.forEach((strategy, strategyId) => {
+    strategiesStatus[strategyId] = {
+      strategyRunning: strategy.isRunning,
+      klineWsConnected: strategy.klineWsConnected,
+      realtimeWsConnected: strategy.realtimeWsConnected,
+      userDataWsConnected: strategy.userDataWsConnected
+    };
+  });
+
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    strategyRunning: globalStrategy ? globalStrategy.isRunning : false,
-    strategyId: globalStrategy ? globalStrategy.strategyId : null,
-    klineWsConnected: globalStrategy ? globalStrategy.klineWsConnected : false,
-    realtimeWsConnected: globalStrategy ? globalStrategy.realtimeWsConnected : false,
-    userDataWsConnected: globalStrategy ? globalStrategy.userDataWsConnected : false
+    activeStrategiesCount: activeStrategies.size,
+    strategies: strategiesStatus,
+    vmInstanceHealthy: true // NEW: Explicitly indicate VM instance is healthy
   });
 });
 
 // Start strategy endpoint
 app.post('/strategy/start', async (req, res) => {
   try {
-    if (globalStrategy && globalStrategy.isRunning) {
+    const { profileId, gcpProxyUrl, config } = req.body;
+
+    if (!profileId || !gcpProxyUrl || !config) {
+      return res.status(400).json({ error: 'profileId, gcpProxyUrl, and config are required.' });
+    }
+
+    if (activeStrategies.has(profileId) && activeStrategies.get(profileId).isRunning) {
       return res.status(400).json({
-        error: 'Strategy is already running',
-        strategyId: globalStrategy.strategyId
+        error: `Strategy for profile ${profileId} is already running`,
+        strategyId: profileId
       });
     }
 
-    const config = req.body;
-    
-    // Validate required parameters for hedge strategy
+    // Validate required parameters for Ycbot strategy
     if (config.enableSupport && (config.supportLevel === null || config.supportLevel === undefined)) {
       return res.status(400).json({
         error: 'Support level is required when support is enabled'
@@ -76,13 +86,14 @@ app.post('/strategy/start', async (req, res) => {
       });
     }
 
-    globalStrategy = new TradingStrategy(GCF_PROXY_URL);
-    const strategyId = await globalStrategy.start(config);
+    const strategy = new TradingStrategy(gcpProxyUrl);
+    const strategyId = await strategy.start(config, profileId); // Pass profileId as strategyId
+    activeStrategies.set(strategyId, strategy);
 
     res.json({
       success: true,
       strategyId,
-      message: 'Hedge trading strategy started successfully'
+      message: 'Ycbot trading strategy started successfully'
     });
   } catch (error) {
     console.error('Failed to start strategy:', error);
@@ -96,17 +107,25 @@ app.post('/strategy/start', async (req, res) => {
 // Stop strategy endpoint
 app.post('/strategy/stop', async (req, res) => {
   try {
-    if (!globalStrategy || !globalStrategy.isRunning) {
+    const { profileId } = req.body;
+
+    if (!profileId) {
+      return res.status(400).json({ error: 'profileId is required.' });
+    }
+
+    const strategy = activeStrategies.get(profileId);
+    if (!strategy || !strategy.isRunning) {
       return res.status(400).json({
-        error: 'No strategy is currently running'
+        error: `No strategy is currently running for profile ${profileId}`
       });
     }
 
-    await globalStrategy.stop();
+    await strategy.stop();
+    activeStrategies.delete(profileId); // Remove from map after stopping
     
     res.json({
       success: true,
-      message: 'Hedge strategy stopped successfully'
+      message: `Ycbot strategy for profile ${profileId} stopped successfully`
     });
   } catch (error) {
     console.error('Failed to stop strategy:', error);
@@ -120,13 +139,18 @@ app.post('/strategy/stop', async (req, res) => {
 // Update strategy levels endpoint
 app.post('/strategy/update-levels', async (req, res) => {
   try {
-    if (!globalStrategy || !globalStrategy.isRunning) {
-      return res.status(400).json({
-        error: 'No strategy is currently running to update levels.'
-      });
+    const { profileId, supportLevel, resistanceLevel, enableSupport, enableResistance } = req.body;
+
+    if (!profileId) {
+      return res.status(400).json({ error: 'profileId is required.' });
     }
 
-    const { supportLevel, resistanceLevel, enableSupport, enableResistance } = req.body;
+    const strategy = activeStrategies.get(profileId);
+    if (!strategy || !strategy.isRunning) {
+      return res.status(400).json({
+        error: `No strategy is currently running for profile ${profileId} to update levels.`
+      });
+    }
 
     // Basic validation
     if (enableSupport && (supportLevel === null || supportLevel === undefined)) {
@@ -141,7 +165,7 @@ app.post('/strategy/update-levels', async (req, res) => {
     }
 
     // Pass the new configuration to the strategy instance
-    await globalStrategy.updateLevels({
+    await strategy.updateLevels({
       supportLevel,
       resistanceLevel,
       enableSupport,
@@ -150,7 +174,7 @@ app.post('/strategy/update-levels', async (req, res) => {
 
     res.json({
       success: true,
-      message: 'Strategy levels updated successfully.'
+      message: `Strategy levels for profile ${profileId} updated successfully.`
     });
   } catch (error) {
     console.error('Failed to update strategy levels:', error);
@@ -164,13 +188,18 @@ app.post('/strategy/update-levels', async (req, res) => {
 // NEW: Endpoint to update strategy configuration (e.g., initialBasePositionSizeUSDT)
 app.post('/strategy/update-config', async (req, res) => {
   try {
-    if (!globalStrategy || !globalStrategy.isRunning) {
-      return res.status(400).json({
-        error: 'No strategy is currently running to update configuration.'
-      });
+    const { profileId, initialBasePositionSizeUSDT } = req.body;
+
+    if (!profileId) {
+      return res.status(400).json({ error: 'profileId is required.' });
     }
 
-    const { initialBasePositionSizeUSDT } = req.body;
+    const strategy = activeStrategies.get(profileId);
+    if (!strategy || !strategy.isRunning) {
+      return res.status(400).json({
+        error: `No strategy is currently running for profile ${profileId} to update configuration.`
+      });
+    }
 
     if (initialBasePositionSizeUSDT === undefined || initialBasePositionSizeUSDT === null || isNaN(initialBasePositionSizeUSDT) || initialBasePositionSizeUSDT <= 0) {
       return res.status(400).json({
@@ -178,11 +207,11 @@ app.post('/strategy/update-config', async (req, res) => {
       });
     }
 
-    await globalStrategy.updateConfig({ initialBasePositionSizeUSDT });
+    await strategy.updateConfig({ initialBasePositionSizeUSDT });
 
     res.json({
       success: true,
-      message: 'Strategy configuration updated successfully.'
+      message: `Strategy configuration for profile ${profileId} updated successfully.`
     });
   } catch (error) {
     console.error('Failed to update strategy config:', error);
@@ -196,31 +225,38 @@ app.post('/strategy/update-config', async (req, res) => {
 // Get strategy status endpoint
 app.get('/strategy/status', async (req, res) => {
   try {
-    if (!globalStrategy) {
+    const { profileId } = req.query; // Get profileId from query params
+
+    if (!profileId) {
+      return res.status(400).json({ error: 'profileId is required.' });
+    }
+
+    const strategy = activeStrategies.get(profileId);
+    if (!strategy) {
       return res.json({
         isRunning: false,
         strategy: null
       });
     }
 
-    const status = await globalStrategy.getStatus();
+    const status = await strategy.getStatus();
     
     res.json({
-      isRunning: globalStrategy.isRunning,
-      strategyId: globalStrategy.strategyId,
+      isRunning: strategy.isRunning,
+      strategyId: strategy.strategyId,
       strategy: status,
       currentState: {
-        currentPosition: globalStrategy.currentPosition,
-        thresholdLevel: globalStrategy.thresholdLevel,
-        thresholdType: globalStrategy.thresholdType,
-        positionEntryPrice: globalStrategy.positionEntryPrice,
-        positionSize: globalStrategy.positionSize,
-        currentPrice: globalStrategy.currentPrice,
-        positionPnL: globalStrategy.positionPnL,
-        totalPnL: globalStrategy.totalPnL,
-        accumulatedRealizedPnL: globalStrategy.accumulatedRealizedPnL,
-        accumulatedTradingFees: globalStrategy.accumulatedTradingFees,
-        currentPositionQuantity: globalStrategy.currentPositionQuantity, // ADDED THIS LINE
+        currentPosition: strategy.currentPosition,
+        thresholdLevel: strategy.thresholdLevel,
+        thresholdType: strategy.thresholdType,
+        positionEntryPrice: strategy.positionEntryPrice,
+        positionSize: strategy.positionSize,
+        currentPrice: strategy.currentPrice,
+        positionPnL: strategy.positionPnL,
+        totalPnL: strategy.totalPnL,
+        accumulatedRealizedPnL: strategy.accumulatedRealizedPnL,
+        accumulatedTradingFees: strategy.accumulatedTradingFees,
+        currentPositionQuantity: strategy.currentPositionQuantity,
       }
     });
   } catch (error) {
@@ -235,15 +271,22 @@ app.get('/strategy/status', async (req, res) => {
 // New endpoint to save PnL to Firestore
 app.post('/strategy/save-pnl', async (req, res) => {
   try {
-    if (!globalStrategy || !globalStrategy.isRunning) {
+    const { profileId } = req.body;
+
+    if (!profileId) {
+      return res.status(400).json({ error: 'profileId is required.' });
+    }
+
+    const strategy = activeStrategies.get(profileId);
+    if (!strategy || !strategy.isRunning) {
       return res.status(400).json({
-        error: 'No strategy is currently running to save PnL.'
+        error: `No strategy is currently running for profile ${profileId} to save PnL.`
       });
     }
-    await globalStrategy.saveState();
+    await strategy.saveState();
     res.json({
       success: true,
-      message: 'Current PnL and strategy state saved to Firestore.'
+      message: `Current PnL and strategy state for profile ${profileId} saved to Firestore.`
     });
   } catch (error) {
     console.error('Failed to save PnL to Firestore:', error);
@@ -336,6 +379,10 @@ app.get('/wallet-history', async (req, res) => {
 // List all strategies endpoint
 app.get('/strategies', async (req, res) => {
   try {
+    // For a "one user per VM" setup, this endpoint should ideally be filtered by the user associated with this VM.
+    // However, since the VM itself doesn't inherently know the user ID without a request context,
+    // we'll fetch all strategies from Firestore and let the frontend filter.
+    // In a more advanced setup, you'd pass a userId to this endpoint.
     const strategiesRef = firestore.collection('strategies');
     const snapshot = await strategiesRef.orderBy('createdAt', 'desc').get(); // Order by creation date, newest first
     
@@ -348,7 +395,7 @@ app.get('/strategies', async (req, res) => {
         totalPnL: data.totalPnL || 0,
         accumulatedRealizedPnL: data.accumulatedRealizedPnL || 0,
         accumulatedTradingFees: data.accumulatedTradingFees || 0,
-        isRunning: data.isRunning || false, // Include running status
+        isRunning: activeStrategies.has(doc.id) && activeStrategies.get(doc.id).isRunning, // Check if currently running on this VM
       };
     });
     
@@ -385,33 +432,40 @@ app.get('/strategies/:strategyId', async (req, res) => {
 // Resume strategy endpoint
 app.post('/strategy/resume/:strategyId', async (req, res) => {
   try {
-    if (globalStrategy && globalStrategy.isRunning) {
+    const { strategyId } = req.params;
+    const { gcpProxyUrl } = req.body; // Expect gcpProxyUrl in body for resume
+
+    if (!gcpProxyUrl) {
+      return res.status(400).json({ error: 'gcpProxyUrl is required to resume a strategy.' });
+    }
+
+    if (activeStrategies.has(strategyId) && activeStrategies.get(strategyId).isRunning) {
       return res.status(400).json({
-        error: 'Another strategy is already running'
+        error: `Strategy for profile ${strategyId} is already running`
       });
     }
 
-    const strategyId = req.params.strategyId;
-    globalStrategy = new TradingStrategy(GCF_PROXY_URL);
-    globalStrategy.strategyId = strategyId;
+    const strategy = new TradingStrategy(gcpProxyUrl); // Initialize with provided GCF URL
+    strategy.strategyId = strategyId; // Set strategyId for the instance
     
-    const loaded = await globalStrategy.loadState(strategyId);
+    const loaded = await strategy.loadState(strategyId);
     if (!loaded) {
       return res.status(404).json({
         error: 'Strategy not found'
       });
     }
 
-    globalStrategy.isRunning = true;
-    globalStrategy.connectRealtimeWebSocket(); // Connect real-time WS
-    globalStrategy.connectUserDataStream(); // Connect user data WS
-    await globalStrategy.addLog('🔄 Hedge strategy resumed from saved state (manual resume)');
-    await globalStrategy.saveState();
+    strategy.isRunning = true;
+    strategy.connectRealtimeWebSocket(); // Connect real-time WS
+    strategy.connectUserDataStream(); // Connect user data WS
+    await strategy.addLog('🔄 Ycbot strategy resumed from saved state (manual resume)');
+    await strategy.saveState();
+    activeStrategies.set(strategyId, strategy); // Add to map
 
     res.json({
       success: true,
       strategyId,
-      message: 'Hedge strategy resumed successfully'
+      message: 'Ycbot strategy resumed successfully'
     });
   } catch (error) {
     console.error('Failed to resume strategy:', error);
@@ -423,26 +477,24 @@ app.post('/strategy/resume/:strategyId', async (req, res) => {
 });
 
 // Graceful shutdown handling
-process.on('SIGTERM', async () => {
-  console.log('Received SIGTERM, shutting down gracefully...');
-  if (globalStrategy && globalStrategy.isRunning) {
-    await globalStrategy.stop();
+const shutdown = async () => {
+  console.log('Received shutdown signal, stopping all active strategies...');
+  for (const [strategyId, strategy] of activeStrategies.entries()) {
+    if (strategy.isRunning) {
+      console.log(`Stopping strategy ${strategyId}...`);
+      await strategy.stop();
+    }
   }
+  console.log('All strategies stopped. Exiting.');
   process.exit(0);
-});
+};
 
-process.on('SIGINT', async () => {
-  console.log('Received SIGINT, shutting down gracefully...');
-  if (globalStrategy && globalStrategy.isRunning) {
-    await globalStrategy.stop();
-  }
-  process.exit(0);
-});
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
 // Start the server
 server.listen(PORT, () => {
   console.log(`🚀 YcBot API server running on port ${PORT}`);
-  console.log(`📡 Using GCF Proxy: ${GCF_PROXY_URL}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
   console.log(`🤞 Good luck bro! On the road to Million now`);
 });
