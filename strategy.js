@@ -12,7 +12,9 @@ const PING_INTERVAL_MS = 30000; // Send ping every 30 seconds
 const PONG_TIMEOUT_MS = 10000; // Expect pong within 10 seconds
 
 class TradingStrategy {
-  constructor(gcfProxyUrl) {
+  // --- AMENDMENT START ---
+  constructor(gcfProxyUrl, userId) {
+  // --- AMENDMENT END ---
     // Initialize Firestore project ID and database ID
     this.firestore = new Firestore({
       ignoreUndefinedProperties: true,
@@ -28,6 +30,9 @@ class TradingStrategy {
     this.strategyId = null;
     this.isRunning = false;
     this.gcfProxyUrl = gcfProxyUrl;
+    // --- AMENDMENT START ---
+    this.userId = userId; // Store the userId (profileId) for authentication
+    // --- AMENDMENT END ---
     
     // Dynamic threshold trading strategy state variables
     this.supportLevel = null;
@@ -356,17 +361,25 @@ class TradingStrategy {
   // Make API calls through GCF proxy
   async makeProxyRequest(endpoint, method = 'GET', params = {}, signed = false, apiType = 'spot') {
     try {
+      // --- AMENDMENT START ---
+      const headers = {
+        'Content-Type': 'application/json',
+        'X-User-Id': this.userId, // Add the X-User-Id header
+      };
+      // --- AMENDMENT END ---
+
       const response = await fetch(this.gcfProxyUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: headers, // Use the updated headers
         body: JSON.stringify({
           endpoint,
           method,
           params,
           apiType,
           signed,
+          // --- AMENDMENT START ---
+          // No need to pass userId in the body, it's in the header
+          // --- AMENDMENT END ---
         }),
       });
 
@@ -1634,7 +1647,7 @@ class TradingStrategy {
       this.initialWalletBalance = null; // Set to null if fetching fails
     }
 
-    this.strategyId = `threshold_strategy_${Date.now()}`;
+    this.strategyId = `strategy_${Date.now()}`;
 
     // Set tradesCollectionRef for the new strategy
     this.tradesCollectionRef = this.firestore.collection('strategies').doc(this.strategyId).collection('trades');
