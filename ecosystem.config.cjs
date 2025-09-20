@@ -1,6 +1,6 @@
 module.exports = {
   apps: [{
-    name: 'trading-bot',
+    name: 'ycbot',
     script: 'app.js',
     instances: 1,
     autorestart: true,
@@ -16,6 +16,6 @@ module.exports = {
     time: true,
     mode: 'fork',
     exec_mode: 'fork',
-    cwd: '/opt/vm-trading-bot'
+    cwd: '/opt/vm-bot'
   }]
 };
