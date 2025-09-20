@@ -86,7 +86,7 @@ app.post('/strategy/start', async (req, res) => {
       });
     }
 
-    const strategy = new TradingStrategy(gcpProxyUrl);
+    const strategy = new TradingStrategy(gcpProxyUrl, profileId); // Pass profileId to constructor
     const strategyId = await strategy.start(config, profileId); // Pass profileId as strategyId
     activeStrategies.set(strategyId, strategy);
 
