@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import TradingStrategy from './strategy.js';
 import http from 'http';
-import { Firestore } from '@google-cloud/firestore';
+import { Firestore, Timestamp } from '@google-cloud/firestore'; // MODIFIED: Added Timestamp to import
 
 const app = express();
 const PORT = process.env.PORT || 3000; // Default to 3000 if PORT is not set
@@ -17,11 +17,7 @@ const firestore = new Firestore({
 app.use(cors({
   origin: [
     'https://ycbot.trade',
-    'https://www.ycbot.trade',
-    "https://https://zp1v56uxy8rdx5ypatb0ockcb9tr6a-oci3--5173--96435430.local-credentialless.webcontainer-api.io/",
-    'http://localhost:5173',
-    'https://localhost:5173',
-    'http://localhost:3000'
+    'https://www.ycbot.trade'
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -30,7 +26,7 @@ app.use(cors({
 
 app.use(express.json());
 
-// Global map to store active strategy instances, keyed by strategyId (profileId)
+// Global map to store active strategy instances, keyed by strategyId
 const activeStrategies = new Map();
 
 // Create HTTP server
@@ -42,7 +38,6 @@ app.get('/health', (req, res) => {
   activeStrategies.forEach((strategy, strategyId) => {
     strategiesStatus[strategyId] = {
       strategyRunning: strategy.isRunning,
-      klineWsConnected: strategy.klineWsConnected,
       realtimeWsConnected: strategy.realtimeWsConnected,
       userDataWsConnected: strategy.userDataWsConnected
     };
@@ -60,43 +55,48 @@ app.get('/health', (req, res) => {
 // Start strategy endpoint
 app.post('/strategy/start', async (req, res) => {
   try {
-    const { profileId, gcpProxyUrl, config } = req.body;
+    const { profileId, gcpProxyUrl, sharedVmProxyGcfUrl, config } = req.body; // NEW: sharedVmProxyGcfUrl
 
-    if (!profileId || !gcpProxyUrl || !config) {
-      return res.status(400).json({ error: 'profileId, gcpProxyUrl, and config are required.' });
+    if (!profileId || !gcpProxyUrl || !sharedVmProxyGcfUrl || !config) { // NEW: Check sharedVmProxyGcfUrl
+      console.error('Missing required parameters for /strategy/start');
+      return res.status(400).json({ error: 'profileId, gcpProxyUrl, sharedVmProxyGcfUrl, and config are required.' });
     }
 
-    if (activeStrategies.has(profileId) && activeStrategies.get(profileId).isRunning) {
+    // Check if a strategy for this profile is already running (optional, depending on desired behavior)
+    // If you want to allow multiple strategies per profile, remove this check or modify it.
+    // For now, we'll assume one active strategy per profile.
+    let existingStrategyIdForProfile = null;
+    for (const [sId, strategy] of activeStrategies.entries()) {
+      if (strategy.profileId === profileId && strategy.isRunning) {
+        existingStrategyIdForProfile = sId;
+        break;
+      }
+    }
+
+    if (existingStrategyIdForProfile) {
+      console.error(`Strategy for profile ${profileId} (strategyId: ${existingStrategyIdForProfile}) is already running`);
       return res.status(400).json({
         error: `Strategy for profile ${profileId} is already running`,
-        strategyId: profileId
+        strategyId: existingStrategyIdForProfile // Return existing strategyId
       });
     }
 
-    // Validate required parameters for Ycbot strategy
-    if (config.enableSupport && (config.supportLevel === null || config.supportLevel === undefined)) {
-      return res.status(400).json({
-        error: 'Support level is required when support is enabled'
-      });
-    }
-    
-    if (config.enableResistance && (config.resistanceLevel === null || config.resistanceLevel === undefined)) {
-      return res.status(400).json({
-        error: 'Resistance level is required when resistance is enabled'
-      });
-    }
+    // Pass profileId to the TradingStrategy constructor so it can be stored internally
+    const strategy = new TradingStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl); // NEW: Pass sharedVmProxyGcfUrl and profileId
+    const strategyId = await strategy.start(config); // strategy.start() should now generate and return the strategyId
 
-    const strategy = new TradingStrategy(gcpProxyUrl, profileId); // Pass profileId to constructor
-    const strategyId = await strategy.start(config, profileId); // Pass profileId as strategyId
-    activeStrategies.set(strategyId, strategy);
+    activeStrategies.set(strategyId, strategy); // Use strategyId as the key
 
+    console.log(`Strategy ${strategyId} started successfully.`);
     res.json({
       success: true,
-      strategyId,
+      strategyId, // Return the generated strategyId
       message: 'Ycbot trading strategy started successfully'
     });
   } catch (error) {
     console.error('Failed to start strategy:', error);
+    // Log full error object for more details
+    console.error('Full error object for /strategy/start:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
     res.status(500).json({
       error: error.message,
       timestamp: new Date().toISOString()
@@ -107,25 +107,25 @@ app.post('/strategy/start', async (req, res) => {
 // Stop strategy endpoint
 app.post('/strategy/stop', async (req, res) => {
   try {
-    const { profileId } = req.body;
+    const { strategyId } = req.body; // Expect strategyId
 
-    if (!profileId) {
-      return res.status(400).json({ error: 'profileId is required.' });
+    if (!strategyId) {
+      return res.status(400).json({ error: 'strategyId is required.' });
     }
 
-    const strategy = activeStrategies.get(profileId);
+    const strategy = activeStrategies.get(strategyId);
     if (!strategy || !strategy.isRunning) {
       return res.status(400).json({
-        error: `No strategy is currently running for profile ${profileId}`
+        error: `No strategy is currently running with ID ${strategyId}`
       });
     }
 
     await strategy.stop();
-    activeStrategies.delete(profileId); // Remove from map after stopping
+    activeStrategies.delete(strategyId); // Remove from map after stopping
     
     res.json({
       success: true,
-      message: `Ycbot strategy for profile ${profileId} stopped successfully`
+      message: `Ycbot strategy ${strategyId} stopped successfully`
     });
   } catch (error) {
     console.error('Failed to stop strategy:', error);
@@ -139,42 +139,43 @@ app.post('/strategy/stop', async (req, res) => {
 // Update strategy levels endpoint
 app.post('/strategy/update-levels', async (req, res) => {
   try {
-    const { profileId, supportLevel, resistanceLevel, enableSupport, enableResistance } = req.body;
+    // MODIFIED: Removed supportLevel and resistanceLevel from req.body
+    const { strategyId, reversalThreshold, enableSupport, enableResistance } = req.body; 
 
-    if (!profileId) {
-      return res.status(400).json({ error: 'profileId is required.' });
+    if (!strategyId) {
+      return res.status(400).json({ error: 'strategyId is required.' });
     }
 
-    const strategy = activeStrategies.get(profileId);
+    const strategy = activeStrategies.get(strategyId);
     if (!strategy || !strategy.isRunning) {
       return res.status(400).json({
-        error: `No strategy is currently running for profile ${profileId} to update levels.`
+        error: `No strategy is currently running with ID ${strategyId} to update levels.`
       });
     }
 
-    // Basic validation
-    if (enableSupport && (supportLevel === null || supportLevel === undefined)) {
+    // Basic validation for enable flags remains
+    // REMOVED: Validation for supportLevel and resistanceLevel
+    if (enableSupport && (reversalThreshold === null || reversalThreshold === undefined)) {
       return res.status(400).json({
-        error: 'Support level is required when support is enabled.'
+        error: 'Reversal threshold is required when support is enabled.'
       });
     }
-    if (enableResistance && (resistanceLevel === null || resistanceLevel === undefined)) {
+    if (enableResistance && (reversalThreshold === null || reversalThreshold === undefined)) {
       return res.status(400).json({
-        error: 'Resistance level is required when resistance is enabled.'
+        error: 'Reversal threshold is required when resistance is enabled'
       });
     }
 
     // Pass the new configuration to the strategy instance
     await strategy.updateLevels({
-      supportLevel,
-      resistanceLevel,
+      reversalThreshold, // MODIFIED: Pass reversalThreshold instead of support/resistance levels
       enableSupport,
       enableResistance
     });
 
     res.json({
       success: true,
-      message: `Strategy levels for profile ${profileId} updated successfully.`
+      message: `Strategy levels for ${strategyId} updated successfully.`
     });
   } catch (error) {
     console.error('Failed to update strategy levels:', error);
@@ -188,16 +189,16 @@ app.post('/strategy/update-levels', async (req, res) => {
 // NEW: Endpoint to update strategy configuration (e.g., initialBasePositionSizeUSDT)
 app.post('/strategy/update-config', async (req, res) => {
   try {
-    const { profileId, initialBasePositionSizeUSDT } = req.body;
+    const { strategyId, initialBasePositionSizeUSDT } = req.body; // Expect strategyId
 
-    if (!profileId) {
-      return res.status(400).json({ error: 'profileId is required.' });
+    if (!strategyId) {
+      return res.status(400).json({ error: 'strategyId is required.' });
     }
 
-    const strategy = activeStrategies.get(profileId);
+    const strategy = activeStrategies.get(strategyId);
     if (!strategy || !strategy.isRunning) {
       return res.status(400).json({
-        error: `No strategy is currently running for profile ${profileId} to update configuration.`
+        error: `No strategy is currently running with ID ${strategyId} to update configuration.`
       });
     }
 
@@ -211,7 +212,7 @@ app.post('/strategy/update-config', async (req, res) => {
 
     res.json({
       success: true,
-      message: `Strategy configuration for profile ${profileId} updated successfully.`
+      message: `Strategy configuration for ${strategyId} updated successfully.`
     });
   } catch (error) {
     console.error('Failed to update strategy config:', error);
@@ -225,13 +226,13 @@ app.post('/strategy/update-config', async (req, res) => {
 // Get strategy status endpoint
 app.get('/strategy/status', async (req, res) => {
   try {
-    const { profileId } = req.query; // Get profileId from query params
+    const { strategyId } = req.query; // Get strategyId from query params
 
-    if (!profileId) {
-      return res.status(400).json({ error: 'profileId is required.' });
+    if (!strategyId) {
+      return res.status(400).json({ error: 'strategyId is required.' });
     }
 
-    const strategy = activeStrategies.get(profileId);
+    const strategy = activeStrategies.get(strategyId);
     if (!strategy) {
       return res.json({
         isRunning: false,
@@ -271,22 +272,22 @@ app.get('/strategy/status', async (req, res) => {
 // New endpoint to save PnL to Firestore
 app.post('/strategy/save-pnl', async (req, res) => {
   try {
-    const { profileId } = req.body;
+    const { strategyId } = req.body; // Expect strategyId
 
-    if (!profileId) {
-      return res.status(400).json({ error: 'profileId is required.' });
+    if (!strategyId) {
+      return res.status(400).json({ error: 'strategyId is required.' });
     }
 
-    const strategy = activeStrategies.get(profileId);
+    const strategy = activeStrategies.get(strategyId);
     if (!strategy || !strategy.isRunning) {
       return res.status(400).json({
-        error: `No strategy is currently running for profile ${profileId} to save PnL.`
+        error: `No strategy is currently running with ID ${strategyId} to save PnL.`
       });
     }
     await strategy.saveState();
     res.json({
       success: true,
-      message: `Current PnL and strategy state for profile ${profileId} saved to Firestore.`
+      message: `Current PnL and strategy state for ${strategyId} saved to Firestore.`
     });
   } catch (error) {
     console.error('Failed to save PnL to Firestore:', error);
@@ -348,16 +349,19 @@ app.get('/wallet-history', async (req, res) => {
   try {
     let query = firestore.collection('wallet_history').orderBy('timestamp');
 
-    const { startDate, endDate, strategyId } = req.query; // Added strategyId to query
-
-    if (strategyId) {
-      query = query.where('strategyId', '==', strategyId); // Filter by strategyId if provided
+    const { startDate, endDate, profileId } = req.query;
+    
+    if (profileId) {
+      query = query.where('profileId', '==', profileId);
     }
     if (startDate) {
       query = query.where('timestamp', '>=', new Date(startDate));
     }
     if (endDate) {
-      query = query.where('timestamp', '<=', new Date(endDate));
+      // To include the entire end date, set the filter to be strictly less than the start of the next day
+      const nextDay = new Date(endDate);
+      nextDay.setDate(nextDay.getDate() + 1); // Increment to the next day
+      query = query.where('timestamp', '<', nextDay);
     }
 
     const snapshot = await query.get();
@@ -390,6 +394,7 @@ app.get('/strategies', async (req, res) => {
       const data = doc.data();
       return {
         strategyId: doc.id,
+        profileId: data.profileId, // ADDED: Include profileId from Firestore document
         symbol: data.symbol,
         createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null, // Convert Firestore Timestamp to ISO string
         totalPnL: data.totalPnL || 0,
@@ -419,7 +424,24 @@ app.get('/strategies/:strategyId', async (req, res) => {
       return res.status(404).json({ error: 'Strategy not found' });
     }
 
-    res.json(strategyDoc.data());
+    const data = strategyDoc.data();
+    const formattedData = { ...data };
+
+    // Convert Firestore Timestamps to ISO strings for frontend consumption
+    if (formattedData.createdAt && typeof formattedData.createdAt.toDate === 'function') {
+      formattedData.createdAt = formattedData.createdAt.toDate().toISOString();
+    }
+    if (formattedData.updatedAt && typeof formattedData.updatedAt.toDate === 'function') {
+      formattedData.updatedAt = formattedData.updatedAt.toDate().toISOString();
+    }
+    if (formattedData.strategyStartTime && typeof formattedData.strategyStartTime.toDate === 'function') {
+      formattedData.strategyStartTime = formattedData.strategyStartTime.toDate().toISOString();
+    }
+    if (formattedData.strategyEndTime && typeof formattedData.strategyEndTime.toDate === 'function') {
+      formattedData.strategyEndTime = formattedData.strategyEndTime.toDate().toISOString();
+    }
+
+    res.json(formattedData);
   } catch (error) {
     console.error('Failed to fetch strategy details:', error);
     res.status(500).json({
@@ -441,7 +463,7 @@ app.post('/strategy/resume/:strategyId', async (req, res) => {
 
     if (activeStrategies.has(strategyId) && activeStrategies.get(strategyId).isRunning) {
       return res.status(400).json({
-        error: `Strategy for profile ${strategyId} is already running`
+        error: `Strategy with ID ${strategyId} is already running`
       });
     }
 
