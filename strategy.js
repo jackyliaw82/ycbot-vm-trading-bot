@@ -11,10 +11,11 @@ const MAX_RECONNECT_ATTEMPTS = 10; // Max attempts before giving up or requiring
 const PING_INTERVAL_MS = 30000; // Send ping every 30 seconds
 const PONG_TIMEOUT_MS = 10000; // Expect pong within 10 seconds
 
+// Desired profit percentage
+const DESIRED_PROFIT_PERCENTAGE = 1.5 // in percentage 
+
 class TradingStrategy {
-  // --- AMENDMENT START ---
-  constructor(gcfProxyUrl, userId) {
-  // --- AMENDMENT END ---
+  constructor(gcfProxyUrl, profileId, sharedVmProxyGcfUrl) {
     // Initialize Firestore project ID and database ID
     this.firestore = new Firestore({
       ignoreUndefinedProperties: true,
@@ -27,12 +28,12 @@ class TradingStrategy {
     this.userDataWs = null; // WebSocket for User Data Stream
     this.listenKey = null; // Binance listenKey for User Data Stream
     this.listenKeyRefreshInterval = null; // Interval for refreshing listenKey
-    this.strategyId = null;
+    this.strategyId = null; // Will be set uniquely in start() or loadState()
     this.isRunning = false;
-    this.gcfProxyUrl = gcfProxyUrl;
-    // --- AMENDMENT START ---
-    this.userId = userId; // Store the userId (profileId) for authentication
-    // --- AMENDMENT END ---
+    this.isStopping = false; // NEW: Add isStopping flag
+    this.gcfProxyUrl = gcfProxyUrl; // This is the profile-specific binance-proxy GCF URL
+    this.profileId = profileId; // Store the profileId for authentication and logging
+    this.sharedVmProxyGcfUrl = sharedVmProxyGcfUrl; // NEW: Store the shared VM proxy GCF URL
     
     // Dynamic threshold trading strategy state variables
     this.supportLevel = null;
@@ -75,9 +76,6 @@ class TradingStrategy {
     this.supportReversalLevel = null;
     this.resistanceReversalLevel = null;
 
-    // Reversal Method selection
-    this.reversalMethod = 'currentPrice'; // Hardcoded to 'currentPrice'
-
     // New Order Type and Direction states
     this.orderType = 'MARKET'; // 'LIMIT' | 'MARKET'
     this.buyLongEnabled = false;
@@ -104,7 +102,6 @@ class TradingStrategy {
     this.userDataWsPingInterval = null;
     
     // Configuration
-    this.timeframe = '1h';
     this.symbol = 'BTCUSDT'; // Default trading symbol
     this.positionSizeUSDT = 0; // Default position size in USDT
 
@@ -149,7 +146,8 @@ class TradingStrategy {
       second: '2-digit',
     });
     
-    const logEntry = `${timestamp}: ${message}`;
+    const logPrefix = this.profileId ? `[${this.profileId.slice(-6)}] ` : '[STRATEGY] ';
+    const logEntry = `${logPrefix}${timestamp}: ${message}`;
     console.log(logEntry);
     
     // Filter out specific messages from being broadcast to the frontend
@@ -162,7 +160,7 @@ class TradingStrategy {
     if (this.strategyId && !messagesToFilter.some(filterMsg => message.includes(filterMsg))) {
       try {
         await this.logsCollectionRef.add({
-          message: logEntry,
+          message: logEntry, // Use the prefixed logEntry for Firestore
           timestamp: now, // Use the Date object directly for Firestore Timestamp
         });
       } catch (error) {
@@ -186,6 +184,7 @@ class TradingStrategy {
     
     try {
       const dataToSave = {
+        profileId: this.profileId, // ADDED: Save profileId to Firestore
         supportLevel: this.supportLevel,
         resistanceLevel: this.resistanceLevel,
         enableSupport: this.enableSupport,
@@ -201,14 +200,12 @@ class TradingStrategy {
         accumulatedTradingFees: this.accumulatedTradingFees,
         lastUpdated: new Date(),
         isRunning: this.isRunning,
-        timeframe: this.timeframe,
         symbol: this.symbol,
         positionSizeUSDT: this.positionSizeUSDT,
         initialBasePositionSizeUSDT: this.initialBasePositionSizeUSDT,
         MAX_POSITION_SIZE_USDT: this.MAX_POSITION_SIZE_USDT, // ADDED THIS LINE
         supportReversalLevel: this.supportReversalLevel,
         resistanceReversalLevel: this.resistanceReversalLevel,
-        reversalMethod: this.reversalMethod,
         reversalLevelPercentage: this.reversalLevelPercentage, // Add to saveState
         // NEW: Partial TP states
         entryPositionQuantity: this.entryPositionQuantity,
@@ -259,6 +256,8 @@ class TradingStrategy {
       
       if (doc.exists) {
         const data = doc.data();
+        this.strategyId = strategyId; // Set strategyId on load
+        this.profileId = data.profileId; // ADDED: Load profileId
         this.supportLevel = data.supportLevel;
         this.resistanceLevel = data.resistanceLevel;
         this.enableSupport = data.enableSupport || false;
@@ -272,8 +271,6 @@ class TradingStrategy {
         this.totalPnL = data.totalPnL || null;
         this.accumulatedRealizedPnL = data.accumulatedRealizedPnL || 0;
         this.accumulatedTradingFees = data.accumulatedTradingFees || 0;
-        await this.addLog(`Loaded state. Acc. Fees: ${this.accumulatedTradingFees.toFixed(8)}`);
-        this.timeframe = data.timeframe || '1h';
         this.symbol = data.symbol || 'BTCUSDT';
         this.isRunning = data.isRunning || false;
         
@@ -297,7 +294,6 @@ class TradingStrategy {
 
         this.supportReversalLevel = data.supportReversalLevel || null;
         this.resistanceReversalLevel = data.resistanceReversalLevel || null;
-        this.reversalMethod = data.reversalMethod || 'currentPrice';
         this.reversalLevelPercentage = data.reversalLevelPercentage !== undefined ? data.reversalLevelPercentage : null; // Add to loadState
 
         // NEW: Load Partial TP states
@@ -359,27 +355,24 @@ class TradingStrategy {
   }
 
   // Make API calls through GCF proxy
-  async makeProxyRequest(endpoint, method = 'GET', params = {}, signed = false, apiType = 'spot') {
+  async makeProxyRequest(endpoint, method = 'GET', params = {}, signed = false, apiType = 'futures') {
     try {
-      // --- AMENDMENT START ---
       const headers = {
         'Content-Type': 'application/json',
-        'X-User-Id': this.userId, // Add the X-User-Id header
+        'X-User-Id': this.profileId, // Use this.profileId for X-User-Id header
       };
-      // --- AMENDMENT END ---
 
-      const response = await fetch(this.gcfProxyUrl, {
+      // MODIFIED: Call the shared VM proxy GCF
+      const response = await fetch(this.sharedVmProxyGcfUrl, { // NEW: Target sharedVmProxyGcfUrl
         method: 'POST',
-        headers: headers, // Use the updated headers
+        headers: headers,
         body: JSON.stringify({
           endpoint,
           method,
           params,
-          apiType,
           signed,
-          // --- AMENDMENT START ---
-          // No need to pass userId in the body, it's in the header
-          // --- AMENDMENT END ---
+          apiType,
+          profileBinanceApiGcfUrl: this.gcfProxyUrl, // NEW: Pass the profile-specific GCF URL
         }),
       });
 
@@ -553,7 +546,7 @@ class TradingStrategy {
     // Validate against MIN_NOTIONAL
     const notionalValue = adjustedQuantity * currentPrice;
     if (notionalValue < minNotional) {
-        this.addLog(`Calculated notional value ${this._formatNotional(notionalValue)} is less than minNotional ${this._formatNotional(minNotional)}. Adjusting quantity to meet minNotional.`);
+        this.addLog(`Adjusting quantity from ${adjustedQuantity} to meet MIN_NOTIONAL of ${this._formatNotional(minNotional)} USDT.`);
         adjustedQuantity = Math.ceil(minNotional / currentPrice / stepSize) * stepSize;
         adjustedQuantity = parseFloat(adjustedQuantity.toFixed(precision));
         this.addLog(`Adjusted quantity to ${adjustedQuantity} to meet minNotional.`);
@@ -833,20 +826,24 @@ class TradingStrategy {
       
       if (positions.length === 0) {
         this.currentPosition = 'NONE';
-        this.positionEntryPrice = null;
-        this.positionSize = null;
-        this.entryPositionQuantity = null;
-        this.currentPositionQuantity = null;
+        // Only null these if the strategy is NOT in the process of stopping.
+        // When stopping, we want to preserve their last values for saveState().
+        if (!this.isStopping) { // NEW: Conditional nulling
+          this.positionEntryPrice = null;
+          this.positionSize = null;
+          this.entryPositionQuantity = null;
+          this.currentPositionQuantity = null;
+          this.breakevenPrice = null;
+          this.finalTpPrice = null;
+          this.breakevenPercentage = null;
+          this.finalTpPercentage = null;
+        }
         this.partialTp1Hit = false;
         this.accumulatedRealizedPnLForCurrentTrade = 0;
         this.accumulatedTradingFeesForCurrentTrade = 0;
         // Reset Final TP states
-        this.breakevenPrice = null;
-        this.finalTpPrice = null;
         this.finalTpActive = false;
         this.finalTpOrderSent = false;
-        this.breakevenPercentage = null;
-        this.finalTpPercentage = null;
         //await this.addLog(`Partial TP and Final TP flags reset due to position becoming NONE.`);
       } else if (positions.length === 1) {
         const p = positions[0];
@@ -911,7 +908,7 @@ class TradingStrategy {
           }
 
           // Add 0.05% to cover trading fees for the final TP
-          const finalTpPercentFromEntry = bePercentFromEntry + 2 + 0.05; 
+          const finalTpPercentFromEntry = bePercentFromEntry + DESIRED_PROFIT_PERCENTAGE + 0.05; 
 
           let finalTpPriceRaw;
           if (this.currentPosition === 'LONG') {
@@ -929,7 +926,7 @@ class TradingStrategy {
           } else {
             this.finalTpPercentage = null;
           }
-
+          
           await this.addLog(`Final TP: Breakeven Price: ${this._formatPrice(this.breakevenPrice)} (${this.breakevenPercentage.toFixed(2)}% from entry).`);
           await this.addLog(`Final TP: Final TP Price: ${this._formatPrice(this.finalTpPrice)} (${this.finalTpPercentage.toFixed(2)}% from entry).`);
         } else {
@@ -1036,7 +1033,7 @@ class TradingStrategy {
 
     this.realtimeWs.on('close', async (code, reason) => {
       this.realtimeWsConnected = false;
-      await this.addLog(`Real-time price WebSocket closed. Code: ${code}, Reason: ${reason}.`);
+      //await this.addLog(`Real-time price WebSocket closed. Code: ${code}, Reason: ${reason}.`);
       // Clear heartbeat on close
       if (this.realtimeWsPingInterval) clearInterval(this.realtimeWsPingInterval);
       if (this.realtimeWsPingTimeout) clearTimeout(this.realtimeWsPingTimeout);
@@ -1190,7 +1187,7 @@ class TradingStrategy {
 
     this.userDataWs.on('close', async (code, reason) => {
       this.userDataWsConnected = false;
-      await this.addLog(`User Data Stream WebSocket closed. Code: ${code}, Reason: ${reason}.`);
+      //await this.addLog(`User Data Stream WebSocket closed. Code: ${code}, Reason: ${reason}.`);
       // Clear heartbeat on close
       if (this.userDataWsPingInterval) clearInterval(this.userDataWsPingInterval);
       if (this.userDataWsPingTimeout) clearTimeout(this.userDataWsPingTimeout);
@@ -1303,7 +1300,6 @@ class TradingStrategy {
           let triggerCondition;
           let orderSide;
           
-
           if (this.currentPosition === 'LONG') {
             tpPrice = this.roundPrice(this.positionEntryPrice * (1 + tp.percentFromEntry));
             triggerCondition = currentPrice >= tpPrice;
@@ -1360,6 +1356,7 @@ class TradingStrategy {
                 }
               } catch (error) {
                 console.error(`Error executing Partial TP ${tp.id}: ${error.message}`);
+                await this.addLog(`ERROR executing Partial TP ${tp.id}: ${error.message}`);
               }
             }
           }
@@ -1388,6 +1385,7 @@ class TradingStrategy {
           await this.stop(); // Stop the entire strategy
         } catch (error) {
           console.error(`Error closing position for Final TP: ${error.message}`);
+          await this.addLog(`ERROR closing position for Final TP: ${error.message}`);
           // If closing fails, reset flag to allow re-attempt or manual intervention
           this.finalTpOrderSent = false; 
         }
@@ -1395,12 +1393,13 @@ class TradingStrategy {
     }
 
     // Reversal logic based on Current Price (only if a position is open and an active mode is set)
-    if (this.reversalMethod === 'currentPrice' && this.currentPosition !== 'NONE' && this.activeMode !== 'NONE') {
+    if (this.currentPosition !== 'NONE' && this.activeMode !== 'NONE') {
           if (this.activeMode === 'RESISTANCE_DRIVEN') {
               if (this.currentPosition === 'LONG') {
                   // Reversal from LONG to SHORT: current price hits or below resistance reversal level
                   if (this.resistanceReversalLevel !== null && currentPrice <= this.resistanceReversalLevel) {
                       try {
+                          await this.addLog(`Reversal: LONG position hit resistance reversal level. Closing position.`);
                           await this.closeCurrentPosition(); 
                           await this.addLog('Reversal: Waiting for position to be fully closed...'); // New log
                           await this._waitForPositionChange('NONE'); // Wait for position to be NONE
@@ -1408,6 +1407,7 @@ class TradingStrategy {
                           await new Promise(resolve => setTimeout(resolve, 500)); // Small delay to ensure state propagation
                       } catch (error) {
                           console.error(`Error closing LONG position before reversal: ${error.message}`);
+                          await this.addLog(`ERROR closing LONG position before reversal: ${error.message}`);
                           return; 
                       }
                       
@@ -1415,6 +1415,7 @@ class TradingStrategy {
                       const quantity = await this._calculateAdjustedQuantity(this.symbol, this.positionSizeUSDT);
                       if (quantity > 0) {
                           try {
+                              await this.addLog(`Reversal: Opening SHORT position with quantity ${quantity}.`);
                               await this.placeMarketOrder(this.symbol, 'SELL', quantity); 
                               this.currentPosition = 'SHORT';
                               this._pendingLogMessage = 'reversal'; // Set flag for consolidated log
@@ -1434,6 +1435,7 @@ class TradingStrategy {
 
                           } catch (error) {
                               console.error(`Error opening SHORT position after LONG reversal: ${error.message}`);
+                              await this.addLog(`ERROR opening SHORT position after LONG reversal: ${error.message}`);
                           }
                       }
                   }
@@ -1441,6 +1443,7 @@ class TradingStrategy {
                   // Reversal from SHORT to LONG: current price hits or above resistance level
                   if (this.resistanceLevel !== null && currentPrice >= this.resistanceLevel) {
                       try {
+                          await this.addLog(`Reversal: SHORT position hit resistance level. Closing position.`);
                           await this.closeCurrentPosition(); 
                           await this.addLog('Reversal: Waiting for position to be fully closed...'); // New log
                           await this._waitForPositionChange('NONE'); // Wait for position to be NONE
@@ -1448,6 +1451,7 @@ class TradingStrategy {
                           await new Promise(resolve => setTimeout(resolve, 500)); // Small delay to ensure state propagation
                       } catch (error) {
                           console.error(`Error closing SHORT position before re-entry: ${error.message}`);
+                          await this.addLog(`ERROR closing SHORT position before re-entry: ${error.message}`);
                           return; 
                       }
 
@@ -1455,6 +1459,7 @@ class TradingStrategy {
                       const quantity = await this._calculateAdjustedQuantity(this.symbol, this.positionSizeUSDT);
                       if (quantity > 0) {
                           try {
+                              await this.addLog(`Reversal: Opening LONG position with quantity ${quantity}.`);
                               await this.placeMarketOrder(this.symbol, 'BUY', quantity); 
                               this.currentPosition = 'LONG';
                               this._pendingLogMessage = 'reversal'; // Set flag for consolidated log
@@ -1474,6 +1479,7 @@ class TradingStrategy {
 
                           } catch (error) {
                               console.error(`Error opening LONG position after SHORT re-entry: ${error.message}`);
+                              await this.addLog(`ERROR opening LONG position after SHORT re-entry: ${error.message}`);
                           }
                       }
                   }
@@ -1483,6 +1489,7 @@ class TradingStrategy {
                   // Reversal from SHORT to LONG: current price hits or above support reversal level
                   if (this.supportReversalLevel !== null && currentPrice >= this.supportReversalLevel) {
                       try {
+                          await this.addLog(`Reversal: SHORT position hit support reversal level. Closing position.`);
                           await this.closeCurrentPosition(); 
                           await this.addLog('Reversal: Waiting for position to be fully closed...'); // New log
                           await this._waitForPositionChange('NONE'); // Wait for position to be NONE
@@ -1490,6 +1497,7 @@ class TradingStrategy {
                           await new Promise(resolve => setTimeout(resolve, 500)); // Small delay to ensure state propagation
                       } catch (error) {
                           console.error(`Error closing SHORT position before reversal: ${error.message}`);
+                          await this.addLog(`ERROR closing SHORT position before reversal: ${error.message}`);
                           return; 
                       }
 
@@ -1497,6 +1505,7 @@ class TradingStrategy {
                       const quantity = await this._calculateAdjustedQuantity(this.symbol, this.positionSizeUSDT);
                       if (quantity > 0) {
                           try {
+                              await this.addLog(`Reversal: Opening LONG position with quantity ${quantity}.`);
                               await this.placeMarketOrder(this.symbol, 'BUY', quantity); 
                               this.currentPosition = 'LONG';
                               this._pendingLogMessage = 'reversal'; // Set flag for consolidated log
@@ -1516,6 +1525,7 @@ class TradingStrategy {
 
                           } catch (error) {
                               console.error(`Error opening LONG position after SHORT reversal: ${error.message}`);
+                              await this.addLog(`ERROR opening LONG position after SHORT reversal: ${error.message}`);
                           }
                       }
                   }
@@ -1523,6 +1533,7 @@ class TradingStrategy {
                   // Reversal from LONG to SHORT: current price hits or below support level
                   if (this.supportLevel !== null && currentPrice <= this.supportLevel) {
                       try {
+                          await this.addLog(`Reversal: LONG position hit support level. Closing position.`);
                           await this.closeCurrentPosition(); 
                           await this.addLog('Reversal: Waiting for position to be fully closed...'); // New log
                           await this._waitForPositionChange('NONE'); // Wait for position to be NONE
@@ -1530,6 +1541,7 @@ class TradingStrategy {
                           await new Promise(resolve => setTimeout(resolve, 500)); // Small delay to ensure state propagation
                       } catch (error) {
                           console.error(`Error closing LONG position before re-entry: ${error.message}`);
+                          await this.addLog(`ERROR closing LONG position before re-entry: ${error.message}`);
                           return; 
                       }
 
@@ -1537,6 +1549,7 @@ class TradingStrategy {
                       const quantity = await this._calculateAdjustedQuantity(this.symbol, this.positionSizeUSDT);
                       if (quantity > 0) {
                           try {
+                              await this.addLog(`Reversal: Opening SHORT position with quantity ${quantity}.`);
                               await this.placeMarketOrder(this.symbol, 'SELL', quantity); 
                               this.currentPosition = 'SHORT';
                               this._pendingLogMessage = 'reversal'; // Set flag for consolidated log
@@ -1556,6 +1569,7 @@ class TradingStrategy {
 
                           } catch (error) {
                               console.error(`Error opening SHORT position after LONG re-entry: ${error.message}`);
+                              await this.addLog(`ERROR opening SHORT position after LONG re-entry: ${error.message}`);
                           }
                       }
                   }
@@ -1564,8 +1578,14 @@ class TradingStrategy {
     }
   }
 
-  async start(config = {}) {
-    this.timeframe = config.timeframe || this.timeframe;
+  async start(config = {}) { // Removed profileId parameter as it's already in constructor
+    // Generate unique strategyId at the start of the strategy execution
+    this.strategyId = `strategy_${this.profileId.slice(-6)}_${Date.now()}`; // Use profileId for context
+    
+    // Set tradesCollectionRef for the new strategy
+    this.tradesCollectionRef = this.firestore.collection('strategies').doc(this.strategyId).collection('trades');
+    this.logsCollectionRef = this.firestore.collection('strategies').doc(this.strategyId).collection('logs'); // NEW: Initialize logs collection ref
+    
     this.symbol = config.symbol || 'BTCUSDT';
 
     // Strictly take positionSizeUSDT from config
@@ -1579,16 +1599,7 @@ class TradingStrategy {
     // Ensure initialBasePositionSizeUSDT always reflects the user's chosen base
     this.initialBasePositionSizeUSDT = this.positionSizeUSDT;
     this.MAX_POSITION_SIZE_USDT = (3 / 4) * this.initialBasePositionSizeUSDT * 50; // Set MAX_POSITION_SIZE_USDT dynamically here
-    
-    this.reversalMethod = 'currentPrice'; // Hardcoded to currentPrice
     this.reversalLevelPercentage = config.reversalLevelPercentage !== undefined ? config.reversalLevelPercentage : null; // Get from config
-    
-    // Manually set S/R levels from config
-    this.supportLevel = config.supportLevel !== undefined ? config.supportLevel : null;
-    this.resistanceLevel = config.resistanceLevel !== undefined ? config.resistanceLevel : null;
-    // NEW: Set reversal levels to null at start
-    this.supportReversalLevel = null;
-    this.resistanceReversalLevel = null;
 
     this.enableSupport = config.enableSupport !== undefined ? config.enableSupport : false;
     this.enableResistance = config.enableResistance !== undefined ? config.enableResistance : false;
@@ -1600,13 +1611,47 @@ class TradingStrategy {
     this.buyLimitPrice = config.buyLimitPrice || null;
     this.sellLimitPrice = config.sellLimitPrice || null;
 
+    // NEW: Calculate initial supportLevel and resistanceLevel based on current price or limit price
+    if (this.reversalLevelPercentage !== null) {
+      const currentPriceAtStart = await this._getCurrentPrice(this.symbol); // Always fetch current price
+
+      let basePriceForSupport = currentPriceAtStart;
+      let basePriceForResistance = currentPriceAtStart;
+
+      if (this.orderType === 'LIMIT') {
+        if (this.buyLongEnabled && this.buyLimitPrice !== null) {
+          basePriceForSupport = this.buyLimitPrice;
+        }
+        if (this.sellShortEnabled && this.sellLimitPrice !== null) {
+          basePriceForResistance = this.sellLimitPrice;
+        }
+      }
+
+      if (this.enableSupport) {
+        this.supportLevel = this.roundPrice(basePriceForSupport * (1 - this.reversalLevelPercentage / 100));
+      } else {
+        this.supportLevel = null;
+      }
+      if (this.enableResistance) {
+        this.resistanceLevel = this.roundPrice(basePriceForResistance * (1 + this.reversalLevelPercentage / 100));
+      } else {
+        this.resistanceLevel = null;
+      }
+    } else {
+      this.supportLevel = null;
+      this.resistanceLevel = null;
+    }
+
+    // NEW: Set reversal levels to null at start
+    this.supportReversalLevel = null;
+    this.resistanceReversalLevel = null;
+
     // Calculate partialTpConfig based on reversalLevelPercentage
     if (this.reversalLevelPercentage !== null) {
       const tp1PercentFromEntry = (this.reversalLevelPercentage / 100) * 1; //Jacky Liaw: Changed the multiplier from 0.5 to 1
       this.partialTpConfig = [
         { id: 1, percentFromEntry: tp1PercentFromEntry, tpPercentOfEntrySize: 0.3, hitFlag: 'partialTp1Hit' },
       ];
-      await this.addLog(`TP1 set to ${tp1PercentFromEntry * 100}% of entry price.`);
     } else {
       this.partialTpConfig = []; // Clear if reversalLevelPercentage is not set
     }
@@ -1641,27 +1686,20 @@ class TradingStrategy {
     try {
       const futuresAccountInfo = await this.makeProxyRequest('/fapi/v2/account', 'GET', {}, true, 'futures');
       this.initialWalletBalance = parseFloat(futuresAccountInfo.totalWalletBalance);
-      await this.addLog(`Initial wallet balance recorded: ${this.initialWalletBalance.toFixed(2)} USDT.`);
     } catch (error) {
       await this.addLog(`WARNING: Could not fetch initial wallet balance: ${error.message}`);
       this.initialWalletBalance = null; // Set to null if fetching fails
     }
-
-    this.strategyId = `strategy_${Date.now()}`;
-
-    // Set tradesCollectionRef for the new strategy
-    this.tradesCollectionRef = this.firestore.collection('strategies').doc(this.strategyId).collection('trades');
-    this.logsCollectionRef = this.firestore.collection('strategies').doc(this.strategyId).collection('logs'); // NEW: Initialize logs collection ref
 
     // Create strategy document in Firestore immediately
     await this.firestore
       .collection('strategies')
       .doc(this.strategyId)
       .set({
-        timeframe: this.timeframe,
+        profileId: this.profileId, // ADDED: Save profileId to Firestore
         symbol: this.symbol,
-        supportLevel: this.supportLevel,
-        resistanceLevel: this.resistanceLevel,
+        supportLevel: this.supportLevel, // Now the calculated value
+        resistanceLevel: this.resistanceLevel, // Now the calculated value
         enableSupport: this.enableSupport,
         enableResistance: this.enableResistance,
         currentPosition: this.currentPosition,
@@ -1681,7 +1719,6 @@ class TradingStrategy {
         MAX_POSITION_SIZE_USDT: this.MAX_POSITION_SIZE_USDT, // ADDED THIS LINE
         supportReversalLevel: this.supportReversalLevel, // Will be null
         resistanceReversalLevel: this.resistanceReversalLevel, // Will be null
-        reversalMethod: this.reversalMethod,
         reversalLevelPercentage: this.reversalLevelPercentage, // Add to Firestore
         // NEW: Partial TP states
         entryPositionQuantity: this.entryPositionQuantity,
@@ -1730,7 +1767,7 @@ class TradingStrategy {
       try {
         const listenKeyResponse = await this.makeProxyRequest('/fapi/v1/listenKey', 'POST', {}, true, 'futures');
         this.listenKey = listenKeyResponse.listenKey;
-        await this.addLog(`ListenKey obtained: ${this.listenKey}.`);
+        //await this.addLog(`ListenKey obtained: ${this.listenKey}.`);
         this.connectUserDataStream();
         // Keep listenKey alive every 30 minutes
         this.listenKeyRefreshInterval = setInterval(async () => {
@@ -1761,10 +1798,12 @@ class TradingStrategy {
         const quantity = await this._calculateAdjustedQuantity(this.symbol, this.positionSizeUSDT);
         if (quantity > 0) {
           if (this.buyLongEnabled) {
+            await this.addLog(`Placing initial BUY MARKET order for ${quantity} ${this.symbol}.`);
             await this.placeMarketOrder(this.symbol, 'BUY', quantity);
             this.activeMode = 'SUPPORT_DRIVEN';
             this._pendingLogMessage = 'initial';
           } else if (this.sellShortEnabled) {
+            await this.addLog(`Placing initial SELL MARKET order for ${quantity} ${this.symbol}.`);
             await this.placeMarketOrder(this.symbol, 'SELL', quantity);
             this.activeMode = 'RESISTANCE_DRIVEN';
             this._pendingLogMessage = 'initial';
@@ -1776,11 +1815,13 @@ class TradingStrategy {
         const quantity = await this._calculateAdjustedQuantity(this.symbol, this.positionSizeUSDT);
         if (quantity > 0) {
           if (this.buyLongEnabled && this.buyLimitPrice !== null) {
+            await this.addLog(`Placing initial BUY LIMIT order for ${quantity} at ${this.buyLimitPrice}.`);
             const orderResult = await this.placeLimitOrder(this.symbol, 'BUY', quantity, this.buyLimitPrice);
             this.longLimitOrderId = orderResult.orderId;
             //await this.addLog(`Initial LONG LIMIT order ${this.longLimitOrderId} placed at ${this.buyLimitPrice}.`);
           }
           if (this.sellShortEnabled && this.sellLimitPrice !== null) {
+            await this.addLog(`Placing initial SELL LIMIT order for ${quantity} at ${this.sellLimitPrice}.`);
             const orderResult = await this.placeLimitOrder(this.symbol, 'SELL', quantity, this.sellLimitPrice);
             this.shortLimitOrderId = orderResult.orderId;
             //await this.addLog(`Initial SHORT LIMIT order ${this.shortLimitOrderId} placed at ${this.sellLimitPrice}.`);
@@ -1793,6 +1834,8 @@ class TradingStrategy {
     } catch (error) {
       console.error(`Failed to initialize strategy settings: ${error.message}`); 
       await this.addLog(`ERROR during strategy initialization: ${error.message}`);
+      // Ensure isRunning is false if initialization fails
+      this.isRunning = false;
       throw error;
     }
 
@@ -1802,16 +1845,18 @@ class TradingStrategy {
     await this.addLog(`  Max Exposure: ${this._formatNotional(this.MAX_POSITION_SIZE_USDT)} USDT`); // Log max exposure
     await this.addLog(`  Leverage: 50x`); 
     await this.addLog(`  Pos. Mode: One-way`); 
-    await this.addLog(`  Reversal Level: ${this.reversalLevelPercentage !== null ? `${this.reversalLevelPercentage}%` : 'N/A'}`); // Log the new value
+    await this.addLog(`  Reversal %: ${this.reversalLevelPercentage !== null ? `${this.reversalLevelPercentage}%` : 'N/A'}`);
+    await this.addLog(`  Partial TP %: ${this.partialTpConfig.length > 0 ? (this.partialTpConfig[0].percentFromEntry * 100).toFixed(2) : 'N/A'}%`); 
+    await this.addLog(`  Desired Profit %: ${DESIRED_PROFIT_PERCENTAGE}%`);
     await this.addLog(`  Order Type: ${this.orderType}`);
     await this.addLog(`  Buy/Long Enabled: ${this.buyLongEnabled}`);
     if (this.buyLongEnabled && this.buyLimitPrice !== null) await this.addLog(`    Buy Limit Price: ${this.buyLimitPrice}`);
     await this.addLog(`  Sell/Short Enabled: ${this.sellShortEnabled}`);
     if (this.sellShortEnabled && this.sellLimitPrice !== null) await this.addLog(`    Sell Limit Price: ${this.sellLimitPrice}`);
-    await this.addLog(`  Support: ${this.supportLevel !== null ? this._formatPrice(this.supportLevel) : 'N/A'}`);
-    await this.addLog(`  Resistance: ${this.resistanceLevel !== null ? this._formatPrice(this.resistanceLevel) : 'N/A'}`);
-    await this.addLog(`  Support Rev: ${this.supportReversalLevel !== null ? this._formatPrice(this.supportReversalLevel) : 'N/A'}`);
-    await this.addLog(`  Resistance Rev: ${this.resistanceReversalLevel !== null ? this._formatPrice(this.resistanceReversalLevel) : 'N/A'}`);
+    await this.addLog(`  Support Level: ${this.supportLevel !== null ? this._formatPrice(this.supportLevel) : 'N/A'}`);
+    await this.addLog(`  Resistance Level: ${this.resistanceLevel !== null ? this._formatPrice(this.resistanceLevel) : 'N/A'}`);
+    await this.addLog(`  Support Rev Level: ${this.supportReversalLevel !== null ? this._formatPrice(this.supportReversalLevel) : 'N/A'}`);
+    await this.addLog(`  Resistance Rev Level: ${this.resistanceReversalLevel !== null ? this._formatPrice(this.resistanceReversalLevel) : 'N/A'}`);
 
     this.isRunning = true;
     return this.strategyId;
@@ -1843,6 +1888,7 @@ class TradingStrategy {
 
   async stop() {
     this.isRunning = false;
+    this.isStopping = true; // NEW: Set flag to indicate strategy is stopping
     this.strategyEndTime = new Date(); // Set end time
 
     // Cancel any pending limit orders first
@@ -1860,49 +1906,51 @@ class TradingStrategy {
       try {
         await this.closeCurrentPosition(); // This places the market order to close
         await this.addLog(`Position closed: ${this.currentPosition} for ${this.symbol}.`);
-        // Wait for confirmation that position is NONE, then reset flag
-        await this._waitForPositionChange('NONE'); // This waits for the position to be NONE
+        // Wait for confirmation that position is NONE, then detectCurrentPosition will null out internal state
+        await this._waitForPositionChange('NONE'); 
         await this.addLog('Position confirmed as NONE after stop request.');
       } catch (err) {
         console.error(`Failed to close position or confirm closure for ${this.symbol}: ${err.message}`);
         await this.addLog(`ERROR: Failed to close position or confirm closure: ${err.message}`);
         // Even if closing fails, we should still attempt to reset state and save
         // The frontend should then show the strategy as stopped, but with a warning about the position.
-      } finally {
-        // No _strategyInitiatedClose to reset here
       }
-    }  
-
-    // Fetch and record wallet balance and calculate profit percentage AFTER saving state
-    try {
-      const futuresAccountInfo = await this.makeProxyRequest('/fapi/v2/account', 'GET', {}, true, 'futures');
-      const totalWalletBalance = parseFloat(futuresAccountInfo.totalWalletBalance);
-      if (!isNaN(totalWalletBalance)) {
-        await this.firestore.collection('wallet_history').add({
-          strategyId: this.strategyId,
-          timestamp: new Date(),
-          balance: totalWalletBalance,
-        });
-        await this.addLog(`Wallet balance ${totalWalletBalance.toFixed(2)} recorded to Firestore.`);
-
-        // Calculate profitPercentage
-        if (this.initialWalletBalance !== null && !isNaN(totalWalletBalance) && this.initialBasePositionSizeUSDT !== null && this.initialBasePositionSizeUSDT > 0) {
-          this.profitPercentage = ((totalWalletBalance - this.initialWalletBalance) / this.initialBasePositionSizeUSDT) * 100;
-          await this.addLog(`Profit Percentage: ${this.profitPercentage.toFixed(2)}%.`);
-        } else {
-          this.profitPercentage = null;
-          await this.addLog(`Could not calculate profit percentage. Initial balance: ${this.initialWalletBalance}, Final balance: ${totalWalletBalance}, Initial position size: ${this.initialBasePositionSizeUSDT}`);
-        }
-
-      }
-    } catch (error) {
-      console.error(`Failed to record wallet balance or calculate profit percentage: ${error.message}`);
-      await this.addLog(`Failed to record wallet balance or calculate profit percentage: ${error.message}`);
-      this.profitPercentage = null; // Ensure it's null on error
     }
 
-    await this.saveState();
+    // Only save wallet balance if there was trading activity (position opened/closed)
+    if (this.accumulatedRealizedPnL !== 0 || this.accumulatedTradingFees !== 0 || this.tradeSequence !== '') {
+      try {
+        const futuresAccountInfo = await this.makeProxyRequest('/fapi/v2/account', 'GET', {}, true, 'futures');
+        const totalWalletBalance = parseFloat(futuresAccountInfo.totalWalletBalance);
+        if (!isNaN(totalWalletBalance)) {
+          await this.firestore.collection('wallet_history').add({
+            strategyId: this.strategyId,
+            profileId: this.profileId, // ADDED: Save profileId with wallet history
+            timestamp: new Date(),
+            balance: totalWalletBalance,
+          });
+          await this.addLog(`Wallet balance ${totalWalletBalance.toFixed(2)} recorded to Firestore.`);
 
+          // Calculate profitPercentage
+          if (this.initialWalletBalance !== null && !isNaN(totalWalletBalance) && this.initialBasePositionSizeUSDT !== null && this.initialBasePositionSizeUSDT > 0) {
+            this.profitPercentage = ((totalWalletBalance - this.initialWalletBalance) / this.initialBasePositionSizeUSDT) * 100;
+            await this.addLog(`Profit Percentage: ${this.profitPercentage.toFixed(2)}%.`);
+          } else {
+            this.profitPercentage = null;
+            await this.addLog(`Could not calculate profit percentage. Initial balance: ${this.initialWalletBalance}, Final balance: ${totalWalletBalance}, Initial position size: ${this.initialBasePositionSizeUSDT}`);
+          }
+        }
+      } catch (error) {
+        console.error(`Failed to record wallet balance or calculate profit percentage: ${error.message}`);
+        await this.addLog(`Failed to record wallet balance or calculate profit percentage: ${error.message}`);
+        this.profitPercentage = null; // Ensure it's null on error
+      }
+    } else {
+      await this.addLog('No trading activity detected. Skipping wallet balance save.');
+    }
+
+    await this.saveState(); // Save the final state to Firestore
+    
     // Now close WebSockets and invalidate ListenKey
     const closePromises = [];
 
@@ -1953,7 +2001,8 @@ class TradingStrategy {
 
     await this.addLog('Strategy stopped.');
 
-    // Reset strategy state variables AFTER saving
+    // Reset strategy state variables AFTER saving to Firestore and closing connections.
+    // These resets are for the *instance* of the strategy, not for the historical record.
     this.currentPosition = 'NONE';
     this.positionEntryPrice = null;
     this.positionSize = null;
@@ -1961,8 +2010,8 @@ class TradingStrategy {
     this.currentPrice = null;
     this.positionPnL = null;
     this.totalPnL = null;
-    this.accumulatedRealizedPnL = 0;
-    this.accumulatedTradingFees = 0;
+    this.accumulatedRealizedPnL = 0; 
+    this.accumulatedTradingFees = 0; 
 
     this.entryPositionQuantity = null;
     this.currentPositionQuantity = null;
@@ -1974,8 +2023,8 @@ class TradingStrategy {
     this.finalTpPrice = null;
     this.finalTpActive = false;
     this.finalTpOrderSent = false;
-    this.breakevenPercentage = null; // NEW
-    this.finalTpPercentage = null;     // NEW
+    this.breakevenPercentage = null;
+    this.finalTpPercentage = null;
 
     this.supportLevel = null;
     this.resistanceLevel = null;
@@ -1993,21 +2042,21 @@ class TradingStrategy {
     // Reset summary section data
     this.reversalCount = 0;
     this.partialTpCount = 0;
-    this.tradeSequence = ''; // NEW
+    this.tradeSequence = '';
     this.initialWalletBalance = null;
     this.profitPercentage = null;
     this.strategyStartTime = null;
     this.strategyEndTime = null;
+    this.isStopping = false; // NEW: Reset flag at the very end
   }
 
   async getStatus() {
     // In a real scenario, this would fetch live data from Binance
     // For simulation, we return current internal state
     return {
-      timeframe: this.timeframe,
+      strategyId: this.strategyId,
       symbol: this.symbol,
       positionSizeUSDT: this.positionSizeUSDT,
-      reversalMethod: this.reversalMethod,
       supportLevel: this.supportLevel,
       resistanceLevel: this.resistanceLevel,
       enableSupport: this.enableSupport,
