@@ -2,16 +2,20 @@ import express from 'express';
 import cors from 'cors';
 import TradingStrategy from './strategy.js';
 import http from 'http';
-import { Firestore, Timestamp } from '@google-cloud/firestore'; // MODIFIED: Added Timestamp to import
+import { Firestore, Timestamp } from '@google-cloud/firestore';
+import { initializeFirebaseAdmin } from './pushNotificationHelper.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000; // Default to 3000 if PORT is not set
 
 // Initialize Firestore globally
 const firestore = new Firestore({
-  projectId: 'ycbot-6f336', // Hardcode Firestore project ID
-  databaseId: '(default)', // Hardcode Firestore database ID
+  projectId: 'ycbot-6f336',
+  databaseId: '(default)',
 });
+
+// Initialize Firebase Admin SDK for push notifications
+initializeFirebaseAdmin();
 
 // Middleware
 app.use(cors({
@@ -55,16 +59,43 @@ app.get('/health', (req, res) => {
 // Start strategy endpoint
 app.post('/strategy/start', async (req, res) => {
   try {
-    const { profileId, gcpProxyUrl, sharedVmProxyGcfUrl, config } = req.body; // NEW: sharedVmProxyGcfUrl
+    const { profileId, gcpProxyUrl, sharedVmProxyGcfUrl, config, userId } = req.body;
 
-    if (!profileId || !gcpProxyUrl || !sharedVmProxyGcfUrl || !config) { // NEW: Check sharedVmProxyGcfUrl
+    if (!profileId || !gcpProxyUrl || !sharedVmProxyGcfUrl || !config) {
       console.error('Missing required parameters for /strategy/start');
       return res.status(400).json({ error: 'profileId, gcpProxyUrl, sharedVmProxyGcfUrl, and config are required.' });
     }
 
-    // Check if a strategy for this profile is already running (optional, depending on desired behavior)
-    // If you want to allow multiple strategies per profile, remove this check or modify it.
-    // For now, we'll assume one active strategy per profile.
+    if (!userId) {
+      console.error('Missing userId for balance validation');
+      return res.status(400).json({ error: 'userId is required for balance validation.' });
+    }
+
+    const requiredBalance = config.positionSizeUSDT || 0;
+    if (requiredBalance <= 0) {
+      return res.status(400).json({ error: 'Invalid position size for balance validation.' });
+    }
+
+    const walletRef = firestore.collection('users').doc(userId).collection('wallets').doc('default');
+    const walletDoc = await walletRef.get();
+
+    if (!walletDoc.exists) {
+      return res.status(400).json({
+        error: 'Wallet not found. Please reload your account first.',
+        code: 'WALLET_NOT_FOUND'
+      });
+    }
+
+    const currentBalance = walletDoc.data()?.balance || 0;
+    if (currentBalance < requiredBalance) {
+      return res.status(400).json({
+        error: `Insufficient reload balance. You have ${currentBalance.toFixed(2)} USDT but need ${requiredBalance.toFixed(2)} USDT.`,
+        code: 'INSUFFICIENT_BALANCE',
+        currentBalance,
+        requiredBalance
+      });
+    }
+
     let existingStrategyIdForProfile = null;
     for (const [sId, strategy] of activeStrategies.entries()) {
       if (strategy.profileId === profileId && strategy.isRunning) {
@@ -77,25 +108,26 @@ app.post('/strategy/start', async (req, res) => {
       console.error(`Strategy for profile ${profileId} (strategyId: ${existingStrategyIdForProfile}) is already running`);
       return res.status(400).json({
         error: `Strategy for profile ${profileId} is already running`,
-        strategyId: existingStrategyIdForProfile // Return existing strategyId
+        strategyId: existingStrategyIdForProfile
       });
     }
 
-    // Pass profileId to the TradingStrategy constructor so it can be stored internally
-    const strategy = new TradingStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl); // NEW: Pass sharedVmProxyGcfUrl and profileId
-    const strategyId = await strategy.start(config); // strategy.start() should now generate and return the strategyId
+    const strategy = new TradingStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
+    strategy.userId = userId;
+    const strategyId = await strategy.start(config);
 
-    activeStrategies.set(strategyId, strategy); // Use strategyId as the key
+    activeStrategies.set(strategyId, strategy);
 
-    console.log(`Strategy ${strategyId} started successfully.`);
+    console.log(`Strategy ${strategyId} started successfully with validated balance: ${currentBalance} USDT`);
     res.json({
       success: true,
-      strategyId, // Return the generated strategyId
-      message: 'Ycbot trading strategy started successfully'
+      strategyId,
+      message: 'Ycbot trading strategy started successfully',
+      balanceValidated: true,
+      currentBalance
     });
   } catch (error) {
     console.error('Failed to start strategy:', error);
-    // Log full error object for more details
     console.error('Full error object for /strategy/start:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
     res.status(500).json({
       error: error.message,
@@ -107,7 +139,7 @@ app.post('/strategy/start', async (req, res) => {
 // Stop strategy endpoint
 app.post('/strategy/stop', async (req, res) => {
   try {
-    const { strategyId } = req.body; // Expect strategyId
+    const { strategyId } = req.body;
 
     if (!strategyId) {
       return res.status(400).json({ error: 'strategyId is required.' });
@@ -121,11 +153,144 @@ app.post('/strategy/stop', async (req, res) => {
     }
 
     await strategy.stop();
-    activeStrategies.delete(strategyId); // Remove from map after stopping
-    
+    activeStrategies.delete(strategyId);
+
+    const strategyDoc = await firestore.collection('strategies').doc(strategyId).get();
+    if (!strategyDoc.exists) {
+      console.warn(`Strategy ${strategyId} not found in Firestore, skipping fee calculation`);
+      return res.json({
+        success: true,
+        message: `Ycbot strategy ${strategyId} stopped successfully`,
+        feeProcessed: false
+      });
+    }
+
+    const strategyData = strategyDoc.data();
+    const finalPnL = strategyData.totalPnL || 0;
+    const userId = strategy.userId || strategyData.userId;
+    const profileId = strategy.profileId || strategyData.profileId;
+
+    if (!userId) {
+      console.error(`UserId not found for strategy ${strategyId}, skipping fee calculation`);
+      return res.json({
+        success: true,
+        message: `Ycbot strategy ${strategyId} stopped successfully`,
+        feeProcessed: false,
+        error: 'UserId not found'
+      });
+    }
+
+    let feeResult = null;
+    if (finalPnL > 0) {
+      const FEE_PERCENTAGE = 0.15;
+      const feeAmount = Math.round(finalPnL * FEE_PERCENTAGE * 100) / 100;
+      const feeId = firestore.collection('temp').doc().id;
+
+      const strategyFee = {
+        feeId,
+        strategyId,
+        userId,
+        profileId,
+        initialPnL: 0,
+        finalPnL,
+        feeAmount,
+        feePercentage: FEE_PERCENTAGE,
+        calculatedAt: Timestamp.now(),
+        status: 'calculated',
+      };
+
+      await firestore.collection('strategy_fees').doc(feeId).set(strategyFee);
+
+      const walletRef = firestore.collection('users').doc(userId).collection('wallets').doc('default');
+      const walletDoc = await walletRef.get();
+
+      if (!walletDoc.exists) {
+        console.error(`Wallet not found for user ${userId}, fee calculated but not deducted`);
+        feeResult = {
+          feeCalculated: true,
+          feeAmount,
+          feeDeducted: false,
+          reason: 'Wallet not found'
+        };
+      } else {
+        const currentBalance = walletDoc.data()?.balance || 0;
+        let deductAmount = feeAmount;
+        let feeStatus = 'deducted';
+
+        if (currentBalance < feeAmount) {
+          deductAmount = currentBalance;
+          feeStatus = 'insufficient_balance';
+          console.warn(`Insufficient balance for full fee. Available: ${currentBalance}, Required: ${feeAmount}`);
+        }
+
+        const newBalance = Math.max(0, currentBalance - deductAmount);
+        const now = Timestamp.now();
+
+        await walletRef.update({
+          balance: newBalance,
+          updatedAt: now,
+          lastTransactionAt: now,
+        });
+
+        const transactionId = firestore.collection('temp').doc().id;
+        const transactionRef = walletRef.collection('transactions').doc(transactionId);
+        await transactionRef.set({
+          transactionId,
+          type: 'debit',
+          amount: deductAmount,
+          balanceBefore: currentBalance,
+          balanceAfter: newBalance,
+          reason: 'platform_fee',
+          relatedResourceType: 'strategy',
+          relatedResourceId: strategyId,
+          createdAt: now,
+        });
+
+        await firestore.collection('strategy_fees').doc(feeId).update({
+          status: feeStatus,
+          deductedAt: now,
+          balanceBefore: currentBalance,
+          balanceAfter: newBalance,
+        });
+
+        if (deductAmount > 0) {
+          const earningId = firestore.collection('temp').doc().id;
+          await firestore.collection('platform_earnings').doc(earningId).set({
+            earningId,
+            feeId,
+            strategyId,
+            userId,
+            amount: deductAmount,
+            collectedAt: now,
+            source: 'performance_fee',
+          });
+        }
+
+        console.log(`Performance fee of ${deductAmount.toFixed(2)} USDT deducted from user ${userId}. Status: ${feeStatus}`);
+
+        feeResult = {
+          feeCalculated: true,
+          feeAmount,
+          feeDeducted: true,
+          deductedAmount: deductAmount,
+          newBalance,
+          status: feeStatus
+        };
+      }
+    } else {
+      console.log(`Strategy ${strategyId} ended with non-positive PnL (${finalPnL}). No fee charged.`);
+      feeResult = {
+        feeCalculated: false,
+        finalPnL,
+        reason: 'Non-positive PnL'
+      };
+    }
+
     res.json({
       success: true,
-      message: `Ycbot strategy ${strategyId} stopped successfully`
+      message: `Ycbot strategy ${strategyId} stopped successfully`,
+      feeProcessed: true,
+      feeDetails: feeResult
     });
   } catch (error) {
     console.error('Failed to stop strategy:', error);
