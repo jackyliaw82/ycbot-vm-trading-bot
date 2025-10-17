@@ -8,7 +8,9 @@ module.exports = {
     max_memory_restart: '1G',
     env: {
       NODE_ENV: 'production',
-      PORT: 3000
+      PORT: 3000,
+      GOOGLE_APPLICATION_CREDENTIALS: '/opt/vm-bot/service-account-key.json',
+      GOOGLE_CLOUD_PROJECT_ID: 'ycbot-6f336'
     },
     error_file: './logs/err.log',
     out_file: './logs/out.log',
