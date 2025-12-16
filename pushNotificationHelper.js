@@ -207,7 +207,7 @@ export async function sendPushNotification(userId, notificationData) {
                 consecutiveFailures: currentFailures,
                 lastErrorCode: errorCode,
                 lastErrorMessage: errorMessage,
-                lastFailureTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+                lastFailureTimestamp: Date.now(),
                 status: currentFailures >= 2 ? 'warning' : 'active',
               });
             }
@@ -221,7 +221,7 @@ export async function sendPushNotification(userId, notificationData) {
               consecutiveFailures: 0,
               lastErrorCode: null,
               lastErrorMessage: null,
-              lastSuccessTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+              lastSuccessTimestamp: Date.now(),
               status: 'active',
             });
           }
@@ -253,7 +253,7 @@ export async function sendPushNotification(userId, notificationData) {
           consecutiveFailures: 0,
           lastErrorCode: null,
           lastErrorMessage: null,
-          lastSuccessTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+          lastSuccessTimestamp: Date.now(),
           status: 'active',
         }));
 
@@ -344,19 +344,26 @@ async function logNotificationEvent(userId, eventData) {
 }
 
 export async function sendStrategyCompletionNotification(userId, strategyData) {
-  const isProfitable = strategyData.netPnL > 0;
+  // Validate and provide defaults for strategyData
+  const netPnL = typeof strategyData?.netPnL === 'number' ? strategyData.netPnL : 0;
+  const profitPercentage = typeof strategyData?.profitPercentage === 'number' ? strategyData.profitPercentage : 0;
+  const symbol = strategyData?.symbol || 'Unknown';
+  const timeTaken = strategyData?.timeTaken || 'N/A';
+  const tradeCount = strategyData?.tradeCount || 0;
+
+  const isProfitable = netPnL > 0;
   const profitSign = isProfitable ? '+' : '';
-  const profitPercentSign = strategyData.profitPercentage > 0 ? '+' : '';
+  const profitPercentSign = profitPercentage > 0 ? '+' : '';
 
   const notificationData = {
-    title: `${isProfitable ? '🎉' : '📊'} Final TP Reached - ${strategyData.symbol}`,
-    body: `Net PnL: ${profitSign}$${strategyData.netPnL.toFixed(2)} (${profitPercentSign}${strategyData.profitPercentage.toFixed(2)}%)\nTime: ${strategyData.timeTaken} | Trades: ${strategyData.tradeCount}`,
+    title: `${isProfitable ? '🎉' : '📊'} Final TP Reached - ${symbol}`,
+    body: `Net PnL: ${profitSign}$${netPnL.toFixed(2)} (${profitPercentSign}${profitPercentage.toFixed(2)}%)\nTime: ${timeTaken} | Trades: ${tradeCount}`,
     data: {
       type: 'final_tp',
-      strategyId: strategyData.strategyId,
-      symbol: strategyData.symbol,
-      netPnL: strategyData.netPnL.toString(),
-      profitPercentage: strategyData.profitPercentage.toString(),
+      strategyId: strategyData?.strategyId || '',
+      symbol: symbol,
+      netPnL: netPnL.toString(),
+      profitPercentage: profitPercentage.toString(),
     },
   };
 
@@ -364,15 +371,20 @@ export async function sendStrategyCompletionNotification(userId, strategyData) {
 }
 
 export async function sendCapitalProtectionNotification(userId, protectionData) {
+  // Validate and provide defaults for protectionData
+  const lossAmount = typeof protectionData?.lossAmount === 'number' ? protectionData.lossAmount : 0;
+  const lossPercentage = typeof protectionData?.lossPercentage === 'number' ? protectionData.lossPercentage : 0;
+  const symbol = protectionData?.symbol || 'Unknown';
+
   const notificationData = {
-    title: `⚠️ Capital Protection - ${protectionData.symbol}`,
-    body: `Circuit breaker triggered!\nLoss: $${Math.abs(protectionData.lossAmount).toFixed(2)} (${protectionData.lossPercentage.toFixed(2)}%)\nStrategy stopped automatically.`,
+    title: `⚠️ Capital Protection - ${symbol}`,
+    body: `Circuit breaker triggered!\nLoss: $${Math.abs(lossAmount).toFixed(2)} (${lossPercentage.toFixed(2)}%)\nStrategy stopped automatically.`,
     data: {
       type: 'capital_protection',
-      strategyId: protectionData.strategyId,
-      symbol: protectionData.symbol,
-      lossAmount: protectionData.lossAmount.toString(),
-      lossPercentage: protectionData.lossPercentage.toString(),
+      strategyId: protectionData?.strategyId || '',
+      symbol: symbol,
+      lossAmount: lossAmount.toString(),
+      lossPercentage: lossPercentage.toString(),
     },
   };
 
@@ -380,17 +392,24 @@ export async function sendCapitalProtectionNotification(userId, protectionData) 
 }
 
 export async function sendReversalNotification(userId, reversalData) {
+  // Validate and provide defaults for reversalData
+  const currentPrice = typeof reversalData?.currentPrice === 'number' ? reversalData.currentPrice : 0;
+  const reversalCount = typeof reversalData?.reversalCount === 'number' ? reversalData.reversalCount : 0;
+  const symbol = reversalData?.symbol || 'Unknown';
+  const oldPosition = reversalData?.oldPosition || 'NONE';
+  const newPosition = reversalData?.newPosition || 'NONE';
+
   const notificationData = {
-    title: `🔄 Reversal #${reversalData.reversalCount} - ${reversalData.symbol}`,
-    body: `Position reversed: ${reversalData.oldPosition} → ${reversalData.newPosition}\nPrice: $${reversalData.currentPrice.toFixed(2)}\nTotal reversals: ${reversalData.reversalCount}`,
+    title: `🔄 Reversal #${reversalCount} - ${symbol}`,
+    body: `Position reversed: ${oldPosition} → ${newPosition}\nPrice: $${currentPrice.toFixed(2)}\nTotal reversals: ${reversalCount}`,
     data: {
       type: 'reversal',
-      strategyId: reversalData.strategyId,
-      symbol: reversalData.symbol,
-      oldPosition: reversalData.oldPosition,
-      newPosition: reversalData.newPosition,
-      reversalCount: reversalData.reversalCount.toString(),
-      currentPrice: reversalData.currentPrice.toString(),
+      strategyId: reversalData?.strategyId || '',
+      symbol: symbol,
+      oldPosition: oldPosition,
+      newPosition: newPosition,
+      reversalCount: reversalCount.toString(),
+      currentPrice: currentPrice.toString(),
     },
   };
 
