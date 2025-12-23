@@ -9,14 +9,14 @@ import { precisionFormatter } from './precisionUtils.js';
 const app = express();
 const PORT = process.env.PORT || 3000; // Default to 3000 if PORT is not set
 
-// Initialize Firestore globally
-const firestore = new Firestore({
-  projectId: 'ycbot-6f336',
-  databaseId: '(default)',
-});
-
-// Initialize Firebase Admin SDK for push notifications
-initializeFirebaseAdmin();
+// Track startup status for health checks
+let startupStatus = {
+  phase: 'initializing',
+  startTime: Date.now(),
+  firestoreReady: false,
+  firebaseReady: false,
+  serverReady: false
+};
 
 // Middleware
 app.use(cors({
@@ -30,6 +30,33 @@ app.use(cors({
 }));
 
 app.use(express.json());
+
+// Lightweight startup status endpoint - responds immediately without waiting for full initialization
+app.get('/startup-status', (req, res) => {
+  const uptime = Math.floor((Date.now() - startupStatus.startTime) / 1000);
+  res.json({
+    phase: startupStatus.phase,
+    uptime,
+    firestoreReady: startupStatus.firestoreReady,
+    firebaseReady: startupStatus.firebaseReady,
+    serverReady: startupStatus.serverReady,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Initialize Firestore globally
+startupStatus.phase = 'initializing_firestore';
+const firestore = new Firestore({
+  projectId: 'ycbot-6f336',
+  databaseId: '(default)',
+});
+startupStatus.firestoreReady = true;
+
+// Initialize Firebase Admin SDK for push notifications
+startupStatus.phase = 'initializing_firebase';
+initializeFirebaseAdmin();
+startupStatus.firebaseReady = true;
+startupStatus.phase = 'ready';
 
 // Global map to store active strategy instances, keyed by strategyId
 const activeStrategies = new Map();
@@ -1354,8 +1381,11 @@ app.post('/test/reset-reconnection-state', async (req, res) => {
 
 // Start the server
 server.listen(PORT, () => {
+  startupStatus.serverReady = true;
+  startupStatus.phase = 'ready';
   console.log(`🚀 YcBot API server running on port ${PORT}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+  console.log(`🔗 Startup status: http://localhost:${PORT}/startup-status`);
   console.log(`🤞 Good luck bro! On the road to Million now`);
 });
 
