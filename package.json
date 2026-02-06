@@ -7,9 +7,9 @@
     "start": "node app.js",
     "dev": "node --watch app.js",
     "pm2:start": "pm2 start ecosystem.config.cjs",
-    "pm2:stop": "pm2 stop trading-bot",
-    "pm2:restart": "pm2 restart trading-bot",
-    "pm2:logs": "pm2 logs trading-bot"
+    "pm2:stop": "pm2 stop ycbot",
+    "pm2:restart": "pm2 restart ycbot",
+    "pm2:logs": "pm2 logs ycbot"
   },
   "dependencies": {
     "@google-cloud/firestore": "^7.1.0",
