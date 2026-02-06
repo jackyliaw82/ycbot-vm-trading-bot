@@ -6,11 +6,13 @@ import { Firestore, Timestamp } from '@google-cloud/firestore';
 import { initializeFirebaseAdmin } from './pushNotificationHelper.js';
 import { precisionFormatter } from './precisionUtils.js';
 import { execFile } from 'child_process';
+import { readFileSync } from 'fs';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BOT_VERSION = '1.0.0';
+const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+const BOT_VERSION = pkg.version;
 let updateAvailable = false;
 let targetVersion = null;
 let isUpdating = false;
@@ -1688,13 +1690,28 @@ function triggerSelfUpdate() {
     updateStartedAt = new Date().toISOString();
     console.log(`[UPDATE] Starting self-update to ${targetVersion}...`);
 
+    reportUpdateStatus('updating', { targetVersion, startedAt: updateStartedAt }).catch(() => {});
+
     const scriptPath = '/opt/vm-bot/self-update.sh';
-    execFile('bash', [scriptPath], { timeout: 300000 }, (error, stdout, stderr) => {
+    execFile('bash', [scriptPath], {
+      timeout: 300000,
+      env: {
+        ...process.env,
+        PM2_HOME: process.env.PM2_HOME || '/root/.pm2',
+        PATH: process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+      }
+    }, (error, stdout, stderr) => {
       if (error) {
         console.error('[UPDATE] Self-update script failed:', error);
         console.error('[UPDATE] stderr:', stderr);
         isUpdating = false;
         updateStartedAt = null;
+        reportUpdateStatus('update_failed', {
+          targetVersion,
+          error: error.message,
+          stderr: stderr?.substring(0, 500),
+          failedAt: new Date().toISOString(),
+        }).catch(() => {});
         reject(error);
         return;
       }
@@ -1702,6 +1719,23 @@ function triggerSelfUpdate() {
       resolve(stdout);
     });
   });
+}
+
+async function reportUpdateStatus(status, details = {}) {
+  try {
+    const userId = await getVmOwnerUserId();
+    if (!userId) return;
+    const vmStatusRef = firestore.collection('users').doc(userId).collection('vm_status').doc('current');
+    await vmStatusRef.set({
+      updateStatus: status,
+      updateDetails: details,
+      botVersion: BOT_VERSION,
+      lastUpdateStatusAt: Timestamp.now(),
+    }, { merge: true });
+    console.log(`[UPDATE] Reported update status: ${status} for user ${userId}`);
+  } catch (error) {
+    console.error('[UPDATE] Failed to report update status:', error);
+  }
 }
 
 async function getVmOwnerUserId() {
@@ -1795,6 +1829,8 @@ async function reportVersionOnStartup() {
         lastReportedAt: Timestamp.now(),
         status: 'online',
         activeStrategiesCount: activeStrategies.size,
+        updateStatus: 'idle',
+        updateDetails: {},
       }, { merge: true });
       console.log(`[UPDATE] Reported version ${BOT_VERSION} for user ${userId}`);
     } else {
