@@ -1,4 +1,4 @@
-import { Firestore } from '@google-cloud/firestore';
+import { Firestore, Timestamp } from '@google-cloud/firestore';
 import WebSocket from 'ws';
 import fetch from 'node-fetch';
 import { sendStrategyCompletionNotification, sendCapitalProtectionNotification, sendReversalNotification } from './pushNotificationHelper.js';
@@ -17,6 +17,11 @@ const PONG_TIMEOUT_MS = 10000; // Expect pong within 10 seconds
 const ORDER_CONFIRMATION_TIMEOUT_MS = 15000; // 15 seconds timeout for WebSocket order confirmation
 const ORDER_STATUS_POLL_INTERVAL_MS = 2000; // Poll every 2 seconds when using REST API fallback
 const MAX_ORDER_STATUS_POLLS = 10; // Maximum number of polling attempts
+
+// Entry price update constants
+const ENTRY_PRICE_UPDATE_MAX_RETRIES = 6; // Max retry attempts to get updated entry price
+const ENTRY_PRICE_UPDATE_INITIAL_DELAY_MS = 200; // Initial delay: 200ms
+const ENTRY_PRICE_UPDATE_MAX_DELAY_MS = 3200; // Max delay: 3200ms
 
 // Desired profit percentage
 const DESIRED_PROFIT_PERCENTAGE = 1.55; // Fixed profit target: 1.55%
@@ -38,6 +43,7 @@ class TradingStrategy {
     });
     this.tradesCollectionRef = null; // Initialized here, set in start() and loadState()
     this.logsCollectionRef = null; // Firestore collection for logs
+    this.strategyFlowCollectionRef = null; // Firestore collection for strategy flow events
     this.realtimeWs = null;
     this.userDataWs = null; // WebSocket for User Data Stream
     this.listenKey = null; // Binance listenKey for User Data Stream
@@ -45,6 +51,7 @@ class TradingStrategy {
     this.strategyId = null; // Will be set uniquely in start() or loadState()
     this.isRunning = false;
     this.isStopping = false; // Add isStopping flag
+    this.willBeDeleted = false; // Flag to indicate strategy will be deleted (prevents log writes)
     this.gcfProxyUrl = gcfProxyUrl; // This is the profile-specific binance-proxy GCF URL
     this.profileId = profileId; // Store the profileId for authentication and logging
     this.sharedVmProxyGcfUrl = sharedVmProxyGcfUrl; // Store the shared VM proxy GCF URL
@@ -52,13 +59,14 @@ class TradingStrategy {
     // Dynamic threshold trading strategy state variables
     this.entryLevel = null;
     this.reversalLevel = null;
+    this.initialReversalLevel = null; // Stores the original reversal level calculated at position open (never trails)
     this.enableSupport = false; // Indicates if support zone is active for initial entry
     this.enableResistance = false; // Indicates if resistance zone is active for initial entry
     this.currentPosition = 'NONE'; // 'LONG' | 'SHORT' | 'NONE'
     this.positionEntryPrice = null;
     this.positionSize = null; // in notional USDT
     this.activeMode = 'NONE'; // 'RESISTANCE_ZONE' | 'SUPPORT_ZONE' | 'NONE'
-    
+
     // Real-time price and PnL for status checks
     this.currentPrice = null;
     this.positionPnL = null; // Single position PnL
@@ -67,7 +75,6 @@ class TradingStrategy {
     // PnL breakdown variables (overall accumulated)
     this.accumulatedRealizedPnL = 0;
     this.accumulatedTradingFees = 0;
-    this.sessionStartTradeId = null; // First trade ID of current strategy session for verification
 
     // Position quantity tracking
     this.entryPositionQuantity = null; // Quantity of the position at initial entry (in base asset, e.g., BTC)
@@ -86,13 +93,6 @@ class TradingStrategy {
     this.breakevenPercentage = null;
     this.finalTpPercentage = null;
 
-    // Partial TP states
-    this.partialTpLevels = [0.5, 1.0, 2.0]; // Default: 0.5%, 1%, 2.0% from entry
-    this.partialTpSizes = [0, 0, 0]; // Default: Disabled, Disabled, Disabled (0 means disabled)
-    this.partialTpPrices = [null, null, null]; // Calculated TP price for each level
-    this.partialTpExecuted = [false, false, false]; // Track which levels have been executed
-    this.currentEntryReference = null; // Reference price for partial TP calculations
-
     // Custom Final TP Levels - Position Specific
     this.customFinalTpLong = null; // If set, overrides DESIRED_PROFIT_PERCENTAGE for LONG positions
     this.customFinalTpShort = null; // If set, overrides DESIRED_PROFIT_PERCENTAGE for SHORT positions
@@ -104,10 +104,30 @@ class TradingStrategy {
     // Reversal level percentage
     this.reversalLevelPercentage = null; // Initialize to null, will be set from config
 
-    // Move Reversal Level feature
-    this.moveReversalLevel = 'DO_NOT_MOVE'; // 'DO_NOT_MOVE' | 'MOVE_TO_BREAKEVEN'
-    this.reversalLevelMoved = false; // Tracks if reversal level has been moved for current position
-    this.originalReversalLevel = null; // Stores the original reversal level before moving
+    // Fixed reversal levels (calculated once at initial position)
+    this.longReversalLevel = null; // Fixed level where LONG positions can be triggered
+    this.shortReversalLevel = null; // Fixed level where SHORT positions can be triggered
+    this.fixedReversalLevelsCalculated = false; // Flag to track if fixed levels have been set
+
+    // Trailing reversal level state variables
+    this.trailStepFactor = 1; // How many ticks price must move before reversal level trails (default: 1)
+    this.highestFavorablePrice = null; // Highest price reached for LONG positions
+    this.lowestFavorablePrice = null; // Lowest price reached for SHORT positions
+    this.trailingReversalActive = false; // Whether trailing is currently active
+    this.ticksMovedInFavor = 0; // Accumulated ticks moved in favorable direction
+
+    // Partial Take-Profit state variables
+    this.tpLevel = null; // Trailing TP level (trails independently from initialReversalLevel)
+    this.tp1Executed = false; // Whether TP1 has been executed
+    this.tp2Executed = false; // Whether TP2 has been executed
+    this.tp3Executed = false; // Whether TP3 has been executed
+    this.tp1TriggerLevel = null; // TP level at which TP1 was triggered
+    this.tp2TriggerLevel = null; // TP level at which TP2 was triggered
+    this.tp3TriggerLevel = null; // TP level at which TP3 was triggered
+    this.tpLevelTrailingPaused = false; // Whether TP level trailing is paused (set to true after TP3)
+    this.partialTp1SizePercent = 20; // Percentage of position to close at TP1 (default: 20%)
+    this.partialTp2SizePercent = 20; // Percentage of position to close at TP2 (default: 20%)
+    this.partialTp3SizePercent = 10; // Percentage of position to close at TP3 (default: 10%)
 
     // New Order Type and Direction states
     this.orderType = 'MARKET'; // 'LIMIT' | 'MARKET'
@@ -115,6 +135,9 @@ class TradingStrategy {
     this.sellShortEnabled = false;
     this.buyLimitPrice = null;
     this.sellLimitPrice = null;
+    this.longLimitOrderId = null; // To store the orderId of a pending LONG LIMIT order
+    this.shortLimitOrderId = null; // To store the orderId of a pending SHORT LIMIT order
+    this.priceType = 'MARK'; // 'LAST' | 'MARK' - WebSocket price stream type
 
     // WebSocket connection statuses (to be reported to frontend)
     this.realtimeWsConnected = false;
@@ -141,51 +164,20 @@ class TradingStrategy {
     // Dynamic Position Sizing Constants
     this.initialBasePositionSizeUSDT = null; // Initialized to null, must come from config or loaded state
     this.restartPositionSizeUSDT = null; // One-time restart capital - used only for the first trade after restart
-    this.RECOVERY_FACTOR = 0.15; // Percentage of accumulated loss to target for recovery in next trade's TP (default: 15%)
+    this.RECOVERY_FACTOR = 0.20; // Percentage of accumulated loss to target for recovery in next trade's TP (default: 20%)
     this.MAX_POSITION_SIZE_USDT = 0; // Will be set dynamically in start()
     this.RECOVERY_DISTANCE = 0.005; //0.5%
 
     // Binance exchange info cache for precision and step size
     this.exchangeInfoCache = {}; // Stores tickSize, stepSize, minQty, maxQty, minNotional for each symbol
-
-    // ===== Volatility Filter State =====
-    this.volatilityEnabled = true; // Option to enable/disable volatility filter
-    this.volatilityMeasurementActive = false; // Only measure when price hits limit order price
-    this.microbarOpen = null;
-    this.microbarHigh = null;
-    this.microbarLow = null;
-    this.microbarClose = null;
-    this.microbarTickCount = 0;
-
-    this.MICROBAR_TICK_LIMIT = 15; // number of ticks per synthetic microbar
-    this.volatilityLookback = 20; // number of microbars to average
-    this.volatilityMultiplier = 1.5; // 50% expansion threshold
-
-    this.microbarHistory = []; // rolling history of microbar body percentages
-    this.volatilityExpanded = false; // default false - must measure actual volatility expansion before trading
-
-    // ===== Virtual Position Tracking State =====
-    this.virtualPositionActive = false; // True when waiting for volatility expansion
-    this.virtualPositionDirection = null; // 'LONG' | 'SHORT' | null
-    this.virtualOriginalDirection = null; // Track original direction for flip logic
-    this.volatilityWaitStartTime = null; // Timestamp when virtual tracking started
-    this.lastVirtualDirectionChange = null; // Timestamp of last direction change
-    this.virtualDirectionChanges = []; // Array of {timestamp, price, from, to}
-    this.virtualLongLimitOrder = null; // {price, side, quantity, timestamp} - for BUY LIMIT orders
-    this.virtualShortLimitOrder = null; // {price, side, quantity, timestamp} - for SELL LIMIT orders
-    this.virtualDirectionBuffer = null; // For debounce: {direction, count}
-    this.lastVirtualStatusLogTime = null; // For periodic status logging every 30s
-    this.virtualEntryLevel = null; // Entry level reference during virtual tracking
-    this.virtualReversalLevel = null; // Reversal level reference during virtual tracking
-    this.closedPositionType = null; // Track what position was just closed (for direction logic)
-    this.virtualLimitFirstTriggered = false; // Track if virtual limit was triggered at least once
-    this.isInitializingVirtualLimits = false; // Flag to prevent premature logging during dual-limit setup
-
+    
     // Testnet status
     this.isTestnet = null;
 
     // Map to store pending order promises, resolving when order is filled/rejected
     this.pendingOrders = new Map();
+    // NEW: Map to store timeout IDs for initial LIMIT orders
+    this.pendingInitialLimitOrders = new Map();
     // NEW: Set to track saved trade order IDs to prevent duplicates
     this.savedTradeOrderIds = new Set();
 
@@ -194,11 +186,10 @@ class TradingStrategy {
 
     // Summary section data
     this.reversalCount = 0;
-    this.partialTpCount = 0; // Track total number of partial TPs executed
     this.tradeSequence = '';
     this.initialWalletBalance = null;
     this.tradingMode = 'NORMAL'; // Trading mode: AGGRESSIVE, NORMAL, or CONSERVATIVE
-    this.lastDynamicSizingReversalCount = -1; // Track which reversal number last applied dynamic sizing (-1 = conceptual start before first reversal)
+    this.lastDynamicSizingReversalCount = 0;
     this.profitPercentage = null;
     this.strategyStartTime = null;
     this.strategyEndTime = null;
@@ -233,19 +224,19 @@ class TradingStrategy {
       minute: '2-digit',
       second: '2-digit',
     });
-    
+
     const logPrefix = this.profileId ? `[${this.profileId.slice(-6)}] ` : '[STRATEGY] ';
     const logEntry = `${logPrefix}${timestamp}: ${message}`;
     console.log(logEntry);
-    
+
     // Filter out specific messages from being broadcast to the frontend
     const messagesToFilter = [
       'WebSocket client connected for logs',
       'WebSocket client disconnected for logs'
     ];
 
-    // Save log to Firestore
-    if (this.strategyId && !messagesToFilter.some(filterMsg => message.includes(filterMsg))) {
+    // Save log to Firestore (skip if strategy will be deleted)
+    if (this.strategyId && !this.willBeDeleted && !messagesToFilter.some(filterMsg => message.includes(filterMsg))) {
       try {
         await this.logsCollectionRef.add({
           message: logEntry, // Use the prefixed logEntry for Firestore
@@ -254,6 +245,35 @@ class TradingStrategy {
       } catch (error) {
         console.error('Failed to save log to Firestore:', error);
       }
+    }
+  }
+
+  // Helper to delete all documents in a subcollection using batch operations
+  async deleteSubcollection(collectionRef, subcollectionName) {
+    try {
+      const batchSize = 500; // Firestore batch limit
+      const snapshot = await collectionRef.limit(batchSize).get();
+
+      if (snapshot.empty) {
+        console.log(`[${this.strategyId}] Subcollection ${subcollectionName} is empty or does not exist`);
+        return;
+      }
+
+      const batch = this.firestore.batch();
+      snapshot.docs.forEach(doc => {
+        batch.delete(doc.ref);
+      });
+
+      await batch.commit();
+      console.log(`[${this.strategyId}] Deleted ${snapshot.size} documents from ${subcollectionName} subcollection`);
+
+      // Recursively delete remaining documents if there are more
+      if (snapshot.size === batchSize) {
+        await this.deleteSubcollection(collectionRef, subcollectionName);
+      }
+    } catch (error) {
+      console.error(`[${this.strategyId}] Failed to delete ${subcollectionName} subcollection: ${error.message}`);
+      throw error;
     }
   }
 
@@ -266,6 +286,23 @@ class TradingStrategy {
       return this.roundPrice(basePrice * (1 - factor));
     }
   }
+
+  _calculateTicksBetween(price1, price2) {
+    const tickSize = this.exchangeInfoCache[this.symbol]?.tickSize || 0.01;
+    const priceDiff = Math.abs(price2 - price1);
+    return Math.floor(priceDiff / tickSize);
+  }
+
+  _adjustPriceByTicks(basePrice, ticks, increase) {
+    const tickSize = this.exchangeInfoCache[this.symbol]?.tickSize || 0.01;
+    const adjustment = ticks * tickSize;
+    if (increase) {
+      return this.roundPrice(basePrice + adjustment);
+    } else {
+      return this.roundPrice(basePrice - adjustment);
+    }
+  }
+
 
   calculateCurrentLoss() {
     const netLoss = -(this.accumulatedRealizedPnL - this.accumulatedTradingFees);
@@ -338,6 +375,10 @@ class TradingStrategy {
         profileId: this.profileId,
         entryLevel: this.entryLevel,
         reversalLevel: this.reversalLevel,
+        initialReversalLevel: this.initialReversalLevel,
+        longReversalLevel: this.longReversalLevel,
+        shortReversalLevel: this.shortReversalLevel,
+        fixedReversalLevelsCalculated: this.fixedReversalLevelsCalculated,
         enableSupport: this.enableSupport,
         enableResistance: this.enableResistance,
         currentPosition: this.currentPosition,
@@ -349,7 +390,6 @@ class TradingStrategy {
         totalPnL: this.totalPnL,
         accumulatedRealizedPnL: this.accumulatedRealizedPnL,
         accumulatedTradingFees: this.accumulatedTradingFees,
-        sessionStartTradeId: this.sessionStartTradeId,
         lastUpdated: new Date(),
         isRunning: this.isRunning,
         symbol: this.symbol,
@@ -372,12 +412,6 @@ class TradingStrategy {
         finalTpOrderSent: this.finalTpOrderSent,
         breakevenPercentage: this.breakevenPercentage,
         finalTpPercentage: this.finalTpPercentage,
-        // Partial TP states
-        partialTpLevels: this.partialTpLevels,
-        partialTpSizes: this.partialTpSizes,
-        partialTpPrices: this.partialTpPrices,
-        partialTpExecuted: this.partialTpExecuted,
-        currentEntryReference: this.currentEntryReference,
         // Custom Final TP Levels - Position Specific
         customFinalTpLong: this.customFinalTpLong,
         customFinalTpShort: this.customFinalTpShort,
@@ -389,9 +423,11 @@ class TradingStrategy {
         sellShortEnabled: this.sellShortEnabled,
         buyLimitPrice: this.buyLimitPrice,
         sellLimitPrice: this.sellLimitPrice,
+        longLimitOrderId: this.longLimitOrderId,
+        shortLimitOrderId: this.shortLimitOrderId,
+        priceType: this.priceType,
         // Summary section data
         reversalCount: this.reversalCount,
-        partialTpCount: this.partialTpCount,
         tradeSequence: this.tradeSequence,
         initialWalletBalance: this.initialWalletBalance,
         profitPercentage: this.profitPercentage,
@@ -404,55 +440,41 @@ class TradingStrategy {
         capitalProtectionWarning: this.capitalProtectionWarning,
         maxAllowableLoss: this.maxAllowableLoss,
         circuitBreakerTimestamp: this.circuitBreakerTimestamp,
-        // Move Reversal Level feature
-        moveReversalLevel: this.moveReversalLevel,
-        reversalLevelMoved: this.reversalLevelMoved,
-        originalReversalLevel: this.originalReversalLevel,
-        // Volatility Filter State
-        volatilityEnabled: this.volatilityEnabled,
-        volatilityMeasurementActive: this.volatilityMeasurementActive,
-        microbarOpen: this.microbarOpen,
-        microbarHigh: this.microbarHigh,
-        microbarLow: this.microbarLow,
-        microbarClose: this.microbarClose,
-        microbarTickCount: this.microbarTickCount,
-        MICROBAR_TICK_LIMIT: this.MICROBAR_TICK_LIMIT,
-        volatilityLookback: this.volatilityLookback,
-        volatilityMultiplier: this.volatilityMultiplier,
-        microbarHistory: this.microbarHistory,
-        volatilityExpanded: this.volatilityExpanded,
-        // Virtual Position Tracking State
-        virtualPositionActive: this.virtualPositionActive,
-        virtualPositionDirection: this.virtualPositionDirection,
-        virtualOriginalDirection: this.virtualOriginalDirection,
-        volatilityWaitStartTime: this.volatilityWaitStartTime,
-        lastVirtualDirectionChange: this.lastVirtualDirectionChange,
-        virtualDirectionChanges: this.virtualDirectionChanges,
-        virtualLongLimitOrder: this.virtualLongLimitOrder,
-        virtualShortLimitOrder: this.virtualShortLimitOrder,
-        virtualDirectionBuffer: this.virtualDirectionBuffer,
-        lastVirtualStatusLogTime: this.lastVirtualStatusLogTime,
-        virtualEntryLevel: this.virtualEntryLevel,
-        virtualReversalLevel: this.virtualReversalLevel,
-        closedPositionType: this.closedPositionType,
-        virtualLimitFirstTriggered: this.virtualLimitFirstTriggered,
+        // Trailing reversal level state
+        trailStepFactor: this.trailStepFactor,
+        highestFavorablePrice: this.highestFavorablePrice,
+        lowestFavorablePrice: this.lowestFavorablePrice,
+        trailingReversalActive: this.trailingReversalActive,
+        ticksMovedInFavor: this.ticksMovedInFavor,
+        // Partial Take-Profit state
+        tpLevel: this.tpLevel,
+        tp1Executed: this.tp1Executed,
+        tp2Executed: this.tp2Executed,
+        tp3Executed: this.tp3Executed,
+        tp1TriggerLevel: this.tp1TriggerLevel,
+        tp2TriggerLevel: this.tp2TriggerLevel,
+        tp3TriggerLevel: this.tp3TriggerLevel,
+        tpLevelTrailingPaused: this.tpLevelTrailingPaused,
+        partialTp1SizePercent: this.partialTp1SizePercent,
+        partialTp2SizePercent: this.partialTp2SizePercent,
+        partialTp3SizePercent: this.partialTp3SizePercent,
       };
 
       // Filter out undefined values and validate numeric fields to prevent Firestore errors
       const dataToSave = {};
       const numericFields = [
-        'entryLevel', 'reversalLevel', 'positionEntryPrice', 'positionSize',
+        'entryLevel', 'reversalLevel', 'initialReversalLevel', 'longReversalLevel', 'shortReversalLevel', 'positionEntryPrice', 'positionSize',
         'currentPrice', 'positionPnL', 'totalPnL', 'accumulatedRealizedPnL',
         'accumulatedTradingFees', 'positionSizeUSDT', 'initialBasePositionSizeUSDT',
-        'MAX_POSITION_SIZE_USDT', 'reversalLevelPercentage', 'entryPositionQuantity',
-        'currentPositionQuantity', 'lastPositionQuantity', 'lastPositionEntryPrice',
+        'MAX_POSITION_SIZE_USDT', 'reversalLevelPercentage',
+        'entryPositionQuantity', 'currentPositionQuantity', 'lastPositionQuantity', 'lastPositionEntryPrice',
         'breakevenPrice', 'finalTpPrice', 'breakevenPercentage', 'finalTpPercentage',
         'buyLimitPrice', 'sellLimitPrice', 'initialWalletBalance', 'profitPercentage',
         'maxAllowableLoss', 'customFinalTpLong', 'customFinalTpShort', 'desiredProfitUSDT',
-        'originalReversalLevel', 'microbarOpen', 'microbarHigh', 'microbarLow', 'microbarClose',
-        'microbarTickCount', 'MICROBAR_TICK_LIMIT', 'volatilityLookback', 'volatilityMultiplier',
-        'volatilityWaitStartTime', 'lastVirtualDirectionChange', 'lastVirtualStatusLogTime',
-        'virtualEntryLevel', 'virtualReversalLevel'
+        'trailStepFactor', 'highestFavorablePrice', 'lowestFavorablePrice',
+        'ticksMovedInFavor',
+        'tpLevel', 'tp1TriggerLevel', 'tp2TriggerLevel', 'tp3TriggerLevel',
+        'partialTp1SizePercent', 'partialTp2SizePercent', 'partialTp3SizePercent'
       ];
 
       for (const key in rawData) {
@@ -502,6 +524,51 @@ class TradingStrategy {
     }
   }
 
+  async saveStrategyFlowEvent(tradeType, side, entryPrice, currentQty, breakevenLevel, breakevenPercentage, takeProfitLevel, takeProfitPercentage) {
+    // Validate strategyId and collection reference
+    if (!this.strategyId) {
+      console.error('Cannot save strategy flow event: strategyId is not set');
+      return;
+    }
+
+    if (!this.strategyFlowCollectionRef) {
+      console.error('Cannot save strategy flow event: strategyFlowCollectionRef is not initialized');
+      await this.addLog(`ERROR: Strategy flow collection reference not initialized`);
+      return;
+    }
+
+    // Validate critical parameters
+    if (entryPrice === null || entryPrice === undefined || currentQty === null || currentQty === undefined) {
+      console.error(`Cannot save strategy flow event: Invalid parameters - entryPrice: ${entryPrice}, currentQty: ${currentQty}`);
+      await this.addLog(`ERROR: Cannot save strategy flow - missing entry price or quantity`);
+      return;
+    }
+
+    try {
+      const flowEventData = {
+        timestamp: Timestamp.now(),
+        tradeType: tradeType,
+        side: side,
+        entryPrice: entryPrice,
+        currentQty: currentQty,
+        breakevenLevel: breakevenLevel,
+        breakevenPercentage: breakevenPercentage,
+        takeProfitLevel: takeProfitLevel,
+        takeProfitPercentage: takeProfitPercentage
+      };
+
+      // Log the data being saved for debugging
+      console.log(`[STRATEGY_FLOW] Saving flow event: ${tradeType} (${side}) - Entry: ${entryPrice}, Qty: ${currentQty}, BE: ${breakevenLevel}, TP: ${takeProfitLevel}`);
+
+      await this.strategyFlowCollectionRef.add(flowEventData);
+
+      //await this.addLog(`Strategy flow event saved: ${tradeType} (${side}) - Entry: ${this._formatPrice(entryPrice)}, Qty: ${this._formatQuantity(currentQty)}`);
+    } catch (error) {
+      console.error('Failed to save strategy flow event to Firestore:', error);
+      await this.addLog(`ERROR: [CONNECTION_ERROR] Failed to save strategy flow event: ${error.message}`);
+    }
+  }
+
   // Helper method to safely load and validate numeric values from Firestore
   _validateNumericValue(value, fieldName, defaultValue = null) {
     if (value === null || value === undefined) {
@@ -536,6 +603,10 @@ class TradingStrategy {
         this.profileId = data.profileId; // ADDED: Load profileId
         this.entryLevel = this._validateNumericValue(data.entryLevel, 'entryLevel', null);
         this.reversalLevel = this._validateNumericValue(data.reversalLevel, 'reversalLevel', null);
+        this.initialReversalLevel = this._validateNumericValue(data.initialReversalLevel, 'initialReversalLevel', null);
+        this.longReversalLevel = this._validateNumericValue(data.longReversalLevel, 'longReversalLevel', null);
+        this.shortReversalLevel = this._validateNumericValue(data.shortReversalLevel, 'shortReversalLevel', null);
+        this.fixedReversalLevelsCalculated = data.fixedReversalLevelsCalculated !== undefined ? data.fixedReversalLevelsCalculated : false;
         this.enableSupport = data.enableSupport || false;
         this.enableResistance = data.enableResistance || false;
         this.currentPosition = data.currentPosition || 'NONE';
@@ -547,7 +618,6 @@ class TradingStrategy {
         this.totalPnL = this._validateNumericValue(data.totalPnL, 'totalPnL', null);
         this.accumulatedRealizedPnL = this._validateNumericValue(data.accumulatedRealizedPnL, 'accumulatedRealizedPnL', 0);
         this.accumulatedTradingFees = this._validateNumericValue(data.accumulatedTradingFees, 'accumulatedTradingFees', 0);
-        this.sessionStartTradeId = this._validateNumericValue(data.sessionStartTradeId, 'sessionStartTradeId', null);
         this.symbol = data.symbol || 'BTCUSDT';
         this.isRunning = data.isRunning || false;
 
@@ -571,6 +641,10 @@ class TradingStrategy {
 
         this.reversalLevelPercentage = this._validateNumericValue(data.reversalLevelPercentage, 'reversalLevelPercentage', null);
 
+        // Load Recovery Factor and Recovery Distance
+        this.RECOVERY_FACTOR = this._validateNumericValue(data.RECOVERY_FACTOR, 'RECOVERY_FACTOR', 0.20);
+        this.RECOVERY_DISTANCE = this._validateNumericValue(data.RECOVERY_DISTANCE, 'RECOVERY_DISTANCE', 0.005);
+
         // Load Position quantity tracking
         this.entryPositionQuantity = this._validateNumericValue(data.entryPositionQuantity, 'entryPositionQuantity', null);
         this.currentPositionQuantity = this._validateNumericValue(data.currentPositionQuantity, 'currentPositionQuantity', null);
@@ -588,13 +662,6 @@ class TradingStrategy {
         this.breakevenPercentage = this._validateNumericValue(data.breakevenPercentage, 'breakevenPercentage', null);
         this.finalTpPercentage = this._validateNumericValue(data.finalTpPercentage, 'finalTpPercentage', null);
 
-        // Load Partial TP states
-        this.partialTpLevels = data.partialTpLevels || [0.5, 1.0, 2.0];
-        this.partialTpSizes = data.partialTpSizes || [0, 0, 0];
-        this.partialTpPrices = data.partialTpPrices || [null, null, null];
-        this.partialTpExecuted = data.partialTpExecuted || [false, false, false];
-        this.currentEntryReference = data.currentEntryReference || null;
-
         // Load Custom Final TP Levels - Position Specific
         this.customFinalTpLong = this._validateNumericValue(data.customFinalTpLong, 'customFinalTpLong', null);
         this.customFinalTpShort = this._validateNumericValue(data.customFinalTpShort, 'customFinalTpShort', null);
@@ -607,15 +674,17 @@ class TradingStrategy {
         this.sellShortEnabled = data.sellShortEnabled || false;
         this.buyLimitPrice = this._validateNumericValue(data.buyLimitPrice, 'buyLimitPrice', null);
         this.sellLimitPrice = this._validateNumericValue(data.sellLimitPrice, 'sellLimitPrice', null);
+        this.longLimitOrderId = data.longLimitOrderId || null;
+        this.shortLimitOrderId = data.shortLimitOrderId || null;
+        this.priceType = data.priceType || 'MARK';
 
         // Load Summary section data
         this.reversalCount = data.reversalCount || 0;
-        this.partialTpCount = data.partialTpCount || 0;
         this.tradeSequence = data.tradeSequence || '';
         this.initialWalletBalance = this._validateNumericValue(data.initialWalletBalance, 'initialWalletBalance', null);
         this.profitPercentage = this._validateNumericValue(data.profitPercentage, 'profitPercentage', null);
         this.tradingMode = data.tradingMode || 'NORMAL';
-        this.lastDynamicSizingReversalCount = data.lastDynamicSizingReversalCount ?? -1;
+        this.lastDynamicSizingReversalCount = data.lastDynamicSizingReversalCount ?? 0;
         this.strategyStartTime = data.strategyStartTime ? data.strategyStartTime.toDate() : null;
         this.strategyEndTime = data.strategyEndTime ? data.strategyEndTime.toDate() : null;
 
@@ -625,51 +694,31 @@ class TradingStrategy {
         this.maxAllowableLoss = this._validateNumericValue(data.maxAllowableLoss, 'maxAllowableLoss', null);
         this.circuitBreakerTimestamp = data.circuitBreakerTimestamp ? data.circuitBreakerTimestamp.toDate() : null;
 
-        // Load Move Reversal Level feature
-        this.moveReversalLevel = data.moveReversalLevel || 'DO_NOT_MOVE';
-        this.reversalLevelMoved = data.reversalLevelMoved || false;
-        this.originalReversalLevel = this._validateNumericValue(data.originalReversalLevel, 'originalReversalLevel', null);
+        // Load Trailing reversal level state
+        this.trailStepFactor = this._validateNumericValue(data.trailStepFactor, 'trailStepFactor', 1);
+        this.highestFavorablePrice = this._validateNumericValue(data.highestFavorablePrice, 'highestFavorablePrice', null);
+        this.lowestFavorablePrice = this._validateNumericValue(data.lowestFavorablePrice, 'lowestFavorablePrice', null);
+        this.trailingReversalActive = data.trailingReversalActive !== undefined ? data.trailingReversalActive : false;
+        this.ticksMovedInFavor = this._validateNumericValue(data.ticksMovedInFavor, 'ticksMovedInFavor', 0);
 
-        // Load Volatility Filter State
-        this.volatilityEnabled = data.volatilityEnabled !== undefined ? data.volatilityEnabled : true;
-        this.volatilityMeasurementActive = data.volatilityMeasurementActive || false;
-        this.microbarOpen = this._validateNumericValue(data.microbarOpen, 'microbarOpen', null);
-        this.microbarHigh = this._validateNumericValue(data.microbarHigh, 'microbarHigh', null);
-        this.microbarLow = this._validateNumericValue(data.microbarLow, 'microbarLow', null);
-        this.microbarClose = this._validateNumericValue(data.microbarClose, 'microbarClose', null);
-        this.microbarTickCount = this._validateNumericValue(data.microbarTickCount, 'microbarTickCount', 0);
-        this.MICROBAR_TICK_LIMIT = this._validateNumericValue(data.MICROBAR_TICK_LIMIT, 'MICROBAR_TICK_LIMIT', 80);
-        this.volatilityLookback = this._validateNumericValue(data.volatilityLookback, 'volatilityLookback', 20);
-        this.volatilityMultiplier = this._validateNumericValue(data.volatilityMultiplier, 'volatilityMultiplier', 1.4);
-        this.microbarHistory = Array.isArray(data.microbarHistory) ? data.microbarHistory : [];
-        this.volatilityExpanded = data.volatilityExpanded !== undefined ? data.volatilityExpanded : false;
-
-        // Load Virtual Position Tracking State
-        this.virtualPositionActive = data.virtualPositionActive || false;
-        this.virtualPositionDirection = data.virtualPositionDirection || null;
-        this.virtualOriginalDirection = data.virtualOriginalDirection || null;
-        this.volatilityWaitStartTime = this._validateNumericValue(data.volatilityWaitStartTime, 'volatilityWaitStartTime', null);
-        this.lastVirtualDirectionChange = this._validateNumericValue(data.lastVirtualDirectionChange, 'lastVirtualDirectionChange', null);
-        this.virtualDirectionChanges = Array.isArray(data.virtualDirectionChanges) ? data.virtualDirectionChanges : [];
-        // Backward compatibility: load from both old (virtualLimitOrder) and new (virtualLongLimitOrder) property names
-        this.virtualLongLimitOrder = data.virtualLongLimitOrder || data.virtualLimitOrder || null;
-        this.virtualShortLimitOrder = data.virtualShortLimitOrder || null;
-        this.virtualDirectionBuffer = data.virtualDirectionBuffer || null;
-        this.lastVirtualStatusLogTime = this._validateNumericValue(data.lastVirtualStatusLogTime, 'lastVirtualStatusLogTime', null);
-        this.virtualEntryLevel = this._validateNumericValue(data.virtualEntryLevel, 'virtualEntryLevel', null);
-        this.virtualReversalLevel = this._validateNumericValue(data.virtualReversalLevel, 'virtualReversalLevel', null);
-        this.closedPositionType = data.closedPositionType || null;
-        this.virtualLimitFirstTriggered = data.virtualLimitFirstTriggered || false;
-
-        // Log if resuming virtual tracking
-        if (this.virtualPositionActive) {
-          await this.addLog(`Resuming virtual position tracking from previous session - Direction: ${this.virtualPositionDirection}`);
-        }
+        // Load Partial Take-Profit state (with defaults for backward compatibility)
+        this.tpLevel = this._validateNumericValue(data.tpLevel, 'tpLevel', null);
+        this.tp1Executed = data.tp1Executed !== undefined ? data.tp1Executed : false;
+        this.tp2Executed = data.tp2Executed !== undefined ? data.tp2Executed : false;
+        this.tp3Executed = data.tp3Executed !== undefined ? data.tp3Executed : false;
+        this.tp1TriggerLevel = this._validateNumericValue(data.tp1TriggerLevel, 'tp1TriggerLevel', null);
+        this.tp2TriggerLevel = this._validateNumericValue(data.tp2TriggerLevel, 'tp2TriggerLevel', null);
+        this.tp3TriggerLevel = this._validateNumericValue(data.tp3TriggerLevel, 'tp3TriggerLevel', null);
+        this.tpLevelTrailingPaused = data.tpLevelTrailingPaused !== undefined ? data.tpLevelTrailingPaused : false;
+        this.partialTp1SizePercent = this._validateNumericValue(data.partialTp1SizePercent, 'partialTp1SizePercent', 20);
+        this.partialTp2SizePercent = this._validateNumericValue(data.partialTp2SizePercent, 'partialTp2SizePercent', 20);
+        this.partialTp3SizePercent = this._validateNumericValue(data.partialTp3SizePercent, 'partialTp3SizePercent', 10);
 
         await this._getExchangeInfo(this.symbol); // Use the new method to fetch and cache exchange info
 
         this.tradesCollectionRef = this.firestore.collection('strategies').doc(this.strategyId).collection('trades');
         this.logsCollectionRef = this.firestore.collection('strategies').doc(this.strategyId).collection('logs');
+        this.strategyFlowCollectionRef = this.firestore.collection('strategies').doc(this.strategyId).collection('strategyFlow');
 
         return true;
       }
@@ -1201,7 +1250,14 @@ class TradingStrategy {
         this.finalTpActive = false;
         this.finalTpOrderSent = false;
         // Reset Partial TP states
-        await this._resetPartialTpState();
+        this.tpLevel = null;
+        this.tp1Executed = false;
+        this.tp2Executed = false;
+        this.tp3Executed = false;
+        this.tp1TriggerLevel = null;
+        this.tp2TriggerLevel = null;
+        this.tp3TriggerLevel = null;
+        this.tpLevelTrailingPaused = false;
       } else if (positions.length === 1) {
         const p = positions[0];
         const positionAmt = parseFloat(p.positionAmt);
@@ -1246,13 +1302,43 @@ class TradingStrategy {
     }
   }
 
+  // Helper function to sync position state from Binance API (lightweight, no logging)
+  async _syncPositionFromAPI() {
+    try {
+      const positions = await this.getCurrentPositions();
+
+      if (positions.length === 0) {
+        this.currentPosition = 'NONE';
+        if (!this.isStopping) {
+          this.positionEntryPrice = null;
+          this.positionSize = null;
+          this.currentPositionQuantity = null;
+        }
+      } else {
+        const p = positions[0];
+        const positionAmt = parseFloat(p.positionAmt);
+        this.currentPosition = positionAmt > 0 ? 'LONG' : 'SHORT';
+        this.positionEntryPrice = parseFloat(p.entryPrice);
+        this.positionSize = Math.abs(parseFloat(p.notional));
+        this.currentPositionQuantity = Math.abs(positionAmt);
+
+        // Update persistent fields for historical analysis
+        this.lastPositionQuantity = Math.abs(positionAmt);
+        this.lastPositionEntryPrice = parseFloat(p.entryPrice);
+      }
+    } catch (error) {
+      console.error(`Failed to sync position from API: ${error.message}`);
+      throw error;
+    }
+  }
+
   // Helper function to wait for a specific position state
   async _waitForPositionChange(targetPosition, timeoutMs = 15000) {
     const startTime = Date.now();
     //await this.addLog(`Waiting for position to become: ${targetPosition}. Current: ${this.currentPosition}`);
     return new Promise(async (resolve, reject) => {
       const checkInterval = setInterval(async () => {
-        await this.detectCurrentPosition(); 
+        await this.detectCurrentPosition();
 
         if (this.currentPosition === targetPosition) {
           clearInterval(checkInterval);
@@ -1263,7 +1349,7 @@ class TradingStrategy {
           await this.addLog(`Timeout waiting for position to change to ${targetPosition}. Current: ${this.currentPosition}`);
           reject(new Error(`Timeout waiting for position to change to ${targetPosition}`));
         }
-      }, 500);
+      }, 100);
     });
   }
 
@@ -1284,9 +1370,12 @@ class TradingStrategy {
     const wsBaseUrl = this.isTestnet === true
       ? 'wss://stream.binance.com/ws'
       : 'wss://fstream.binance.com/ws';
-    
+
     // Real-time price WebSocket for current price updates
-    const tickerStream = `${this.symbol.toLowerCase()}@ticker`;
+    // Select stream type based on priceType setting
+    const tickerStream = this.priceType === 'LAST'
+      ? `${this.symbol.toLowerCase()}@ticker` // Last price WebSocket Stream
+      : `${this.symbol.toLowerCase()}@markPrice@1s`; // Mark price WebSocket Stream
     this.realtimeWs = new WebSocket(`${wsBaseUrl}/${tickerStream}`);
 
     this.realtimeWs.on('open', async () => {
@@ -1316,8 +1405,11 @@ class TradingStrategy {
     this.realtimeWs.on('message', async (data) => {
       try {
         const message = JSON.parse(data.toString());
-        if (message.e === '24hrTicker') {
+        // Handle both Last Price and Mark Price based on priceType setting
+        if (this.priceType === 'LAST' && message.e === '24hrTicker') {
           await this.handleRealtimePrice(parseFloat(message.c));
+        } else if (this.priceType === 'MARK' && message.e === 'markPriceUpdate') {
+          await this.handleRealtimePrice(parseFloat(message.p));
         }
       } catch (error) {
         console.error(`Error processing price message: ${error.message}`);
@@ -1351,6 +1443,132 @@ class TradingStrategy {
         }
       }
     });
+  }
+
+  // NEW: Helper to handle initial LIMIT order fill
+  async _handleInitialLimitOrderFill(order) {
+    // Clear pending limit order IDs
+    if (order.i === this.longLimitOrderId) {
+      this.longLimitOrderId = null;
+      this.activeMode = 'SUPPORT_ZONE';
+      await this.addLog(`LONG LIMIT order ${order.i} filled. Entering SUPPORT_ZONE mode.`);
+      await this.cancelOrder(this.symbol, this.shortLimitOrderId); // Cancel other pending limit order
+      this.shortLimitOrderId = null;
+    } else if (order.i === this.shortLimitOrderId) {
+      this.shortLimitOrderId = null;
+      this.activeMode = 'RESISTANCE_ZONE';
+      await this.addLog(`SHORT LIMIT order ${order.i} filled. Entering RESISTANCE_ZONE mode.`);
+      await this.cancelOrder(this.symbol, this.longLimitOrderId); // Cancel other pending limit order
+      this.longLimitOrderId = null;
+    }
+    this.isTradingSequenceInProgress = false; // Reset flag after initial LIMIT order fill
+    await this.detectCurrentPosition(); // Re-detect position after order fill to update entry price and size
+
+    // Calculate and set Entry Level and Reversal Level based on actual filled position
+    if (this.reversalLevelPercentage !== null && this.positionEntryPrice !== null) {
+      this.entryLevel = this.positionEntryPrice;
+
+      // Calculate FIXED reversal levels (only once at initial position)
+      // LONG positions: longReversalLevel = entry, shortReversalLevel = below entry
+      // SHORT positions: shortReversalLevel = entry, longReversalLevel = above entry
+      if (this.currentPosition === 'LONG') {
+        this.longReversalLevel = this.positionEntryPrice;
+        this.shortReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, false);
+        this.fixedReversalLevelsCalculated = true;
+
+        // For backward compatibility, set reversalLevel and initialReversalLevel
+        this.reversalLevel = this.shortReversalLevel;
+        this.initialReversalLevel = this.shortReversalLevel;
+        this.tpLevel = this.positionEntryPrice * 0.999; // Initialize TP level 0.1% below entry
+        this.tp1Executed = false;
+        this.tp2Executed = false;
+        this.tp3Executed = false;
+        this.tp1TriggerLevel = null;
+        this.tp2TriggerLevel = null;
+        this.tp3TriggerLevel = null;
+        this.tpLevelTrailingPaused = false;
+        await this.addLog(`Initial LONG position established. Entry: ${this._formatPrice(this.entryLevel)}, Long Reversal Level: ${this._formatPrice(this.longReversalLevel)}, Short Reversal Level: ${this._formatPrice(this.shortReversalLevel)} (fixed range), TP Level: ${this._formatPrice(this.tpLevel)} (will trail independently).`);
+
+        // Initialize continuous trailing for LONG position
+        this.highestFavorablePrice = this.positionEntryPrice;
+        this.trailingReversalActive = true;
+        this.ticksMovedInFavor = 0;
+      } else if (this.currentPosition === 'SHORT') {
+        this.shortReversalLevel = this.positionEntryPrice;
+        this.longReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, true);
+        this.fixedReversalLevelsCalculated = true;
+
+        // For backward compatibility, set reversalLevel and initialReversalLevel
+        this.reversalLevel = this.longReversalLevel;
+        this.initialReversalLevel = this.longReversalLevel;
+        this.tpLevel = this.positionEntryPrice * 1.001; // Initialize TP level 0.1% above entry
+        this.tp1Executed = false;
+        this.tp2Executed = false;
+        this.tp3Executed = false;
+        this.tp1TriggerLevel = null;
+        this.tp2TriggerLevel = null;
+        this.tp3TriggerLevel = null;
+        this.tpLevelTrailingPaused = false;
+        await this.addLog(`Initial SHORT position established. Entry: ${this._formatPrice(this.entryLevel)}, Short Reversal Level: ${this._formatPrice(this.shortReversalLevel)}, Long Reversal Level: ${this._formatPrice(this.longReversalLevel)} (fixed range), TP Level: ${this._formatPrice(this.tpLevel)} (will trail independently).`);
+
+        // Initialize continuous trailing for SHORT position
+        this.lowestFavorablePrice = this.positionEntryPrice;
+        this.trailingReversalActive = true;
+        this.ticksMovedInFavor = 0;
+      }
+    }
+
+    // Set strategy start time after initial LIMIT order is filled (only if not already set)
+    if (!this.strategyStartTime) {
+      this.strategyStartTime = new Date();
+      await this.addLog(`Strategy timer started after initial position filled.`);
+    } else {
+      await this.addLog(`Strategy timer preserved from original start time: ${this.strategyStartTime.toISOString()}.`);
+    }
+
+    // Update trade sequence with initial entry marker
+    if (this.activeMode === 'SUPPORT_ZONE') {
+      this.tradeSequence += 'L.';
+    } else if (this.activeMode === 'RESISTANCE_ZONE') {
+      this.tradeSequence += 'S.';
+    }
+
+    // Calculate BE and final TP for initial position
+    await this._calculateBreakevenAndFinalTp();
+
+    // Save strategy flow event for initial position
+    const tradeType = this.activeMode === 'SUPPORT_ZONE' ? 'L' : 'S';
+    const side = this.currentPosition;
+    await this.saveStrategyFlowEvent(
+      tradeType,
+      side,
+      this.positionEntryPrice,
+      this.currentPositionQuantity,
+      this.breakevenPrice,
+      this.breakevenPercentage,
+      this.finalTpPrice,
+      this.finalTpPercentage
+    );
+
+    await this.saveState();
+  }
+
+  // NEW: Helper to handle initial LIMIT order failure
+  async _handleInitialLimitOrderFailure(order) {
+    // Clear pending limit order IDs
+    if (order.i === this.longLimitOrderId) this.longLimitOrderId = null;
+    if (order.i === this.shortLimitOrderId) this.shortLimitOrderId = null;
+    this.isTradingSequenceInProgress = false; // Reset flag on failure
+
+    // MODIFIED: Only stop the strategy if no active position has been established yet.
+    // If activeMode is not NONE, it means one of the initial LIMIT orders has already filled.
+    if (this.activeMode === 'NONE') {
+      await this.addLog(`Initial LIMIT order ${order.i} ${order.X}. Stopping strategy.`);
+      await this.stop(); // Stop the strategy if initial order fails and no position is active
+    } else {
+      await this.addLog(`Initial LIMIT order ${order.i} ${order.X}, but an active position is already established. Continuing strategy.`);
+    }
+    await this.saveState();
   }
 
   // Helper method to handle User Data WebSocket reconnection logic
@@ -1486,7 +1704,7 @@ class TradingStrategy {
           const order = message.o;
           // Only log if status is not PARTIALLY_FILLED
           if (order.X !== 'PARTIALLY_FILLED') {
-            await this.addLog(`[WebSocket] ORDER_TRADE_UPDATE for order ${order.i}, status: ${order.X}, side: ${order.S}, quantity: ${order.q}, filled: ${order.z}`);
+            //await this.addLog(`[WebSocket] ORDER_TRADE_UPDATE for order ${order.i}, status: ${order.X}, side: ${order.S}, quantity: ${order.q}, filled: ${order.z}`); // Jacky Liaw: Comment out for future use
           }
 
           // FIXED: Capture trade data only from TRADE events (each fill is a distinct trade)
@@ -1516,11 +1734,11 @@ class TradingStrategy {
             // Accumulate realized PnL and fees (these are incremental values per fill)
             if (!isNaN(realizedPnl) && realizedPnl !== 0) {
               this.accumulatedRealizedPnL += realizedPnl;
-              await this.addLog(`Trade: Order ${order.i}, PnL: ${this._formatNotional(realizedPnl)} USDT, Total: ${this._formatNotional(this.accumulatedRealizedPnL)} USDT`);
+              //await this.addLog(`Trade: Order ${order.i}, PnL: ${this._formatNotional(realizedPnl)} USDT, Total: ${this._formatNotional(this.accumulatedRealizedPnL)} USDT`);
             }
             if (!isNaN(commission) && commission !== 0) {
               this.accumulatedTradingFees += commission;
-              await this.addLog(`Trade: Order ${order.i}, Fee: ${this._formatNotional(commission)} USDT, Total: ${this._formatNotional(this.accumulatedTradingFees)} USDT`);
+              //await this.addLog(`Trade: Order ${order.i}, Fee: ${this._formatNotional(commission)} USDT, Total: ${this._formatNotional(this.accumulatedTradingFees)} USDT`);
             }
 
             // Save individual trade details to Firestore
@@ -1542,7 +1760,19 @@ class TradingStrategy {
             // Note: Removed savedTradeOrderIds.add() here - each TRADE event is unique and should be captured
           }
 
-          // Resolve/Reject pending order promises based on order status
+          // Check if this is one of the initial LIMIT orders
+          const isInitialLimitOrder = (order.i === this.longLimitOrderId || order.i === this.shortLimitOrderId);
+
+          // Clear timeout if it exists for this order
+          if (isInitialLimitOrder && this.pendingInitialLimitOrders.has(order.i)) {
+            const { timeoutId } = this.pendingInitialLimitOrders.get(order.i);
+            if (timeoutId) {
+              clearTimeout(timeoutId);
+              this.pendingInitialLimitOrders.delete(order.i); // Remove from pendingInitialLimitOrders after clearing timeout
+            }
+          }
+
+          // Resolve/Reject pending order promises based on order status (for other order types)
           if (this.pendingOrders.has(order.i)) { // This block handles MARKET, Partial TP, Close Position orders
             const { resolve, reject } = this.pendingOrders.get(order.i);
             if (order.X === 'FILLED') {
@@ -1555,6 +1785,14 @@ class TradingStrategy {
             }
           }
 
+          // Handle initial LIMIT order specifically
+          if (isInitialLimitOrder) {
+            if (order.X === 'FILLED') {
+              await this._handleInitialLimitOrderFill(order);
+            } else if (order.X === 'CANCELED' || order.X === 'REJECTED' || order.X === 'EXPIRED') {
+              await this._handleInitialLimitOrderFailure(order);
+            }
+          }
           // Always save state after processing an order update to ensure PnL and fees are persisted
           await this.saveState();
         }
@@ -1630,6 +1868,7 @@ class TradingStrategy {
 
     this.userDataWs.on('close', async (code, reason) => {
       this.userDataWsConnected = false;
+      //await this.addLog(`[WebSocket] User Data Stream WebSocket closed. Code: ${code}, Reason: ${reason || 'none'}, isRunning: ${this.isRunning}, isUserDataReconnecting: ${this.isUserDataReconnecting}`);
       await this.addLog(`[WebSocket] User Data Stream WebSocket closed. Code: ${code}, Reason: ${reason || 'none'}, isRunning: ${this.isRunning}, isUserDataReconnecting: ${this.isUserDataReconnecting}`);
 
       // Clear heartbeat on close
@@ -1686,7 +1925,7 @@ class TradingStrategy {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        await this.addLog(`[REST-API] Attempting listenKey ${isRefresh ? 'refresh' : 'request'}... (Attempt ${attempt}/${maxAttempts})`);
+        //await this.addLog(`[REST-API] Attempting listenKey ${isRefresh ? 'refresh' : 'request'}... (Attempt ${attempt}/${maxAttempts})`);
 
         const endpoint = '/fapi/v1/listenKey';
         const method = isRefresh ? 'PUT' : 'POST';
@@ -1696,11 +1935,11 @@ class TradingStrategy {
 
         if (!isRefresh && response.listenKey) {
           this.listenKey = response.listenKey;
-          await this.addLog(`[REST-API] ListenKey obtained successfully on attempt ${attempt}.`);
+          await this.addLog(`[REST-API] ListenKey obtained successfully on attempt ${attempt}/${maxAttempts}.`);
           this.listenKeyRetryAttempts = 0; // Reset on success
           return response;
         } else if (isRefresh) {
-          await this.addLog(`[REST-API] ListenKey refreshed successfully on attempt ${attempt}.`);
+          await this.addLog(`[REST-API] ListenKey refreshed successfully on attempt ${attempt}/${maxAttempts}.`);
           this.listenKeyRetryAttempts = 0; // Reset on success
           return response;
         }
@@ -1957,7 +2196,7 @@ class TradingStrategy {
       const realtimeStatus = this.realtimeWsConnected ? 'CONNECTED' : 'DISCONNECTED';
       const userDataStatus = this.userDataWsConnected ? 'CONNECTED' : 'DISCONNECTED';
 
-      await this.addLog(`[Health Check] WebSocket Status - Real-time Price: ${realtimeStatus}, User Data: ${userDataStatus}`);
+      //await this.addLog(`[Health Check] WebSocket Status - Real-time Price: ${realtimeStatus}, User Data: ${userDataStatus}`);
 
       // Warn if User Data WebSocket is down
       if (!this.userDataWsConnected) {
@@ -1998,7 +2237,7 @@ class TradingStrategy {
 
   // Helper to calculate dynamic position size and log it
   async _calculateDynamicPositionSize() {
-    let newPositionSizeUSDT = this.initialBasePositionSizeUSDT;
+    let newPositionSizeUSDT = this.positionSizeUSDT;
     let loggedEntry = false;
 
     const currentNetLoss = -(this.accumulatedRealizedPnL - this.accumulatedTradingFees);
@@ -2010,7 +2249,7 @@ class TradingStrategy {
         const recoveryTargetForNextTrade = currentNetLoss * this.RECOVERY_FACTOR;
         // Assuming initialLevelPercentage is a reasonable proxy for average TP gain
         const additionalSizeNeeded = recoveryTargetForNextTrade / this.RECOVERY_DISTANCE;
-        
+
         newPositionSizeUSDT = this.initialBasePositionSizeUSDT + additionalSizeNeeded;
         
         if (newPositionSizeUSDT > this.MAX_POSITION_SIZE_USDT) {
@@ -2036,7 +2275,7 @@ class TradingStrategy {
     }
 
     if (loggedEntry || this.positionSizeUSDT !== newPositionSizeUSDT) {
-        await this.addLog(`Final positionSizeUSDT for next trade: ${this._formatNotional(newPositionSizeUSDT)} USDT.`);
+        //await this.addLog(`Final positionSizeUSDT for next trade: ${this._formatNotional(newPositionSizeUSDT)} USDT.`);
     }
     return newPositionSizeUSDT;
   }
@@ -2057,18 +2296,14 @@ class TradingStrategy {
         return;
       }
 
-      // Filter trades using session start trade ID (baseline captured at strategy start)
-      // Only include trades with IDs GREATER than the baseline (not equal, since baseline is pre-session)
-      if (this.sessionStartTradeId !== null) {
-        await this.addLog(`[VERIFICATION] Filtering trades with ID > ${this.sessionStartTradeId} (baseline)`);
-      }
-
-      const strategyTrades = this.sessionStartTradeId !== null
-        ? binanceTrades.filter(trade => parseInt(trade.id) > this.sessionStartTradeId)
+      // Filter trades to only include those from this strategy (after or at strategy start time)
+      // Using >= to ensure the initial entry trade at the exact start time is included
+      const strategyTrades = this.strategyStartTime
+        ? binanceTrades.filter(trade => trade.time >= this.strategyStartTime.getTime())
         : binanceTrades;
 
       if (strategyTrades.length === 0) {
-        await this.addLog(`[VERIFICATION] No trades found for current session`);
+        await this.addLog(`[VERIFICATION] No trades found in Binance history for this strategy`);
         return;
       }
 
@@ -2084,42 +2319,40 @@ class TradingStrategy {
         binanceCommission += commission;
       }
 
-      // Calculate expected trade count from trade sequence
-      const expectedTradeCount = this.tradeSequence.split('.').filter(x => x).length;
-
-      await this.addLog(`[VERIFICATION] Current session trades: ${strategyTrades.length} (filtered from ${binanceTrades.length} total)`);
-      await this.addLog(`[VERIFICATION] Expected trades from sequence: ${expectedTradeCount}`);
+      await this.addLog(`[VERIFICATION] Binance trade history: ${strategyTrades.length} trades`);
       await this.addLog(`[VERIFICATION] Binance Realized PnL: ${this._formatNotional(binanceRealizedPnL)} USDT`);
       await this.addLog(`[VERIFICATION] Binance Commission: ${this._formatNotional(binanceCommission)} USDT`);
       await this.addLog(`[VERIFICATION] Strategy Realized PnL: ${this._formatNotional(this.accumulatedRealizedPnL)} USDT`);
       await this.addLog(`[VERIFICATION] Strategy Commission: ${this._formatNotional(this.accumulatedTradingFees)} USDT`);
 
-      // Safety check: Warn if Binance returns significantly more trades than expected
-      if (strategyTrades.length > expectedTradeCount * 2 && expectedTradeCount > 0) {
-        await this.addLog(`[VERIFICATION] WARNING: Binance returned ${strategyTrades.length} trades but expected ~${expectedTradeCount}.`);
-        await this.addLog(`[VERIFICATION] This may indicate historical trades are being included. Skipping auto-correction.`);
-        return;
-      }
-
       // Calculate differences
       const pnlDifference = Math.abs(binanceRealizedPnL - this.accumulatedRealizedPnL);
       const feeDifference = Math.abs(binanceCommission - this.accumulatedTradingFees);
 
-      // Log discrepancies if significant (> 1 USDT)
-      if (pnlDifference > 1.0) {
+      // Check Realized PnL verification status
+      if (pnlDifference === 0) {
+        await this.addLog(`[VERIFICATION] Realized PnL verified - exact match`);
+      } else if (pnlDifference > 1.0) {
         await this.addLog(`[VERIFICATION] WARNING: Realized PnL mismatch of ${this._formatNotional(pnlDifference)} USDT detected!`);
         await this.addLog(`[VERIFICATION] Auto-correcting to Binance value...`);
         this.accumulatedRealizedPnL = binanceRealizedPnL;
+      } else if (pnlDifference <= 0.01) {
+        await this.addLog(`[VERIFICATION] Realized PnL verified - within tolerance (difference: ${this._formatNotional(pnlDifference)} USDT)`);
       } else {
-        await this.addLog(`[VERIFICATION] Realized PnL verified (difference: ${this._formatNotional(pnlDifference)} USDT)`);
+        await this.addLog(`[VERIFICATION] Realized PnL UNVERIFIED (difference: ${this._formatNotional(pnlDifference)} USDT)`);
       }
 
-      if (feeDifference > 1.0) {
+      // Check Commission verification status
+      if (feeDifference === 0) {
+        await this.addLog(`[VERIFICATION] Commission verified - exact match`);
+      } else if (feeDifference > 1.0) {
         await this.addLog(`[VERIFICATION] WARNING: Commission mismatch of ${this._formatNotional(feeDifference)} USDT detected!`);
         await this.addLog(`[VERIFICATION] Auto-correcting to Binance value...`);
         this.accumulatedTradingFees = binanceCommission;
+      } else if (feeDifference <= 0.01) {
+        await this.addLog(`[VERIFICATION] Commission verified - within tolerance (difference: ${this._formatNotional(feeDifference)} USDT)`);
       } else {
-        await this.addLog(`[VERIFICATION] Commission verified (difference: ${this._formatNotional(feeDifference)} USDT)`);
+        await this.addLog(`[VERIFICATION] Commission UNVERIFIED (difference: ${this._formatNotional(feeDifference)} USDT)`);
       }
 
       // Save corrected state if changes were made
@@ -2134,141 +2367,6 @@ class TradingStrategy {
     }
   }
 
-  // Volatility detection using synthetic microbars
-  async _updateMicrobar(tickPrice) {
-    // Skip if volatility disabled OR measurement not active yet
-    if (!this.volatilityEnabled || !this.volatilityMeasurementActive) {
-      return;
-    }
-
-    // Initialize microbar on first tick
-    if (this.microbarOpen === null) {
-      this.microbarOpen = tickPrice;
-      this.microbarHigh = tickPrice;
-      this.microbarLow = tickPrice;
-      this.microbarClose = tickPrice;
-      this.microbarTickCount = 1;
-      return;
-    }
-
-    // Update microbar fields
-    this.microbarHigh = Math.max(this.microbarHigh, tickPrice);
-    this.microbarLow = Math.min(this.microbarLow, tickPrice);
-    this.microbarClose = tickPrice;
-    this.microbarTickCount++;
-
-    // Not enough ticks yet → return
-    if (this.microbarTickCount < this.MICROBAR_TICK_LIMIT) return;
-
-    // ===== Close microbar =====
-    const bodyPercent = Math.abs(this.microbarClose - this.microbarOpen) / this.microbarOpen * 100;
-
-    // Update rolling history
-    this.microbarHistory.push(bodyPercent);
-    if (this.microbarHistory.length > this.volatilityLookback) {
-      this.microbarHistory.shift();
-    }
-
-    // Compute volatility expansion
-    let volatilityState = 'INITIALIZING';
-    if (this.microbarHistory.length >= this.volatilityLookback) {
-      const avgBody = this.microbarHistory.reduce((a, b) => a + b, 0) / this.microbarHistory.length;
-      const threshold = avgBody * this.volatilityMultiplier;
-      const previousState = this.volatilityExpanded;
-      this.volatilityExpanded = bodyPercent > threshold;
-
-      volatilityState = this.volatilityExpanded ? 'EXPANDED' : 'CHOPPY';
-
-      // Log state changes (DO NOT REMOVE: Keep this log for future use)
-      // if (previousState !== this.volatilityExpanded) {
-      //   if (this.volatilityExpanded) {
-      //     await this.addLog(`Volatility state changed: CHOPPY → EXPANDED (body ${bodyPercent.toFixed(3)}% > threshold ${threshold.toFixed(3)}%)`);
-      //   } else {
-      //     await this.addLog(`Volatility state changed: EXPANDED → CHOPPY (body ${bodyPercent.toFixed(3)}% < threshold ${threshold.toFixed(3)}%)`);
-      //   }
-      //   await this.saveState();
-      // }
-
-      // Log microbar closure with full details
-      await this.addLog(`Microbar closed | Body: ${bodyPercent.toFixed(3)}% | Avg: ${avgBody.toFixed(3)}% | Threshold: ${threshold.toFixed(3)}% | State: ${volatilityState} | Count: ${this.microbarHistory.length}/${this.volatilityLookback}`);
-    } else {
-      // During initialization phase, show average of available data
-      const currentAvg = this.microbarHistory.length > 0
-        ? (this.microbarHistory.reduce((a, b) => a + b, 0) / this.microbarHistory.length).toFixed(3)
-        : 'N/A';
-      await this.addLog(`Microbar closed | Body: ${bodyPercent.toFixed(3)}% | Avg: ${currentAvg}% | State: ${volatilityState} | Count: ${this.microbarHistory.length}/${this.volatilityLookback}`);
-    }
-
-    // Reset microbar
-    this.microbarOpen = tickPrice;
-    this.microbarHigh = tickPrice;
-    this.microbarLow = tickPrice;
-    this.microbarClose = tickPrice;
-    this.microbarTickCount = 1;
-  }
-
-  // Helper to calculate breakeven and final TP after scaling
-  async _checkAndMoveReversalLevel(currentPrice) {
-    // Only proceed if feature is enabled and not already moved
-    if (this.moveReversalLevel !== 'MOVE_TO_BREAKEVEN' || this.reversalLevelMoved) {
-      return;
-    }
-
-    // Only proceed if we have a position and entry price
-    if (this.currentPosition === 'NONE' || !this.positionEntryPrice) {
-      return;
-    }
-
-    let shouldMove = false;
-    let newReversalLevel = null;
-
-    if (this.currentPosition === 'LONG' && currentPrice >= this.positionEntryPrice * 1.005) {
-      // LONG position: Price moved 0.5% UP from entry
-      shouldMove = true;
-      // Move reversal level to 0.05% ABOVE entry (from below to above)
-      newReversalLevel = this.positionEntryPrice * 1.0005;
-
-      await this.addLog(`Price moved favorably to ${this._formatPrice(currentPrice)} (+0.50% from entry ${this._formatPrice(this.positionEntryPrice)})`);
-    } else if (this.currentPosition === 'SHORT' && currentPrice <= this.positionEntryPrice * 0.995) {
-      // SHORT position: Price moved 0.5% DOWN from entry
-      shouldMove = true;
-      // Move reversal level to 0.05% BELOW entry (from above to below)
-      newReversalLevel = this.positionEntryPrice * 0.9995;
-
-      await this.addLog(`Price moved favorably to ${this._formatPrice(currentPrice)} (-0.50% from entry ${this._formatPrice(this.positionEntryPrice)})`);
-    }
-
-    if (shouldMove && newReversalLevel !== null) {
-      // Validate new reversal level is reasonable (not too close to current price)
-      const priceDistance = Math.abs((newReversalLevel - currentPrice) / currentPrice);
-      if (priceDistance < 0.001) { // Less than 0.1% from current price
-        await this.addLog(`Reversal level movement skipped - too close to current price (${(priceDistance * 100).toFixed(3)}%)`);
-        return;
-      }
-
-      // Store original reversal level for logging
-      this.originalReversalLevel = this.reversalLevel;
-
-      // Calculate percentage change for logging
-      const originalPercent = ((this.originalReversalLevel - this.positionEntryPrice) / this.positionEntryPrice) * 100;
-      const newPercent = ((newReversalLevel - this.positionEntryPrice) / this.positionEntryPrice) * 100;
-
-      // Update reversal level
-      this.reversalLevel = newReversalLevel;
-      this.reversalLevelMoved = true;
-
-      // Log the movement
-      if (this.currentPosition === 'LONG') {
-        await this.addLog(`Reversal Level moved: ${this._formatPrice(this.originalReversalLevel)} → ${this._formatPrice(this.reversalLevel)} (from ${originalPercent.toFixed(2)}% to +${newPercent.toFixed(2)}% of entry) - Profit protection active`);
-      } else {
-        await this.addLog(`Reversal Level moved: ${this._formatPrice(this.originalReversalLevel)} → ${this._formatPrice(this.reversalLevel)} (from +${originalPercent.toFixed(2)}% to ${newPercent.toFixed(2)}% of entry) - Profit protection active`);
-      }
-
-      // Save state to persist the change
-      await this.saveState();
-    }
-  }
-
   async _calculateBreakevenAndFinalTp() {
     if (!this.currentPositionQuantity || this.currentPositionQuantity <= 0 || !this.positionEntryPrice) {
       await this.addLog(`BE/Final TP Calc: Cannot calculate - invalid position quantity or entry price.`);
@@ -2276,7 +2374,7 @@ class TradingStrategy {
     }
 
     // Verify accumulated metrics before calculating breakeven
-    await this._verifyAccumulatedMetrics();
+    //await this._verifyAccumulatedMetrics(); Commented out and kept for future use
 
     // Calculate Breakeven Price
     const netRealizedPnL = this.accumulatedRealizedPnL - this.accumulatedTradingFees;
@@ -2284,10 +2382,10 @@ class TradingStrategy {
     // Count trades from trade sequence
     const tradeCount = this.tradeSequence.split('.').filter(x => x).length;
 
-    await this.addLog(`BE Calc: Accumulated Realized PnL: ${precisionFormatter.formatNotional(this.accumulatedRealizedPnL)} (from ${tradeCount} trades)`);
+    await this.addLog(`BE Calc: Accumulated Realized PnL: ${precisionFormatter.formatNotional(this.accumulatedRealizedPnL)}`);
     await this.addLog(`BE Calc: Accumulated Trading Fees: ${precisionFormatter.formatNotional(this.accumulatedTradingFees)}`);
     await this.addLog(`BE Calc: Net Realized PnL: ${precisionFormatter.formatNotional(netRealizedPnL)}`);
-    await this.addLog(`BE Calc: Current Position Quantity: ${this._formatQuantity(this.currentPositionQuantity)}`);
+    //await this.addLog(`BE Calc: Current Position Quantity: ${this._formatQuantity(this.currentPositionQuantity)}`);
 
     let breakevenPriceRaw;
     if (this.currentPosition === 'LONG') {
@@ -2296,7 +2394,7 @@ class TradingStrategy {
       breakevenPriceRaw = this.positionEntryPrice + (netRealizedPnL / this.currentPositionQuantity);
     }
 
-    await this.addLog(`BE Calc: Raw Breakeven Price: ${this._formatPrice(breakevenPriceRaw)}`);
+    //await this.addLog(`BE Calc: Raw Breakeven Price: ${this._formatPrice(breakevenPriceRaw)}`);
     this.breakevenPrice = this.roundPrice(breakevenPriceRaw);
 
     // Calculate Breakeven Percentage
@@ -2432,336 +2530,64 @@ class TradingStrategy {
     this.finalTpActive = true;
   }
 
-  async _calculatePartialTpLevels() {
-    // Check if any partial TP levels are enabled (size > 0)
-    const hasPartialTpEnabled = this.partialTpSizes.some(size => size > 0);
-    if (!hasPartialTpEnabled || !this.positionEntryPrice || this.currentPosition === 'NONE') {
-      return;
-    }
-
-    this.currentEntryReference = this.positionEntryPrice;
-    this.partialTpPrices = [null, null, null];
-    this.partialTpExecuted = [false, false, false];
-
-    await this.addLog(`Calculating Partial TP levels for ${this.currentPosition} position at entry ${this._formatPrice(this.positionEntryPrice)}`);
-
-    for (let i = 0; i < 3; i++) {
-      if (this.partialTpSizes[i] > 0) {
-        const percentageDistance = this.partialTpLevels[i];
-
-        if (this.currentPosition === 'LONG') {
-          this.partialTpPrices[i] = this.roundPrice(this.positionEntryPrice * (1 + percentageDistance / 100));
-        } else {
-          this.partialTpPrices[i] = this.roundPrice(this.positionEntryPrice * (1 - percentageDistance / 100));
-        }
-
-        await this.addLog(`  Partial TP Level ${i + 1}: ${percentageDistance}% (${this.partialTpSizes[i]}% position) -> Price: ${this._formatPrice(this.partialTpPrices[i])}`);
-      } else {
-        await this.addLog(`  Partial TP Level ${i + 1}: Disabled (size = 0%)`);
-      }
-    }
-  }
-
-  async _executePartialTp(levelIndex) {
-    if (levelIndex < 0 || levelIndex >= 3) {
-      await this.addLog(`ERROR: [VALIDATION_ERROR] Invalid partial TP level index: ${levelIndex}`);
-      return false;
-    }
-
-    if (this.partialTpExecuted[levelIndex]) {
-      return false;
-    }
-
-    if (this.partialTpSizes[levelIndex] <= 0) {
-      return false;
-    }
-
-    this.isTradingSequenceInProgress = true;
-
+  async _updateEntryPriceFromBinance() {
     try {
-      const canTrade = await this.checkCapitalProtection();
-      if (!canTrade) {
-        this.isTradingSequenceInProgress = false;
-        return false;
-      }
+      const oldEntryPrice = this.positionEntryPrice;
 
-      const currentPositions = await this.getCurrentPositions();
-      const targetPosition = currentPositions.find(p => p.symbol === this.symbol);
+      // Retry with exponential backoff until API returns updated entry price
+      for (let attempt = 1; attempt <= ENTRY_PRICE_UPDATE_MAX_RETRIES; attempt++) {
+        const currentPositions = await this.getCurrentPositions();
+        const targetPosition = currentPositions.find(p => p.symbol === this.symbol);
 
-      if (!targetPosition || parseFloat(targetPosition.positionAmt) === 0) {
-        await this.addLog(`Partial TP Level ${levelIndex + 1}: No active position found.`);
-        this.isTradingSequenceInProgress = false;
-        return false;
-      }
+        if (targetPosition && parseFloat(targetPosition.positionAmt) !== 0) {
+          const newEntryPrice = parseFloat(targetPosition.entryPrice);
 
-      const currentPositionAmt = Math.abs(parseFloat(targetPosition.positionAmt));
-      const percentageToClose = this.partialTpSizes[levelIndex];
-      const quantityToClose = currentPositionAmt * (percentageToClose / 100);
-      const roundedQuantity = this.roundQuantity(quantityToClose);
+          if (!isNaN(newEntryPrice) && newEntryPrice > 0) {
+            // Check if entry price has actually changed (API has updated)
+            const priceChanged = Math.abs(newEntryPrice - oldEntryPrice) > 0.00001;
 
-      if (roundedQuantity <= 0) {
-        await this.addLog(`Partial TP Level ${levelIndex + 1}: Calculated quantity too small (${quantityToClose}). Skipping.`);
-        this.isTradingSequenceInProgress = false;
-        return false;
-      }
+            if (priceChanged) {
+              // Validate that the change is in the expected direction
+              const isLong = this.tradingDirection === 'LONG';
+              const expectedHigher = isLong; // LONG should have higher new entry, SHORT should have lower
+              const actualHigher = newEntryPrice > oldEntryPrice;
 
-      const closingSide = this.currentPosition === 'LONG' ? 'SELL' : 'BUY';
-      const targetPrice = this.partialTpPrices[levelIndex];
-
-      await this.addLog(`===== PARTIAL TP LEVEL ${levelIndex + 1} TRIGGERED! =====`);
-      await this.addLog(`  Target Price: ${this._formatPrice(targetPrice)}`);
-      await this.addLog(`  Closing ${percentageToClose}% of position (${this._formatQuantity(roundedQuantity)} ${this.symbol})`);
-
-      const result = await this.makeProxyRequest('/fapi/v1/order', 'POST', {
-        symbol: this.symbol,
-        side: closingSide,
-        type: 'MARKET',
-        quantity: roundedQuantity,
-        newOrderRespType: 'FULL'
-      }, true, 'futures');
-
-      if (result && result.orderId) {
-        await this.addLog(`[REST-API] Partial TP order ${result.orderId} placed. Waiting for confirmation...`);
-
-        // Use new fallback mechanism for order confirmation
-        const confirmation = await this._waitForOrderConfirmation(result.orderId, this.symbol);
-        await this.addLog(`[${confirmation.source}] Partial TP order ${result.orderId} confirmed as FILLED.`);
-
-        this.partialTpExecuted[levelIndex] = true;
-        this.partialTpCount++; // Increment partial TP counter
-        this.tradeSequence += `${levelIndex + 1}.`;
-
-        await this.addLog(`Partial TP Level ${levelIndex + 1} executed successfully.`);
-
-        // Position already detected in _processOrderFillViaRestApi if using REST API fallback
-        // But call it again to be safe
-        await this.detectCurrentPosition();
-
-        // Recalculate BE/Final TP after partial TP execution
-        // The BE and Final TP should adjust based on:
-        // - Updated accumulated realized PnL (profit from partial TP)
-        // - Reduced position quantity (remaining position after partial close)
-        await this._calculateBreakevenAndFinalTp();
-
-        if (this.currentPositionQuantity && this.positionEntryPrice) {
-          const remainingNotional = this.currentPositionQuantity * this.positionEntryPrice;
-          await this.addLog(`Remaining position: ${this._formatQuantity(this.currentPositionQuantity)} (${this._formatNotional(remainingNotional)} USDT)`);
+              if (expectedHigher === actualHigher) {
+                // Valid update - entry price changed in expected direction
+                this.positionEntryPrice = newEntryPrice;
+                this.entryLevel = newEntryPrice;
+                await this.addLog(`Entry price updated from Binance API: ${this._formatPrice(oldEntryPrice)} -> ${this._formatPrice(newEntryPrice)}`);
+                return; // Success
+              } else {
+                // Unexpected direction - log warning but use the value
+                await this.addLog(`WARNING: Entry price changed in unexpected direction: ${this._formatPrice(oldEntryPrice)} -> ${this._formatPrice(newEntryPrice)} for ${this.tradingDirection} position`);
+                this.positionEntryPrice = newEntryPrice;
+                this.entryLevel = newEntryPrice;
+                return;
+              }
+            } else {
+              // Entry price hasn't changed yet - API latency
+              if (attempt < ENTRY_PRICE_UPDATE_MAX_RETRIES) {
+                const delay = Math.min(ENTRY_PRICE_UPDATE_MAX_DELAY_MS, ENTRY_PRICE_UPDATE_INITIAL_DELAY_MS * Math.pow(2, attempt - 1));
+                await this.addLog(`Waiting for Binance API to update entry price... (Attempt ${attempt}/${ENTRY_PRICE_UPDATE_MAX_RETRIES}, retrying in ${delay}ms)`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+              } else {
+                // Max retries reached - use current value with warning
+                await this.addLog(`WARNING: Binance API entry price unchanged after ${ENTRY_PRICE_UPDATE_MAX_RETRIES} attempts (${this._formatPrice(oldEntryPrice)} -> ${this._formatPrice(newEntryPrice)}). Using current value.`);
+                this.positionEntryPrice = newEntryPrice;
+                this.entryLevel = newEntryPrice;
+                return;
+              }
+            }
+          }
         }
-
-        await this.saveState();
-        this.isTradingSequenceInProgress = false;
-        return true;
-      } else {
-        throw new Error('Partial TP order placement failed: No orderId in response.');
       }
     } catch (error) {
-      await this.addLog(`ERROR: [TRADING_ERROR] Executing Partial TP Level ${levelIndex + 1}: ${error.message}`);
-      this.isTradingSequenceInProgress = false;
-      return false;
-    }
-  }
-
-  async _resetPartialTpState() {
-    this.partialTpPrices = [null, null, null];
-    this.partialTpExecuted = [false, false, false];
-    this.currentEntryReference = null;
-  }
-
-  // Helper to check if virtual limit order has been triggered
-  async _checkVirtualLimitTrigger(currentPrice) {
-    // Early return if still initializing virtual limits (prevents premature logging during dual-limit setup)
-    if (this.isInitializingVirtualLimits) return false;
-
-    // Check if we have any virtual limit orders
-    if (!this.virtualLongLimitOrder && !this.virtualShortLimitOrder) return false;
-
-    // If virtual limit was already triggered once, don't check again
-    // Just return status indicating we're in volatility check mode
-    if (this.virtualLimitFirstTriggered) {
-      return 'in_volatility_check';
-    }
-
-    let limitTriggered = false;
-    let triggeredOrder = null;
-
-    // Check primary virtual limit order (virtualLongLimitOrder)
-    if (this.virtualLongLimitOrder) {
-      if (this.virtualLongLimitOrder.side === 'BUY' && currentPrice <= this.virtualLongLimitOrder.price) {
-        limitTriggered = true;
-        triggeredOrder = this.virtualLongLimitOrder;
-      } else if (this.virtualLongLimitOrder.side === 'SELL' && currentPrice >= this.virtualLongLimitOrder.price) {
-        limitTriggered = true;
-        triggeredOrder = this.virtualLongLimitOrder;
-      }
-    }
-
-    // Check secondary virtual limit order (if dual limit setup)
-    if (!limitTriggered && this.virtualShortLimitOrder) {
-      if (this.virtualShortLimitOrder.side === 'BUY' && currentPrice <= this.virtualShortLimitOrder.price) {
-        limitTriggered = true;
-        triggeredOrder = this.virtualShortLimitOrder;
-      } else if (this.virtualShortLimitOrder.side === 'SELL' && currentPrice >= this.virtualShortLimitOrder.price) {
-        limitTriggered = true;
-        triggeredOrder = this.virtualShortLimitOrder;
-      }
-    }
-
-    if (!limitTriggered) {
-      // Periodic status logging for virtual limit orders (every 30 seconds)
-      const now = Date.now();
-      if (!this.lastVirtualStatusLogTime || (now - this.lastVirtualStatusLogTime) >= 30000) {
-        // Detect dual-limit mode and show both limits
-        if (this.virtualLongLimitOrder && this.virtualShortLimitOrder) {
-          await this.addLog(`Virtual LIMIT: Price ${this._formatPrice(currentPrice)} | Waiting for BUY at ${this._formatPrice(this.virtualLongLimitOrder.price)} or SELL at ${this._formatPrice(this.virtualShortLimitOrder.price)}`);
-        } else if (this.virtualLongLimitOrder) {
-          await this.addLog(`Virtual LIMIT: Price ${this._formatPrice(currentPrice)} | Waiting for ${this.virtualLongLimitOrder.side} trigger at ${this._formatPrice(this.virtualLongLimitOrder.price)}`);
-        } else if (this.virtualShortLimitOrder) {
-          await this.addLog(`Virtual LIMIT: Price ${this._formatPrice(currentPrice)} | Waiting for ${this.virtualShortLimitOrder.side} trigger at ${this._formatPrice(this.virtualShortLimitOrder.price)}`);
-        }
-        this.lastVirtualStatusLogTime = now;
-      }
-      return false;
-    }
-
-    // Limit/Market price hit for the FIRST TIME! Mark it and log it
-    const orderTypeLabel = triggeredOrder.isMarketOrder ? 'MARKET' : 'LIMIT';
-    await this.addLog(`Virtual ${triggeredOrder.side} ${orderTypeLabel} triggered (first time) at ${this._formatPrice(currentPrice)} (limit: ${this._formatPrice(triggeredOrder.price)})`);
-    this.virtualLimitFirstTriggered = true;
-
-    await this.addLog(`Checking volatility before opening position...`);
-
-    if (!this.volatilityEnabled || this.volatilityExpanded) {
-      // ===== VOLATILITY EXPANDED OR DISABLED - Open position immediately =====
-      await this.addLog(`Volatility: ${this.volatilityEnabled ? 'EXPANDED' : 'DISABLED'} - opening position immediately`);
-
-      this.isTradingSequenceInProgress = true;
-
-      try {
-        const orderSide = triggeredOrder.side;
-        const quantity = triggeredOrder.quantity;
-        const newPositionType = orderSide === 'BUY' ? 'LONG' : 'SHORT';
-
-        await this.addLog(`Opening ${newPositionType} position with ${this._formatQuantity(quantity)} contracts`);
-        await this.placeMarketOrder(this.symbol, orderSide, quantity);
-        await this._waitForPositionChange(newPositionType);
-
-        // Set active mode
-        this.activeMode = newPositionType === 'LONG' ? 'SUPPORT_ZONE' : 'RESISTANCE_ZONE';
-        this.currentPosition = newPositionType;
-        this.entryPositionQuantity = quantity;
-        this.currentPositionQuantity = quantity;
-
-        // Set entry and reversal levels
-        this.entryLevel = this.positionEntryPrice;
-        if (this.reversalLevelPercentage !== null) {
-          if (this.activeMode === 'SUPPORT_ZONE') {
-            this.reversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, false);
-          } else {
-            this.reversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, true);
-          }
-          await this.addLog(`Entry: ${this._formatPrice(this.entryLevel)}, Reversal: ${this._formatPrice(this.reversalLevel)} (${this.activeMode})`);
-        }
-
-        // Reset Move Reversal Level state
-        this.reversalLevelMoved = false;
-        this.originalReversalLevel = null;
-
-        // Set strategy start time if not already set
-        if (!this.strategyStartTime) {
-          this.strategyStartTime = new Date();
-          await this.addLog(`Strategy timer started after virtual limit fill.`);
-        }
-
-        // Update trade sequence
-        this.tradeSequence += newPositionType === 'LONG' ? 'L.' : 'S.';
-
-        // Calculate BE, final TP, and partial TP
-        await this._calculateBreakevenAndFinalTp();
-        await this._calculatePartialTpLevels();
-
-        await this.addLog(`Position opened: ${this.currentPosition} at ${this._formatPrice(this.positionEntryPrice)}`);
-
-        // Clear virtual tracking state
-        this.virtualPositionActive = false;
-        this.virtualPositionDirection = null;
-        this.virtualOriginalDirection = null;
-        this.virtualLongLimitOrder = null;
-        this.virtualShortLimitOrder = null;
-        this.volatilityWaitStartTime = null;
-        this.lastVirtualStatusLogTime = null;
-        this.virtualEntryLevel = null;
-        this.virtualReversalLevel = null;
-        this.virtualLimitFirstTriggered = false;
-
-        this.isTradingSequenceInProgress = false;
-        await this.saveState();
-        return true;
-
-      } catch (error) {
-        await this.addLog(`ERROR: [TRADING_ERROR] Opening position from virtual limit trigger: ${error.message}`);
-        this.isTradingSequenceInProgress = false;
-        return false;
-      }
-
-    } else {
-      // ===== VOLATILITY CHOPPY - Continue virtual tracking with direction monitoring =====
-      await this.addLog(`Volatility is CHOPPY - continuing virtual tracking mode with direction monitoring`);
-
-      // Update virtual position direction based on triggered order
-      const newDirection = triggeredOrder.side === 'BUY' ? 'LONG' : 'SHORT';
-
-      if (this.virtualPositionDirection !== newDirection) {
-        await this.addLog(`Virtual direction changed from ${this.virtualPositionDirection} to ${newDirection}`);
-        this.virtualPositionDirection = newDirection;
-      }
-
-      // Set original direction if not already set (critical for direction flip logic)
-      if (!this.virtualOriginalDirection) {
-        this.virtualOriginalDirection = newDirection;
-      }
-
-      // Clear the non-triggered order if in dual limit setup
-      if (triggeredOrder === this.virtualLongLimitOrder) {
-        this.virtualShortLimitOrder = null; // Clear the other limit
-      } else if (triggeredOrder === this.virtualShortLimitOrder) {
-        this.virtualLongLimitOrder = triggeredOrder; // Promote triggered order to primary
-        this.virtualShortLimitOrder = null;
-      }
-
-      // Update entry/reversal levels based on triggered direction
-      this.entryLevel = triggeredOrder.price;
-      this.virtualEntryLevel = triggeredOrder.price;
-
-      if (this.reversalLevelPercentage !== null) {
-        if (newDirection === 'LONG') {
-          this.reversalLevel = this._calculateAdjustedPrice(triggeredOrder.price, this.reversalLevelPercentage, false);
-          this.activeMode = 'SUPPORT_ZONE';
-        } else {
-          this.reversalLevel = this._calculateAdjustedPrice(triggeredOrder.price, this.reversalLevelPercentage, true);
-          this.activeMode = 'RESISTANCE_ZONE';
-        }
-        this.virtualReversalLevel = this.reversalLevel;
-        await this.addLog(`Updated levels: Entry=${this._formatPrice(this.entryLevel)}, Reversal=${this._formatPrice(this.reversalLevel)}`);
-      }
-
-      // Mark as waiting for volatility with direction tracking enabled
-      if (!this.volatilityWaitStartTime) {
-        this.volatilityWaitStartTime = Date.now();
-      }
-      this.lastVirtualDirectionChange = Date.now();
-      this.virtualDirectionChanges = [];
-      this.closedPositionType = null; // No position was closed for initial entry
-
-      await this.addLog(`Waiting for volatility expansion - Direction: ${newDirection}`);
-      await this.saveState();
-      return true; // Continue virtual tracking
+      await this.addLog(`WARNING: Failed to update entry price from Binance API: ${error.message}`);
     }
   }
 
   async handleRealtimePrice(currentPrice) {
-    // ===== 0. Update microbar for volatility detection =====
-    await this._updateMicrobar(currentPrice);
-
     // Update current price and PnL values (always update these)
     this.currentPrice = currentPrice;
 
@@ -2780,23 +2606,6 @@ class TradingStrategy {
       return;
     }
 
-    // ===== NEW: Check for virtual limit order triggers BEFORE position logic =====
-    if (this.virtualPositionActive && (this.virtualLongLimitOrder || this.virtualShortLimitOrder) && this.currentPosition === 'NONE') {
-      const triggerStatus = await this._checkVirtualLimitTrigger(currentPrice);
-
-      // Handle different trigger statuses
-      if (triggerStatus === 'in_volatility_check') {
-        // Already triggered, now in volatility check mode - continue to direction monitoring
-        // Don't return, let it fall through to _updateVirtualPositionDirection
-      } else if (triggerStatus === true) {
-        // Just triggered for first time - handler managed the flow
-        return;
-      } else if (triggerStatus === false) {
-        // Not triggered yet - keep waiting
-        return;
-      }
-    }
-
     // Check if desired profit target is reached
     if (this.desiredProfitUSDT !== null && this.totalPnL >= this.desiredProfitUSDT) {
       await this.addLog(`===== DESIRED PROFIT TARGET REACHED =====`);
@@ -2807,50 +2616,12 @@ class TradingStrategy {
       return;
     }
 
-    // ===== NEW: Virtual Position Direction Tracking =====
-    if (this.virtualPositionActive) {
-      await this._updateVirtualPositionDirection(currentPrice);
-      // If position was opened, continue with normal logic
-      // If still waiting, return here to avoid other checks
-      if (this.virtualPositionActive) {
-        return; // Still waiting for volatility
-      }
-    }
-
-    // Only execute trading logic if strategy is running AND position is open
+    // Only execute trading logic if strategy is running AND position exists
     if (!this.isRunning || this.currentPosition === 'NONE') {
       return;
     }
 
-    // ===== 0. Check and Move Reversal Level (if enabled) =====
-    if (!this.isTradingSequenceInProgress) {
-      await this._checkAndMoveReversalLevel(currentPrice);
-    }
-
-    // ===== 1. Partial TP Trigger Logic (Highest priority - runs before Final TP) =====
-    const hasPartialTpEnabled = this.partialTpSizes.some(size => size > 0);
-    if (hasPartialTpEnabled && this.currentPosition !== 'NONE' && !this.isTradingSequenceInProgress) {
-      for (let i = 0; i < 3; i++) {
-        if (!this.partialTpExecuted[i] && this.partialTpSizes[i] > 0 && this.partialTpPrices[i] !== null) {
-          let shouldExecutePartialTp = false;
-
-          if (this.currentPosition === 'LONG' && currentPrice >= this.partialTpPrices[i]) {
-            shouldExecutePartialTp = true;
-          } else if (this.currentPosition === 'SHORT' && currentPrice <= this.partialTpPrices[i]) {
-            shouldExecutePartialTp = true;
-          }
-
-          if (shouldExecutePartialTp) {
-            const executed = await this._executePartialTp(i);
-            if (executed) {
-              return;
-            }
-          }
-        }
-      }
-    }
-
-    // ===== 1. Final TP Trigger Logic (Priority check - runs before guard) =====
+    // ===== 2. Final TP Trigger Logic (Priority check - runs before guard) =====
     if (this.finalTpActive && this.currentPosition !== 'NONE' && !this.finalTpOrderSent && this.finalTpPrice !== null) {
       // Validate that Final TP price is appropriate for current position direction
       let isFinalTpValid = false;
@@ -2879,7 +2650,21 @@ class TradingStrategy {
         this.isTradingSequenceInProgress = true;
         this.finalTpOrderSent = true;
         this.tradeSequence += 'F.';
+        await this.addLog(`===== FINAL TP HIT! CONGRATULATIONS, BRO! =====`);
         await this.addLog(`Final TP hit! Current price: ${this._formatPrice(currentPrice)}, Target: ${this._formatPrice(this.finalTpPrice)}. Closing remaining position and stopping strategy.`);
+
+        // Save strategy flow event for Final TP (before closing position)
+        await this.saveStrategyFlowEvent(
+          'F',
+          this.currentPosition,
+          this.positionEntryPrice,
+          this.currentPositionQuantity,
+          this.breakevenPrice,
+          this.breakevenPercentage,
+          this.finalTpPrice,
+          this.finalTpPercentage
+        );
+
         try {
           await this.closeCurrentPosition();
           await this.addLog('Final TP: Waiting for position to be fully closed...');
@@ -2901,83 +2686,357 @@ class TradingStrategy {
       return;
     }
 
-    // ===== 4. Reversal Logic (only if a position is open and an active mode is set) =====
-    if (this.currentPosition !== 'NONE' && this.activeMode !== 'NONE' && this.reversalLevel !== null) {
-      let shouldReverse = false;
-      let newPositionType = null;
-
-      if (this.activeMode === 'RESISTANCE_ZONE') {
-        if (this.currentPosition === 'LONG' && currentPrice <= this.reversalLevel) {
-          // LONG position in resistance zone hits reversal level below entry
-          shouldReverse = true;
-          newPositionType = 'SHORT';
-        } else if (this.currentPosition === 'SHORT' && currentPrice >= this.reversalLevel) {
-          // SHORT position in resistance zone hits reversal level above entry
-          shouldReverse = true;
-          newPositionType = 'LONG';
+    // ===== 2.4. Real Position Continuous Trailing Logic =====
+    // Trail TP Level independently (reversal level remains fixed at initialReversalLevel)
+    if (this.currentPosition !== 'NONE' && this.tpLevel !== null && this.positionEntryPrice !== null && !this.tpLevelTrailingPaused) {
+      // Trail LONG positions in Support Zone
+      if (this.currentPosition === 'LONG' && this.activeMode === 'SUPPORT_ZONE') {
+        // Initialize highestFavorablePrice if needed
+        if (this.highestFavorablePrice === null) {
+          this.highestFavorablePrice = this.positionEntryPrice;
         }
-      } else if (this.activeMode === 'SUPPORT_ZONE') {
-        if (this.currentPosition === 'SHORT' && currentPrice >= this.reversalLevel) {
-          // SHORT position in support zone hits reversal level above entry
-          shouldReverse = true;
-          newPositionType = 'LONG';
-        } else if (this.currentPosition === 'LONG' && currentPrice <= this.reversalLevel) {
-          // LONG position in support zone hits reversal level below entry
-          shouldReverse = true;
-          newPositionType = 'SHORT';
+
+        // Trail TP level upward as price rises
+        if (currentPrice > this.highestFavorablePrice) {
+          const ticksMoved = this._calculateTicksBetween(this.highestFavorablePrice, currentPrice);
+
+          if (ticksMoved >= this.trailStepFactor) {
+            const trailSteps = Math.floor(ticksMoved / this.trailStepFactor);
+            const actualTicksToTrail = trailSteps * this.trailStepFactor;
+
+            const previousTpLevel = this.tpLevel;
+            const newTpLevel = this._adjustPriceByTicks(this.tpLevel, actualTicksToTrail, true);
+
+            // Trail TP level upward (reversal level stays at initialReversalLevel)
+            this.tpLevel = newTpLevel;
+            this.highestFavorablePrice = this._adjustPriceByTicks(this.highestFavorablePrice, actualTicksToTrail, true);
+            this.ticksMovedInFavor += actualTicksToTrail;
+
+            await this.addLog(`LONG Trailing: Price ${this._formatPrice(currentPrice)} (+${ticksMoved} ticks). TP Level: ${this._formatPrice(previousTpLevel)} -> ${this._formatPrice(this.tpLevel)} (+${actualTicksToTrail} ticks). Initial Reversal: ${this._formatPrice(this.initialReversalLevel)} (unchanged)`);
+            await this.saveState();
+          }
+        }
+      }
+      // Trail SHORT positions in Resistance Zone
+      else if (this.currentPosition === 'SHORT' && this.activeMode === 'RESISTANCE_ZONE') {
+        // Initialize lowestFavorablePrice if needed
+        if (this.lowestFavorablePrice === null) {
+          this.lowestFavorablePrice = this.positionEntryPrice;
+        }
+
+        // Trail TP level downward as price falls
+        if (currentPrice < this.lowestFavorablePrice) {
+          const ticksMoved = this._calculateTicksBetween(this.lowestFavorablePrice, currentPrice);
+
+          if (ticksMoved >= this.trailStepFactor) {
+            const trailSteps = Math.floor(ticksMoved / this.trailStepFactor);
+            const actualTicksToTrail = trailSteps * this.trailStepFactor;
+
+            const previousTpLevel = this.tpLevel;
+            const newTpLevel = this._adjustPriceByTicks(this.tpLevel, actualTicksToTrail, false);
+
+            // Trail TP level downward (reversal level stays at initialReversalLevel)
+            this.tpLevel = newTpLevel;
+            this.lowestFavorablePrice = this._adjustPriceByTicks(this.lowestFavorablePrice, actualTicksToTrail, false);
+            this.ticksMovedInFavor += actualTicksToTrail;
+
+            await this.addLog(`SHORT Trailing: Price ${this._formatPrice(currentPrice)} (-${ticksMoved} ticks). TP Level: ${this._formatPrice(previousTpLevel)} -> ${this._formatPrice(this.tpLevel)} (-${actualTicksToTrail} ticks). Initial Reversal: ${this._formatPrice(this.initialReversalLevel)} (unchanged)`);
+            await this.saveState();
+          }
+        }
+      }
+    }
+
+    // ===== 2.5. Partial Take-Profit Trigger Logic =====
+    // Check TP triggers BEFORE reversal logic to allow partial exits
+    if (this.currentPosition !== 'NONE' && this.tpLevel !== null && this.positionEntryPrice !== null) {
+      let shouldExecuteTp = false;
+      let tpLabel = null;
+      let tpPercentage = null;
+
+      // For LONG positions
+      if (this.currentPosition === 'LONG' && this.activeMode === 'SUPPORT_ZONE') {
+        // Only trigger TPs if tpLevel has crossed above entry price (we're in profit)
+        if (this.tpLevel > this.positionEntryPrice) {
+          // Check if price has retraced to tpLevel
+          if (currentPrice <= this.tpLevel) {
+            // Execute TPs sequentially: TP1 -> TP2 -> TP3
+            if (!this.tp1Executed) {
+              shouldExecuteTp = true;
+              tpLabel = 'TP1';
+              tpPercentage = this.partialTp1SizePercent;
+            } else if (!this.tp2Executed) {
+              // TP2: Only execute if tpLevel has trailed higher than TP1's trigger level
+              if (this.tp1TriggerLevel !== null && this.tpLevel > this.tp1TriggerLevel) {
+                shouldExecuteTp = true;
+                tpLabel = 'TP2';
+                tpPercentage = this.partialTp2SizePercent;
+              }
+            } else if (!this.tp3Executed) {
+              // TP3: Only execute if tpLevel has trailed higher than TP2's trigger level
+              if (this.tp2TriggerLevel !== null && this.tpLevel > this.tp2TriggerLevel) {
+                shouldExecuteTp = true;
+                tpLabel = 'TP3';
+                tpPercentage = this.partialTp3SizePercent;
+              }
+            }
+          }
+        }
+      }
+      // For SHORT positions
+      else if (this.currentPosition === 'SHORT' && this.activeMode === 'RESISTANCE_ZONE') {
+        // Only trigger TPs if tpLevel has crossed below entry price (we're in profit)
+        if (this.tpLevel < this.positionEntryPrice) {
+          // Check if price has retraced to tpLevel
+          if (currentPrice >= this.tpLevel) {
+            // Execute TPs sequentially: TP1 -> TP2 -> TP3
+            if (!this.tp1Executed) {
+              shouldExecuteTp = true;
+              tpLabel = 'TP1';
+              tpPercentage = this.partialTp1SizePercent;
+            } else if (!this.tp2Executed) {
+              // TP2: Only execute if tpLevel has trailed lower than TP1's trigger level
+              if (this.tp1TriggerLevel !== null && this.tpLevel < this.tp1TriggerLevel) {
+                shouldExecuteTp = true;
+                tpLabel = 'TP2';
+                tpPercentage = this.partialTp2SizePercent;
+              }
+            } else if (!this.tp3Executed) {
+              // TP3: Only execute if tpLevel has trailed lower than TP2's trigger level
+              if (this.tp2TriggerLevel !== null && this.tpLevel < this.tp2TriggerLevel) {
+                shouldExecuteTp = true;
+                tpLabel = 'TP3';
+                tpPercentage = this.partialTp3SizePercent;
+              }
+            }
+          }
         }
       }
 
-      if (shouldReverse && newPositionType) {
-        await this._handleReversal(newPositionType, this.reversalLevel, 'reversal');
+      // Execute TP if trigger conditions met
+      if (shouldExecuteTp && tpLabel && tpPercentage) {
+        const success = await this.executePartialTakeProfit(tpPercentage, tpLabel);
+        if (success) {
+          // Mark TP as executed and capture the trigger level
+          if (tpLabel === 'TP1') {
+            this.tp1Executed = true;
+            this.tp1TriggerLevel = this.tpLevel;
+          } else if (tpLabel === 'TP2') {
+            this.tp2Executed = true;
+            this.tp2TriggerLevel = this.tpLevel;
+          } else if (tpLabel === 'TP3') {
+            this.tp3Executed = true;
+            this.tp3TriggerLevel = this.tpLevel;
+            this.tpLevelTrailingPaused = true;
+            await this.addLog(`${tpLabel}: TP level trailing has been paused after TP3 completion.`);
+          }
+          await this.saveState();
+        }
+        return; // Exit to prevent reversal from triggering in same tick
+      }
+    }
+
+    // ===== 3. Real Position Reversal Logic =====
+    // Use fixed reversal levels for reversal trigger (calculated once at initial position)
+    if (this.currentPosition !== 'NONE' && this.activeMode !== 'NONE' && this.fixedReversalLevelsCalculated) {
+      let shouldHandleReversal = false;
+      let triggeredReversalLevel = null;
+
+      if (this.activeMode === 'RESISTANCE_ZONE') {
+        // SHORT positions in Resistance Zone: reverse when price hits longReversalLevel (above)
+        if (this.currentPosition === 'SHORT' && currentPrice >= this.longReversalLevel) {
+          shouldHandleReversal = true;
+          triggeredReversalLevel = this.longReversalLevel;
+        }
+      } else if (this.activeMode === 'SUPPORT_ZONE') {
+        // LONG positions in Support Zone: reverse when price hits shortReversalLevel (below)
+        if (this.currentPosition === 'LONG' && currentPrice <= this.shortReversalLevel) {
+          shouldHandleReversal = true;
+          triggeredReversalLevel = this.shortReversalLevel;
+        }
+      }
+
+      if (shouldHandleReversal) {
+        await this.addLog(`===== POSITION REVERSAL =====`);
+        await this.addLog(`Price hit Fixed Reversal Level: ${this._formatPrice(triggeredReversalLevel)} (TP Level was at: ${this._formatPrice(this.tpLevel)}). Closing remaining position.`);
+        await this._handleDirectReversal(currentPrice);
         return;
       }
     }
   }
 
-  // Helper method to handle reversal logic
-  async _handleReversal(newPositionType, reversalPrice, reversalType) {
+  // Execute partial take-profit by closing a percentage of the current position
+  async executePartialTakeProfit(percentage, tpLabel) {
     this.isTradingSequenceInProgress = true;
 
-    // CRITICAL: Immediately deactivate Final TP to prevent race conditions
+    try {
+      await this.addLog(`===== ${tpLabel} HIT =====`);
+      await this.addLog(`${tpLabel}: Price ${this._formatPrice(this.currentPrice)}, TP Level: ${this._formatPrice(this.tpLevel)}. Executing partial close...`);
+
+      // Step 1: Get current position quantity
+      let currentQuantity = null;
+
+      // Use internal tracking first (maintained by WebSocket)
+      if (this.currentPositionQuantity && this.currentPositionQuantity > 0) {
+        currentQuantity = this.currentPositionQuantity;
+        await this.addLog(`${tpLabel}: Current position: ${this._formatQuantity(currentQuantity)} ${this.symbol.replace('USDT', '')} (from internal tracking)`);
+      } else {
+        // Fallback to REST API if internal tracking is not available
+        await this.addLog(`${tpLabel}: Internal position tracking unavailable. Fetching from REST API...`);
+        const positions = await this.getCurrentPositions();
+
+        if (!positions || positions.length === 0) {
+          await this.addLog(`${tpLabel}: No position found. Aborting TP execution.`);
+          this.isTradingSequenceInProgress = false;
+          return false;
+        }
+
+        const positionData = positions.find(p => p.symbol === this.symbol);
+        if (!positionData) {
+          await this.addLog(`${tpLabel}: No position found for ${this.symbol}. Aborting TP execution.`);
+          this.isTradingSequenceInProgress = false;
+          return false;
+        }
+
+        currentQuantity = Math.abs(parseFloat(positionData.positionAmt));
+        if (currentQuantity === 0) {
+          await this.addLog(`${tpLabel}: Position quantity is zero. Aborting TP execution.`);
+          this.isTradingSequenceInProgress = false;
+          return false;
+        }
+
+        await this.addLog(`${tpLabel}: Current position: ${this._formatQuantity(currentQuantity)} ${this.symbol.replace('USDT', '')} (from REST API)`);
+      }
+
+      // Step 2: Calculate quantity to close using direct percentage calculation
+      const quantityToClose = currentQuantity * (percentage / 100);
+      const adjustedQuantityToClose = this.roundQuantity(quantityToClose);
+
+      if (adjustedQuantityToClose === 0) {
+        await this.addLog(`${tpLabel}: Calculated quantity to close is zero after rounding. Aborting TP execution.`);
+        this.isTradingSequenceInProgress = false;
+        return false;
+      }
+
+      // Step 3: Validate against minimum quantity requirement
+      const { minQty } = await this._getExchangeInfo(this.symbol);
+      if (adjustedQuantityToClose < minQty) {
+        await this.addLog(`${tpLabel}: Quantity to close ${this._formatQuantity(adjustedQuantityToClose)} is below minimum ${this._formatQuantity(minQty)}. Aborting TP execution.`);
+        this.isTradingSequenceInProgress = false;
+        return false;
+      }
+
+      await this.addLog(`${tpLabel}: Closing ${this._formatQuantity(adjustedQuantityToClose)} ${this.symbol.replace('USDT', '')} (${percentage}% of position)`);
+
+      // Step 4: Execute market order to close partial position
+      const orderSide = this.currentPosition === 'LONG' ? 'SELL' : 'BUY';
+      await this.addLog(`${tpLabel}: Placing ${orderSide} order for ${this._formatQuantity(adjustedQuantityToClose)} ${this.symbol.replace('USDT', '')}...`);
+      await this.placeMarketOrder(this.symbol, orderSide, adjustedQuantityToClose);
+
+      // Step 5: Wait for order confirmation
+      await this.addLog(`${tpLabel}: Waiting for order confirmation...`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Step 6: Update position tracking from REST API
+      await this.addLog(`${tpLabel}: Fetching updated position from REST API...`);
+      const updatedPositions = await this.getCurrentPositions();
+
+      if (updatedPositions && updatedPositions.length > 0) {
+        const updatedPositionData = updatedPositions.find(p => p.symbol === this.symbol);
+        if (updatedPositionData) {
+          const updatedQuantity = Math.abs(parseFloat(updatedPositionData.positionAmt));
+          this.currentPositionQuantity = updatedQuantity;
+          this.positionSize = updatedQuantity * this.positionEntryPrice;
+
+          const remainingPercent = ((updatedQuantity / currentQuantity) * 100).toFixed(1);
+          await this.addLog(`${tpLabel}: Completed successfully. Remaining position: ${this._formatQuantity(updatedQuantity)} ${this.symbol.replace('USDT', '')} (${remainingPercent}%)`);
+        }
+      }
+
+      // Step 7: Recalculate breakeven and Final TP
+      if (this.currentPositionQuantity > 0) {
+        await this._calculateBreakevenAndFinalTp();
+      }
+
+      // Step 8: Update trade sequence marker
+      const tpMarker = tpLabel === 'TP1' ? 'T1.' : tpLabel === 'TP2' ? 'T2.' : 'T3.';
+      this.tradeSequence += tpMarker;
+
+      // Step 8.5: Save strategy flow event for partial TP
+      await this.saveStrategyFlowEvent(
+        tpLabel,
+        this.currentPosition,
+        this.positionEntryPrice,
+        this.currentPositionQuantity,
+        this.breakevenPrice,
+        this.breakevenPercentage,
+        this.finalTpPrice,
+        this.finalTpPercentage
+      );
+
+      // Step 9: Save state
+      await this.saveState();
+
+      await this.addLog(`${tpLabel}: Execution complete.`);
+
+      this.isTradingSequenceInProgress = false;
+      return true;
+
+    } catch (error) {
+      console.error(`Error executing ${tpLabel}:`, error);
+      await this.addLog(`ERROR: [TRADING_ERROR] ${tpLabel} execution failed: ${error.message}`);
+      this.isTradingSequenceInProgress = false;
+      return false;
+    }
+  }
+
+  // Handle direct reversal
+  async _handleDirectReversal(currentPrice) {
+    this.isTradingSequenceInProgress = true;
+
+    // Deactivate Final TP
     this.finalTpActive = false;
     this.finalTpOrderSent = false;
 
     try {
-      // Capture old position before reversal for notification
       const oldPosition = this.currentPosition;
-      this.closedPositionType = this.currentPosition; // Track for virtual direction logic
+      const newPosition = oldPosition === 'LONG' ? 'SHORT' : 'LONG';
+      const oldZone = this.activeMode;
+      const newZone = oldZone === 'SUPPORT_ZONE' ? 'RESISTANCE_ZONE' : 'SUPPORT_ZONE';
 
-      // ===== PHASE 1: Close existing position (NO VOLATILITY CHECK) =====
-      if (this.currentPosition !== 'NONE') {
-        await this.addLog(`===== REVERSAL =====`);
-        await this.addLog(`Reversal: ${this.currentPosition} position hit ${reversalType} level at ${this._formatPrice(reversalPrice)}. Closing position.`);
-        await this.closeCurrentPosition();
-        await this._waitForPositionChange('NONE');
-        await this.addLog('Reversal: Position confirmed as NONE.');
-        this.tradeSequence += 'C.'; // Add close notation
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
+      await this.addLog(`${oldPosition} position hit reversal at ${this._formatPrice(currentPrice)}. Reversing to ${newPosition} in ${newZone}.`);
 
-      // Step 2: Check capital protection
+      // Step 1: Close existing real position
+      await this.closeCurrentPosition();
+      await this._waitForPositionChange('NONE');
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      // Step 2: Increment reversal count and update trade sequence
+      this.reversalCount++;
+      this.tradeSequence += newPosition === 'LONG' ? 'L.' : 'S.';
+
+      // Step 3: Switch zone
+      this.activeMode = newZone;
+      await this.addLog(`Zone switched from ${oldZone} to ${newZone}.`);
+
+      // Step 4: Check capital protection
       const canTrade = await this.checkCapitalProtection();
       if (!canTrade) {
         this.isTradingSequenceInProgress = false;
         return;
       }
 
-      // Step 3: Determine if dynamic sizing should be applied based on trading mode
+      // Step 5: Apply dynamic sizing
       const shouldApplyDynamic = this._shouldApplyDynamicSizing();
 
       if (shouldApplyDynamic) {
         this.positionSizeUSDT = await this._calculateDynamicPositionSize();
         this.lastDynamicSizingReversalCount = this.reversalCount;
 
-        // Calculate next dynamic sizing reversal
         const interval = this.tradingMode === 'NORMAL' ? 3 : this.tradingMode === 'CONSERVATIVE' ? 5 : 1;
-        const nextDynamicReversal = (this.reversalCount + 1) + interval;
+        const nextDynamicReversal = this.reversalCount + interval;
 
-        await this.addLog(`Reversal #${this.reversalCount + 1}: Applying dynamic position sizing: ${this._formatNotional(this.positionSizeUSDT)} USDT.`);
+        await this.addLog(`Applying dynamic position sizing: ${this._formatNotional(this.positionSizeUSDT)} USDT.`);
         if (this.tradingMode !== 'AGGRESSIVE') {
           await this.addLog(`Next dynamic sizing at reversal #${nextDynamicReversal}.`);
         }
@@ -2985,132 +3044,82 @@ class TradingStrategy {
         const interval = this.tradingMode === 'NORMAL' ? 3 : 5;
         const reversalsSinceLastDynamic = this.reversalCount - this.lastDynamicSizingReversalCount;
         const reversalsUntilNext = interval - reversalsSinceLastDynamic;
-        const nextDynamicReversal = this.reversalCount + 1 + reversalsUntilNext;
-        await this.addLog(`Reversal #${this.reversalCount + 1}: Reusing position size: ${this._formatNotional(this.positionSizeUSDT)} USDT (Dynamic sizing will happen at #${nextDynamicReversal}).`);
+        const nextDynamicReversal = this.reversalCount + reversalsUntilNext;
+        await this.addLog(`Reusing position size: ${this._formatNotional(this.positionSizeUSDT)} USDT (Dynamic sizing will happen at #${nextDynamicReversal}).`);
       }
 
-      // ===== PHASE 2: Check Volatility Before Opening =====
-      if (this.volatilityEnabled && !this.volatilityExpanded) {
-        // Enter virtual tracking mode instead of opening position
-        this.virtualPositionActive = true;
-        this.virtualPositionDirection = newPositionType; // Initial direction
-        this.virtualOriginalDirection = newPositionType; // Track original direction for flip logic
-        this.volatilityWaitStartTime = Date.now();
-        this.lastVirtualDirectionChange = Date.now();
-        this.lastVirtualStatusLogTime = Date.now();
-        this.virtualDirectionChanges = [];
-        this.virtualDirectionBuffer = null;
-
-        // Calculate NEW entry and reversal levels for the virtual position
-        // Entry = where reversal just occurred (reversalPrice)
-        // Reversal = calculated from new entry based on new position type
-        this.virtualEntryLevel = reversalPrice;
-
-        if (newPositionType === 'LONG') {
-          // LONG: reversal level is BELOW entry
-          this.virtualReversalLevel = this._calculateAdjustedPrice(this.virtualEntryLevel, this.reversalLevelPercentage, false);
-        } else {
-          // SHORT: reversal level is ABOVE entry
-          this.virtualReversalLevel = this._calculateAdjustedPrice(this.virtualEntryLevel, this.reversalLevelPercentage, true);
-        }
-
-        await this.addLog(`Entering virtual position tracking mode - waiting for volatility expansion`);
-        await this.addLog(`Initial virtual direction: ${newPositionType}, Entry: ${this._formatPrice(this.virtualEntryLevel)}, Reversal: ${this._formatPrice(this.virtualReversalLevel)}`);
-
-        this.isTradingSequenceInProgress = false; // Allow price monitoring
-        await this.saveState();
-        return; // Don't open position yet
-      }
-
-      // ===== PHASE 3: Open Position (Volatility is expanded or disabled) =====
+      // Step 6: Open new position
       const quantity = await this._calculateAdjustedQuantity(this.symbol, this.positionSizeUSDT);
 
       if (quantity > 0) {
-        const orderSide = (newPositionType === 'LONG') ? 'BUY' : 'SELL';
-        await this.addLog(`Reversal: Opening ${newPositionType} position with quantity ${quantity} (Volatility: ${this.volatilityExpanded ? 'EXPANDED' : 'DISABLED'})`);
+        const orderSide = (newPosition === 'LONG') ? 'BUY' : 'SELL';
+        await this.addLog(`Opening ${newPosition} position with quantity ${quantity}.`);
         await this.placeMarketOrder(this.symbol, orderSide, quantity);
-        await this._waitForPositionChange(newPositionType);
+        await this._waitForPositionChange(newPosition);
 
-        this.currentPosition = newPositionType;
-        this.reversalCount++;
-        this.tradeSequence += 'R.';
+        // Add delay to ensure position data is fully synchronized
+        //await new Promise(resolve => setTimeout(resolve, 200));
+
+        this.currentPosition = newPosition;
         this.entryPositionQuantity = quantity;
         this.currentPositionQuantity = quantity;
 
-        // Send reversal push notification
-        try {
-          const userId = await this.getUserIdFromProfileId();
-          if (userId) {
-            await sendReversalNotification(userId, {
-              strategyId: this.strategyId,
-              symbol: this.symbol,
-              oldPosition: oldPosition,
-              newPosition: newPositionType,
-              reversalCount: this.reversalCount,
-              currentPrice: this.currentPrice || reversalPrice,
-            });
-          } else {
-            await this.addLog('Warning: Could not find userId for reversal notification.');
-          }
-        } catch (notifError) {
-          console.error(`Error sending reversal notification: ${notifError.message}`);
-          await this.addLog(`Warning: Failed to send reversal notification: ${notifError.message}`);
-        }
-
-        // Reset states for new position
-        this.finalTpPrice = null;
-        this.breakevenPrice = null;
-        this.finalTpActive = false;
-        this.finalTpOrderSent = false;
-        this.breakevenPercentage = null;
-        this.finalTpPercentage = null;
-        await this._resetPartialTpState();
-
-        // Position-specific custom Final TP levels are preserved during reversal
-        // The appropriate custom TP (Long/Short) will be applied based on the new position type
-        // NOTE: tpAtBreakeven is also preserved to maintain user's intent to exit at breakeven
-
-        const hasCustomTpForNewPosition = (newPositionType === 'LONG' && this.customFinalTpLong !== null) ||
-                                          (newPositionType === 'SHORT' && this.customFinalTpShort !== null);
-
-        if (this.tpAtBreakeven) {
-          await this.addLog(`TP at Breakeven mode is ACTIVE - Final TP will be set to the new BE level + buffer for the reversed ${newPositionType} position.`);
-        } else if (hasCustomTpForNewPosition) {
-          const customTpValue = newPositionType === 'LONG' ? this.customFinalTpLong : this.customFinalTpShort;
-          await this.addLog(`Custom ${newPositionType} Final TP preserved: ${this._formatPrice(customTpValue)} - Will be applied after position is established.`);
-        } else if (this.desiredProfitUSDT !== null && this.desiredProfitUSDT > 0) {
-          await this.addLog(`Desired Profit Target is active: ${this._formatNotional(this.desiredProfitUSDT)} USDT - Will be applied after position is established.`);
-        } else {
-          await this.addLog(`No custom Final TP set for ${newPositionType} position - Default percentage will be used.`);
-        }
-
-        // Step 4: Switch activeMode based on new position type
-        if (newPositionType === 'LONG') {
-          this.activeMode = 'SUPPORT_ZONE';
-        } else if (newPositionType === 'SHORT') {
-          this.activeMode = 'RESISTANCE_ZONE';
-        }
-
-        // Step 5: Calculate new entry level and reversal level based on new position
+        // Set position states
         this.entryLevel = this.positionEntryPrice;
 
-        if (this.activeMode === 'SUPPORT_ZONE') {
-          // For Support Zone (LONG), reversal level is below entry level
-          this.reversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, false);
-          await this.addLog(`Dynamic Adjustment: New Entry Level: ${this._formatPrice(this.entryLevel)}, Reversal Level: ${this._formatPrice(this.reversalLevel)} (Support Zone).`);
-        } else if (this.activeMode === 'RESISTANCE_ZONE') {
-          // For Resistance Zone (SHORT), reversal level is above entry level
-          this.reversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, true);
-          await this.addLog(`Dynamic Adjustment: New Entry Level: ${this._formatPrice(this.entryLevel)}, Reversal Level: ${this._formatPrice(this.reversalLevel)} (Resistance Zone).`);
+        // Use FIXED reversal levels (DO NOT recalculate)
+        // Set initialReversalLevel to the appropriate fixed level for TP trailing
+        if (newPosition === 'LONG') {
+          // LONG position: use shortReversalLevel for reversal and TP logic
+          this.reversalLevel = this.shortReversalLevel;
+          this.initialReversalLevel = this.shortReversalLevel;
+          this.tpLevel = this.positionEntryPrice * 0.999; // Initialize TP level 0.1% below entry
+          this.tp1Executed = false;
+          this.tp2Executed = false;
+          this.tp3Executed = false;
+          this.tp1TriggerLevel = null;
+          this.tp2TriggerLevel = null;
+          this.tp3TriggerLevel = null;
+          this.tpLevelTrailingPaused = false;
+          this.highestFavorablePrice = this.positionEntryPrice;
+          this.lowestFavorablePrice = null;
+          this.trailingReversalActive = true;
+          this.ticksMovedInFavor = 0;
+          await this.addLog(`Reversal #${this.reversalCount}: LONG position opened at ${this._formatPrice(this.entryLevel)}. Will reverse at Short Reversal Level: ${this._formatPrice(this.shortReversalLevel)} (fixed).`);
+        } else if (newPosition === 'SHORT') {
+          // SHORT position: use longReversalLevel for reversal and TP logic
+          this.reversalLevel = this.longReversalLevel;
+          this.initialReversalLevel = this.longReversalLevel;
+          this.tpLevel = this.positionEntryPrice * 1.001; // Initialize TP level 0.1% above entry
+          this.tp1Executed = false;
+          this.tp2Executed = false;
+          this.tp3Executed = false;
+          this.tp1TriggerLevel = null;
+          this.tp2TriggerLevel = null;
+          this.tp3TriggerLevel = null;
+          this.tpLevelTrailingPaused = false;
+          this.highestFavorablePrice = null;
+          this.lowestFavorablePrice = this.positionEntryPrice;
+          this.trailingReversalActive = true;
+          this.ticksMovedInFavor = 0;
+          await this.addLog(`Reversal #${this.reversalCount}: SHORT position opened at ${this._formatPrice(this.entryLevel)}. Will reverse at Long Reversal Level: ${this._formatPrice(this.longReversalLevel)} (fixed).`);
         }
 
-        // Reset Move Reversal Level state for new reversed position
-        this.reversalLevelMoved = false;
-        this.originalReversalLevel = null;
-
-        // Step 6: Calculate breakeven, final TP, and partial TP
+        // Calculate breakeven and final TP
         await this._calculateBreakevenAndFinalTp();
-        await this._calculatePartialTpLevels();
+
+        // Save strategy flow event for reversal
+        const reversalTradeType = newPosition === 'LONG' ? 'L' : 'S';
+        await this.saveStrategyFlowEvent(
+          reversalTradeType,
+          newPosition,
+          this.positionEntryPrice,
+          this.currentPositionQuantity,
+          this.breakevenPrice,
+          this.breakevenPercentage,
+          this.finalTpPrice,
+          this.finalTpPercentage
+        );
 
         await this.saveState();
       }
@@ -3122,259 +3131,25 @@ class TradingStrategy {
     }
   }
 
-  // Virtual Position Direction Tracking
-  async _updateVirtualPositionDirection(currentPrice) {
-    if (!this.virtualPositionActive) return;
-
-    // ===== 1. Determine which direction current price suggests =====
-    let suggestedDirection = this.virtualPositionDirection; // Default: keep current
-
-    // NEW LOGIC: Direction flip based on ORIGINAL and CURRENT virtual direction
-    // - Virtual LONG (original) should flip to SHORT when price < reversal level
-    // - Virtual LONG (original) should flip back to LONG when price > entry level
-    // - Virtual SHORT (original) should flip to LONG when price > reversal level
-    // - Virtual SHORT (original) should flip back to SHORT when price < entry level
-
-    if (this.virtualOriginalDirection === 'LONG') {
-      // Original direction was LONG
-      if (this.virtualPositionDirection === 'LONG') {
-        // Current is LONG - check if should flip to SHORT
-        if (currentPrice < this.virtualReversalLevel) {
-          suggestedDirection = 'SHORT';
-        }
-      } else if (this.virtualPositionDirection === 'SHORT') {
-        // Current is SHORT - check if should flip back to LONG
-        if (currentPrice > this.virtualEntryLevel) {
-          suggestedDirection = 'LONG';
-        }
-      }
-    } else if (this.virtualOriginalDirection === 'SHORT') {
-      // Original direction was SHORT
-      if (this.virtualPositionDirection === 'SHORT') {
-        // Current is SHORT - check if should flip to LONG
-        if (currentPrice > this.virtualReversalLevel) {
-          suggestedDirection = 'LONG';
-        }
-      } else if (this.virtualPositionDirection === 'LONG') {
-        // Current is LONG - check if should flip back to SHORT
-        if (currentPrice < this.virtualEntryLevel) {
-          suggestedDirection = 'SHORT';
-        }
-      }
-    }
-
-    // ===== 2. Apply debounce mechanism =====
-    if (suggestedDirection !== this.virtualPositionDirection) {
-      // Direction change suggested
-      if (!this.virtualDirectionBuffer || this.virtualDirectionBuffer.direction !== suggestedDirection) {
-        // First time seeing this new direction
-        this.virtualDirectionBuffer = { direction: suggestedDirection, count: 1 };
-      } else {
-        // Increment counter
-        this.virtualDirectionBuffer.count++;
-
-        // Require 3 consecutive ticks to confirm direction change
-        if (this.virtualDirectionBuffer.count >= 3) {
-          // Direction change confirmed!
-          const oldDirection = this.virtualPositionDirection;
-          this.virtualPositionDirection = suggestedDirection;
-          this.lastVirtualDirectionChange = Date.now();
-
-          // Record change
-          this.virtualDirectionChanges.push({
-            timestamp: Date.now(),
-            price: currentPrice,
-            from: oldDirection,
-            to: suggestedDirection
-          });
-
-          // Determine why the flip happened
-          let flipReason = '';
-          if (oldDirection === 'LONG' && suggestedDirection === 'SHORT') {
-            // Flipping away from LONG or back to SHORT
-            if (this.virtualOriginalDirection === 'LONG') {
-              flipReason = `(price ${this._formatPrice(currentPrice)} < reversal ${this._formatPrice(this.virtualReversalLevel)})`;
-            } else {
-              flipReason = `(price ${this._formatPrice(currentPrice)} < entry ${this._formatPrice(this.virtualEntryLevel)})`;
-            }
-          } else if (oldDirection === 'SHORT' && suggestedDirection === 'LONG') {
-            // Flipping away from SHORT or back to LONG
-            if (this.virtualOriginalDirection === 'SHORT') {
-              flipReason = `(price ${this._formatPrice(currentPrice)} > reversal ${this._formatPrice(this.virtualReversalLevel)})`;
-            } else {
-              flipReason = `(price ${this._formatPrice(currentPrice)} > entry ${this._formatPrice(this.virtualEntryLevel)})`;
-            }
-          }
-
-          await this.addLog(`🔄 Virtual direction flipped: ${oldDirection} → ${suggestedDirection} at ${this._formatPrice(currentPrice)} ${flipReason}`);
-          await this.saveState();
-
-          // Reset buffer
-          this.virtualDirectionBuffer = null;
-        }
-      }
-    } else {
-      // Price suggests current direction - reset buffer
-      this.virtualDirectionBuffer = null;
-    }
-
-    // ===== 3. Periodic status logging (every 30 seconds) =====
-    const now = Date.now();
-    if (!this.lastVirtualStatusLogTime || (now - this.lastVirtualStatusLogTime) >= 30000) {
-      const elapsedSec = Math.floor((now - this.volatilityWaitStartTime) / 1000);
-      const elapsedMin = Math.floor(elapsedSec / 60);
-      const elapsedSecRemainder = elapsedSec % 60;
-      const elapsedStr = `${elapsedMin}m ${elapsedSecRemainder}s`;
-      const stateStr = this.volatilityExpanded ? 'EXPANDED' : 'CHOPPY';
-      const directionChanges = this.virtualDirectionChanges.length;
-
-      // Enhanced logging to show entry and reversal levels
-      await this.addLog(`Virtual tracking | Price: ${this._formatPrice(currentPrice)} | Direction: ${this.virtualPositionDirection} | Entry: ${this._formatPrice(this.virtualEntryLevel)} | Reversal: ${this._formatPrice(this.virtualReversalLevel)} | Volatility: ${stateStr} | Elapsed: ${elapsedStr} | Flips: ${directionChanges}`);
-      this.lastVirtualStatusLogTime = now;
-    }
-
-    // ===== 4. Check if volatility has expanded =====
-    if (this.volatilityExpanded) {
-      // Volatility has expanded! Open position in current virtual direction
-      const now = Date.now();
-      const elapsedMs = now - this.volatilityWaitStartTime;
-      const elapsedSec = Math.floor(elapsedMs / 1000);
-      const elapsedMin = Math.floor(elapsedSec / 60);
-      const elapsedSecRemainder = elapsedSec % 60;
-      const elapsedStr = `${elapsedMin}m ${elapsedSecRemainder}s`;
-      const directionChanges = this.virtualDirectionChanges.length;
-
-      await this.addLog(`Volatility expanded - opening ${this.virtualPositionDirection} position (waited ${elapsedStr}, ${directionChanges} direction changes)`);
-
-      // Prepare to open position
-      this.isTradingSequenceInProgress = true;
-
-      try {
-        const quantity = await this._calculateAdjustedQuantity(this.symbol, this.positionSizeUSDT);
-        if (quantity > 0) {
-          const orderSide = (this.virtualPositionDirection === 'LONG') ? 'BUY' : 'SELL';
-          await this.placeMarketOrder(this.symbol, orderSide, quantity);
-          await this._waitForPositionChange(this.virtualPositionDirection);
-
-          this.currentPosition = this.virtualPositionDirection;
-          this.reversalCount++; // Increment reversal count for scenario 2 (choppy -> expanded)
-
-          // Update trade sequence with wait notation
-          if (directionChanges === 0) {
-            this.tradeSequence += `W(${this.virtualPositionDirection[0]}).O.`;
-          } else if (directionChanges === 1) {
-            const fromDir = this.virtualDirectionChanges[0].from[0];
-            const toDir = this.virtualDirectionChanges[0].to[0];
-            this.tradeSequence += `W(${fromDir}→${toDir}).O.`;
-          } else {
-            const firstDir = this.virtualDirectionChanges[0].from[0];
-            const lastDir = this.virtualDirectionChanges[directionChanges - 1].to[0];
-            this.tradeSequence += `W(${firstDir}→…→${lastDir}).O.`;
-          }
-
-          this.entryPositionQuantity = quantity;
-          this.currentPositionQuantity = quantity;
-
-          // Send position open notification after volatility expansion
-          // Note: This may send as a "reversal" notification if a position was previously closed
-          try {
-            const userId = await this.getUserIdFromProfileId();
-            if (userId && this.closedPositionType) {
-              await sendReversalNotification(userId, {
-                strategyId: this.strategyId,
-                symbol: this.symbol,
-                oldPosition: this.closedPositionType,
-                newPosition: this.currentPosition,
-                reversalCount: this.reversalCount,
-                currentPrice: this.currentPrice || currentPrice,
-              });
-            }
-          } catch (notifError) {
-            console.error(`Error sending reversal notification: ${notifError.message}`);
-            await this.addLog(`Warning: Failed to send reversal notification: ${notifError.message}`);
-          }
-
-          // Reset states for new position
-          this.finalTpPrice = null;
-          this.breakevenPrice = null;
-          this.finalTpActive = false;
-          this.finalTpOrderSent = false;
-          this.breakevenPercentage = null;
-          this.finalTpPercentage = null;
-          await this._resetPartialTpState();
-
-          // Switch activeMode based on new position type
-          if (this.currentPosition === 'LONG') {
-            this.activeMode = 'SUPPORT_ZONE';
-          } else if (this.currentPosition === 'SHORT') {
-            this.activeMode = 'RESISTANCE_ZONE';
-          }
-
-          // Calculate new entry level and reversal level based on new position
-          this.entryLevel = this.positionEntryPrice;
-
-          if (this.activeMode === 'SUPPORT_ZONE') {
-            this.reversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, false);
-            await this.addLog(`Dynamic Adjustment: New Entry Level: ${this._formatPrice(this.entryLevel)}, Reversal Level: ${this._formatPrice(this.reversalLevel)} (Support Zone).`);
-          } else if (this.activeMode === 'RESISTANCE_ZONE') {
-            this.reversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, true);
-            await this.addLog(`Dynamic Adjustment: New Entry Level: ${this._formatPrice(this.entryLevel)}, Reversal Level: ${this._formatPrice(this.reversalLevel)} (Resistance Zone).`);
-          }
-
-          // Reset Move Reversal Level state for new position
-          this.reversalLevelMoved = false;
-          this.originalReversalLevel = null;
-
-          // Calculate breakeven, final TP, and partial TP
-          await this._calculateBreakevenAndFinalTp();
-          await this._calculatePartialTpLevels();
-
-          await this.addLog(`Position opened: ${this.currentPosition} at ${this._formatPrice(this.positionEntryPrice)} with ${this._formatQuantity(quantity)} contracts`);
-
-          // Reset virtual tracking state
-          this.virtualPositionActive = false;
-          this.virtualPositionDirection = null;
-          this.virtualOriginalDirection = null;
-          this.volatilityWaitStartTime = null;
-          this.lastVirtualDirectionChange = null;
-          this.virtualDirectionChanges = [];
-          this.virtualDirectionBuffer = null;
-          this.virtualLongLimitOrder = null;
-          this.virtualEntryLevel = null;
-          this.virtualReversalLevel = null;
-          this.closedPositionType = null;
-          this.lastVirtualStatusLogTime = null;
-          this.virtualLimitFirstTriggered = false;
-
-          this.isTradingSequenceInProgress = false;
-          await this.saveState();
-        }
-      } catch (error) {
-        console.error(`Error opening position after virtual tracking: ${error.message}`);
-        await this.addLog(`ERROR: [TRADING_ERROR] Opening position after virtual tracking: ${error.message}`);
-        this.isTradingSequenceInProgress = false;
-      }
-    }
-  }
-
   async start(config = {}) {
     await this.addLog(`Hey bro! Starting strategy.. Good luck!🤞`);
-    
+
     // Generate unique strategyId at the start of the strategy execution
     this.strategyId = `strategy_${this.profileId.slice(-6)}_${Date.now()}`; // Use profileId for context
     
     // Set tradesCollectionRef for the new strategy
     this.tradesCollectionRef = this.firestore.collection('strategies').doc(this.strategyId).collection('trades');
     this.logsCollectionRef = this.firestore.collection('strategies').doc(this.strategyId).collection('logs'); // Initialize logs collection ref
-    
+    this.strategyFlowCollectionRef = this.firestore.collection('strategies').doc(this.strategyId).collection('strategyFlow'); // Initialize strategy flow collection ref
+
     this.symbol = config.symbol || 'BTCUSDT';
 
     // Strictly take positionSizeUSDT from config
     this.positionSizeUSDT = config.positionSizeUSDT;
 
-    // Validate that positionSizeUSDT is provided and valid
-    if (this.positionSizeUSDT === null || this.positionSizeUSDT === undefined || this.positionSizeUSDT <= 0) {
-        throw new Error('Position size (positionSizeUSDT) must be provided from the UI and be a positive number.');
+    // Validate that positionSizeUSDT is provided and valid (minimum 120 USDT)
+    if (this.positionSizeUSDT === null || this.positionSizeUSDT === undefined || this.positionSizeUSDT < 120) {
+        throw new Error('Position size (positionSizeUSDT) must be at least 120 USDT.');
     }
 
     // Set initial base position size (no scaling, use full config size)
@@ -3382,13 +3157,15 @@ class TradingStrategy {
     this.MAX_POSITION_SIZE_USDT = (3 / 4) * this.positionSizeUSDT * 50; // Set MAX_POSITION_SIZE_USDT dynamically here
     this.reversalLevelPercentage = config.reversalLevelPercentage !== undefined ? config.reversalLevelPercentage : null;
 
-    // Configure Recovery Factor from config (convert percentage to decimal)
-    if (config.recoveryFactor !== undefined && config.recoveryFactor !== null) {
-      this.RECOVERY_FACTOR = config.recoveryFactor / 100;
-    }
+    // Configure Trail Step Factor from config (default: 1)
+    this.trailStepFactor = config.trailStepFactor !== undefined ? config.trailStepFactor : 1;
 
     // Configure Trading Mode from config
     this.tradingMode = config.tradingMode || 'NORMAL';
+
+    // Configure Recovery Factor and Recovery Distance from config
+    this.RECOVERY_FACTOR = config.recoveryFactor !== undefined ? config.recoveryFactor : 0.20;
+    this.RECOVERY_DISTANCE = config.recoveryDistance !== undefined ? config.recoveryDistance : 0.005;
 
     this.enableSupport = config.enableSupport !== undefined ? config.enableSupport : false;
     this.enableResistance = config.enableResistance !== undefined ? config.enableResistance : false;
@@ -3399,14 +3176,7 @@ class TradingStrategy {
     this.sellShortEnabled = config.sellShortEnabled || false;
     this.buyLimitPrice = config.buyLimitPrice || null;
     this.sellLimitPrice = config.sellLimitPrice || null;
-
-    // Partial TP configuration
-    if (config.partialTpLevels && Array.isArray(config.partialTpLevels) && config.partialTpLevels.length === 3) {
-      this.partialTpLevels = config.partialTpLevels;
-    }
-    if (config.partialTpSizes && Array.isArray(config.partialTpSizes) && config.partialTpSizes.length === 3) {
-      this.partialTpSizes = config.partialTpSizes;
-    }
+    this.priceType = config.priceType || 'MARK';
 
     // Calculate initial entryLevel and reversalLevel based on order type and enabled zones
     // For LIMIT orders, wait until position is filled before calculating these levels
@@ -3445,27 +3215,29 @@ class TradingStrategy {
     this.finalTpActive = false;
     this.finalTpOrderSent = false;
     this.breakevenPercentage = null;
-    this.finalTpPercentage = null;     // NEW
-
-    // Reset Partial TP states (preserve config but reset execution state)
-    this.partialTpPrices = [null, null, null];
-    this.partialTpExecuted = [false, false, false];
-    this.currentEntryReference = null;
+    this.finalTpPercentage = null;
+    // Reset Partial TP states
+    this.tpLevel = null;
+    this.tp1Executed = false;
+    this.tp2Executed = false;
+    this.tp3Executed = false;
+    this.tp1TriggerLevel = null;
+    this.tp2TriggerLevel = null;
+    this.tp3TriggerLevel = null;
+    this.tpLevelTrailingPaused = false;
 
     // Reset accumulated PnL and fees for the new strategy run
     this.accumulatedRealizedPnL = 0;
     this.accumulatedTradingFees = 0;
-    this.sessionStartTradeId = null; // Reset for new session
 
     // Reset saved trade order IDs for the new strategy run
     this.savedTradeOrderIds.clear();
 
     // Reset summary section data
     this.reversalCount = 0;
-    this.partialTpCount = 0;
     this.tradeSequence = '';
     this.profitPercentage = null;
-    this.lastDynamicSizingReversalCount = -1;
+    this.lastDynamicSizingReversalCount = 0;
     this.strategyStartTime = null; // Will be set when initial position is filled
     this.strategyEndTime = null; // Reset end time
 
@@ -3476,27 +3248,6 @@ class TradingStrategy {
     } catch (error) {
       await this.addLog(`WARNING: Could not fetch initial wallet balance: ${error.message}`);
       this.initialWalletBalance = null; // Set to null if fetching fails
-    }
-
-    // Capture the latest trade ID at session start for accurate PnL verification
-    // This ensures we only count trades that belong to this strategy session
-    try {
-      const latestTrades = await this.makeProxyRequest('/fapi/v1/userTrades', 'GET', {
-        symbol: this.symbol,
-        limit: 1
-      }, true, 'futures');
-
-      if (latestTrades && latestTrades.length > 0) {
-        // Store the latest trade ID - all new trades will have IDs greater than this
-        this.sessionStartTradeId = parseInt(latestTrades[0].id);
-        await this.addLog(`[SESSION] Captured baseline trade ID: ${this.sessionStartTradeId}`);
-      } else {
-        await this.addLog(`[SESSION] No previous trades found for ${this.symbol}, starting fresh`);
-        this.sessionStartTradeId = 0; // Start from 0 if no previous trades
-      }
-    } catch (error) {
-      await this.addLog(`WARNING: Could not fetch baseline trade ID: ${error.message}`);
-      this.sessionStartTradeId = null; // Will fall back to using all trades in verification
     }
 
     // Reset capital protection for new strategy run
@@ -3515,6 +3266,9 @@ class TradingStrategy {
         symbol: this.symbol,
         entryLevel: this.entryLevel,
         reversalLevel: this.reversalLevel,
+        longReversalLevel: this.longReversalLevel,
+        shortReversalLevel: this.shortReversalLevel,
+        fixedReversalLevelsCalculated: this.fixedReversalLevelsCalculated,
         enableSupport: this.enableSupport,
         enableResistance: this.enableResistance,
         currentPosition: this.currentPosition,
@@ -3526,7 +3280,6 @@ class TradingStrategy {
         totalPnL: this.totalPnL,
         accumulatedRealizedPnL: this.accumulatedRealizedPnL,
         accumulatedTradingFees: this.accumulatedTradingFees,
-        sessionStartTradeId: this.sessionStartTradeId,
         isRunning: true,
         createdAt: new Date(),
         lastUpdated: new Date(),
@@ -3546,21 +3299,17 @@ class TradingStrategy {
         finalTpOrderSent: this.finalTpOrderSent,
         breakevenPercentage: this.breakevenPercentage,
         finalTpPercentage: this.finalTpPercentage,
-        // Partial TP states
-        partialTpLevels: this.partialTpLevels,
-        partialTpSizes: this.partialTpSizes,
-        partialTpPrices: this.partialTpPrices,
-        partialTpExecuted: this.partialTpExecuted,
-        currentEntryReference: this.currentEntryReference,
         // Order Type and Direction states
         orderType: this.orderType,
         buyLongEnabled: this.buyLongEnabled,
         sellShortEnabled: this.sellShortEnabled,
         buyLimitPrice: this.buyLimitPrice,
         sellLimitPrice: this.sellLimitPrice,
+        longLimitOrderId: this.longLimitOrderId,
+        shortLimitOrderId: this.shortLimitOrderId,
+        priceType: this.priceType,
         // Summary section data
         reversalCount: this.reversalCount,
-        partialTpCount: this.partialTpCount,
         tradeSequence: this.tradeSequence,
         initialWalletBalance: this.initialWalletBalance,
         profitPercentage: this.profitPercentage,
@@ -3626,23 +3375,19 @@ class TradingStrategy {
 
       // Initial order placement based on UI selection
       if (this.orderType === 'MARKET') {
-        // ===== MARKET ORDER WITH VOLATILITY CHECK =====
-        // Activate volatility measurement before placing MARKET order
-        this.volatilityMeasurementActive = true;
-        await this.addLog(`MARKET order mode: Checking volatility before entry`);
+        // For MARKET orders, _calculateAdjustedQuantity will use the current market price by default
+        const quantity = await this._calculateAdjustedQuantity(this.symbol, this.initialBasePositionSizeUSDT);
+        if (quantity > 0) {
+          if (this.buyLongEnabled) {
+            //await this.addLog(`Placing initial BUY MARKET order for ${quantity} ${this.symbol}.`);
+            const initialEntryLevel = this.entryLevel;
+            await this.placeMarketOrder(this.symbol, 'BUY', quantity);
+            await this._waitForPositionChange('LONG'); // Wait for position to be LONG
 
-        // Check if volatility is expanded (or disabled)
-        if (!this.volatilityEnabled || this.volatilityExpanded) {
-          // Volatility is good - proceed with MARKET order
-          await this.addLog(`Volatility check: ${this.volatilityEnabled ? 'EXPANDED' : 'DISABLED'} - placing MARKET order immediately`);
+            // Add delay to ensure position data is fully synchronized
+            //await new Promise(resolve => setTimeout(resolve, 200));
 
-          const quantity = await this._calculateAdjustedQuantity(this.symbol, this.initialBasePositionSizeUSDT);
-          if (quantity > 0) {
-            if (this.buyLongEnabled) {
-              const initialEntryLevel = this.entryLevel;
-              await this.placeMarketOrder(this.symbol, 'BUY', quantity);
-              await this._waitForPositionChange('LONG');
-              this.activeMode = 'SUPPORT_ZONE';
+            this.activeMode = 'SUPPORT_ZONE';
 
             // Explicitly set entryPositionQuantity from current position quantity
             this.entryPositionQuantity = this.currentPositionQuantity;
@@ -3650,13 +3395,32 @@ class TradingStrategy {
             // Update Entry Level with actual filled position entry price
             this.entryLevel = this.positionEntryPrice;
 
-            // Recalculate Reversal Level based on actual Entry Level
+            // Calculate FIXED reversal levels (LONG: longReversalLevel = entry, shortReversalLevel = below entry)
             if (this.reversalLevelPercentage !== null) {
-              const previousReversalLevel = this.reversalLevel;
-              this.reversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, false);
+              this.longReversalLevel = this.positionEntryPrice;
+              this.shortReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, false);
+              this.fixedReversalLevelsCalculated = true;
+
+              // For backward compatibility, set reversalLevel and initialReversalLevel
+              this.reversalLevel = this.shortReversalLevel;
+              this.initialReversalLevel = this.shortReversalLevel;
+              this.tpLevel = this.positionEntryPrice * 0.999; // Initialize TP level 0.1% below entry
+              this.tp1Executed = false;
+              this.tp2Executed = false;
+              this.tp3Executed = false;
+              this.tp1TriggerLevel = null;
+              this.tp2TriggerLevel = null;
+              this.tp3TriggerLevel = null;
+              this.tpLevelTrailingPaused = false;
               await this.addLog(`Entry Level updated: ${this._formatPrice(initialEntryLevel)} -> ${this._formatPrice(this.entryLevel)} (actual fill price).`);
-              await this.addLog(`Reversal Level updated: ${this._formatPrice(previousReversalLevel)} -> ${this._formatPrice(this.reversalLevel)} (Support Zone).`);
+              await this.addLog(`Fixed Reversal Levels - Long: ${this._formatPrice(this.longReversalLevel)}, Short: ${this._formatPrice(this.shortReversalLevel)}.`);
+              await this.addLog(`TP Trailing Level starts at ${this.tpLevel}.`);
             }
+
+            // LONG position in Support Zone: Initialize continuous trailing
+            this.highestFavorablePrice = this.positionEntryPrice;
+            this.trailingReversalActive = true;
+            this.ticksMovedInFavor = 0;
 
             // Log initial position immediately after confirmation
             await this.addLog(`Initial ${this.currentPosition} position established. Entry: ${this._formatPrice(this.positionEntryPrice)}, Size: ${this._formatNotional(this.positionSize)}, Qty: ${this._formatQuantity(this.entryPositionQuantity)}. Mode: ${this.activeMode}.`);
@@ -3672,14 +3436,30 @@ class TradingStrategy {
             // Update trade sequence with initial LONG entry marker
             this.tradeSequence += 'L.';
 
-            // Calculate BE, final TP, and partial TP for initial position
+            // Calculate BE and final TP for initial position
             await this._calculateBreakevenAndFinalTp();
-            await this._calculatePartialTpLevels();
+
+            // Save strategy flow event for initial LONG position
+            await this.saveStrategyFlowEvent(
+              'L',
+              'LONG',
+              this.positionEntryPrice,
+              this.currentPositionQuantity,
+              this.breakevenPrice,
+              this.breakevenPercentage,
+              this.finalTpPrice,
+              this.finalTpPercentage
+            );
+
           } else if (this.sellShortEnabled) {
             //await this.addLog(`Placing initial SELL MARKET order for ${quantity} ${this.symbol}.`);
             const initialEntryLevel = this.entryLevel;
             await this.placeMarketOrder(this.symbol, 'SELL', quantity);
             await this._waitForPositionChange('SHORT'); // Wait for position to be SHORT
+
+            // Add delay to ensure position data is fully synchronized
+            //await new Promise(resolve => setTimeout(resolve, 200));
+
             this.activeMode = 'RESISTANCE_ZONE';
 
             // Explicitly set entryPositionQuantity from current position quantity
@@ -3688,13 +3468,32 @@ class TradingStrategy {
             // Update Entry Level with actual filled position entry price
             this.entryLevel = this.positionEntryPrice;
 
-            // Recalculate Reversal Level based on actual Entry Level
+            // Calculate FIXED reversal levels (SHORT: shortReversalLevel = entry, longReversalLevel = above entry)
             if (this.reversalLevelPercentage !== null) {
-              const previousReversalLevel = this.reversalLevel;
-              this.reversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, true);
+              this.shortReversalLevel = this.positionEntryPrice;
+              this.longReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, true);
+              this.fixedReversalLevelsCalculated = true;
+
+              // For backward compatibility, set reversalLevel and initialReversalLevel
+              this.reversalLevel = this.longReversalLevel;
+              this.initialReversalLevel = this.longReversalLevel;
+              this.tpLevel = this.positionEntryPrice * 1.001; // Initialize TP level 0.1% above entry
+              this.tp1Executed = false;
+              this.tp2Executed = false;
+              this.tp3Executed = false;
+              this.tp1TriggerLevel = null;
+              this.tp2TriggerLevel = null;
+              this.tp3TriggerLevel = null;
+              this.tpLevelTrailingPaused = false;
               await this.addLog(`Entry Level updated: ${this._formatPrice(initialEntryLevel)} -> ${this._formatPrice(this.entryLevel)} (actual fill price).`);
-              await this.addLog(`Reversal Level updated: ${this._formatPrice(previousReversalLevel)} -> ${this._formatPrice(this.reversalLevel)} (Resistance Zone).`);
+              await this.addLog(`Fixed Reversal Levels - Short: ${this._formatPrice(this.shortReversalLevel)}, Long: ${this._formatPrice(this.longReversalLevel)}.`);
+              await this.addLog(`TP Trailing Level starts at ${this.tpLevel}.`);
             }
+
+            // SHORT position in Resistance Zone: Initialize continuous trailing
+            this.lowestFavorablePrice = this.positionEntryPrice;
+            this.trailingReversalActive = true;
+            this.ticksMovedInFavor = 0;
 
             // Log initial position immediately after confirmation
             await this.addLog(`Initial ${this.currentPosition} position established. Entry: ${this._formatPrice(this.positionEntryPrice)}, Size: ${this._formatNotional(this.positionSize)}, Qty: ${this._formatQuantity(this.entryPositionQuantity)}. Mode: ${this.activeMode}.`);
@@ -3710,171 +3509,119 @@ class TradingStrategy {
             // Update trade sequence with initial SHORT entry marker
             this.tradeSequence += 'S.';
 
-              // Calculate BE, final TP, and partial TP for initial position
-              await this._calculateBreakevenAndFinalTp();
-              await this._calculatePartialTpLevels();
-            }
-          } else {
-            throw new Error('Calculated quantity for initial MARKET order is zero or negative.');
+            // Calculate BE and final TP for initial position
+            await this._calculateBreakevenAndFinalTp();
+
+            // Save strategy flow event for initial SHORT position
+            await this.saveStrategyFlowEvent(
+              'S',
+              'SHORT',
+              this.positionEntryPrice,
+              this.currentPositionQuantity,
+              this.breakevenPrice,
+              this.breakevenPercentage,
+              this.finalTpPrice,
+              this.finalTpPercentage
+            );
+
           }
-          this.isTradingSequenceInProgress = false;
         } else {
-          // ===== VOLATILITY IS CHOPPY - Enter virtual tracking for MARKET order =====
-          await this.addLog(`Volatility is CHOPPY - delaying MARKET order entry, entering virtual tracking mode`);
-
-          const quantity = await this._calculateAdjustedQuantity(this.symbol, this.initialBasePositionSizeUSDT);
-          if (quantity > 0) {
-            // Setup virtual tracking state
-            this.virtualPositionActive = true;
-            this.virtualPositionDirection = this.buyLongEnabled ? 'LONG' : 'SHORT';
-            this.virtualOriginalDirection = this.virtualPositionDirection; // Track original direction for flip logic
-            this.volatilityWaitStartTime = Date.now();
-            this.lastVirtualStatusLogTime = Date.now();
-
-            // Store the intended MARKET order details
-            const currentPrice = await this._getCurrentPrice(this.symbol);
-            this.virtualLongLimitOrder = {
-              price: currentPrice,
-              side: this.buyLongEnabled ? 'BUY' : 'SELL',
-              quantity: quantity,
-              timestamp: Date.now(),
-              isMarketOrder: true // Flag to indicate this was originally a MARKET order
-            };
-
-            // Set entry/reversal levels for direction tracking
-            this.entryLevel = currentPrice;
-            if (this.reversalLevelPercentage !== null) {
-              if (this.buyLongEnabled) {
-                this.reversalLevel = this._calculateAdjustedPrice(currentPrice, this.reversalLevelPercentage, false);
-                this.activeMode = 'SUPPORT_ZONE';
-              } else {
-                this.reversalLevel = this._calculateAdjustedPrice(currentPrice, this.reversalLevelPercentage, true);
-                this.activeMode = 'RESISTANCE_ZONE';
-              }
-              this.virtualEntryLevel = this.entryLevel;
-              this.virtualReversalLevel = this.reversalLevel;
-            }
-
-            await this.addLog(`Virtual tracking started: Direction=${this.virtualPositionDirection}, Entry=${this._formatPrice(this.entryLevel)}, Reversal=${this._formatPrice(this.reversalLevel)}`);
-            await this.addLog(`Waiting for volatility expansion before opening ${this.virtualPositionDirection} position`);
-
-            this.isTradingSequenceInProgress = false; // Allow price monitoring
-          } else {
-            throw new Error('Calculated quantity for initial MARKET order is zero or negative.');
-          }
+          throw new Error('Calculated quantity for initial MARKET order is zero or negative.');
         }
+        this.isTradingSequenceInProgress = false; // Reset flag after initial MARKET order sequence
       } else if (this.orderType === 'LIMIT') {
-        // ===== VIRTUAL LIMIT ORDER MODE =====
-        // Don't place actual orders on Binance - track virtually and wait for volatility
-        await this.addLog(`LIMIT order mode: Setting up virtual limit tracking (no orders placed on exchange)`);
-
-        // Set flag to prevent premature logging during dual-limit setup
-        this.isInitializingVirtualLimits = true;
-
-        let virtualLimitSetup = false;
+        // For LIMIT orders, _calculateAdjustedQuantity will use the specified limit price
+        let quantity;
+        let initialOrderPlaced = false; // Flag to track if any limit order was successfully placed
 
         if (this.buyLongEnabled && this.buyLimitPrice !== null) {
-          const quantity = await this._calculateAdjustedQuantity(this.symbol, this.initialBasePositionSizeUSDT, this.buyLimitPrice);
+          quantity = await this._calculateAdjustedQuantity(this.symbol, this.initialBasePositionSizeUSDT, this.buyLimitPrice);
           if (quantity > 0) {
-            // Setup virtual LONG limit tracking
-            this.virtualPositionActive = true;
-            this.virtualPositionDirection = 'LONG'; // Initial direction, will be updated if dual limit
-            this.virtualLongLimitOrder = {
-              price: this.buyLimitPrice,
-              side: 'BUY',
-              quantity: quantity,
-              timestamp: Date.now()
-            };
-            virtualLimitSetup = true;
-            await this.addLog(`Virtual BUY LIMIT: ${this._formatQuantity(quantity)} at ${this._formatPrice(this.buyLimitPrice)} - waiting for price trigger`);
+            try {
+              const orderResult = await this.placeLimitOrder(this.symbol, 'BUY', quantity, this.buyLimitPrice);
+              this.longLimitOrderId = orderResult.orderId;
+              initialOrderPlaced = true;
+              // Store timeout for this order
+              const timeoutId = setTimeout(async () => {
+                await this.addLog(`Timeout for initial BUY LIMIT order ${this.longLimitOrderId}. Querying status via REST API.`);
+                try {
+                  const queriedOrder = await this._queryOrder(this.symbol, this.longLimitOrderId);
+                  if (queriedOrder.status === 'FILLED') {
+                    await this.addLog(`Initial BUY LIMIT order ${this.longLimitOrderId} found FILLED via REST API after WS timeout.`);
+                    await this._handleInitialLimitOrderFill(queriedOrder);
+                  } else if (queriedOrder.status === 'CANCELED' || queriedOrder.status === 'REJECTED' || queriedOrder.status === 'EXPIRED') {
+                    await this.addLog(`Initial BUY LIMIT order ${this.longLimitOrderId} found ${queriedOrder.status} via REST API after WS timeout.`);
+                    await this._handleInitialLimitOrderFailure(queriedOrder);
+                  } else {
+                    // Order is still NEW or PARTIALLY_FILLED. Log and continue waiting via WS.
+                    await this.addLog(`Initial BUY LIMIT order ${this.longLimitOrderId} still ${queriedOrder.status} via REST API after WS timeout. Continuing to wait for WS update.`);
+                  }
+                } catch (queryError) {
+                  await this.addLog(`ERROR: [API_ERROR] REST API query for initial BUY LIMIT order ${this.longLimitOrderId} after WS timeout: ${queryError.message}`);
+                  await this._handleInitialLimitOrderFailure({ i: this.longLimitOrderId, X: 'QUERY_FAILED' }); // Treat query failure as order failure
+                } finally {
+                  this.pendingInitialLimitOrders.delete(this.longLimitOrderId); // Clean up timeout entry
+                }
+              }, 15000); // 15 seconds timeout
+              this.pendingInitialLimitOrders.set(this.longLimitOrderId, { timeoutId }); // Store timeoutId
+            } catch (error) {
+              await this.addLog(`ERROR: [TRADING_ERROR] Initial BUY LIMIT order placement failed: ${error.message}`);
+              this.isTradingSequenceInProgress = false; // Reset flag on placement failure
+              throw error; // Re-throw to stop strategy if initial order fails
+            }
           } else {
             throw new Error('Calculated quantity for initial BUY LIMIT order is zero or negative.');
           }
         }
-
-        // Check if SELL limit will be added (for dual-limit mode)
-        const willAddSellLimit = this.sellShortEnabled && this.sellLimitPrice !== null;
-
+        
         if (this.sellShortEnabled && this.sellLimitPrice !== null) {
-          const quantity = await this._calculateAdjustedQuantity(this.symbol, this.initialBasePositionSizeUSDT, this.sellLimitPrice);
+          quantity = await this._calculateAdjustedQuantity(this.symbol, this.initialBasePositionSizeUSDT, this.sellLimitPrice);
           if (quantity > 0) {
-            // If we already have a BUY limit, this becomes a dual limit setup
-            if (virtualLimitSetup) {
-              // Store SELL limit in a separate property for dual monitoring
-              this.virtualShortLimitOrder = {
-                price: this.sellLimitPrice,
-                side: 'SELL',
-                quantity: quantity,
-                timestamp: Date.now()
-              };
-              // Set direction to null for dual-limit mode (will be determined by which triggers first)
-              this.virtualPositionDirection = null;
-              await this.addLog(`Virtual SELL LIMIT: ${this._formatQuantity(quantity)} at ${this._formatPrice(this.sellLimitPrice)} - waiting for price trigger`);
-              await this.addLog(`Dual-limit mode: Direction will be determined by which limit triggers first`);
-
-              // Clear initialization flag - dual-limit setup is complete
-              this.isInitializingVirtualLimits = false;
-            } else {
-              // Setup virtual SHORT limit tracking only
-              this.virtualPositionActive = true;
-              this.virtualPositionDirection = 'SHORT';
-              this.virtualLongLimitOrder = {
-                price: this.sellLimitPrice,
-                side: 'SELL',
-                quantity: quantity,
-                timestamp: Date.now()
-              };
-              virtualLimitSetup = true;
-              await this.addLog(`Virtual SELL LIMIT: ${this._formatQuantity(quantity)} at ${this._formatPrice(this.sellLimitPrice)} - waiting for price trigger`);
-
-              // Clear initialization flag - single limit setup is complete
-              this.isInitializingVirtualLimits = false;
+            try {
+              //await this.addLog(`Placing initial SELL LIMIT order for ${quantity} at ${this.sellLimitPrice}.`);
+              this._pendingLogMessage = 'initial'; // Set flag before order
+              const orderResult = await this.placeLimitOrder(this.symbol, 'SELL', quantity, this.sellLimitPrice);
+              this.shortLimitOrderId = orderResult.orderId;
+              initialOrderPlaced = true;
+              // Store timeout for this order
+              const timeoutId = setTimeout(async () => {
+                await this.addLog(`Timeout for initial SELL LIMIT order ${this.shortLimitOrderId}. Querying status via REST API.`);
+                try {
+                  const queriedOrder = await this._queryOrder(this.symbol, this.shortLimitOrderId);
+                  if (queriedOrder.status === 'FILLED') {
+                    await this.addLog(`Initial SELL LIMIT order ${this.shortLimitOrderId} found FILLED via REST API after WS timeout.`);
+                    await this._handleInitialLimitOrderFill(queriedOrder);
+                  } else if (queriedOrder.status === 'CANCELED' || queriedOrder.status === 'REJECTED' || queriedOrder.status === 'EXPIRED') {
+                    await this.addLog(`Initial SELL LIMIT order ${this.shortLimitOrderId} found ${queriedOrder.status} via REST API after WS timeout.`);
+                    await this._handleInitialLimitOrderFailure(queriedOrder);
+                  } else {
+                    // Order is still NEW or PARTIALLY_FILLED. Log and continue waiting via WS.
+                    await this.addLog(`Initial SELL LIMIT order ${this.shortLimitOrderId} still ${queriedOrder.status} via REST API after WS timeout. Continuing to wait for WS update.`);
+                  }
+                } catch (queryError) {
+                  await this.addLog(`ERROR: [API_ERROR] REST API query for initial SELL LIMIT order ${this.shortLimitOrderId} after WS timeout: ${queryError.message}`);
+                  await this._handleInitialLimitOrderFailure({ i: this.shortLimitOrderId, X: 'QUERY_FAILED' }); // Treat query failure as order failure
+                } finally {
+                  this.pendingInitialLimitOrders.delete(this.shortLimitOrderId); // Clean up timeout entry
+                }
+              }, 16000); // 15 seconds timeout
+              this.pendingInitialLimitOrders.set(this.shortLimitOrderId, { timeoutId }); // Store timeoutId
+            } catch (error) {
+              await this.addLog(`ERROR: [TRADING_ERROR] Initial SELL LIMIT order placement failed: ${error.message}`);
+              this.isTradingSequenceInProgress = false; // Reset flag on placement failure
+              throw error; // Re-throw to stop strategy if initial order fails
             }
           } else {
             throw new Error('Calculated quantity for initial SELL LIMIT order is zero or negative.');
           }
         }
 
-        if (!virtualLimitSetup) {
-          this.isTradingSequenceInProgress = false;
-          throw new Error('No virtual limit order was configured. Strategy cannot start.');
+        if (!initialOrderPlaced) {
+          // If no initial LIMIT order was even placed (e.g., due to quantity error or neither buy/sell enabled)
+          this.isTradingSequenceInProgress = false; // Reset flag
+          throw new Error('No initial LIMIT order was placed. Strategy cannot start.');
         }
-
-        // Ensure initialization flag is cleared (safety check for BUY-only or SELL-only cases)
-        if (this.isInitializingVirtualLimits) {
-          this.isInitializingVirtualLimits = false;
-        }
-
-        // Set initial entry/reversal levels for direction tracking
-        const currentPrice = await this._getCurrentPrice(this.symbol);
-        this.entryLevel = this.buyLongEnabled && this.buyLimitPrice ? this.buyLimitPrice : this.sellLimitPrice;
-
-        if (this.reversalLevelPercentage !== null) {
-          if (this.buyLongEnabled) {
-            this.reversalLevel = this._calculateAdjustedPrice(this.entryLevel, this.reversalLevelPercentage, false);
-          } else {
-            this.reversalLevel = this._calculateAdjustedPrice(this.entryLevel, this.reversalLevelPercentage, true);
-          }
-          this.virtualEntryLevel = this.entryLevel;
-          this.virtualReversalLevel = this.reversalLevel;
-        }
-
-        // Activate volatility measurement immediately for LIMIT orders
-        this.volatilityMeasurementActive = true;
-        this.volatilityWaitStartTime = Date.now();
-        this.lastVirtualStatusLogTime = Date.now();
-
-        // Detect if dual-limit mode is active
-        const isDualLimitMode = this.buyLongEnabled && this.sellShortEnabled && this.buyLimitPrice !== null && this.sellLimitPrice !== null;
-        const dualLimitSuffix = isDualLimitMode ? ' (Dual-limit mode)' : '';
-        await this.addLog(`Volatility measurement ACTIVE - monitoring ${this.symbol} price for limit trigger + expansion${dualLimitSuffix}`);
-
-        // Skip Entry/Reversal log for dual-limit mode (direction is undetermined)
-        if (!isDualLimitMode) {
-          await this.addLog(`Entry: ${this._formatPrice(this.entryLevel)}, Reversal: ${this._formatPrice(this.reversalLevel)}`);
-        }
-
-        this.isTradingSequenceInProgress = false; // Allow price monitoring
+        // isTradingSequenceInProgress remains true until the LIMIT order is filled (handled in userDataWs.on('message') or timeout)
       }
       
     } catch (error) {
@@ -3886,16 +3633,21 @@ class TradingStrategy {
       throw error;
     }
 
-    await this.addLog(`Strategy started:`);
+    await this.addLog(`Strategy started: ${this.strategyId}`);
     await this.addLog(`  Pair: ${this.symbol}`);
-    await this.addLog(`  Initial Base Pos. Size: ${this._formatNotional(this.initialBasePositionSizeUSDT)} USDT`); // Log initial base
+    await this.addLog(`  Initial Position Size: ${this._formatNotional(this.initialBasePositionSizeUSDT)} USDT`); // Log initial base
     await this.addLog(`  Allowable Exposure: ${this._formatNotional(this.MAX_POSITION_SIZE_USDT)} USDT`); // Log max exposure
     await this.addLog(`  Leverage: 50x`);
     await this.addLog(`  Pos. Mode: One-way`);
     await this.addLog(`  Reversal %: ${this.reversalLevelPercentage !== null ? `${this.reversalLevelPercentage}%` : 'N/A'}`);
-    await this.addLog(`  Move Reversal Level: ${this.moveReversalLevel === 'MOVE_TO_BREAKEVEN' ? 'ACTIVE - Will move to breakeven after 0.5% favorable price movement' : 'Disabled'}`);
-    await this.addLog(`  Recovery Factor: ${this.RECOVERY_FACTOR * 100}%`);
     await this.addLog(`  Trading Mode: ${this.tradingMode}`);
+    await this.addLog(`  Price Type: ${this.priceType === 'LAST' ? 'Last Price' : 'Mark Price'}`);
+    await this.addLog(`  Recovery Factor: ${(this.RECOVERY_FACTOR * 100).toFixed(1)}%`);
+    await this.addLog(`  Recovery Distance: ${(this.RECOVERY_DISTANCE * 100).toFixed(2)}%`);
+    await this.addLog(`  Trail Step Factor: ${this.trailStepFactor}`);
+    await this.addLog(`  TP Size 1: ${this.partialTp1SizePercent}%`);
+    await this.addLog(`  TP Size 2: ${this.partialTp2SizePercent}%`);
+    await this.addLog(`  TP Size 3: ${this.partialTp3SizePercent}%`);
     const currentProfitPercentage = 1.55;
     await this.addLog(`  Desired Profit %: ${currentProfitPercentage}%`);
     await this.addLog(`  Order Type: ${this.orderType}`);
@@ -3931,7 +3683,7 @@ class TradingStrategy {
 
     // Start WebSocket health monitoring
     this._startWebSocketHealthMonitoring();
-    await this.addLog('[Health Check] WebSocket health monitoring started (checks every 5 minutes).');
+    //await this.addLog('[Health Check] WebSocket health monitoring started (checks every 5 minutes).');
 
     return this.strategyId;
   }
@@ -3990,6 +3742,133 @@ class TradingStrategy {
       await this.addLog(`Note: Base position size (${this._formatNotional(this.initialBasePositionSizeUSDT)} USDT) remains unchanged for dynamic sizing.`);
     }
 
+    // Update price type if provided (requires WebSocket reconnection)
+    if (newConfig.priceType !== undefined && newConfig.priceType !== this.priceType) {
+      const oldPriceType = this.priceType;
+      this.priceType = newConfig.priceType;
+      await this.addLog(`Updated priceType from ${oldPriceType === 'LAST' ? 'Last Price' : 'Mark Price'} to ${this.priceType === 'LAST' ? 'Last Price' : 'Mark Price'}.`);
+      await this.addLog(`Reconnecting real-time price WebSocket with new price stream...`);
+      // Reconnect the real-time WebSocket with new price type
+      try {
+        this.connectRealtimeWebSocket();
+        await this.addLog(`Successfully initiated WebSocket reconnection with ${this.priceType === 'LAST' ? 'Last Price' : 'Mark Price'} stream.`);
+      } catch (error) {
+        await this.addLog(`ERROR: Failed to reconnect WebSocket: ${error.message}`);
+      }
+    }
+
+    // Update Recovery Factor if provided
+    if (newConfig.recoveryFactor !== undefined) {
+      const oldValue = this.RECOVERY_FACTOR;
+      this.RECOVERY_FACTOR = newConfig.recoveryFactor;
+      await this.addLog(`Updated Recovery Factor from ${(oldValue * 100).toFixed(1)}% to ${(this.RECOVERY_FACTOR * 100).toFixed(1)}%.`);
+    }
+
+    // Update Recovery Distance if provided
+    if (newConfig.recoveryDistance !== undefined) {
+      const oldValue = this.RECOVERY_DISTANCE;
+      this.RECOVERY_DISTANCE = newConfig.recoveryDistance;
+      await this.addLog(`Updated Recovery Distance from ${(oldValue * 100).toFixed(2)}% to ${(this.RECOVERY_DISTANCE * 100).toFixed(2)}%.`);
+    }
+
+    // Update Trading Mode if provided
+    if (newConfig.tradingMode !== undefined && newConfig.tradingMode !== this.tradingMode) {
+      const oldMode = this.tradingMode;
+      this.tradingMode = newConfig.tradingMode;
+      await this.addLog(`Updated Trading Mode from ${oldMode} to ${this.tradingMode}.`);
+    }
+
+    // Update Reversal Level Percentage if provided
+    if (newConfig.reversalLevelPercentage !== undefined && newConfig.reversalLevelPercentage !== null) {
+      const oldValue = this.reversalLevelPercentage;
+      this.reversalLevelPercentage = newConfig.reversalLevelPercentage;
+
+      await this.addLog(`Updated Reversal Level from ${oldValue !== null ? oldValue + '%' : 'N/A'} to ${this.reversalLevelPercentage}%.`);
+
+      // If there's an active position, recalculate FIXED reversal levels based on new percentage
+      if (this.currentPosition !== 'NONE' && this.positionEntryPrice !== null) {
+        const oldLongLevel = this.longReversalLevel;
+        const oldShortLevel = this.shortReversalLevel;
+
+        if (this.currentPosition === 'LONG') {
+          // For LONG position: keep longReversalLevel at entry, recalculate shortReversalLevel
+          this.longReversalLevel = this.positionEntryPrice;
+          this.shortReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, false);
+
+          // Update reversal and TP levels for LONG position
+          this.reversalLevel = this.shortReversalLevel;
+          this.initialReversalLevel = this.shortReversalLevel;
+          this.tpLevel = this.positionEntryPrice * 0.999; // Update TP level 0.1% below entry
+          this.tp1Executed = false;
+          this.tp2Executed = false;
+          this.tp3Executed = false;
+          this.tp1TriggerLevel = null;
+          this.tp2TriggerLevel = null;
+          this.tp3TriggerLevel = null;
+          this.tpLevelTrailingPaused = false;
+          // Reset trailing state
+          this.highestFavorablePrice = this.positionEntryPrice;
+          this.ticksMovedInFavor = 0;
+
+          await this.addLog(`Fixed reversal levels recalculated - Long: ${this._formatPrice(this.longReversalLevel)} (unchanged), Short: ${this._formatPrice(oldShortLevel)} -> ${this._formatPrice(this.shortReversalLevel)}.`);
+        } else if (this.currentPosition === 'SHORT') {
+          // For SHORT position: keep shortReversalLevel at entry, recalculate longReversalLevel
+          this.shortReversalLevel = this.positionEntryPrice;
+          this.longReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, true);
+
+          // Update reversal and TP levels for SHORT position
+          this.reversalLevel = this.longReversalLevel;
+          this.initialReversalLevel = this.longReversalLevel;
+          this.tpLevel = this.positionEntryPrice * 1.001; // Update TP level 0.1% above entry
+          this.tp1Executed = false;
+          this.tp2Executed = false;
+          this.tp3Executed = false;
+          this.tp1TriggerLevel = null;
+          this.tp2TriggerLevel = null;
+          this.tp3TriggerLevel = null;
+          this.tpLevelTrailingPaused = false;
+          // Reset trailing state
+          this.lowestFavorablePrice = this.positionEntryPrice;
+          this.ticksMovedInFavor = 0;
+
+          await this.addLog(`Fixed reversal levels recalculated - Short: ${this._formatPrice(this.shortReversalLevel)} (unchanged), Long: ${this._formatPrice(oldLongLevel)} -> ${this._formatPrice(this.longReversalLevel)}.`);
+        }
+      }
+    }
+
+    // Update Trail Step Factor if provided
+    if (newConfig.trailStepFactor !== undefined && newConfig.trailStepFactor !== null) {
+      const oldValue = this.trailStepFactor;
+      this.trailStepFactor = newConfig.trailStepFactor;
+
+      const stepDescription = this.trailStepFactor === 1 ? 'Every tick' : `Every ${this.trailStepFactor} ticks`;
+      const oldStepDescription = oldValue === 1 ? 'Every tick' : `Every ${oldValue} ticks`;
+
+      await this.addLog(`Updated Trail Step Factor from ${oldValue} (${oldStepDescription}) to ${this.trailStepFactor} (${stepDescription}).`);
+      await this.addLog(`Note: New trail step factor will affect trailing behavior on future price movements.`);
+    }
+
+    // Update Partial TP1 Size Percent if provided
+    if (newConfig.partialTp1SizePercent !== undefined && newConfig.partialTp1SizePercent !== null) {
+      const oldValue = this.partialTp1SizePercent;
+      this.partialTp1SizePercent = newConfig.partialTp1SizePercent;
+      await this.addLog(`Updated Partial TP1 Size from ${oldValue}% to ${this.partialTp1SizePercent}%.`);
+    }
+
+    // Update Partial TP2 Size Percent if provided
+    if (newConfig.partialTp2SizePercent !== undefined && newConfig.partialTp2SizePercent !== null) {
+      const oldValue = this.partialTp2SizePercent;
+      this.partialTp2SizePercent = newConfig.partialTp2SizePercent;
+      await this.addLog(`Updated Partial TP2 Size from ${oldValue}% to ${this.partialTp2SizePercent}%.`);
+    }
+
+    // Update Partial TP3 Size Percent if provided
+    if (newConfig.partialTp3SizePercent !== undefined && newConfig.partialTp3SizePercent !== null) {
+      const oldValue = this.partialTp3SizePercent;
+      this.partialTp3SizePercent = newConfig.partialTp3SizePercent;
+      await this.addLog(`Updated Partial TP3 Size from ${oldValue}% to ${this.partialTp3SizePercent}%.`);
+    }
+
     // Update specific config parameters
     if (newConfig.initialBasePositionSizeUSDT !== undefined && newConfig.initialBasePositionSizeUSDT !== null) {
       const oldInitialBasePositionSizeUSDT = this.initialBasePositionSizeUSDT;
@@ -4010,34 +3889,6 @@ class TradingStrategy {
       this.MAX_POSITION_SIZE_USDT = newConfig.newMaxExposureUSDT;
 
       await this.addLog(`Allowable Exposure updated from ${this._formatNotional(oldMaxPositionSize)} USDT to ${this._formatNotional(this.MAX_POSITION_SIZE_USDT)} USDT.`);
-    }
-
-    // Update partial TP sizes if provided
-    if (newConfig.partialTpSizes !== undefined && newConfig.partialTpSizes !== null) {
-      const oldSizes = [...this.partialTpSizes];
-      this.partialTpSizes = newConfig.partialTpSizes;
-      await this.addLog(`Updated partial TP sizes from [${oldSizes.join(', ')}]% to [${this.partialTpSizes.join(', ')}]%.`);
-
-      // Recalculate partial TP prices if there's an active position
-      const hasPartialTpEnabled = this.partialTpSizes.some(size => size > 0);
-      if (this.currentPosition !== 'NONE' && this.positionEntryPrice !== null && hasPartialTpEnabled) {
-        await this._calculatePartialTpLevels();
-        await this.addLog(`Recalculated partial TP prices based on new sizes.`);
-      }
-    }
-
-    // Update partial TP levels if provided
-    if (newConfig.partialTpLevels !== undefined && newConfig.partialTpLevels !== null) {
-      const oldLevels = [...this.partialTpLevels];
-      this.partialTpLevels = newConfig.partialTpLevels;
-      await this.addLog(`Updated partial TP levels from [${oldLevels.join(', ')}]% to [${this.partialTpLevels.join(', ')}]%.`);
-
-      // Recalculate partial TP prices if there's an active position
-      const hasPartialTpLevelsEnabled = this.partialTpSizes.some(size => size > 0);
-      if (this.currentPosition !== 'NONE' && this.positionEntryPrice !== null && hasPartialTpLevelsEnabled) {
-        await this._calculatePartialTpLevels();
-        await this.addLog(`Recalculated partial TP prices based on new levels.`);
-      }
     }
 
     // Update custom final TP level for LONG positions
@@ -4066,7 +3917,7 @@ class TradingStrategy {
         // Recalculate final TP if currently in a LONG position
         if (this.currentPosition === 'LONG' && this.positionEntryPrice !== null) {
           await this._calculateBreakevenAndFinalTp();
-          await this.addLog(`Recalculated final TP based on custom LONG price target.`);
+          //await this.addLog(`Recalculated final TP based on custom LONG price target.`);
         }
       }
     }
@@ -4097,7 +3948,7 @@ class TradingStrategy {
         // Recalculate final TP if currently in a SHORT position
         if (this.currentPosition === 'SHORT' && this.positionEntryPrice !== null) {
           await this._calculateBreakevenAndFinalTp();
-          await this.addLog(`Recalculated final TP based on custom SHORT price target.`);
+          //await this.addLog(`Recalculated final TP based on custom SHORT price target.`);
         }
       }
     }
@@ -4142,27 +3993,6 @@ class TradingStrategy {
       }
     }
 
-    // Update Move Reversal Level setting if provided
-    if (newConfig.moveReversalLevel !== undefined && newConfig.moveReversalLevel !== null) {
-      const oldValue = this.moveReversalLevel;
-      this.moveReversalLevel = newConfig.moveReversalLevel;
-      await this.addLog(`Updated Move Reversal Level from ${oldValue} to ${this.moveReversalLevel}.`);
-
-      // If changing from MOVE_TO_BREAKEVEN to DO_NOT_MOVE, reset the moved flag
-      if (oldValue === 'MOVE_TO_BREAKEVEN' && newConfig.moveReversalLevel === 'DO_NOT_MOVE') {
-        this.reversalLevelMoved = false;
-        this.originalReversalLevel = null;
-        await this.addLog(`Reset reversal level movement state - feature now disabled.`);
-      }
-
-      // Log the feature status
-      if (this.moveReversalLevel === 'MOVE_TO_BREAKEVEN') {
-        await this.addLog(`Move Reversal Level: ACTIVE - Will move to breakeven after 0.5% favorable price movement.`);
-      } else {
-        await this.addLog(`Move Reversal Level: Disabled - Reversal level will remain at original setting.`);
-      }
-    }
-
       await this.saveState(); // Persist the updated config
       await this.addLog('Strategy configuration updated and saved.');
 
@@ -4193,6 +4023,11 @@ class TradingStrategy {
 
       // Use restart-specific position size if provided, otherwise calculate dynamic position size
       if (this.restartPositionSizeUSDT !== null && this.restartPositionSizeUSDT > 0) {
+        // Validate minimum restart position size (120 USDT)
+        if (this.restartPositionSizeUSDT < 120) {
+          await this.addLog('ERROR: Restart position size must be at least 120 USDT.');
+          throw new Error('Restart position size must be at least 120 USDT.');
+        }
         this.positionSizeUSDT = this.restartPositionSizeUSDT;
         await this.addLog(`Restart: Using restart position size: ${this._formatNotional(this.positionSizeUSDT)} USDT.`);
         await this.addLog(`Note: This is a one-time opening trade size. Base position size remains ${this._formatNotional(this.initialBasePositionSizeUSDT)} USDT.`);
@@ -4211,9 +4046,6 @@ class TradingStrategy {
         }
       }
 
-      // Reset partial TP states
-      await this._resetPartialTpState();
-
       // Set flag to prevent overlapping trading sequences
       this.isTradingSequenceInProgress = true;
 
@@ -4229,7 +4061,7 @@ class TradingStrategy {
         }
 
         // Double-check position is NONE before opening new MARKET position
-        await this.addLog(`Restart: Verifying current position is NONE before opening new MARKET position...`);
+        //await this.addLog(`Restart: Verifying current position is NONE before opening new MARKET position...`);
         if (this.currentPosition !== 'NONE') {
           await this.addLog(`ERROR: Current position is ${this.currentPosition}, not NONE. Cannot proceed with MARKET restart.`);
           throw new Error(`Cannot execute MARKET restart: position is ${this.currentPosition}, expected NONE`);
@@ -4240,6 +4072,10 @@ class TradingStrategy {
           await this.addLog(`Restart: Placing BUY MARKET order for ${this._formatQuantity(quantity)} ${this.symbol}.`);
           await this.placeMarketOrder(this.symbol, 'BUY', quantity);
           await this._waitForPositionChange('LONG');
+
+          // Add delay to ensure position data is fully synchronized
+          //await new Promise(resolve => setTimeout(resolve, 200));
+
           this.activeMode = 'SUPPORT_ZONE';
 
           // Set entry position quantity
@@ -4248,25 +4084,62 @@ class TradingStrategy {
           // Update Entry Level with actual filled position entry price
           this.entryLevel = this.positionEntryPrice;
 
-          // Calculate Reversal Level
-          if (this.reversalLevelPercentage !== null) {
-            this.reversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, false);
-            await this.addLog(`Restart: Entry Level: ${this._formatPrice(this.entryLevel)}, Reversal Level: ${this._formatPrice(this.reversalLevel)} (Support Zone).`);
+          // Calculate FIXED reversal levels if not already calculated
+          if (this.reversalLevelPercentage !== null && !this.fixedReversalLevelsCalculated) {
+            this.longReversalLevel = this.positionEntryPrice;
+            this.shortReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, false);
+            this.fixedReversalLevelsCalculated = true;
+            await this.addLog(`Restart: Fixed Reversal Levels calculated - Long: ${this._formatPrice(this.longReversalLevel)}, Short: ${this._formatPrice(this.shortReversalLevel)}.`);
           }
+
+          // Set reversal and TP levels using fixed levels
+          if (this.reversalLevelPercentage !== null) {
+            this.reversalLevel = this.shortReversalLevel;
+            this.initialReversalLevel = this.shortReversalLevel;
+            this.tpLevel = this.positionEntryPrice * 0.999; // Initialize TP level 0.1% below entry
+            this.tp1Executed = false;
+            this.tp2Executed = false;
+            this.tp3Executed = false;
+            this.tp1TriggerLevel = null;
+            this.tp2TriggerLevel = null;
+            this.tp3TriggerLevel = null;
+            this.tpLevelTrailingPaused = false;
+            await this.addLog(`Restart: Entry Level: ${this._formatPrice(this.entryLevel)}, Will reverse at Short Level: ${this._formatPrice(this.shortReversalLevel)} (fixed), TP Level: ${this._formatPrice(this.tpLevel)} (trailing).`);
+          }
+
+          // LONG position: Initialize continuous trailing
+          this.highestFavorablePrice = this.positionEntryPrice;
+          this.trailingReversalActive = true;
+          this.ticksMovedInFavor = 0;
 
           await this.addLog(`Restart: ${this.currentPosition} position established. Entry: ${this._formatPrice(this.positionEntryPrice)}, Size: ${this._formatNotional(this.positionSize)}, Qty: ${this._formatQuantity(this.entryPositionQuantity)}. Mode: ${this.activeMode}.`);
 
           // Update trade sequence
           this.tradeSequence += 'L.';
 
-          // Calculate BE, final TP, and partial TP
+          // Calculate BE and final TP
           await this._calculateBreakevenAndFinalTp();
-          await this._calculatePartialTpLevels();
+
+          // Save strategy flow event for restart LONG position
+          await this.saveStrategyFlowEvent(
+            'L',
+            'LONG',
+            this.positionEntryPrice,
+            this.currentPositionQuantity,
+            this.breakevenPrice,
+            this.breakevenPercentage,
+            this.finalTpPrice,
+            this.finalTpPercentage
+          );
 
         } else if (this.sellShortEnabled) {
           await this.addLog(`Restart: Placing SELL MARKET order for ${this._formatQuantity(quantity)} ${this.symbol}.`);
           await this.placeMarketOrder(this.symbol, 'SELL', quantity);
           await this._waitForPositionChange('SHORT');
+
+          // Add delay to ensure position data is fully synchronized
+          //await new Promise(resolve => setTimeout(resolve, 200));
+
           this.activeMode = 'RESISTANCE_ZONE';
 
           // Set entry position quantity
@@ -4275,20 +4148,53 @@ class TradingStrategy {
           // Update Entry Level with actual filled position entry price
           this.entryLevel = this.positionEntryPrice;
 
-          // Calculate Reversal Level
-          if (this.reversalLevelPercentage !== null) {
-            this.reversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, true);
-            await this.addLog(`Restart: Entry Level: ${this._formatPrice(this.entryLevel)}, Reversal Level: ${this._formatPrice(this.reversalLevel)} (Resistance Zone).`);
+          // Calculate FIXED reversal levels if not already calculated
+          if (this.reversalLevelPercentage !== null && !this.fixedReversalLevelsCalculated) {
+            this.shortReversalLevel = this.positionEntryPrice;
+            this.longReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, true);
+            this.fixedReversalLevelsCalculated = true;
+            await this.addLog(`Restart: Fixed Reversal Levels calculated - Short: ${this._formatPrice(this.shortReversalLevel)}, Long: ${this._formatPrice(this.longReversalLevel)}.`);
           }
+
+          // Set reversal and TP levels using fixed levels
+          if (this.reversalLevelPercentage !== null) {
+            this.reversalLevel = this.longReversalLevel;
+            this.initialReversalLevel = this.longReversalLevel;
+            this.tpLevel = this.positionEntryPrice * 1.001; // Initialize TP level 0.1% above entry
+            this.tp1Executed = false;
+            this.tp2Executed = false;
+            this.tp3Executed = false;
+            this.tp1TriggerLevel = null;
+            this.tp2TriggerLevel = null;
+            this.tp3TriggerLevel = null;
+            this.tpLevelTrailingPaused = false;
+            await this.addLog(`Restart: Entry Level: ${this._formatPrice(this.entryLevel)}, Will reverse at Long Level: ${this._formatPrice(this.longReversalLevel)} (fixed), TP Level: ${this._formatPrice(this.tpLevel)} (trailing).`);
+          }
+
+          // SHORT position: Initialize continuous trailing
+          this.lowestFavorablePrice = this.positionEntryPrice;
+          this.trailingReversalActive = true;
+          this.ticksMovedInFavor = 0;
 
           await this.addLog(`Restart: ${this.currentPosition} position established. Entry: ${this._formatPrice(this.positionEntryPrice)}, Size: ${this._formatNotional(this.positionSize)}, Qty: ${this._formatQuantity(this.entryPositionQuantity)}. Mode: ${this.activeMode}.`);
 
           // Update trade sequence
           this.tradeSequence += 'S.';
 
-          // Calculate BE, final TP, and partial TP
+          // Calculate BE and final TP
           await this._calculateBreakevenAndFinalTp();
-          await this._calculatePartialTpLevels();
+
+          // Save strategy flow event for restart SHORT position
+          await this.saveStrategyFlowEvent(
+            'S',
+            'SHORT',
+            this.positionEntryPrice,
+            this.currentPositionQuantity,
+            this.breakevenPrice,
+            this.breakevenPercentage,
+            this.finalTpPrice,
+            this.finalTpPercentage
+          );
 
         } else {
           throw new Error('No zone enabled for MARKET order. Enable support (BUY) or resistance (SELL) zone.');
@@ -4300,126 +4206,117 @@ class TradingStrategy {
         return { success: true, orderType: 'MARKET', position: this.currentPosition };
 
       } else if (this.orderType === 'LIMIT') {
-        // ===== VIRTUAL LIMIT ORDER MODE FOR RESTART =====
-        await this.addLog(`Restart: Order Type is LIMIT. Setting up virtual limit tracking (no orders placed on exchange).`);
+        await this.addLog(`Restart: Order Type is LIMIT. Placing limit orders on exchange.`);
 
-        // Set flag to prevent premature logging during dual-limit setup
-        this.isInitializingVirtualLimits = true;
+        let initialOrderPlaced = false;
 
-        let virtualLimitSetup = false;
-
-        // Setup BUY virtual limit if enabled
+        // Place BUY LIMIT order if enabled
         if (this.buyLongEnabled && this.buyLimitPrice !== null) {
           const quantity = await this._calculateAdjustedQuantity(this.symbol, this.positionSizeUSDT, this.buyLimitPrice);
 
           if (quantity > 0) {
-            this.virtualPositionActive = true;
-            this.virtualPositionDirection = 'LONG'; // Initial direction, will be updated if dual limit
-            this.virtualLongLimitOrder = {
-              price: this.buyLimitPrice,
-              side: 'BUY',
-              quantity: quantity,
-              timestamp: Date.now()
-            };
-            virtualLimitSetup = true;
-            await this.addLog(`Restart: Virtual BUY LIMIT: ${this._formatQuantity(quantity)} at ${this._formatPrice(this.buyLimitPrice)}`);
+            try {
+              await this.addLog(`Restart: Placing BUY LIMIT order for ${this._formatQuantity(quantity)} at ${this._formatPrice(this.buyLimitPrice)}.`);
+              const orderResult = await this.placeLimitOrder(this.symbol, 'BUY', quantity, this.buyLimitPrice);
+              this.longLimitOrderId = orderResult.orderId;
+              initialOrderPlaced = true;
+
+              // Set up timeout for order status check
+              const timeoutId = setTimeout(async () => {
+                await this.addLog(`Timeout for restart BUY LIMIT order ${this.longLimitOrderId}. Querying status via REST API.`);
+                try {
+                  const queriedOrder = await this._queryOrder(this.symbol, this.longLimitOrderId);
+                  if (queriedOrder.status === 'FILLED') {
+                    await this.addLog(`Restart BUY LIMIT order ${this.longLimitOrderId} found FILLED via REST API after WS timeout.`);
+                    await this._handleInitialLimitOrderFill(queriedOrder);
+                  } else if (queriedOrder.status === 'CANCELED' || queriedOrder.status === 'REJECTED' || queriedOrder.status === 'EXPIRED') {
+                    await this.addLog(`Restart BUY LIMIT order ${this.longLimitOrderId} found ${queriedOrder.status} via REST API after WS timeout.`);
+                    await this._handleInitialLimitOrderFailure(queriedOrder);
+                  } else {
+                    await this.addLog(`Restart BUY LIMIT order ${this.longLimitOrderId} still ${queriedOrder.status} via REST API. Continuing to wait for WS update.`);
+                  }
+                } catch (queryError) {
+                  await this.addLog(`ERROR: [API_ERROR] REST API query for restart BUY LIMIT order ${this.longLimitOrderId}: ${queryError.message}`);
+                  await this._handleInitialLimitOrderFailure({ i: this.longLimitOrderId, X: 'QUERY_FAILED' });
+                } finally {
+                  this.pendingInitialLimitOrders.delete(this.longLimitOrderId);
+                }
+              }, 15000);
+              this.pendingInitialLimitOrders.set(this.longLimitOrderId, { timeoutId });
+
+            } catch (error) {
+              await this.addLog(`ERROR: [TRADING_ERROR] Restart BUY LIMIT order placement failed: ${error.message}`);
+              this.isTradingSequenceInProgress = false;
+              throw error;
+            }
           } else {
             throw new Error('Calculated quantity for restart BUY LIMIT order is zero or negative.');
           }
         }
 
-        // Setup SELL virtual limit if enabled
+        // Place SELL LIMIT order if enabled
         if (this.sellShortEnabled && this.sellLimitPrice !== null) {
           const quantity = await this._calculateAdjustedQuantity(this.symbol, this.positionSizeUSDT, this.sellLimitPrice);
 
           if (quantity > 0) {
-            if (virtualLimitSetup) {
-              // Dual limit setup
-              this.virtualShortLimitOrder = {
-                price: this.sellLimitPrice,
-                side: 'SELL',
-                quantity: quantity,
-                timestamp: Date.now()
-              };
-              // Set direction to null for dual-limit mode (will be determined by which triggers first)
-              this.virtualPositionDirection = null;
-              await this.addLog(`Restart: Virtual SELL LIMIT: ${this._formatQuantity(quantity)} at ${this._formatPrice(this.sellLimitPrice)}`);
-              await this.addLog(`Restart: Dual-limit mode - direction will be determined by which limit triggers first`);
+            try {
+              await this.addLog(`Restart: Placing SELL LIMIT order for ${this._formatQuantity(quantity)} at ${this._formatPrice(this.sellLimitPrice)}.`);
+              const orderResult = await this.placeLimitOrder(this.symbol, 'SELL', quantity, this.sellLimitPrice);
+              this.shortLimitOrderId = orderResult.orderId;
+              initialOrderPlaced = true;
 
-              // Clear initialization flag - dual-limit setup is complete
-              this.isInitializingVirtualLimits = false;
-            } else {
-              // Single SHORT limit
-              this.virtualPositionActive = true;
-              this.virtualPositionDirection = 'SHORT';
-              this.virtualLongLimitOrder = {
-                price: this.sellLimitPrice,
-                side: 'SELL',
-                quantity: quantity,
-                timestamp: Date.now()
-              };
-              virtualLimitSetup = true;
-              await this.addLog(`Restart: Virtual SELL LIMIT: ${this._formatQuantity(quantity)} at ${this._formatPrice(this.sellLimitPrice)}`);
+              // Set up timeout for order status check
+              const timeoutId = setTimeout(async () => {
+                await this.addLog(`Timeout for restart SELL LIMIT order ${this.shortLimitOrderId}. Querying status via REST API.`);
+                try {
+                  const queriedOrder = await this._queryOrder(this.symbol, this.shortLimitOrderId);
+                  if (queriedOrder.status === 'FILLED') {
+                    await this.addLog(`Restart SELL LIMIT order ${this.shortLimitOrderId} found FILLED via REST API after WS timeout.`);
+                    await this._handleInitialLimitOrderFill(queriedOrder);
+                  } else if (queriedOrder.status === 'CANCELED' || queriedOrder.status === 'REJECTED' || queriedOrder.status === 'EXPIRED') {
+                    await this.addLog(`Restart SELL LIMIT order ${this.shortLimitOrderId} found ${queriedOrder.status} via REST API after WS timeout.`);
+                    await this._handleInitialLimitOrderFailure(queriedOrder);
+                  } else {
+                    await this.addLog(`Restart SELL LIMIT order ${this.shortLimitOrderId} still ${queriedOrder.status} via REST API. Continuing to wait for WS update.`);
+                  }
+                } catch (queryError) {
+                  await this.addLog(`ERROR: [API_ERROR] REST API query for restart SELL LIMIT order ${this.shortLimitOrderId}: ${queryError.message}`);
+                  await this._handleInitialLimitOrderFailure({ i: this.shortLimitOrderId, X: 'QUERY_FAILED' });
+                } finally {
+                  this.pendingInitialLimitOrders.delete(this.shortLimitOrderId);
+                }
+              }, 16000);
+              this.pendingInitialLimitOrders.set(this.shortLimitOrderId, { timeoutId });
 
-              // Clear initialization flag - single limit setup is complete
-              this.isInitializingVirtualLimits = false;
+            } catch (error) {
+              await this.addLog(`ERROR: [TRADING_ERROR] Restart SELL LIMIT order placement failed: ${error.message}`);
+              this.isTradingSequenceInProgress = false;
+              throw error;
             }
           } else {
             throw new Error('Calculated quantity for restart SELL LIMIT order is zero or negative.');
           }
         }
 
-        if (!virtualLimitSetup) {
+        if (!initialOrderPlaced) {
           this.isTradingSequenceInProgress = false;
-          throw new Error('No virtual limit order was configured after restart.');
+          throw new Error('No LIMIT order was placed after restart. Check zone settings and limit prices.');
         }
 
-        // Ensure initialization flag is cleared (safety check for BUY-only or SELL-only cases)
-        if (this.isInitializingVirtualLimits) {
-          this.isInitializingVirtualLimits = false;
-        }
-
-        // Set entry/reversal levels for direction tracking
-        this.entryLevel = this.buyLongEnabled && this.buyLimitPrice ? this.buyLimitPrice : this.sellLimitPrice;
-
-        if (this.reversalLevelPercentage !== null) {
-          if (this.buyLongEnabled) {
-            this.reversalLevel = this._calculateAdjustedPrice(this.entryLevel, this.reversalLevelPercentage, false);
-          } else {
-            this.reversalLevel = this._calculateAdjustedPrice(this.entryLevel, this.reversalLevelPercentage, true);
-          }
-          this.virtualEntryLevel = this.entryLevel;
-          this.virtualReversalLevel = this.reversalLevel;
-        }
-
-        // Activate volatility measurement
-        this.volatilityMeasurementActive = true;
-        this.volatilityWaitStartTime = Date.now();
-        this.lastVirtualStatusLogTime = Date.now();
-
-        // Detect if dual-limit mode is active
-        const isDualLimitMode = this.buyLongEnabled && this.sellShortEnabled && this.buyLimitPrice !== null && this.sellLimitPrice !== null;
-
-        // Skip Entry/Reversal log for dual-limit mode (direction is undetermined)
-        if (!isDualLimitMode) {
-          await this.addLog(`Restart: Virtual limit tracking active - Entry: ${this._formatPrice(this.entryLevel)}, Reversal: ${this._formatPrice(this.reversalLevel)}`);
-        }
-
-        const dualLimitSuffix = isDualLimitMode ? ' (Dual-limit mode)' : '';
-        await this.addLog(`Restart: Waiting for price trigger + volatility expansion${dualLimitSuffix}`);
-
-        this.isTradingSequenceInProgress = false; // Allow price monitoring
+        // isTradingSequenceInProgress remains true until a LIMIT order is filled
         await this.saveState();
+        await this.addLog(`Restart: LIMIT orders placed. Waiting for price to hit limit levels.`);
 
         const placedOrders = [];
-        if (this.virtualLongLimitOrder && this.virtualLongLimitOrder.side === 'BUY') placedOrders.push(`BUY at ${this._formatPrice(this.buyLimitPrice)}`);
-        if (this.virtualLongLimitOrder && this.virtualLongLimitOrder.side === 'SELL') placedOrders.push(`SELL at ${this._formatPrice(this.sellLimitPrice)}`);
-        if (this.virtualShortLimitOrder) placedOrders.push(`SELL at ${this._formatPrice(this.sellLimitPrice)}`);
+        if (this.longLimitOrderId) placedOrders.push(`BUY at ${this._formatPrice(this.buyLimitPrice)}`);
+        if (this.shortLimitOrderId) placedOrders.push(`SELL at ${this._formatPrice(this.sellLimitPrice)}`);
+        await this.addLog(`Restart: Active limit orders: ${placedOrders.join(', ')}`);
 
         return {
           success: true,
           orderType: 'LIMIT',
-          virtualLimitSetup: true,
+          longOrderId: this.longLimitOrderId,
+          shortOrderId: this.shortLimitOrderId,
           buyLimitPrice: this.buyLimitPrice,
           sellLimitPrice: this.sellLimitPrice
         };
@@ -4462,22 +4359,22 @@ class TradingStrategy {
     if (this.userDataWsPingInterval) clearInterval(this.userDataWsPingInterval);
     if (this.userDataWsPingTimeout) clearTimeout(this.userDataWsPingTimeout);
 
-    // Clean up virtual tracking state if active
-    if (this.virtualPositionActive) {
-      await this.addLog(`Strategy stopped during virtual tracking - no position opened`);
-      this.virtualPositionActive = false;
-      this.virtualPositionDirection = null;
-      this.virtualOriginalDirection = null;
-      this.volatilityWaitStartTime = null;
-      this.lastVirtualDirectionChange = null;
-      this.virtualDirectionChanges = [];
-      this.virtualLongLimitOrder = null;
-      this.virtualDirectionBuffer = null;
-      this.lastVirtualStatusLogTime = null;
-      this.virtualEntryLevel = null;
-      this.virtualReversalLevel = null;
-      this.closedPositionType = null;
-      this.virtualLimitFirstTriggered = false;
+    // Cancel any pending limit orders first
+    if (this.longLimitOrderId) {
+      await this.cancelOrder(this.symbol, this.longLimitOrderId);
+      this.longLimitOrderId = null;
+    }
+    if (this.shortLimitOrderId) {
+      await this.cancelOrder(this.symbol, this.shortLimitOrderId);
+      this.shortLimitOrderId = null;
+    }
+
+    // Clear any pending initial LIMIT order timeouts
+    for (const [orderId, { timeoutId }] of this.pendingInitialLimitOrders.entries()) {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+      this.pendingInitialLimitOrders.delete(orderId);
     }
 
     // Close active position first, if any
@@ -4524,7 +4421,15 @@ class TradingStrategy {
       await this.addLog('No trading activity detected. Skipping profit calculation.');
     }
 
-    await this.saveState();
+    // Check if initial position was ever filled
+    if (!this.strategyStartTime) {
+      // No position was ever filled, mark for deletion
+      console.log(`[${this.strategyId}] Strategy will be deleted - no initial position was filled`);
+      this.willBeDeleted = true;
+    } else {
+      // Normal stop - update document with final state
+      await this.saveState();
+    }
 
     await this.sendPushNotificationIfEnabled();
 
@@ -4567,6 +4472,33 @@ class TradingStrategy {
 
     await this.addLog('Strategy stopped.');
 
+    // If strategy was marked for deletion, delete document and subcollections now
+    if (this.willBeDeleted) {
+      try {
+        console.log(`[${this.strategyId}] Deleting strategy document and subcollections`);
+
+        // Delete logs subcollection
+        if (this.logsCollectionRef) {
+          await this.deleteSubcollection(this.logsCollectionRef, 'logs');
+        }
+
+        // Delete trades subcollection
+        if (this.tradesCollectionRef) {
+          await this.deleteSubcollection(this.tradesCollectionRef, 'trades');
+        }
+
+        // Finally, delete the parent strategy document
+        await this.firestore
+          .collection('strategies')
+          .doc(this.strategyId)
+          .delete();
+
+        console.log(`[${this.strategyId}] Strategy document and all subcollections deleted successfully`);
+      } catch (error) {
+        console.error(`[${this.strategyId}] Failed to delete strategy document and subcollections: ${error.message}`);
+      }
+    }
+
     // Reset strategy state variables AFTER saving to Firestore and closing connections.
     // These resets are for the *instance* of the strategy, not for the historical record.
     this.currentPosition = 'NONE';
@@ -4576,9 +4508,8 @@ class TradingStrategy {
     this.currentPrice = null;
     this.positionPnL = null;
     this.totalPnL = null;
-    this.accumulatedRealizedPnL = 0;
-    this.accumulatedTradingFees = 0;
-    this.sessionStartTradeId = null; 
+    this.accumulatedRealizedPnL = 0; 
+    this.accumulatedTradingFees = 0; 
 
     this.entryPositionQuantity = null;
     this.currentPositionQuantity = null;
@@ -4589,6 +4520,15 @@ class TradingStrategy {
     this.finalTpOrderSent = false;
     this.breakevenPercentage = null;
     this.finalTpPercentage = null;
+    // Reset Partial TP states
+    this.tpLevel = null;
+    this.tp1Executed = false;
+    this.tp2Executed = false;
+    this.tp3Executed = false;
+    this.tp1TriggerLevel = null;
+    this.tp2TriggerLevel = null;
+    this.tp3TriggerLevel = null;
+    this.tpLevelTrailingPaused = false;
 
     this.supportLevel = null;
     this.resistanceLevel = null;
@@ -4605,7 +4545,6 @@ class TradingStrategy {
 
     // Reset summary section data
     this.reversalCount = 0;
-    this.partialTpCount = 0;
     this.tradeSequence = '';
     this.initialWalletBalance = null;
     this.profitPercentage = null;
@@ -4812,29 +4751,30 @@ class TradingStrategy {
       enableSupport: this.enableSupport,
       enableResistance: this.enableResistance,
       reversalLevelPercentage: this.reversalLevelPercentage,
+      trailStepFactor: this.trailStepFactor,
       orderType: this.orderType,
       buyLongEnabled: this.buyLongEnabled,
       sellShortEnabled: this.sellShortEnabled,
       buyLimitPrice: this.buyLimitPrice,
       sellLimitPrice: this.sellLimitPrice,
-      // Partial TP Configuration
-      partialTpLevels: this.partialTpLevels,
-      partialTpSizes: this.partialTpSizes,
       tpAtBreakeven: this.tpAtBreakeven,
       customFinalTpLong: this.customFinalTpLong,
       customFinalTpShort: this.customFinalTpShort,
       desiredProfitUSDT: this.desiredProfitUSDT,
-      moveReversalLevel: this.moveReversalLevel,
-      reversalLevelMoved: this.reversalLevelMoved,
       // Summary fields
       entryLevel: this.entryLevel,
       reversalLevel: this.reversalLevel,
       reversalCount: this.reversalCount,
-      partialTpCount: this.partialTpCount,
+      activeMode: this.activeMode,
       breakevenPrice: this.breakevenPrice,
       finalTpPrice: this.finalTpPrice,
       initialBasePositionSizeUSDT: this.initialBasePositionSizeUSDT,
       MAX_POSITION_SIZE_USDT: this.MAX_POSITION_SIZE_USDT,
+      tradingMode: this.tradingMode,
+      priceType: this.priceType,
+      RECOVERY_FACTOR: this.RECOVERY_FACTOR,
+      RECOVERY_DISTANCE: this.RECOVERY_DISTANCE,
+      middleLevelTrailingEnabled: this.middleLevelTrailingEnabled,
       profitPercentage: this.profitPercentage,
       strategyStartTime: this.strategyStartTime,
       strategyEndTime: this.strategyEndTime,
@@ -4869,8 +4809,39 @@ class TradingStrategy {
         totalPnL: this.totalPnL,
         accumulatedRealizedPnL: this.accumulatedRealizedPnL,
         accumulatedTradingFees: this.accumulatedTradingFees,
-        sessionStartTradeId: this.sessionStartTradeId,
         currentPositionQuantity: this.currentPositionQuantity,
+      },
+      // Trailing reversal level state
+      trailingState: {
+        active: this.trailingReversalActive,
+        highestFavorablePrice: this.highestFavorablePrice,
+        lowestFavorablePrice: this.lowestFavorablePrice,
+        ticksMovedInFavor: this.ticksMovedInFavor,
+      },
+      // Middle level trailing state
+      middleLevelPrice: this.middleLevelPrice,
+      middleLevelReached: this.middleLevelReached,
+      trailingLockPrice: this.middleLevelReached ? this.middleLevelPrice : null,
+      // Partial Take-Profit state
+      partialTpState: {
+        tpLevel: this.tpLevel,
+        initialReversalLevel: this.initialReversalLevel,
+        tp1Executed: this.tp1Executed,
+        tp2Executed: this.tp2Executed,
+        tp3Executed: this.tp3Executed,
+        partialTp1SizePercent: this.partialTp1SizePercent,
+        partialTp2SizePercent: this.partialTp2SizePercent,
+        partialTp3SizePercent: this.partialTp3SizePercent,
+      },
+      // Virtual position state
+      virtualPositionState: {
+        virtualPosition: this.virtualPosition,
+        virtualEntryPrice: this.virtualEntryPrice,
+        virtualReversalLevel: this.virtualReversalLevel,
+        virtualHighestFavorablePrice: this.virtualHighestFavorablePrice,
+        virtualLowestFavorablePrice: this.virtualLowestFavorablePrice,
+        virtualTrailingReversalActive: this.virtualTrailingReversalActive,
+        virtualTicksMovedInFavor: this.virtualTicksMovedInFavor,
       }
     };
   }
