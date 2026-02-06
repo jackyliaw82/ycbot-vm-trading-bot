@@ -7,6 +7,7 @@ import { initializeFirebaseAdmin } from './pushNotificationHelper.js';
 import { precisionFormatter } from './precisionUtils.js';
 import { execFile } from 'child_process';
 import { readFileSync } from 'fs';
+import os from 'os';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1699,6 +1700,7 @@ function triggerSelfUpdate() {
         ...process.env,
         PM2_HOME: process.env.PM2_HOME || '/root/.pm2',
         PATH: process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        TARGET_VERSION: targetVersion || '',
       }
     }, (error, stdout, stderr) => {
       if (error) {
@@ -1716,6 +1718,11 @@ function triggerSelfUpdate() {
         return;
       }
       console.log('[UPDATE] Self-update script output:', stdout);
+      isUpdating = false;
+      updateStartedAt = null;
+      updateAvailable = false;
+      targetVersion = null;
+      reportUpdateStatus('idle', {}).catch(() => {});
       resolve(stdout);
     });
   });
@@ -1741,14 +1748,24 @@ async function reportUpdateStatus(status, details = {}) {
 async function getVmOwnerUserId() {
   try {
     const usersSnapshot = await firestore.collection('users').get();
-    for (const doc of usersSnapshot.docs) {
-      const userData = doc.data();
-      if (userData.vmBotUrl && userData.vmBotUrl.includes(`${PORT}`)) {
-        return doc.id;
+    const localIps = getLocalIpAddresses();
+
+    if (localIps.length > 0) {
+      for (const doc of usersSnapshot.docs) {
+        const userData = doc.data();
+        if (!userData.vmBotUrl) continue;
+        try {
+          const urlHost = new URL(userData.vmBotUrl).hostname;
+          if (localIps.includes(urlHost)) {
+            return doc.id;
+          }
+        } catch {
+          continue;
+        }
       }
     }
 
-    const hostname = await getLocalHostname();
+    const hostname = getLocalHostname();
     if (hostname) {
       for (const doc of usersSnapshot.docs) {
         const userData = doc.data();
@@ -1763,9 +1780,25 @@ async function getVmOwnerUserId() {
   return null;
 }
 
-async function getLocalHostname() {
+function getLocalIpAddresses() {
   try {
-    const os = await import('os');
+    const interfaces = os.networkInterfaces();
+    const ips = [];
+    for (const name of Object.keys(interfaces)) {
+      for (const iface of interfaces[name]) {
+        if (!iface.internal && iface.family === 'IPv4') {
+          ips.push(iface.address);
+        }
+      }
+    }
+    return ips;
+  } catch {
+    return [];
+  }
+}
+
+function getLocalHostname() {
+  try {
     return os.hostname();
   } catch {
     return null;

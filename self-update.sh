@@ -14,11 +14,29 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
+sync_package_version() {
+  if [ -n "$TARGET_VERSION" ] && [ -f "package.json" ]; then
+    CURRENT_PKG_VERSION=$(node -e "console.log(require('./package.json').version)" 2>/dev/null || echo "")
+    if [ "$CURRENT_PKG_VERSION" != "$TARGET_VERSION" ]; then
+      log "Syncing package.json version: $CURRENT_PKG_VERSION -> $TARGET_VERSION"
+      node -e "
+        const fs = require('fs');
+        const pkg = JSON.parse(fs.readFileSync('./package.json', 'utf8'));
+        pkg.version = '$TARGET_VERSION';
+        fs.writeFileSync('./package.json', JSON.stringify(pkg, null, 2) + '\n');
+      " 2>&1 | tee -a "$LOG_FILE"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 log "=== Starting self-update ==="
 cd "$WORK_DIR"
 
 PREV_COMMIT=$(git rev-parse HEAD)
 log "Current commit: ${PREV_COMMIT:0:8}"
+log "Target version: ${TARGET_VERSION:-not set}"
 
 OLD_CHECKSUM=""
 if [ -f "$CHECKSUM_FILE" ]; then
@@ -30,28 +48,43 @@ git fetch origin master 2>&1 | tee -a "$LOG_FILE"
 
 REMOTE=$(git rev-parse origin/master)
 
+NEEDS_RESTART=false
+
 if [ "$PREV_COMMIT" = "$REMOTE" ]; then
-  log "Already up to date. No changes to pull."
-  exit 0
-fi
-
-log "Pulling latest changes (local: ${PREV_COMMIT:0:8}, remote: ${REMOTE:0:8})..."
-git pull origin master 2>&1 | tee -a "$LOG_FILE"
-
-NEW_CHECKSUM=""
-if [ -f "package-lock.json" ]; then
-  NEW_CHECKSUM=$(md5sum package-lock.json | awk '{print $1}')
-fi
-
-if [ "$OLD_CHECKSUM" != "$NEW_CHECKSUM" ]; then
-  log "package-lock.json changed. Running npm install..."
-  npm install --production 2>&1 | tee -a "$LOG_FILE"
+  log "Already on latest commit."
+  if sync_package_version; then
+    NEEDS_RESTART=true
+  else
+    log "Package version already matches. Nothing to do."
+    exit 0
+  fi
 else
-  log "package-lock.json unchanged. Skipping npm install."
+  log "Pulling latest changes (local: ${PREV_COMMIT:0:8}, remote: ${REMOTE:0:8})..."
+  git pull origin master 2>&1 | tee -a "$LOG_FILE"
+
+  NEW_CHECKSUM=""
+  if [ -f "package-lock.json" ]; then
+    NEW_CHECKSUM=$(md5sum package-lock.json | awk '{print $1}')
+  fi
+
+  if [ "$OLD_CHECKSUM" != "$NEW_CHECKSUM" ]; then
+    log "package-lock.json changed. Running npm install..."
+    npm install --production 2>&1 | tee -a "$LOG_FILE"
+  else
+    log "package-lock.json unchanged. Skipping npm install."
+  fi
+
+  if [ -f "package-lock.json" ]; then
+    md5sum package-lock.json | awk '{print $1}' > "$CHECKSUM_FILE"
+  fi
+
+  sync_package_version
+  NEEDS_RESTART=true
 fi
 
-if [ -f "package-lock.json" ]; then
-  md5sum package-lock.json | awk '{print $1}' > "$CHECKSUM_FILE"
+if [ "$NEEDS_RESTART" = false ]; then
+  log "No restart needed."
+  exit 0
 fi
 
 log "Restarting bot via PM2..."
