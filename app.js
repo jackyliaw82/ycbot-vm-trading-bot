@@ -5,11 +5,19 @@ import http from 'http';
 import { Firestore, Timestamp } from '@google-cloud/firestore';
 import { initializeFirebaseAdmin } from './pushNotificationHelper.js';
 import { precisionFormatter } from './precisionUtils.js';
+import { execFile } from 'child_process';
 
 const app = express();
-const PORT = process.env.PORT || 3000; // Default to 3000 if PORT is not set
+const PORT = process.env.PORT || 3000;
 
-// Track startup status for health checks
+const BOT_VERSION = '1.0.0';
+let updateAvailable = false;
+let targetVersion = null;
+let isUpdating = false;
+let updateStartedAt = null;
+let releaseUnsubscribe = null;
+let idleUpdateInterval = null;
+
 let startupStatus = {
   phase: 'initializing',
   startTime: Date.now(),
@@ -40,6 +48,7 @@ app.get('/startup-status', (req, res) => {
     firestoreReady: startupStatus.firestoreReady,
     firebaseReady: startupStatus.firebaseReady,
     serverReady: startupStatus.serverReady,
+    botVersion: BOT_VERSION,
     timestamp: new Date().toISOString()
   });
 });
@@ -71,7 +80,8 @@ app.get('/health', (req, res) => {
     strategiesStatus[strategyId] = {
       strategyRunning: strategy.isRunning,
       realtimeWsConnected: strategy.realtimeWsConnected,
-      userDataWsConnected: strategy.userDataWsConnected
+      userDataWsConnected: strategy.userDataWsConnected,
+      profileId: strategy.profileId // ADDED: Include profileId for ownership validation
     };
   });
 
@@ -80,12 +90,24 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     activeStrategiesCount: activeStrategies.size,
     strategies: strategiesStatus,
-    vmInstanceHealthy: true // NEW: Explicitly indicate VM instance is healthy
+    vmInstanceHealthy: true,
+    botVersion: BOT_VERSION,
+    updateAvailable,
+    targetVersion,
+    isUpdating
   });
 });
 
 // Start strategy endpoint
 app.post('/strategy/start', async (req, res) => {
+  if (isUpdating) {
+    return res.status(503).json({
+      error: 'VM is currently updating to a new version. Please wait and try again shortly.',
+      code: 'VM_UPDATING',
+      targetVersion
+    });
+  }
+
   try {
     const { profileId, gcpProxyUrl, sharedVmProxyGcfUrl, config, userId } = req.body;
 
@@ -104,17 +126,17 @@ app.post('/strategy/start', async (req, res) => {
       return res.status(400).json({ error: 'Invalid initial capital for balance validation.' });
     }
 
-    // Validate recovery factor if provided
-    if (config.recoveryFactor !== undefined && config.recoveryFactor !== null) {
-      if (![10, 15, 20].includes(config.recoveryFactor)) {
-        return res.status(400).json({ error: 'Invalid recoveryFactor. Must be 10, 15, or 20.' });
-      }
-    }
-
     // Validate trading mode if provided
     if (config.tradingMode !== undefined && config.tradingMode !== null) {
       if (!['AGGRESSIVE', 'NORMAL', 'CONSERVATIVE'].includes(config.tradingMode)) {
         return res.status(400).json({ error: 'Invalid tradingMode. Must be AGGRESSIVE, NORMAL, or CONSERVATIVE.' });
+      }
+    }
+
+    // Validate trailStepFactor if provided
+    if (config.trailStepFactor !== undefined && config.trailStepFactor !== null) {
+      if (!Number.isInteger(config.trailStepFactor) || config.trailStepFactor < 1 || config.trailStepFactor > 10) {
+        return res.status(400).json({ error: 'Invalid trailStepFactor. Must be an integer between 1 and 10.' });
       }
     }
 
@@ -273,6 +295,11 @@ app.post('/strategy/stop', async (req, res) => {
 
         await Promise.race([stopPromise, timeoutPromise]);
         activeStrategies.delete(strategyId);
+
+        if (updateAvailable && activeStrategies.size === 0 && !isUpdating) {
+          console.log(`All strategies stopped. Triggering pending self-update to ${targetVersion}...`);
+          triggerSelfUpdate().catch(err => console.error('Post-stop self-update failed:', err));
+        }
 
         const strategyDoc = await firestore.collection('strategies').doc(strategyId).get();
         if (!strategyDoc.exists) {
@@ -492,6 +519,11 @@ app.post('/strategy/restart', async (req, res) => {
     strategy.finalTpActive = false;
     strategy.finalTpOrderSent = false;
 
+    // Reset fixed reversal levels (will be recalculated from new entry price)
+    strategy.fixedReversalLevelsCalculated = false;
+    strategy.longReversalLevel = null;
+    strategy.shortReversalLevel = null;
+
     await strategy.updateConfig(newConfig);
 
     // Execute initial orders after config update (for both MARKET and LIMIT orders)
@@ -543,6 +575,10 @@ app.post('/strategy/restart', async (req, res) => {
         finalTpPercentage: null,
         customFinalTpLevel: null,
         tpAtBreakeven: false,
+        // Reset fixed reversal levels
+        fixedReversalLevelsCalculated: false,
+        longReversalLevel: null,
+        shortReversalLevel: null,
       };
 
       // Only add fields if they have defined values
@@ -678,10 +714,27 @@ app.post('/strategy/update-levels', async (req, res) => {
   }
 });
 
-// NEW: Endpoint to update strategy configuration (e.g., initialBasePositionSizeUSDT, newMaxExposureUSDT, partialTpSizes, partialTpLevels, customFinalTpLong, customFinalTpShort, tpAtBreakeven)
+// NEW: Endpoint to update strategy configuration (e.g., initialBasePositionSizeUSDT, newMaxExposureUSDT, customFinalTpLong, customFinalTpShort, tpAtBreakeven, Advanced Settings)
 app.post('/strategy/update-config', async (req, res) => {
   try {
-    const { strategyId, initialBasePositionSizeUSDT, newMaxExposureUSDT, partialTpSizes, partialTpLevels, customFinalTpLong, customFinalTpShort, tpAtBreakeven, desiredProfitUSDT, moveReversalLevel } = req.body; // Expect strategyId and optional config fields
+    const {
+      strategyId,
+      initialBasePositionSizeUSDT,
+      newMaxExposureUSDT,
+      customFinalTpLong,
+      customFinalTpShort,
+      tpAtBreakeven,
+      desiredProfitUSDT,
+      tradingMode,
+      priceType,
+      reversalLevelPercentage,
+      trailStepFactor,
+      recoveryFactor,
+      recoveryDistance,
+      partialTp1SizePercent,
+      partialTp2SizePercent,
+      partialTp3SizePercent
+    } = req.body; // Expect strategyId and optional config fields
 
     if (!strategyId) {
       return res.status(400).json({ error: 'strategyId is required.' });
@@ -709,38 +762,6 @@ app.post('/strategy/update-config', async (req, res) => {
         return res.status(400).json({
           error: 'Invalid newMaxExposureUSDT provided. Must be a positive number.'
         });
-      }
-    }
-
-    // Validate partialTpSizes if provided
-    if (partialTpSizes !== undefined && partialTpSizes !== null) {
-      if (!Array.isArray(partialTpSizes) || partialTpSizes.length !== 3) {
-        return res.status(400).json({
-          error: 'Invalid partialTpSizes provided. Must be an array of 3 values.'
-        });
-      }
-      for (const size of partialTpSizes) {
-        if (isNaN(size) || size < 0 || size > 90) {
-          return res.status(400).json({
-            error: 'Invalid partialTpSizes value. Each size must be between 0 and 90.'
-          });
-        }
-      }
-    }
-
-    // Validate partialTpLevels if provided
-    if (partialTpLevels !== undefined && partialTpLevels !== null) {
-      if (!Array.isArray(partialTpLevels) || partialTpLevels.length !== 3) {
-        return res.status(400).json({
-          error: 'Invalid partialTpLevels provided. Must be an array of 3 values.'
-        });
-      }
-      for (const level of partialTpLevels) {
-        if (isNaN(level) || level <= 0) {
-          return res.status(400).json({
-            error: 'Invalid partialTpLevels value. Each level must be a positive number.'
-          });
-        }
       }
     }
 
@@ -782,11 +803,85 @@ app.post('/strategy/update-config', async (req, res) => {
       }
     }
 
-    // Validate moveReversalLevel if provided
-    if (moveReversalLevel !== undefined && moveReversalLevel !== null) {
-      if (moveReversalLevel !== 'DO_NOT_MOVE' && moveReversalLevel !== 'MOVE_TO_BREAKEVEN') {
+    // Validate tradingMode if provided
+    if (tradingMode !== undefined && tradingMode !== null) {
+      const validModes = ['AGGRESSIVE', 'NORMAL', 'CONSERVATIVE'];
+      if (!validModes.includes(tradingMode)) {
         return res.status(400).json({
-          error: 'Invalid moveReversalLevel provided. Must be either DO_NOT_MOVE or MOVE_TO_BREAKEVEN.'
+          error: 'Invalid tradingMode. Must be AGGRESSIVE, NORMAL, or CONSERVATIVE.'
+        });
+      }
+    }
+
+    // Validate priceType if provided
+    if (priceType !== undefined && priceType !== null) {
+      const validTypes = ['LAST', 'MARK'];
+      if (!validTypes.includes(priceType)) {
+        return res.status(400).json({
+          error: 'Invalid priceType. Must be LAST or MARK.'
+        });
+      }
+    }
+
+    // Validate reversalLevelPercentage if provided
+    if (reversalLevelPercentage !== undefined && reversalLevelPercentage !== null) {
+      if (isNaN(reversalLevelPercentage) || reversalLevelPercentage <= 0) {
+        return res.status(400).json({
+          error: 'Invalid reversalLevelPercentage. Must be a positive number.'
+        });
+      }
+    }
+
+    // Validate trailStepFactor if provided
+    if (trailStepFactor !== undefined && trailStepFactor !== null) {
+      if (isNaN(trailStepFactor) || trailStepFactor <= 0 || !Number.isInteger(trailStepFactor)) {
+        return res.status(400).json({
+          error: 'Invalid trailStepFactor. Must be a positive integer.'
+        });
+      }
+    }
+
+    // Validate recoveryFactor if provided
+    if (recoveryFactor !== undefined && recoveryFactor !== null) {
+      if (isNaN(recoveryFactor) || recoveryFactor <= 0) {
+        return res.status(400).json({
+          error: 'Invalid recoveryFactor. Must be a positive number.'
+        });
+      }
+    }
+
+    // Validate recoveryDistance if provided
+    if (recoveryDistance !== undefined && recoveryDistance !== null) {
+      if (isNaN(recoveryDistance) || recoveryDistance <= 0) {
+        return res.status(400).json({
+          error: 'Invalid recoveryDistance. Must be a positive number.'
+        });
+      }
+    }
+
+    // Validate partialTp1SizePercent if provided
+    if (partialTp1SizePercent !== undefined && partialTp1SizePercent !== null) {
+      if (isNaN(partialTp1SizePercent) || partialTp1SizePercent < 0 || partialTp1SizePercent > 100) {
+        return res.status(400).json({
+          error: 'Invalid partialTp1SizePercent. Must be between 0 and 100.'
+        });
+      }
+    }
+
+    // Validate partialTp2SizePercent if provided
+    if (partialTp2SizePercent !== undefined && partialTp2SizePercent !== null) {
+      if (isNaN(partialTp2SizePercent) || partialTp2SizePercent < 0 || partialTp2SizePercent > 100) {
+        return res.status(400).json({
+          error: 'Invalid partialTp2SizePercent. Must be between 0 and 100.'
+        });
+      }
+    }
+
+    // Validate partialTp3SizePercent if provided
+    if (partialTp3SizePercent !== undefined && partialTp3SizePercent !== null) {
+      if (isNaN(partialTp3SizePercent) || partialTp3SizePercent < 0 || partialTp3SizePercent > 100) {
+        return res.status(400).json({
+          error: 'Invalid partialTp3SizePercent. Must be between 0 and 100.'
         });
       }
     }
@@ -798,12 +893,6 @@ app.post('/strategy/update-config', async (req, res) => {
     }
     if (newMaxExposureUSDT !== undefined && newMaxExposureUSDT !== null) {
       updateConfig.newMaxExposureUSDT = newMaxExposureUSDT;
-    }
-    if (partialTpSizes !== undefined && partialTpSizes !== null) {
-      updateConfig.partialTpSizes = partialTpSizes;
-    }
-    if (partialTpLevels !== undefined && partialTpLevels !== null) {
-      updateConfig.partialTpLevels = partialTpLevels;
     }
     // Handle customFinalTpLong: allow null to reset to auto-calculation
     if (customFinalTpLong !== undefined) {
@@ -820,8 +909,33 @@ app.post('/strategy/update-config', async (req, res) => {
     if (desiredProfitUSDT !== undefined) {
       updateConfig.desiredProfitUSDT = desiredProfitUSDT;
     }
-    if (moveReversalLevel !== undefined && moveReversalLevel !== null) {
-      updateConfig.moveReversalLevel = moveReversalLevel;
+    // Add Advanced Settings fields
+    if (tradingMode !== undefined && tradingMode !== null) {
+      updateConfig.tradingMode = tradingMode;
+    }
+    if (priceType !== undefined && priceType !== null) {
+      updateConfig.priceType = priceType;
+    }
+    if (reversalLevelPercentage !== undefined && reversalLevelPercentage !== null) {
+      updateConfig.reversalLevelPercentage = reversalLevelPercentage;
+    }
+    if (trailStepFactor !== undefined && trailStepFactor !== null) {
+      updateConfig.trailStepFactor = trailStepFactor;
+    }
+    if (recoveryFactor !== undefined && recoveryFactor !== null) {
+      updateConfig.recoveryFactor = recoveryFactor;
+    }
+    if (recoveryDistance !== undefined && recoveryDistance !== null) {
+      updateConfig.recoveryDistance = recoveryDistance;
+    }
+    if (partialTp1SizePercent !== undefined && partialTp1SizePercent !== null) {
+      updateConfig.partialTp1SizePercent = partialTp1SizePercent;
+    }
+    if (partialTp2SizePercent !== undefined && partialTp2SizePercent !== null) {
+      updateConfig.partialTp2SizePercent = partialTp2SizePercent;
+    }
+    if (partialTp3SizePercent !== undefined && partialTp3SizePercent !== null) {
+      updateConfig.partialTp3SizePercent = partialTp3SizePercent;
     }
 
     await strategy.updateConfig(updateConfig);
@@ -950,16 +1064,49 @@ app.get('/strategy/:strategyId/logs', async (req, res) => {
     const { strategyId } = req.params;
     const logsRef = firestore.collection('strategies').doc(strategyId).collection('logs');
     const snapshot = await logsRef.orderBy('timestamp', 'asc').get(); // Order by timestamp ascending
-    
+
     const logs = snapshot.docs.map(doc => ({
       id: doc.id,
       message: doc.data().message,
       timestamp: doc.data().timestamp.toDate().getTime(), // Convert Firestore Timestamp to milliseconds
     }));
-    
+
     res.json(logs);
   } catch (error) {
     console.error('Failed to fetch strategy logs:', error);
+    res.status(500).json({
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Endpoint to fetch strategy flow events
+app.get('/strategy/:strategyId/strategyFlow', async (req, res) => {
+  try {
+    const { strategyId } = req.params;
+    const flowRef = firestore.collection('strategies').doc(strategyId).collection('strategyFlow');
+    const snapshot = await flowRef.orderBy('timestamp', 'asc').get(); // Order by timestamp ascending
+
+    const flowEvents = snapshot.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        timestamp: data.timestamp.toDate().getTime(), // Convert Firestore Timestamp to milliseconds
+        tradeType: data.tradeType,
+        side: data.side,
+        entryPrice: data.entryPrice,
+        currentQty: data.currentQty,
+        breakevenLevel: data.breakevenLevel,
+        breakevenPercentage: data.breakevenPercentage,
+        takeProfitLevel: data.takeProfitLevel,
+        takeProfitPercentage: data.takeProfitPercentage
+      };
+    });
+
+    res.json(flowEvents);
+  } catch (error) {
+    console.error('Failed to fetch strategy flow events:', error);
     res.status(500).json({
       error: error.message,
       timestamp: new Date().toISOString()
@@ -1106,8 +1253,16 @@ const shutdown = async () => {
   process.exit(0);
 };
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+process.on('SIGTERM', () => {
+  if (releaseUnsubscribe) { releaseUnsubscribe(); releaseUnsubscribe = null; }
+  if (idleUpdateInterval) { clearInterval(idleUpdateInterval); idleUpdateInterval = null; }
+  shutdown();
+});
+process.on('SIGINT', () => {
+  if (releaseUnsubscribe) { releaseUnsubscribe(); releaseUnsubscribe = null; }
+  if (idleUpdateInterval) { clearInterval(idleUpdateInterval); idleUpdateInterval = null; }
+  shutdown();
+});
 
 // ============================
 // Testing Endpoints (Admin Only)
@@ -1379,14 +1534,288 @@ app.post('/test/reset-reconnection-state', async (req, res) => {
   }
 });
 
+// ============================
+// Update Management Endpoints
+// ============================
+
+app.get('/update-status', (req, res) => {
+  res.json({
+    botVersion: BOT_VERSION,
+    updateAvailable,
+    targetVersion,
+    isUpdating,
+    updateStartedAt,
+    activeStrategiesCount: activeStrategies.size,
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.post('/system/update', async (req, res) => {
+  if (isUpdating) {
+    return res.status(409).json({ error: 'Update already in progress.', targetVersion });
+  }
+  if (!updateAvailable) {
+    return res.status(400).json({ error: 'No update available.' });
+  }
+  if (activeStrategies.size > 0) {
+    return res.status(409).json({
+      error: 'Cannot update while strategies are running. Stop all strategies first.',
+      activeStrategiesCount: activeStrategies.size
+    });
+  }
+
+  try {
+    res.json({ success: true, message: `Self-update to ${targetVersion} initiated.` });
+    await triggerSelfUpdate();
+  } catch (error) {
+    console.error('Self-update failed:', error);
+  }
+});
+
+app.post('/system/force-update', async (req, res) => {
+  if (isUpdating) {
+    return res.status(409).json({ error: 'Update already in progress.', targetVersion });
+  }
+  if (!updateAvailable) {
+    return res.status(400).json({ error: 'No update available.' });
+  }
+
+  res.json({
+    success: true,
+    message: `Force update initiated. Stopping ${activeStrategies.size} active strategies before updating to ${targetVersion}.`
+  });
+
+  setImmediate(async () => {
+    try {
+      for (const [strategyId, strategy] of activeStrategies.entries()) {
+        if (strategy.isRunning) {
+          console.log(`[FORCE-UPDATE] Stopping strategy ${strategyId}...`);
+          try {
+            await firestore.collection('strategies').doc(strategyId).update({
+              stoppingStatus: 'in_progress',
+              stoppingStartedAt: Timestamp.now()
+            });
+
+            const stopPromise = strategy.stop();
+            const timeoutPromise = new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('Stop operation timeout')), 45000)
+            );
+            await Promise.race([stopPromise, timeoutPromise]);
+            activeStrategies.delete(strategyId);
+
+            const strategyDoc = await firestore.collection('strategies').doc(strategyId).get();
+            if (strategyDoc.exists) {
+              const strategyData = strategyDoc.data();
+              const finalPnL = strategyData.totalPnL || 0;
+              const userId = strategy.userId || strategyData.userId;
+
+              if (finalPnL > 0 && userId) {
+                const FEE_PERCENTAGE = 0.15;
+                const feeAmount = Math.round(finalPnL * FEE_PERCENTAGE * 100) / 100;
+                const feeId = firestore.collection('temp').doc().id;
+
+                await firestore.collection('strategy_fees').doc(feeId).set({
+                  feeId, strategyId, userId,
+                  profileId: strategy.profileId,
+                  initialPnL: 0, finalPnL, feeAmount,
+                  feePercentage: FEE_PERCENTAGE,
+                  calculatedAt: Timestamp.now(),
+                  status: 'calculated',
+                });
+
+                const walletRef = firestore.collection('users').doc(userId).collection('wallets').doc('default');
+                const walletDoc = await walletRef.get();
+                if (walletDoc.exists) {
+                  const currentBalance = walletDoc.data()?.balance || 0;
+                  const deductAmount = Math.min(feeAmount, currentBalance);
+                  const newBalance = Math.max(0, currentBalance - deductAmount);
+                  const now = Timestamp.now();
+
+                  await walletRef.update({ balance: newBalance, updatedAt: now, lastTransactionAt: now });
+
+                  const transactionId = firestore.collection('temp').doc().id;
+                  await walletRef.collection('transactions').doc(transactionId).set({
+                    transactionId, type: 'debit', amount: deductAmount,
+                    balanceBefore: currentBalance, balanceAfter: newBalance,
+                    reason: 'platform_fee', relatedResourceType: 'strategy',
+                    relatedResourceId: strategyId, createdAt: now,
+                  });
+
+                  await firestore.collection('strategy_fees').doc(feeId).update({
+                    status: currentBalance >= feeAmount ? 'deducted' : 'insufficient_balance',
+                    deductedAt: now, balanceBefore: currentBalance, balanceAfter: newBalance,
+                  });
+
+                  if (deductAmount > 0) {
+                    const earningId = firestore.collection('temp').doc().id;
+                    await firestore.collection('platform_earnings').doc(earningId).set({
+                      earningId, feeId, strategyId, userId, amount: deductAmount,
+                      collectedAt: now, source: 'performance_fee',
+                    });
+                  }
+                }
+              }
+
+              await firestore.collection('strategies').doc(strategyId).update({
+                stoppingStatus: 'completed',
+                stoppingCompletedAt: Timestamp.now()
+              });
+            }
+
+            console.log(`[FORCE-UPDATE] Strategy ${strategyId} stopped and fees processed.`);
+          } catch (err) {
+            console.error(`[FORCE-UPDATE] Error stopping strategy ${strategyId}:`, err);
+            activeStrategies.delete(strategyId);
+          }
+        }
+      }
+
+      console.log(`[FORCE-UPDATE] All strategies stopped. Triggering self-update to ${targetVersion}...`);
+      await triggerSelfUpdate();
+    } catch (error) {
+      console.error('[FORCE-UPDATE] Error during force update:', error);
+    }
+  });
+});
+
+// ============================
+// Update Management Functions
+// ============================
+
+function triggerSelfUpdate() {
+  return new Promise((resolve, reject) => {
+    isUpdating = true;
+    updateStartedAt = new Date().toISOString();
+    console.log(`[UPDATE] Starting self-update to ${targetVersion}...`);
+
+    const scriptPath = '/opt/vm-bot/self-update.sh';
+    execFile('bash', [scriptPath], { timeout: 300000 }, (error, stdout, stderr) => {
+      if (error) {
+        console.error('[UPDATE] Self-update script failed:', error);
+        console.error('[UPDATE] stderr:', stderr);
+        isUpdating = false;
+        updateStartedAt = null;
+        reject(error);
+        return;
+      }
+      console.log('[UPDATE] Self-update script output:', stdout);
+      resolve(stdout);
+    });
+  });
+}
+
+async function getVmOwnerUserId() {
+  try {
+    const usersSnapshot = await firestore.collection('users').get();
+    for (const doc of usersSnapshot.docs) {
+      const userData = doc.data();
+      if (userData.vmBotUrl && userData.vmBotUrl.includes(`${PORT}`)) {
+        return doc.id;
+      }
+    }
+
+    const hostname = await getLocalHostname();
+    if (hostname) {
+      for (const doc of usersSnapshot.docs) {
+        const userData = doc.data();
+        if (userData.vmBotUrl && userData.vmBotUrl.includes(hostname)) {
+          return doc.id;
+        }
+      }
+    }
+  } catch (error) {
+    console.error('[UPDATE] Failed to find VM owner user ID:', error);
+  }
+  return null;
+}
+
+async function getLocalHostname() {
+  try {
+    const os = await import('os');
+    return os.hostname();
+  } catch {
+    return null;
+  }
+}
+
+function setupReleaseListener() {
+  try {
+    const releaseRef = firestore.collection('system_config').doc('release_info');
+    releaseUnsubscribe = releaseRef.onSnapshot((snapshot) => {
+      if (!snapshot.exists) return;
+      const data = snapshot.data();
+      const latestVersion = data?.latestVersion;
+
+      if (latestVersion && latestVersion !== BOT_VERSION) {
+        if (!updateAvailable || targetVersion !== latestVersion) {
+          console.log(`[UPDATE] New version detected: ${latestVersion} (current: ${BOT_VERSION})`);
+          updateAvailable = true;
+          targetVersion = latestVersion;
+
+          if (activeStrategies.size === 0 && !isUpdating) {
+            console.log(`[UPDATE] No active strategies. Auto-triggering update to ${latestVersion}...`);
+            triggerSelfUpdate().catch(err => console.error('[UPDATE] Auto self-update failed:', err));
+          } else {
+            console.log(`[UPDATE] ${activeStrategies.size} strategies running. Update will apply when idle.`);
+          }
+        }
+      } else if (latestVersion === BOT_VERSION) {
+        updateAvailable = false;
+        targetVersion = null;
+      }
+    }, (error) => {
+      console.error('[UPDATE] Release listener error:', error);
+    });
+    console.log('[UPDATE] Release listener started.');
+  } catch (error) {
+    console.error('[UPDATE] Failed to setup release listener:', error);
+  }
+}
+
+function setupIdleUpdatePolling() {
+  idleUpdateInterval = setInterval(async () => {
+    if (updateAvailable && activeStrategies.size === 0 && !isUpdating) {
+      console.log(`[UPDATE] Idle polling: triggering pending update to ${targetVersion}...`);
+      try {
+        await triggerSelfUpdate();
+      } catch (err) {
+        console.error('[UPDATE] Idle polling self-update failed:', err);
+      }
+    }
+  }, 60000);
+}
+
+async function reportVersionOnStartup() {
+  try {
+    const userId = await getVmOwnerUserId();
+    if (userId) {
+      const vmStatusRef = firestore.collection('users').doc(userId).collection('vm_status').doc('current');
+      await vmStatusRef.set({
+        botVersion: BOT_VERSION,
+        lastReportedAt: Timestamp.now(),
+        status: 'online',
+        activeStrategiesCount: activeStrategies.size,
+      }, { merge: true });
+      console.log(`[UPDATE] Reported version ${BOT_VERSION} for user ${userId}`);
+    } else {
+      console.warn('[UPDATE] Could not determine VM owner. Version not reported.');
+    }
+  } catch (error) {
+    console.error('[UPDATE] Failed to report version on startup:', error);
+  }
+}
+
 // Start the server
 server.listen(PORT, () => {
   startupStatus.serverReady = true;
   startupStatus.phase = 'ready';
-  console.log(`🚀 YcBot API server running on port ${PORT}`);
+  console.log(`🚀 YcBot API server running on port ${PORT} (v${BOT_VERSION})`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
   console.log(`🔗 Startup status: http://localhost:${PORT}/startup-status`);
   console.log(`🤞 Good luck bro! On the road to Million now`);
+  setupReleaseListener();
+  setupIdleUpdatePolling();
+  reportVersionOnStartup();
 });
 
 export default app;
