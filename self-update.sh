@@ -83,7 +83,7 @@ else
     md5sum package-lock.json | awk '{print $1}' > "$CHECKSUM_FILE"
   fi
 
-  sync_package_version
+  sync_package_version || true
   NEEDS_RESTART=true
 fi
 
