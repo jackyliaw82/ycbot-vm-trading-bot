@@ -3634,9 +3634,6 @@ class TradingStrategy {
     }
 
     await this.addLog(`Strategy started: ${this.strategyId}`);
-    await this.addLog(`Check it out babe~`);
-    await this.addLog(`babe~`);
-    await this.addLog(`babe~ babe~`);
     await this.addLog(`  Pair: ${this.symbol}`);
     await this.addLog(`  Initial Position Size: ${this._formatNotional(this.initialBasePositionSizeUSDT)} USDT`); // Log initial base
     await this.addLog(`  Allowable Exposure: ${this._formatNotional(this.MAX_POSITION_SIZE_USDT)} USDT`); // Log max exposure
