@@ -34,6 +34,15 @@ sync_package_version() {
 log "=== Starting self-update ==="
 cd "$WORK_DIR"
 
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+if [ "$CURRENT_BRANCH" != "master" ]; then
+  log "Not on master branch (current: ${CURRENT_BRANCH:-detached}). Switching to master..."
+  git checkout master 2>&1 | tee -a "$LOG_FILE"
+fi
+
+log "Resetting local changes to ensure clean working tree..."
+git reset --hard HEAD 2>&1 | tee -a "$LOG_FILE"
+
 PREV_COMMIT=$(git rev-parse HEAD)
 log "Current commit: ${PREV_COMMIT:0:8}"
 log "Target version: ${TARGET_VERSION:-not set}"
@@ -51,13 +60,9 @@ REMOTE=$(git rev-parse origin/master)
 NEEDS_RESTART=false
 
 if [ "$PREV_COMMIT" = "$REMOTE" ]; then
-  log "Already on latest commit."
-  if sync_package_version; then
-    NEEDS_RESTART=true
-  else
-    log "Package version already matches. Nothing to do."
-    exit 0
-  fi
+  log "Already on latest commit. No new code to pull."
+  log "ERROR: Target version ${TARGET_VERSION} requested but no new commits found on remote."
+  exit 2
 else
   log "Pulling latest changes (local: ${PREV_COMMIT:0:8}, remote: ${REMOTE:0:8})..."
   git pull origin master 2>&1 | tee -a "$LOG_FILE"
@@ -113,7 +118,7 @@ if [ "$HEALTHY" = false ]; then
   log "ERROR: Bot failed health check after $MAX_HEALTH_ATTEMPTS attempts."
   log "Rolling back to previous commit ${PREV_COMMIT:0:8}..."
 
-  git checkout "$PREV_COMMIT" 2>&1 | tee -a "$LOG_FILE"
+  git reset --hard "$PREV_COMMIT" 2>&1 | tee -a "$LOG_FILE"
 
   if [ "$OLD_CHECKSUM" != "$NEW_CHECKSUM" ]; then
     log "Restoring previous dependencies..."

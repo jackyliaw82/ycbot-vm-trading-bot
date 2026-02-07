@@ -1685,11 +1685,15 @@ app.post('/system/force-update', async (req, res) => {
 // Update Management Functions
 // ============================
 
-function triggerSelfUpdate() {
+const UPDATE_NO_COMMITS_EXIT_CODE = 2;
+const UPDATE_RETRY_DELAY_MS = 30000;
+const UPDATE_MAX_RETRIES = 5;
+
+function triggerSelfUpdate(retryCount = 0) {
   return new Promise((resolve, reject) => {
     isUpdating = true;
     updateStartedAt = new Date().toISOString();
-    console.log(`[UPDATE] Starting self-update to ${targetVersion}...`);
+    console.log(`[UPDATE] Starting self-update to ${targetVersion}...${retryCount > 0 ? ` (retry ${retryCount}/${UPDATE_MAX_RETRIES})` : ''}`);
 
     reportUpdateStatus('updating', { targetVersion, startedAt: updateStartedAt }).catch(() => {});
 
@@ -1704,6 +1708,18 @@ function triggerSelfUpdate() {
       }
     }, (error, stdout, stderr) => {
       if (error) {
+        const exitCode = error.code;
+
+        if (exitCode === UPDATE_NO_COMMITS_EXIT_CODE && retryCount < UPDATE_MAX_RETRIES) {
+          console.log(`[UPDATE] No new commits on remote yet. Retrying in ${UPDATE_RETRY_DELAY_MS / 1000}s... (attempt ${retryCount + 1}/${UPDATE_MAX_RETRIES})`);
+          isUpdating = false;
+          updateStartedAt = null;
+          setTimeout(() => {
+            triggerSelfUpdate(retryCount + 1).then(resolve).catch(reject);
+          }, UPDATE_RETRY_DELAY_MS);
+          return;
+        }
+
         console.error('[UPDATE] Self-update script failed:', error);
         console.error('[UPDATE] stderr:', stderr);
         isUpdating = false;
@@ -1852,7 +1868,9 @@ function setupIdleUpdatePolling() {
   }, 60000);
 }
 
-async function reportVersionOnStartup() {
+async function reportVersionOnStartup(retryCount = 0) {
+  const MAX_RETRIES = 12;
+  const RETRY_INTERVAL_MS = 15000;
   try {
     const userId = await getVmOwnerUserId();
     if (userId) {
@@ -1866,11 +1884,17 @@ async function reportVersionOnStartup() {
         updateDetails: {},
       }, { merge: true });
       console.log(`[UPDATE] Reported version ${BOT_VERSION} for user ${userId}`);
+    } else if (retryCount < MAX_RETRIES) {
+      console.warn(`[UPDATE] Could not determine VM owner (attempt ${retryCount + 1}/${MAX_RETRIES}). Retrying in ${RETRY_INTERVAL_MS / 1000}s...`);
+      setTimeout(() => reportVersionOnStartup(retryCount + 1), RETRY_INTERVAL_MS);
     } else {
-      console.warn('[UPDATE] Could not determine VM owner. Version not reported.');
+      console.warn('[UPDATE] Could not determine VM owner after all retries. Version not reported.');
     }
   } catch (error) {
     console.error('[UPDATE] Failed to report version on startup:', error);
+    if (retryCount < MAX_RETRIES) {
+      setTimeout(() => reportVersionOnStartup(retryCount + 1), RETRY_INTERVAL_MS);
+    }
   }
 }
 
