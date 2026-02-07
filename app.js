@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import TradingStrategy from './strategy.js';
 import http from 'http';
-import { Firestore, Timestamp } from '@google-cloud/firestore';
+import { Firestore, Timestamp, FieldValue } from '@google-cloud/firestore';
 import { initializeFirebaseAdmin } from './pushNotificationHelper.js';
 import { precisionFormatter } from './precisionUtils.js';
 import { execFile } from 'child_process';
@@ -1695,7 +1695,9 @@ function triggerSelfUpdate(retryCount = 0) {
     updateStartedAt = new Date().toISOString();
     console.log(`[UPDATE] Starting self-update to ${targetVersion}...${retryCount > 0 ? ` (retry ${retryCount}/${UPDATE_MAX_RETRIES})` : ''}`);
 
-    reportUpdateStatus('updating', { targetVersion, startedAt: updateStartedAt }).catch(() => {});
+    if (retryCount === 0) {
+      reportUpdateStatus('updating', { targetVersion, startedAt: updateStartedAt }).catch(() => {});
+    }
 
     const scriptPath = '/opt/vm-bot/self-update.sh';
     execFile('bash', [scriptPath], {
@@ -1712,8 +1714,6 @@ function triggerSelfUpdate(retryCount = 0) {
 
         if (exitCode === UPDATE_NO_COMMITS_EXIT_CODE && retryCount < UPDATE_MAX_RETRIES) {
           console.log(`[UPDATE] No new commits on remote yet. Retrying in ${UPDATE_RETRY_DELAY_MS / 1000}s... (attempt ${retryCount + 1}/${UPDATE_MAX_RETRIES})`);
-          isUpdating = false;
-          updateStartedAt = null;
           setTimeout(() => {
             triggerSelfUpdate(retryCount + 1).then(resolve).catch(reject);
           }, UPDATE_RETRY_DELAY_MS);
@@ -1733,13 +1733,8 @@ function triggerSelfUpdate(retryCount = 0) {
         reject(error);
         return;
       }
-      console.log('[UPDATE] Self-update script output:', stdout);
-      isUpdating = false;
-      updateStartedAt = null;
-      updateAvailable = false;
-      targetVersion = null;
-      reportUpdateStatus('idle', {}).catch(() => {});
-      resolve(stdout);
+      console.log('[UPDATE] Self-update script completed. PM2 will restart the process.');
+      console.log('[UPDATE] stdout:', stdout);
     });
   });
 }
@@ -1749,12 +1744,12 @@ async function reportUpdateStatus(status, details = {}) {
     const userId = await getVmOwnerUserId();
     if (!userId) return;
     const vmStatusRef = firestore.collection('users').doc(userId).collection('vm_status').doc('current');
-    await vmStatusRef.set({
+    await vmStatusRef.update({
       updateStatus: status,
       updateDetails: details,
       botVersion: BOT_VERSION,
       lastUpdateStatusAt: Timestamp.now(),
-    }, { merge: true });
+    });
     console.log(`[UPDATE] Reported update status: ${status} for user ${userId}`);
   } catch (error) {
     console.error('[UPDATE] Failed to report update status:', error);
@@ -1881,34 +1876,36 @@ async function reportVersionOnStartup(retryCount = 0) {
         status: 'online',
         activeStrategiesCount: activeStrategies.size,
         updateStatus: 'idle',
-        updateDetails: {},
+        updateDetails: FieldValue.delete(),
       }, { merge: true });
       console.log(`[UPDATE] Reported version ${BOT_VERSION} for user ${userId}`);
     } else if (retryCount < MAX_RETRIES) {
       console.warn(`[UPDATE] Could not determine VM owner (attempt ${retryCount + 1}/${MAX_RETRIES}). Retrying in ${RETRY_INTERVAL_MS / 1000}s...`);
-      setTimeout(() => reportVersionOnStartup(retryCount + 1), RETRY_INTERVAL_MS);
+      await new Promise(resolve => setTimeout(resolve, RETRY_INTERVAL_MS));
+      return reportVersionOnStartup(retryCount + 1);
     } else {
       console.warn('[UPDATE] Could not determine VM owner after all retries. Version not reported.');
     }
   } catch (error) {
     console.error('[UPDATE] Failed to report version on startup:', error);
     if (retryCount < MAX_RETRIES) {
-      setTimeout(() => reportVersionOnStartup(retryCount + 1), RETRY_INTERVAL_MS);
+      await new Promise(resolve => setTimeout(resolve, RETRY_INTERVAL_MS));
+      return reportVersionOnStartup(retryCount + 1);
     }
   }
 }
 
 // Start the server
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   startupStatus.serverReady = true;
   startupStatus.phase = 'ready';
   console.log(`🚀 YcBot API server running on port ${PORT} (v${BOT_VERSION})`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
   console.log(`🔗 Startup status: http://localhost:${PORT}/startup-status`);
   console.log(`🤞 Good luck bro! On the road to Million now`);
+  await reportVersionOnStartup();
   setupReleaseListener();
   setupIdleUpdatePolling();
-  reportVersionOnStartup();
 });
 
 export default app;

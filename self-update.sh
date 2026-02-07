@@ -26,9 +26,11 @@ sync_package_version() {
         fs.writeFileSync('./package.json', JSON.stringify(pkg, null, 2) + '\n');
       " 2>&1 | tee -a "$LOG_FILE"
       return 0
+    else
+      log "package.json version already matches target ($TARGET_VERSION)"
     fi
   fi
-  return 1
+  return 0
 }
 
 log "=== Starting self-update ==="
@@ -93,7 +95,7 @@ if [ "$NEEDS_RESTART" = false ]; then
 fi
 
 log "Restarting bot via PM2..."
-pm2 restart ycbot 2>&1 | tee -a "$LOG_FILE"
+sudo pm2 restart ycbot 2>&1 | tee -a "$LOG_FILE"
 
 log "Verifying bot health after restart..."
 ATTEMPT=0
@@ -125,7 +127,7 @@ if [ "$HEALTHY" = false ]; then
     npm install --production 2>&1 | tee -a "$LOG_FILE"
   fi
 
-  pm2 restart ycbot 2>&1 | tee -a "$LOG_FILE"
+  sudo pm2 restart ycbot 2>&1 | tee -a "$LOG_FILE"
   log "Rollback complete. Bot restored to ${PREV_COMMIT:0:8}."
 
   sleep 5
