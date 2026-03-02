@@ -109,25 +109,12 @@ class TradingStrategy {
     this.shortReversalLevel = null; // Fixed level where SHORT positions can be triggered
     this.fixedReversalLevelsCalculated = false; // Flag to track if fixed levels have been set
 
-    // Trailing reversal level state variables
-    this.trailStepFactor = 1; // How many ticks price must move before reversal level trails (default: 1)
+    // Grid trading state variables
+    this.gridSize = 0.003; // Grid step size as decimal (e.g., 0.003 = 0.3%)
     this.highestFavorablePrice = null; // Highest price reached for LONG positions
     this.lowestFavorablePrice = null; // Lowest price reached for SHORT positions
     this.trailingReversalActive = false; // Whether trailing is currently active
     this.ticksMovedInFavor = 0; // Accumulated ticks moved in favorable direction
-
-    // Partial Take-Profit state variables
-    this.tpLevel = null; // Trailing TP level (trails independently from initialReversalLevel)
-    this.tp1Executed = false; // Whether TP1 has been executed
-    this.tp2Executed = false; // Whether TP2 has been executed
-    this.tp3Executed = false; // Whether TP3 has been executed
-    this.tp1TriggerLevel = null; // TP level at which TP1 was triggered
-    this.tp2TriggerLevel = null; // TP level at which TP2 was triggered
-    this.tp3TriggerLevel = null; // TP level at which TP3 was triggered
-    this.tpLevelTrailingPaused = false; // Whether TP level trailing is paused (set to true after TP3)
-    this.partialTp1SizePercent = 20; // Percentage of position to close at TP1 (default: 20%)
-    this.partialTp2SizePercent = 20; // Percentage of position to close at TP2 (default: 20%)
-    this.partialTp3SizePercent = 10; // Percentage of position to close at TP3 (default: 10%)
 
     // New Order Type and Direction states
     this.orderType = 'MARKET'; // 'LIMIT' | 'MARKET'
@@ -440,24 +427,12 @@ class TradingStrategy {
         capitalProtectionWarning: this.capitalProtectionWarning,
         maxAllowableLoss: this.maxAllowableLoss,
         circuitBreakerTimestamp: this.circuitBreakerTimestamp,
-        // Trailing reversal level state
-        trailStepFactor: this.trailStepFactor,
+        // Grid trading state
+        gridSize: this.gridSize,
         highestFavorablePrice: this.highestFavorablePrice,
         lowestFavorablePrice: this.lowestFavorablePrice,
         trailingReversalActive: this.trailingReversalActive,
         ticksMovedInFavor: this.ticksMovedInFavor,
-        // Partial Take-Profit state
-        tpLevel: this.tpLevel,
-        tp1Executed: this.tp1Executed,
-        tp2Executed: this.tp2Executed,
-        tp3Executed: this.tp3Executed,
-        tp1TriggerLevel: this.tp1TriggerLevel,
-        tp2TriggerLevel: this.tp2TriggerLevel,
-        tp3TriggerLevel: this.tp3TriggerLevel,
-        tpLevelTrailingPaused: this.tpLevelTrailingPaused,
-        partialTp1SizePercent: this.partialTp1SizePercent,
-        partialTp2SizePercent: this.partialTp2SizePercent,
-        partialTp3SizePercent: this.partialTp3SizePercent,
       };
 
       // Filter out undefined values and validate numeric fields to prevent Firestore errors
@@ -471,10 +446,8 @@ class TradingStrategy {
         'breakevenPrice', 'finalTpPrice', 'breakevenPercentage', 'finalTpPercentage',
         'buyLimitPrice', 'sellLimitPrice', 'initialWalletBalance', 'profitPercentage',
         'maxAllowableLoss', 'customFinalTpLong', 'customFinalTpShort', 'desiredProfitUSDT',
-        'trailStepFactor', 'highestFavorablePrice', 'lowestFavorablePrice',
-        'ticksMovedInFavor',
-        'tpLevel', 'tp1TriggerLevel', 'tp2TriggerLevel', 'tp3TriggerLevel',
-        'partialTp1SizePercent', 'partialTp2SizePercent', 'partialTp3SizePercent'
+        'gridSize', 'highestFavorablePrice', 'lowestFavorablePrice',
+        'ticksMovedInFavor'
       ];
 
       for (const key in rawData) {
@@ -694,25 +667,12 @@ class TradingStrategy {
         this.maxAllowableLoss = this._validateNumericValue(data.maxAllowableLoss, 'maxAllowableLoss', null);
         this.circuitBreakerTimestamp = data.circuitBreakerTimestamp ? data.circuitBreakerTimestamp.toDate() : null;
 
-        // Load Trailing reversal level state
-        this.trailStepFactor = this._validateNumericValue(data.trailStepFactor, 'trailStepFactor', 1);
+        // Load Grid trading state
+        this.gridSize = this._validateNumericValue(data.gridSize, 'gridSize', 0.003);
         this.highestFavorablePrice = this._validateNumericValue(data.highestFavorablePrice, 'highestFavorablePrice', null);
         this.lowestFavorablePrice = this._validateNumericValue(data.lowestFavorablePrice, 'lowestFavorablePrice', null);
         this.trailingReversalActive = data.trailingReversalActive !== undefined ? data.trailingReversalActive : false;
         this.ticksMovedInFavor = this._validateNumericValue(data.ticksMovedInFavor, 'ticksMovedInFavor', 0);
-
-        // Load Partial Take-Profit state (with defaults for backward compatibility)
-        this.tpLevel = this._validateNumericValue(data.tpLevel, 'tpLevel', null);
-        this.tp1Executed = data.tp1Executed !== undefined ? data.tp1Executed : false;
-        this.tp2Executed = data.tp2Executed !== undefined ? data.tp2Executed : false;
-        this.tp3Executed = data.tp3Executed !== undefined ? data.tp3Executed : false;
-        this.tp1TriggerLevel = this._validateNumericValue(data.tp1TriggerLevel, 'tp1TriggerLevel', null);
-        this.tp2TriggerLevel = this._validateNumericValue(data.tp2TriggerLevel, 'tp2TriggerLevel', null);
-        this.tp3TriggerLevel = this._validateNumericValue(data.tp3TriggerLevel, 'tp3TriggerLevel', null);
-        this.tpLevelTrailingPaused = data.tpLevelTrailingPaused !== undefined ? data.tpLevelTrailingPaused : false;
-        this.partialTp1SizePercent = this._validateNumericValue(data.partialTp1SizePercent, 'partialTp1SizePercent', 20);
-        this.partialTp2SizePercent = this._validateNumericValue(data.partialTp2SizePercent, 'partialTp2SizePercent', 20);
-        this.partialTp3SizePercent = this._validateNumericValue(data.partialTp3SizePercent, 'partialTp3SizePercent', 10);
 
         await this._getExchangeInfo(this.symbol); // Use the new method to fetch and cache exchange info
 
@@ -1012,7 +972,7 @@ class TradingStrategy {
     } catch (error) {
       // Handle specific error if mode is already set
       if (error.message.includes('-4059') && error.message.includes('No need to change position side')) {
-        await this.addLog(`Pos. mode already One-way.`);
+        await this.addLog(`Pos. mode already ${dualSidePosition ? 'Hedge' : 'One-way'}.`);
         return { dualSidePosition };
       }
       console.error(`Failed to set position mode: ${error.message}`);
@@ -1068,7 +1028,7 @@ class TradingStrategy {
   }
 
   // Place a market order and return a Promise that resolves upon order fill
-  async placeMarketOrder(symbol, side, quantity) {
+  async placeMarketOrder(symbol, side, quantity, positionSide) {
     // quantity here is already adjusted by _calculateAdjustedQuantity
     if (quantity <= 0) {
       throw new Error('Calculated quantity is zero or negative.');
@@ -1076,13 +1036,15 @@ class TradingStrategy {
 
     return new Promise(async (resolve, reject) => {
       try {
-        const result = await this.makeProxyRequest('/fapi/v1/order', 'POST', {
+        const orderParams = {
           symbol,
           side,
           type: 'MARKET',
           quantity: quantity,
-          newOrderRespType: 'FULL' // Request full response for orderId
-        }, true, 'futures');
+          newOrderRespType: 'FULL',
+        };
+        if (positionSide) orderParams.positionSide = positionSide;
+        const result = await this.makeProxyRequest('/fapi/v1/order', 'POST', orderParams, true, 'futures');
         
         if (result && result.orderId) {
           this.pendingOrders.set(result.orderId, { resolve, reject });
@@ -1108,7 +1070,7 @@ class TradingStrategy {
   }
 
   // Place a limit order and return the initial order response
-  async placeLimitOrder(symbol, side, quantity, price) {
+  async placeLimitOrder(symbol, side, quantity, price, positionSide) {
     if (quantity <= 0) {
       throw new Error('Calculated quantity is zero or negative.');
     }
@@ -1120,15 +1082,17 @@ class TradingStrategy {
     const roundedQuantity = this.roundQuantity(quantity);
 
     try {
-      const result = await this.makeProxyRequest('/fapi/v1/order', 'POST', {
+      const orderParams = {
         symbol,
         side,
         type: 'LIMIT',
         quantity: roundedQuantity,
         price: roundedPrice,
-        timeInForce: 'GTC', // Good Till Cancelled
-        newOrderRespType: 'FULL'
-      }, true, 'futures');
+        timeInForce: 'GTC',
+        newOrderRespType: 'FULL',
+      };
+      if (positionSide) orderParams.positionSide = positionSide;
+      const result = await this.makeProxyRequest('/fapi/v1/order', 'POST', orderParams, true, 'futures');
 
       if (result && result.orderId) {
         await this.addLog(`[REST-API] Placed LIMIT ${side} order ${result.orderId} for ${roundedQuantity} at ${roundedPrice}.`);
@@ -1192,13 +1156,15 @@ class TradingStrategy {
 
         await this.addLog(`Placing ${closingSide} close order for ${this._formatQuantity(roundedQuantity)} ${this.symbol}.`);
 
-        const result = await this.makeProxyRequest('/fapi/v1/order', 'POST', {
+        const closeParams = {
           symbol: this.symbol,
           side: closingSide,
           type: 'MARKET',
           quantity: roundedQuantity,
-          newOrderRespType: 'FULL'
-        }, true, 'futures');
+          newOrderRespType: 'FULL',
+          positionSide: this.currentPosition,
+        };
+        const result = await this.makeProxyRequest('/fapi/v1/order', 'POST', closeParams, true, 'futures');
 
         if (result && result.orderId) {
           this.pendingOrders.set(result.orderId, { resolve, reject });
@@ -1249,15 +1215,6 @@ class TradingStrategy {
         // Reset Final TP states
         this.finalTpActive = false;
         this.finalTpOrderSent = false;
-        // Reset Partial TP states
-        this.tpLevel = null;
-        this.tp1Executed = false;
-        this.tp2Executed = false;
-        this.tp3Executed = false;
-        this.tp1TriggerLevel = null;
-        this.tp2TriggerLevel = null;
-        this.tp3TriggerLevel = null;
-        this.tpLevelTrailingPaused = false;
       } else if (positions.length === 1) {
         const p = positions[0];
         const positionAmt = parseFloat(p.positionAmt);
@@ -1476,20 +1433,11 @@ class TradingStrategy {
         this.shortReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, false);
         this.fixedReversalLevelsCalculated = true;
 
-        // For backward compatibility, set reversalLevel and initialReversalLevel
         this.reversalLevel = this.shortReversalLevel;
         this.initialReversalLevel = this.shortReversalLevel;
-        this.tpLevel = this.positionEntryPrice * 0.999; // Initialize TP level 0.1% below entry
-        this.tp1Executed = false;
-        this.tp2Executed = false;
-        this.tp3Executed = false;
-        this.tp1TriggerLevel = null;
-        this.tp2TriggerLevel = null;
-        this.tp3TriggerLevel = null;
-        this.tpLevelTrailingPaused = false;
-        await this.addLog(`Initial LONG position established. Entry: ${this._formatPrice(this.entryLevel)}, Long Reversal Level: ${this._formatPrice(this.longReversalLevel)}, Short Reversal Level: ${this._formatPrice(this.shortReversalLevel)} (fixed range), TP Level: ${this._formatPrice(this.tpLevel)} (will trail independently).`);
+        await this.addLog(`Initial LONG position established. Entry: ${this._formatPrice(this.entryLevel)}, Long Reversal Level: ${this._formatPrice(this.longReversalLevel)}, Short Reversal Level: ${this._formatPrice(this.shortReversalLevel)} (fixed range), Grid Size: ${(this.gridSize * 100).toFixed(2)}%.`);
 
-        // Initialize continuous trailing for LONG position
+        // Initialize price tracking for LONG position
         this.highestFavorablePrice = this.positionEntryPrice;
         this.trailingReversalActive = true;
         this.ticksMovedInFavor = 0;
@@ -1498,20 +1446,11 @@ class TradingStrategy {
         this.longReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, true);
         this.fixedReversalLevelsCalculated = true;
 
-        // For backward compatibility, set reversalLevel and initialReversalLevel
         this.reversalLevel = this.longReversalLevel;
         this.initialReversalLevel = this.longReversalLevel;
-        this.tpLevel = this.positionEntryPrice * 1.001; // Initialize TP level 0.1% above entry
-        this.tp1Executed = false;
-        this.tp2Executed = false;
-        this.tp3Executed = false;
-        this.tp1TriggerLevel = null;
-        this.tp2TriggerLevel = null;
-        this.tp3TriggerLevel = null;
-        this.tpLevelTrailingPaused = false;
-        await this.addLog(`Initial SHORT position established. Entry: ${this._formatPrice(this.entryLevel)}, Short Reversal Level: ${this._formatPrice(this.shortReversalLevel)}, Long Reversal Level: ${this._formatPrice(this.longReversalLevel)} (fixed range), TP Level: ${this._formatPrice(this.tpLevel)} (will trail independently).`);
+        await this.addLog(`Initial SHORT position established. Entry: ${this._formatPrice(this.entryLevel)}, Short Reversal Level: ${this._formatPrice(this.shortReversalLevel)}, Long Reversal Level: ${this._formatPrice(this.longReversalLevel)} (fixed range), Grid Size: ${(this.gridSize * 100).toFixed(2)}%.`);
 
-        // Initialize continuous trailing for SHORT position
+        // Initialize price tracking for SHORT position
         this.lowestFavorablePrice = this.positionEntryPrice;
         this.trailingReversalActive = true;
         this.ticksMovedInFavor = 0;
@@ -2686,153 +2625,25 @@ class TradingStrategy {
       return;
     }
 
-    // ===== 2.4. Real Position Continuous Trailing Logic =====
-    // Trail TP Level independently (reversal level remains fixed at initialReversalLevel)
-    if (this.currentPosition !== 'NONE' && this.tpLevel !== null && this.positionEntryPrice !== null && !this.tpLevelTrailingPaused) {
-      // Trail LONG positions in Support Zone
+    // ===== 2.4. Grid Price Tracking =====
+    // Track highest/lowest favorable price for position monitoring
+    if (this.currentPosition !== 'NONE' && this.positionEntryPrice !== null) {
       if (this.currentPosition === 'LONG' && this.activeMode === 'SUPPORT_ZONE') {
-        // Initialize highestFavorablePrice if needed
         if (this.highestFavorablePrice === null) {
           this.highestFavorablePrice = this.positionEntryPrice;
         }
-
-        // Trail TP level upward as price rises
         if (currentPrice > this.highestFavorablePrice) {
-          const ticksMoved = this._calculateTicksBetween(this.highestFavorablePrice, currentPrice);
-
-          if (ticksMoved >= this.trailStepFactor) {
-            const trailSteps = Math.floor(ticksMoved / this.trailStepFactor);
-            const actualTicksToTrail = trailSteps * this.trailStepFactor;
-
-            const previousTpLevel = this.tpLevel;
-            const newTpLevel = this._adjustPriceByTicks(this.tpLevel, actualTicksToTrail, true);
-
-            // Trail TP level upward (reversal level stays at initialReversalLevel)
-            this.tpLevel = newTpLevel;
-            this.highestFavorablePrice = this._adjustPriceByTicks(this.highestFavorablePrice, actualTicksToTrail, true);
-            this.ticksMovedInFavor += actualTicksToTrail;
-
-            await this.addLog(`LONG Trailing: Price ${this._formatPrice(currentPrice)} (+${ticksMoved} ticks). TP Level: ${this._formatPrice(previousTpLevel)} -> ${this._formatPrice(this.tpLevel)} (+${actualTicksToTrail} ticks). Initial Reversal: ${this._formatPrice(this.initialReversalLevel)} (unchanged)`);
-            await this.saveState();
-          }
+          this.highestFavorablePrice = currentPrice;
+          this.ticksMovedInFavor = this._calculateTicksBetween(this.positionEntryPrice, this.highestFavorablePrice);
         }
-      }
-      // Trail SHORT positions in Resistance Zone
-      else if (this.currentPosition === 'SHORT' && this.activeMode === 'RESISTANCE_ZONE') {
-        // Initialize lowestFavorablePrice if needed
+      } else if (this.currentPosition === 'SHORT' && this.activeMode === 'RESISTANCE_ZONE') {
         if (this.lowestFavorablePrice === null) {
           this.lowestFavorablePrice = this.positionEntryPrice;
         }
-
-        // Trail TP level downward as price falls
         if (currentPrice < this.lowestFavorablePrice) {
-          const ticksMoved = this._calculateTicksBetween(this.lowestFavorablePrice, currentPrice);
-
-          if (ticksMoved >= this.trailStepFactor) {
-            const trailSteps = Math.floor(ticksMoved / this.trailStepFactor);
-            const actualTicksToTrail = trailSteps * this.trailStepFactor;
-
-            const previousTpLevel = this.tpLevel;
-            const newTpLevel = this._adjustPriceByTicks(this.tpLevel, actualTicksToTrail, false);
-
-            // Trail TP level downward (reversal level stays at initialReversalLevel)
-            this.tpLevel = newTpLevel;
-            this.lowestFavorablePrice = this._adjustPriceByTicks(this.lowestFavorablePrice, actualTicksToTrail, false);
-            this.ticksMovedInFavor += actualTicksToTrail;
-
-            await this.addLog(`SHORT Trailing: Price ${this._formatPrice(currentPrice)} (-${ticksMoved} ticks). TP Level: ${this._formatPrice(previousTpLevel)} -> ${this._formatPrice(this.tpLevel)} (-${actualTicksToTrail} ticks). Initial Reversal: ${this._formatPrice(this.initialReversalLevel)} (unchanged)`);
-            await this.saveState();
-          }
+          this.lowestFavorablePrice = currentPrice;
+          this.ticksMovedInFavor = this._calculateTicksBetween(this.positionEntryPrice, this.lowestFavorablePrice);
         }
-      }
-    }
-
-    // ===== 2.5. Partial Take-Profit Trigger Logic =====
-    // Check TP triggers BEFORE reversal logic to allow partial exits
-    if (this.currentPosition !== 'NONE' && this.tpLevel !== null && this.positionEntryPrice !== null) {
-      let shouldExecuteTp = false;
-      let tpLabel = null;
-      let tpPercentage = null;
-
-      // For LONG positions
-      if (this.currentPosition === 'LONG' && this.activeMode === 'SUPPORT_ZONE') {
-        // Only trigger TPs if tpLevel has crossed above entry price (we're in profit)
-        if (this.tpLevel > this.positionEntryPrice) {
-          // Check if price has retraced to tpLevel
-          if (currentPrice <= this.tpLevel) {
-            // Execute TPs sequentially: TP1 -> TP2 -> TP3
-            if (!this.tp1Executed) {
-              shouldExecuteTp = true;
-              tpLabel = 'TP1';
-              tpPercentage = this.partialTp1SizePercent;
-            } else if (!this.tp2Executed) {
-              // TP2: Only execute if tpLevel has trailed higher than TP1's trigger level
-              if (this.tp1TriggerLevel !== null && this.tpLevel > this.tp1TriggerLevel) {
-                shouldExecuteTp = true;
-                tpLabel = 'TP2';
-                tpPercentage = this.partialTp2SizePercent;
-              }
-            } else if (!this.tp3Executed) {
-              // TP3: Only execute if tpLevel has trailed higher than TP2's trigger level
-              if (this.tp2TriggerLevel !== null && this.tpLevel > this.tp2TriggerLevel) {
-                shouldExecuteTp = true;
-                tpLabel = 'TP3';
-                tpPercentage = this.partialTp3SizePercent;
-              }
-            }
-          }
-        }
-      }
-      // For SHORT positions
-      else if (this.currentPosition === 'SHORT' && this.activeMode === 'RESISTANCE_ZONE') {
-        // Only trigger TPs if tpLevel has crossed below entry price (we're in profit)
-        if (this.tpLevel < this.positionEntryPrice) {
-          // Check if price has retraced to tpLevel
-          if (currentPrice >= this.tpLevel) {
-            // Execute TPs sequentially: TP1 -> TP2 -> TP3
-            if (!this.tp1Executed) {
-              shouldExecuteTp = true;
-              tpLabel = 'TP1';
-              tpPercentage = this.partialTp1SizePercent;
-            } else if (!this.tp2Executed) {
-              // TP2: Only execute if tpLevel has trailed lower than TP1's trigger level
-              if (this.tp1TriggerLevel !== null && this.tpLevel < this.tp1TriggerLevel) {
-                shouldExecuteTp = true;
-                tpLabel = 'TP2';
-                tpPercentage = this.partialTp2SizePercent;
-              }
-            } else if (!this.tp3Executed) {
-              // TP3: Only execute if tpLevel has trailed lower than TP2's trigger level
-              if (this.tp2TriggerLevel !== null && this.tpLevel < this.tp2TriggerLevel) {
-                shouldExecuteTp = true;
-                tpLabel = 'TP3';
-                tpPercentage = this.partialTp3SizePercent;
-              }
-            }
-          }
-        }
-      }
-
-      // Execute TP if trigger conditions met
-      if (shouldExecuteTp && tpLabel && tpPercentage) {
-        const success = await this.executePartialTakeProfit(tpPercentage, tpLabel);
-        if (success) {
-          // Mark TP as executed and capture the trigger level
-          if (tpLabel === 'TP1') {
-            this.tp1Executed = true;
-            this.tp1TriggerLevel = this.tpLevel;
-          } else if (tpLabel === 'TP2') {
-            this.tp2Executed = true;
-            this.tp2TriggerLevel = this.tpLevel;
-          } else if (tpLabel === 'TP3') {
-            this.tp3Executed = true;
-            this.tp3TriggerLevel = this.tpLevel;
-            this.tpLevelTrailingPaused = true;
-            await this.addLog(`${tpLabel}: TP level trailing has been paused after TP3 completion.`);
-          }
-          await this.saveState();
-        }
-        return; // Exit to prevent reversal from triggering in same tick
       }
     }
 
@@ -2858,135 +2669,10 @@ class TradingStrategy {
 
       if (shouldHandleReversal) {
         await this.addLog(`===== POSITION REVERSAL =====`);
-        await this.addLog(`Price hit Fixed Reversal Level: ${this._formatPrice(triggeredReversalLevel)} (TP Level was at: ${this._formatPrice(this.tpLevel)}). Closing remaining position.`);
+        await this.addLog(`Price hit Fixed Reversal Level: ${this._formatPrice(triggeredReversalLevel)}. Closing remaining position.`);
         await this._handleDirectReversal(currentPrice);
         return;
       }
-    }
-  }
-
-  // Execute partial take-profit by closing a percentage of the current position
-  async executePartialTakeProfit(percentage, tpLabel) {
-    this.isTradingSequenceInProgress = true;
-
-    try {
-      await this.addLog(`===== ${tpLabel} HIT =====`);
-      await this.addLog(`${tpLabel}: Price ${this._formatPrice(this.currentPrice)}, TP Level: ${this._formatPrice(this.tpLevel)}. Executing partial close...`);
-
-      // Step 1: Get current position quantity
-      let currentQuantity = null;
-
-      // Use internal tracking first (maintained by WebSocket)
-      if (this.currentPositionQuantity && this.currentPositionQuantity > 0) {
-        currentQuantity = this.currentPositionQuantity;
-        await this.addLog(`${tpLabel}: Current position: ${this._formatQuantity(currentQuantity)} ${this.symbol.replace('USDT', '')} (from internal tracking)`);
-      } else {
-        // Fallback to REST API if internal tracking is not available
-        await this.addLog(`${tpLabel}: Internal position tracking unavailable. Fetching from REST API...`);
-        const positions = await this.getCurrentPositions();
-
-        if (!positions || positions.length === 0) {
-          await this.addLog(`${tpLabel}: No position found. Aborting TP execution.`);
-          this.isTradingSequenceInProgress = false;
-          return false;
-        }
-
-        const positionData = positions.find(p => p.symbol === this.symbol);
-        if (!positionData) {
-          await this.addLog(`${tpLabel}: No position found for ${this.symbol}. Aborting TP execution.`);
-          this.isTradingSequenceInProgress = false;
-          return false;
-        }
-
-        currentQuantity = Math.abs(parseFloat(positionData.positionAmt));
-        if (currentQuantity === 0) {
-          await this.addLog(`${tpLabel}: Position quantity is zero. Aborting TP execution.`);
-          this.isTradingSequenceInProgress = false;
-          return false;
-        }
-
-        await this.addLog(`${tpLabel}: Current position: ${this._formatQuantity(currentQuantity)} ${this.symbol.replace('USDT', '')} (from REST API)`);
-      }
-
-      // Step 2: Calculate quantity to close using direct percentage calculation
-      const quantityToClose = currentQuantity * (percentage / 100);
-      const adjustedQuantityToClose = this.roundQuantity(quantityToClose);
-
-      if (adjustedQuantityToClose === 0) {
-        await this.addLog(`${tpLabel}: Calculated quantity to close is zero after rounding. Aborting TP execution.`);
-        this.isTradingSequenceInProgress = false;
-        return false;
-      }
-
-      // Step 3: Validate against minimum quantity requirement
-      const { minQty } = await this._getExchangeInfo(this.symbol);
-      if (adjustedQuantityToClose < minQty) {
-        await this.addLog(`${tpLabel}: Quantity to close ${this._formatQuantity(adjustedQuantityToClose)} is below minimum ${this._formatQuantity(minQty)}. Aborting TP execution.`);
-        this.isTradingSequenceInProgress = false;
-        return false;
-      }
-
-      await this.addLog(`${tpLabel}: Closing ${this._formatQuantity(adjustedQuantityToClose)} ${this.symbol.replace('USDT', '')} (${percentage}% of position)`);
-
-      // Step 4: Execute market order to close partial position
-      const orderSide = this.currentPosition === 'LONG' ? 'SELL' : 'BUY';
-      await this.addLog(`${tpLabel}: Placing ${orderSide} order for ${this._formatQuantity(adjustedQuantityToClose)} ${this.symbol.replace('USDT', '')}...`);
-      await this.placeMarketOrder(this.symbol, orderSide, adjustedQuantityToClose);
-
-      // Step 5: Wait for order confirmation
-      await this.addLog(`${tpLabel}: Waiting for order confirmation...`);
-      await new Promise(resolve => setTimeout(resolve, 1000));
-
-      // Step 6: Update position tracking from REST API
-      await this.addLog(`${tpLabel}: Fetching updated position from REST API...`);
-      const updatedPositions = await this.getCurrentPositions();
-
-      if (updatedPositions && updatedPositions.length > 0) {
-        const updatedPositionData = updatedPositions.find(p => p.symbol === this.symbol);
-        if (updatedPositionData) {
-          const updatedQuantity = Math.abs(parseFloat(updatedPositionData.positionAmt));
-          this.currentPositionQuantity = updatedQuantity;
-          this.positionSize = updatedQuantity * this.positionEntryPrice;
-
-          const remainingPercent = ((updatedQuantity / currentQuantity) * 100).toFixed(1);
-          await this.addLog(`${tpLabel}: Completed successfully. Remaining position: ${this._formatQuantity(updatedQuantity)} ${this.symbol.replace('USDT', '')} (${remainingPercent}%)`);
-        }
-      }
-
-      // Step 7: Recalculate breakeven and Final TP
-      if (this.currentPositionQuantity > 0) {
-        await this._calculateBreakevenAndFinalTp();
-      }
-
-      // Step 8: Update trade sequence marker
-      const tpMarker = tpLabel === 'TP1' ? 'T1.' : tpLabel === 'TP2' ? 'T2.' : 'T3.';
-      this.tradeSequence += tpMarker;
-
-      // Step 8.5: Save strategy flow event for partial TP
-      await this.saveStrategyFlowEvent(
-        tpLabel,
-        this.currentPosition,
-        this.positionEntryPrice,
-        this.currentPositionQuantity,
-        this.breakevenPrice,
-        this.breakevenPercentage,
-        this.finalTpPrice,
-        this.finalTpPercentage
-      );
-
-      // Step 9: Save state
-      await this.saveState();
-
-      await this.addLog(`${tpLabel}: Execution complete.`);
-
-      this.isTradingSequenceInProgress = false;
-      return true;
-
-    } catch (error) {
-      console.error(`Error executing ${tpLabel}:`, error);
-      await this.addLog(`ERROR: [TRADING_ERROR] ${tpLabel} execution failed: ${error.message}`);
-      this.isTradingSequenceInProgress = false;
-      return false;
     }
   }
 
@@ -3054,7 +2740,7 @@ class TradingStrategy {
       if (quantity > 0) {
         const orderSide = (newPosition === 'LONG') ? 'BUY' : 'SELL';
         await this.addLog(`Opening ${newPosition} position with quantity ${quantity}.`);
-        await this.placeMarketOrder(this.symbol, orderSide, quantity);
+        await this.placeMarketOrder(this.symbol, orderSide, quantity, newPosition);
         await this._waitForPositionChange(newPosition);
 
         // Add delay to ensure position data is fully synchronized
@@ -3068,36 +2754,17 @@ class TradingStrategy {
         this.entryLevel = this.positionEntryPrice;
 
         // Use FIXED reversal levels (DO NOT recalculate)
-        // Set initialReversalLevel to the appropriate fixed level for TP trailing
         if (newPosition === 'LONG') {
-          // LONG position: use shortReversalLevel for reversal and TP logic
           this.reversalLevel = this.shortReversalLevel;
           this.initialReversalLevel = this.shortReversalLevel;
-          this.tpLevel = this.positionEntryPrice * 0.999; // Initialize TP level 0.1% below entry
-          this.tp1Executed = false;
-          this.tp2Executed = false;
-          this.tp3Executed = false;
-          this.tp1TriggerLevel = null;
-          this.tp2TriggerLevel = null;
-          this.tp3TriggerLevel = null;
-          this.tpLevelTrailingPaused = false;
           this.highestFavorablePrice = this.positionEntryPrice;
           this.lowestFavorablePrice = null;
           this.trailingReversalActive = true;
           this.ticksMovedInFavor = 0;
           await this.addLog(`Reversal #${this.reversalCount}: LONG position opened at ${this._formatPrice(this.entryLevel)}. Will reverse at Short Reversal Level: ${this._formatPrice(this.shortReversalLevel)} (fixed).`);
         } else if (newPosition === 'SHORT') {
-          // SHORT position: use longReversalLevel for reversal and TP logic
           this.reversalLevel = this.longReversalLevel;
           this.initialReversalLevel = this.longReversalLevel;
-          this.tpLevel = this.positionEntryPrice * 1.001; // Initialize TP level 0.1% above entry
-          this.tp1Executed = false;
-          this.tp2Executed = false;
-          this.tp3Executed = false;
-          this.tp1TriggerLevel = null;
-          this.tp2TriggerLevel = null;
-          this.tp3TriggerLevel = null;
-          this.tpLevelTrailingPaused = false;
           this.highestFavorablePrice = null;
           this.lowestFavorablePrice = this.positionEntryPrice;
           this.trailingReversalActive = true;
@@ -3157,8 +2824,8 @@ class TradingStrategy {
     this.MAX_POSITION_SIZE_USDT = (3 / 4) * this.positionSizeUSDT * 50; // Set MAX_POSITION_SIZE_USDT dynamically here
     this.reversalLevelPercentage = config.reversalLevelPercentage !== undefined ? config.reversalLevelPercentage : null;
 
-    // Configure Trail Step Factor from config (default: 1)
-    this.trailStepFactor = config.trailStepFactor !== undefined ? config.trailStepFactor : 1;
+    // Configure Grid Size from config (default: 0.003)
+    this.gridSize = config.gridSize !== undefined ? config.gridSize : 0.003;
 
     // Configure Trading Mode from config
     this.tradingMode = config.tradingMode || 'NORMAL';
@@ -3216,16 +2883,6 @@ class TradingStrategy {
     this.finalTpOrderSent = false;
     this.breakevenPercentage = null;
     this.finalTpPercentage = null;
-    // Reset Partial TP states
-    this.tpLevel = null;
-    this.tp1Executed = false;
-    this.tp2Executed = false;
-    this.tp3Executed = false;
-    this.tp1TriggerLevel = null;
-    this.tp2TriggerLevel = null;
-    this.tp3TriggerLevel = null;
-    this.tpLevelTrailingPaused = false;
-
     // Reset accumulated PnL and fees for the new strategy run
     this.accumulatedRealizedPnL = 0;
     this.accumulatedTradingFees = 0;
@@ -3328,11 +2985,11 @@ class TradingStrategy {
       // Core setup steps that must happen first
       await this._getExchangeInfo(this.symbol); 
       await this.setLeverage(this.symbol, 50); 
-      const currentPositionMode = await this.getPositionMode(); 
-      if (currentPositionMode.dualSidePosition) {
-        await this.setPositionMode(false); // Set to one-way mode
+      const currentPositionMode = await this.getPositionMode();
+      if (!currentPositionMode.dualSidePosition) {
+        await this.setPositionMode(true); // Set to hedge mode
       } else {
-        //await this.addLog(`Pos. mode already One-way.`); 
+        //await this.addLog(`Pos. mode already Hedge.`);
       }
       await this._checkExistingOrdersAndPositions();
 
@@ -3381,7 +3038,7 @@ class TradingStrategy {
           if (this.buyLongEnabled) {
             //await this.addLog(`Placing initial BUY MARKET order for ${quantity} ${this.symbol}.`);
             const initialEntryLevel = this.entryLevel;
-            await this.placeMarketOrder(this.symbol, 'BUY', quantity);
+            await this.placeMarketOrder(this.symbol, 'BUY', quantity, 'LONG');
             await this._waitForPositionChange('LONG'); // Wait for position to be LONG
 
             // Add delay to ensure position data is fully synchronized
@@ -3401,23 +3058,13 @@ class TradingStrategy {
               this.shortReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, false);
               this.fixedReversalLevelsCalculated = true;
 
-              // For backward compatibility, set reversalLevel and initialReversalLevel
               this.reversalLevel = this.shortReversalLevel;
               this.initialReversalLevel = this.shortReversalLevel;
-              this.tpLevel = this.positionEntryPrice * 0.999; // Initialize TP level 0.1% below entry
-              this.tp1Executed = false;
-              this.tp2Executed = false;
-              this.tp3Executed = false;
-              this.tp1TriggerLevel = null;
-              this.tp2TriggerLevel = null;
-              this.tp3TriggerLevel = null;
-              this.tpLevelTrailingPaused = false;
               await this.addLog(`Entry Level updated: ${this._formatPrice(initialEntryLevel)} -> ${this._formatPrice(this.entryLevel)} (actual fill price).`);
               await this.addLog(`Fixed Reversal Levels - Long: ${this._formatPrice(this.longReversalLevel)}, Short: ${this._formatPrice(this.shortReversalLevel)}.`);
-              await this.addLog(`TP Trailing Level starts at ${this.tpLevel}.`);
             }
 
-            // LONG position in Support Zone: Initialize continuous trailing
+            // LONG position in Support Zone: Initialize price tracking
             this.highestFavorablePrice = this.positionEntryPrice;
             this.trailingReversalActive = true;
             this.ticksMovedInFavor = 0;
@@ -3454,7 +3101,7 @@ class TradingStrategy {
           } else if (this.sellShortEnabled) {
             //await this.addLog(`Placing initial SELL MARKET order for ${quantity} ${this.symbol}.`);
             const initialEntryLevel = this.entryLevel;
-            await this.placeMarketOrder(this.symbol, 'SELL', quantity);
+            await this.placeMarketOrder(this.symbol, 'SELL', quantity, 'SHORT');
             await this._waitForPositionChange('SHORT'); // Wait for position to be SHORT
 
             // Add delay to ensure position data is fully synchronized
@@ -3474,23 +3121,13 @@ class TradingStrategy {
               this.longReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, true);
               this.fixedReversalLevelsCalculated = true;
 
-              // For backward compatibility, set reversalLevel and initialReversalLevel
               this.reversalLevel = this.longReversalLevel;
               this.initialReversalLevel = this.longReversalLevel;
-              this.tpLevel = this.positionEntryPrice * 1.001; // Initialize TP level 0.1% above entry
-              this.tp1Executed = false;
-              this.tp2Executed = false;
-              this.tp3Executed = false;
-              this.tp1TriggerLevel = null;
-              this.tp2TriggerLevel = null;
-              this.tp3TriggerLevel = null;
-              this.tpLevelTrailingPaused = false;
               await this.addLog(`Entry Level updated: ${this._formatPrice(initialEntryLevel)} -> ${this._formatPrice(this.entryLevel)} (actual fill price).`);
               await this.addLog(`Fixed Reversal Levels - Short: ${this._formatPrice(this.shortReversalLevel)}, Long: ${this._formatPrice(this.longReversalLevel)}.`);
-              await this.addLog(`TP Trailing Level starts at ${this.tpLevel}.`);
             }
 
-            // SHORT position in Resistance Zone: Initialize continuous trailing
+            // SHORT position in Resistance Zone: Initialize price tracking
             this.lowestFavorablePrice = this.positionEntryPrice;
             this.trailingReversalActive = true;
             this.ticksMovedInFavor = 0;
@@ -3538,7 +3175,7 @@ class TradingStrategy {
           quantity = await this._calculateAdjustedQuantity(this.symbol, this.initialBasePositionSizeUSDT, this.buyLimitPrice);
           if (quantity > 0) {
             try {
-              const orderResult = await this.placeLimitOrder(this.symbol, 'BUY', quantity, this.buyLimitPrice);
+              const orderResult = await this.placeLimitOrder(this.symbol, 'BUY', quantity, this.buyLimitPrice, 'LONG');
               this.longLimitOrderId = orderResult.orderId;
               initialOrderPlaced = true;
               // Store timeout for this order
@@ -3580,7 +3217,7 @@ class TradingStrategy {
             try {
               //await this.addLog(`Placing initial SELL LIMIT order for ${quantity} at ${this.sellLimitPrice}.`);
               this._pendingLogMessage = 'initial'; // Set flag before order
-              const orderResult = await this.placeLimitOrder(this.symbol, 'SELL', quantity, this.sellLimitPrice);
+              const orderResult = await this.placeLimitOrder(this.symbol, 'SELL', quantity, this.sellLimitPrice, 'SHORT');
               this.shortLimitOrderId = orderResult.orderId;
               initialOrderPlaced = true;
               // Store timeout for this order
@@ -3634,6 +3271,7 @@ class TradingStrategy {
     }
 
     await this.addLog(`Strategy started: ${this.strategyId}`);
+    await this.addLog(`Check it out babe~`);
     await this.addLog(`  Pair: ${this.symbol}`);
     await this.addLog(`  Initial Position Size: ${this._formatNotional(this.initialBasePositionSizeUSDT)} USDT`); // Log initial base
     await this.addLog(`  Allowable Exposure: ${this._formatNotional(this.MAX_POSITION_SIZE_USDT)} USDT`); // Log max exposure
@@ -3644,10 +3282,7 @@ class TradingStrategy {
     await this.addLog(`  Price Type: ${this.priceType === 'LAST' ? 'Last Price' : 'Mark Price'}`);
     await this.addLog(`  Recovery Factor: ${(this.RECOVERY_FACTOR * 100).toFixed(1)}%`);
     await this.addLog(`  Recovery Distance: ${(this.RECOVERY_DISTANCE * 100).toFixed(2)}%`);
-    await this.addLog(`  Trail Step Factor: ${this.trailStepFactor}`);
-    await this.addLog(`  TP Size 1: ${this.partialTp1SizePercent}%`);
-    await this.addLog(`  TP Size 2: ${this.partialTp2SizePercent}%`);
-    await this.addLog(`  TP Size 3: ${this.partialTp3SizePercent}%`);
+    await this.addLog(`  Grid Size: ${(this.gridSize * 100).toFixed(2)}%`);
     const currentProfitPercentage = 1.55;
     await this.addLog(`  Desired Profit %: ${currentProfitPercentage}%`);
     await this.addLog(`  Order Type: ${this.orderType}`);
@@ -3791,82 +3426,30 @@ class TradingStrategy {
         const oldShortLevel = this.shortReversalLevel;
 
         if (this.currentPosition === 'LONG') {
-          // For LONG position: keep longReversalLevel at entry, recalculate shortReversalLevel
           this.longReversalLevel = this.positionEntryPrice;
           this.shortReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, false);
-
-          // Update reversal and TP levels for LONG position
           this.reversalLevel = this.shortReversalLevel;
           this.initialReversalLevel = this.shortReversalLevel;
-          this.tpLevel = this.positionEntryPrice * 0.999; // Update TP level 0.1% below entry
-          this.tp1Executed = false;
-          this.tp2Executed = false;
-          this.tp3Executed = false;
-          this.tp1TriggerLevel = null;
-          this.tp2TriggerLevel = null;
-          this.tp3TriggerLevel = null;
-          this.tpLevelTrailingPaused = false;
-          // Reset trailing state
           this.highestFavorablePrice = this.positionEntryPrice;
           this.ticksMovedInFavor = 0;
-
           await this.addLog(`Fixed reversal levels recalculated - Long: ${this._formatPrice(this.longReversalLevel)} (unchanged), Short: ${this._formatPrice(oldShortLevel)} -> ${this._formatPrice(this.shortReversalLevel)}.`);
         } else if (this.currentPosition === 'SHORT') {
-          // For SHORT position: keep shortReversalLevel at entry, recalculate longReversalLevel
           this.shortReversalLevel = this.positionEntryPrice;
           this.longReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, true);
-
-          // Update reversal and TP levels for SHORT position
           this.reversalLevel = this.longReversalLevel;
           this.initialReversalLevel = this.longReversalLevel;
-          this.tpLevel = this.positionEntryPrice * 1.001; // Update TP level 0.1% above entry
-          this.tp1Executed = false;
-          this.tp2Executed = false;
-          this.tp3Executed = false;
-          this.tp1TriggerLevel = null;
-          this.tp2TriggerLevel = null;
-          this.tp3TriggerLevel = null;
-          this.tpLevelTrailingPaused = false;
-          // Reset trailing state
           this.lowestFavorablePrice = this.positionEntryPrice;
           this.ticksMovedInFavor = 0;
-
           await this.addLog(`Fixed reversal levels recalculated - Short: ${this._formatPrice(this.shortReversalLevel)} (unchanged), Long: ${this._formatPrice(oldLongLevel)} -> ${this._formatPrice(this.longReversalLevel)}.`);
         }
       }
     }
 
-    // Update Trail Step Factor if provided
-    if (newConfig.trailStepFactor !== undefined && newConfig.trailStepFactor !== null) {
-      const oldValue = this.trailStepFactor;
-      this.trailStepFactor = newConfig.trailStepFactor;
-
-      const stepDescription = this.trailStepFactor === 1 ? 'Every tick' : `Every ${this.trailStepFactor} ticks`;
-      const oldStepDescription = oldValue === 1 ? 'Every tick' : `Every ${oldValue} ticks`;
-
-      await this.addLog(`Updated Trail Step Factor from ${oldValue} (${oldStepDescription}) to ${this.trailStepFactor} (${stepDescription}).`);
-      await this.addLog(`Note: New trail step factor will affect trailing behavior on future price movements.`);
-    }
-
-    // Update Partial TP1 Size Percent if provided
-    if (newConfig.partialTp1SizePercent !== undefined && newConfig.partialTp1SizePercent !== null) {
-      const oldValue = this.partialTp1SizePercent;
-      this.partialTp1SizePercent = newConfig.partialTp1SizePercent;
-      await this.addLog(`Updated Partial TP1 Size from ${oldValue}% to ${this.partialTp1SizePercent}%.`);
-    }
-
-    // Update Partial TP2 Size Percent if provided
-    if (newConfig.partialTp2SizePercent !== undefined && newConfig.partialTp2SizePercent !== null) {
-      const oldValue = this.partialTp2SizePercent;
-      this.partialTp2SizePercent = newConfig.partialTp2SizePercent;
-      await this.addLog(`Updated Partial TP2 Size from ${oldValue}% to ${this.partialTp2SizePercent}%.`);
-    }
-
-    // Update Partial TP3 Size Percent if provided
-    if (newConfig.partialTp3SizePercent !== undefined && newConfig.partialTp3SizePercent !== null) {
-      const oldValue = this.partialTp3SizePercent;
-      this.partialTp3SizePercent = newConfig.partialTp3SizePercent;
-      await this.addLog(`Updated Partial TP3 Size from ${oldValue}% to ${this.partialTp3SizePercent}%.`);
+    // Update Grid Size if provided
+    if (newConfig.gridSize !== undefined && newConfig.gridSize !== null) {
+      const oldValue = this.gridSize;
+      this.gridSize = newConfig.gridSize;
+      await this.addLog(`Updated Grid Size from ${(oldValue * 100).toFixed(2)}% to ${(this.gridSize * 100).toFixed(2)}%.`);
     }
 
     // Update specific config parameters
@@ -4070,7 +3653,7 @@ class TradingStrategy {
 
         if (this.buyLongEnabled) {
           await this.addLog(`Restart: Placing BUY MARKET order for ${this._formatQuantity(quantity)} ${this.symbol}.`);
-          await this.placeMarketOrder(this.symbol, 'BUY', quantity);
+          await this.placeMarketOrder(this.symbol, 'BUY', quantity, 'LONG');
           await this._waitForPositionChange('LONG');
 
           // Add delay to ensure position data is fully synchronized
@@ -4092,19 +3675,11 @@ class TradingStrategy {
             await this.addLog(`Restart: Fixed Reversal Levels calculated - Long: ${this._formatPrice(this.longReversalLevel)}, Short: ${this._formatPrice(this.shortReversalLevel)}.`);
           }
 
-          // Set reversal and TP levels using fixed levels
+          // Set reversal levels using fixed levels
           if (this.reversalLevelPercentage !== null) {
             this.reversalLevel = this.shortReversalLevel;
             this.initialReversalLevel = this.shortReversalLevel;
-            this.tpLevel = this.positionEntryPrice * 0.999; // Initialize TP level 0.1% below entry
-            this.tp1Executed = false;
-            this.tp2Executed = false;
-            this.tp3Executed = false;
-            this.tp1TriggerLevel = null;
-            this.tp2TriggerLevel = null;
-            this.tp3TriggerLevel = null;
-            this.tpLevelTrailingPaused = false;
-            await this.addLog(`Restart: Entry Level: ${this._formatPrice(this.entryLevel)}, Will reverse at Short Level: ${this._formatPrice(this.shortReversalLevel)} (fixed), TP Level: ${this._formatPrice(this.tpLevel)} (trailing).`);
+            await this.addLog(`Restart: Entry Level: ${this._formatPrice(this.entryLevel)}, Will reverse at Short Level: ${this._formatPrice(this.shortReversalLevel)} (fixed), Grid Size: ${(this.gridSize * 100).toFixed(2)}%.`);
           }
 
           // LONG position: Initialize continuous trailing
@@ -4134,7 +3709,7 @@ class TradingStrategy {
 
         } else if (this.sellShortEnabled) {
           await this.addLog(`Restart: Placing SELL MARKET order for ${this._formatQuantity(quantity)} ${this.symbol}.`);
-          await this.placeMarketOrder(this.symbol, 'SELL', quantity);
+          await this.placeMarketOrder(this.symbol, 'SELL', quantity, 'SHORT');
           await this._waitForPositionChange('SHORT');
 
           // Add delay to ensure position data is fully synchronized
@@ -4156,19 +3731,11 @@ class TradingStrategy {
             await this.addLog(`Restart: Fixed Reversal Levels calculated - Short: ${this._formatPrice(this.shortReversalLevel)}, Long: ${this._formatPrice(this.longReversalLevel)}.`);
           }
 
-          // Set reversal and TP levels using fixed levels
+          // Set reversal levels using fixed levels
           if (this.reversalLevelPercentage !== null) {
             this.reversalLevel = this.longReversalLevel;
             this.initialReversalLevel = this.longReversalLevel;
-            this.tpLevel = this.positionEntryPrice * 1.001; // Initialize TP level 0.1% above entry
-            this.tp1Executed = false;
-            this.tp2Executed = false;
-            this.tp3Executed = false;
-            this.tp1TriggerLevel = null;
-            this.tp2TriggerLevel = null;
-            this.tp3TriggerLevel = null;
-            this.tpLevelTrailingPaused = false;
-            await this.addLog(`Restart: Entry Level: ${this._formatPrice(this.entryLevel)}, Will reverse at Long Level: ${this._formatPrice(this.longReversalLevel)} (fixed), TP Level: ${this._formatPrice(this.tpLevel)} (trailing).`);
+            await this.addLog(`Restart: Entry Level: ${this._formatPrice(this.entryLevel)}, Will reverse at Long Level: ${this._formatPrice(this.longReversalLevel)} (fixed), Grid Size: ${(this.gridSize * 100).toFixed(2)}%.`);
           }
 
           // SHORT position: Initialize continuous trailing
@@ -4217,7 +3784,7 @@ class TradingStrategy {
           if (quantity > 0) {
             try {
               await this.addLog(`Restart: Placing BUY LIMIT order for ${this._formatQuantity(quantity)} at ${this._formatPrice(this.buyLimitPrice)}.`);
-              const orderResult = await this.placeLimitOrder(this.symbol, 'BUY', quantity, this.buyLimitPrice);
+              const orderResult = await this.placeLimitOrder(this.symbol, 'BUY', quantity, this.buyLimitPrice, 'LONG');
               this.longLimitOrderId = orderResult.orderId;
               initialOrderPlaced = true;
 
@@ -4261,7 +3828,7 @@ class TradingStrategy {
           if (quantity > 0) {
             try {
               await this.addLog(`Restart: Placing SELL LIMIT order for ${this._formatQuantity(quantity)} at ${this._formatPrice(this.sellLimitPrice)}.`);
-              const orderResult = await this.placeLimitOrder(this.symbol, 'SELL', quantity, this.sellLimitPrice);
+              const orderResult = await this.placeLimitOrder(this.symbol, 'SELL', quantity, this.sellLimitPrice, 'SHORT');
               this.shortLimitOrderId = orderResult.orderId;
               initialOrderPlaced = true;
 
@@ -4520,16 +4087,6 @@ class TradingStrategy {
     this.finalTpOrderSent = false;
     this.breakevenPercentage = null;
     this.finalTpPercentage = null;
-    // Reset Partial TP states
-    this.tpLevel = null;
-    this.tp1Executed = false;
-    this.tp2Executed = false;
-    this.tp3Executed = false;
-    this.tp1TriggerLevel = null;
-    this.tp2TriggerLevel = null;
-    this.tp3TriggerLevel = null;
-    this.tpLevelTrailingPaused = false;
-
     this.supportLevel = null;
     this.resistanceLevel = null;
     this.enableSupport = false;
@@ -4751,7 +4308,7 @@ class TradingStrategy {
       enableSupport: this.enableSupport,
       enableResistance: this.enableResistance,
       reversalLevelPercentage: this.reversalLevelPercentage,
-      trailStepFactor: this.trailStepFactor,
+      gridSize: this.gridSize,
       orderType: this.orderType,
       buyLongEnabled: this.buyLongEnabled,
       sellShortEnabled: this.sellShortEnabled,
@@ -4822,16 +4379,13 @@ class TradingStrategy {
       middleLevelPrice: this.middleLevelPrice,
       middleLevelReached: this.middleLevelReached,
       trailingLockPrice: this.middleLevelReached ? this.middleLevelPrice : null,
-      // Partial Take-Profit state
-      partialTpState: {
-        tpLevel: this.tpLevel,
+      // Grid trading state
+      gridState: {
+        gridSize: this.gridSize,
         initialReversalLevel: this.initialReversalLevel,
-        tp1Executed: this.tp1Executed,
-        tp2Executed: this.tp2Executed,
-        tp3Executed: this.tp3Executed,
-        partialTp1SizePercent: this.partialTp1SizePercent,
-        partialTp2SizePercent: this.partialTp2SizePercent,
-        partialTp3SizePercent: this.partialTp3SizePercent,
+        highestFavorablePrice: this.highestFavorablePrice,
+        lowestFavorablePrice: this.lowestFavorablePrice,
+        ticksMovedInFavor: this.ticksMovedInFavor,
       },
       // Virtual position state
       virtualPositionState: {

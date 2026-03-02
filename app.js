@@ -136,10 +136,10 @@ app.post('/strategy/start', async (req, res) => {
       }
     }
 
-    // Validate trailStepFactor if provided
-    if (config.trailStepFactor !== undefined && config.trailStepFactor !== null) {
-      if (!Number.isInteger(config.trailStepFactor) || config.trailStepFactor < 1 || config.trailStepFactor > 10) {
-        return res.status(400).json({ error: 'Invalid trailStepFactor. Must be an integer between 1 and 10.' });
+    // Validate gridSize if provided
+    if (config.gridSize !== undefined && config.gridSize !== null) {
+      if (isNaN(config.gridSize) || config.gridSize <= 0 || config.gridSize > 0.1) {
+        return res.status(400).json({ error: 'Invalid gridSize. Must be a positive number no greater than 0.1 (10%).' });
       }
     }
 
@@ -731,12 +731,9 @@ app.post('/strategy/update-config', async (req, res) => {
       tradingMode,
       priceType,
       reversalLevelPercentage,
-      trailStepFactor,
+      gridSize,
       recoveryFactor,
       recoveryDistance,
-      partialTp1SizePercent,
-      partialTp2SizePercent,
-      partialTp3SizePercent
     } = req.body; // Expect strategyId and optional config fields
 
     if (!strategyId) {
@@ -835,11 +832,11 @@ app.post('/strategy/update-config', async (req, res) => {
       }
     }
 
-    // Validate trailStepFactor if provided
-    if (trailStepFactor !== undefined && trailStepFactor !== null) {
-      if (isNaN(trailStepFactor) || trailStepFactor <= 0 || !Number.isInteger(trailStepFactor)) {
+    // Validate gridSize if provided
+    if (gridSize !== undefined && gridSize !== null) {
+      if (isNaN(gridSize) || gridSize <= 0 || gridSize > 0.1) {
         return res.status(400).json({
-          error: 'Invalid trailStepFactor. Must be a positive integer.'
+          error: 'Invalid gridSize. Must be a positive number no greater than 0.1 (10%).'
         });
       }
     }
@@ -858,33 +855,6 @@ app.post('/strategy/update-config', async (req, res) => {
       if (isNaN(recoveryDistance) || recoveryDistance <= 0) {
         return res.status(400).json({
           error: 'Invalid recoveryDistance. Must be a positive number.'
-        });
-      }
-    }
-
-    // Validate partialTp1SizePercent if provided
-    if (partialTp1SizePercent !== undefined && partialTp1SizePercent !== null) {
-      if (isNaN(partialTp1SizePercent) || partialTp1SizePercent < 0 || partialTp1SizePercent > 100) {
-        return res.status(400).json({
-          error: 'Invalid partialTp1SizePercent. Must be between 0 and 100.'
-        });
-      }
-    }
-
-    // Validate partialTp2SizePercent if provided
-    if (partialTp2SizePercent !== undefined && partialTp2SizePercent !== null) {
-      if (isNaN(partialTp2SizePercent) || partialTp2SizePercent < 0 || partialTp2SizePercent > 100) {
-        return res.status(400).json({
-          error: 'Invalid partialTp2SizePercent. Must be between 0 and 100.'
-        });
-      }
-    }
-
-    // Validate partialTp3SizePercent if provided
-    if (partialTp3SizePercent !== undefined && partialTp3SizePercent !== null) {
-      if (isNaN(partialTp3SizePercent) || partialTp3SizePercent < 0 || partialTp3SizePercent > 100) {
-        return res.status(400).json({
-          error: 'Invalid partialTp3SizePercent. Must be between 0 and 100.'
         });
       }
     }
@@ -922,23 +892,14 @@ app.post('/strategy/update-config', async (req, res) => {
     if (reversalLevelPercentage !== undefined && reversalLevelPercentage !== null) {
       updateConfig.reversalLevelPercentage = reversalLevelPercentage;
     }
-    if (trailStepFactor !== undefined && trailStepFactor !== null) {
-      updateConfig.trailStepFactor = trailStepFactor;
+    if (gridSize !== undefined && gridSize !== null) {
+      updateConfig.gridSize = gridSize;
     }
     if (recoveryFactor !== undefined && recoveryFactor !== null) {
       updateConfig.recoveryFactor = recoveryFactor;
     }
     if (recoveryDistance !== undefined && recoveryDistance !== null) {
       updateConfig.recoveryDistance = recoveryDistance;
-    }
-    if (partialTp1SizePercent !== undefined && partialTp1SizePercent !== null) {
-      updateConfig.partialTp1SizePercent = partialTp1SizePercent;
-    }
-    if (partialTp2SizePercent !== undefined && partialTp2SizePercent !== null) {
-      updateConfig.partialTp2SizePercent = partialTp2SizePercent;
-    }
-    if (partialTp3SizePercent !== undefined && partialTp3SizePercent !== null) {
-      updateConfig.partialTp3SizePercent = partialTp3SizePercent;
     }
 
     await strategy.updateConfig(updateConfig);
