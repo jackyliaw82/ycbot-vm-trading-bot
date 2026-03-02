@@ -732,6 +732,7 @@ app.post('/strategy/update-config', async (req, res) => {
       priceType,
       reversalLevelPercentage,
       gridSize,
+      gridLevelsPerSide,
       recoveryFactor,
       recoveryDistance,
     } = req.body; // Expect strategyId and optional config fields
@@ -841,6 +842,15 @@ app.post('/strategy/update-config', async (req, res) => {
       }
     }
 
+    // Validate gridLevelsPerSide if provided
+    if (gridLevelsPerSide !== undefined && gridLevelsPerSide !== null) {
+      if (!Number.isInteger(gridLevelsPerSide) || gridLevelsPerSide < 1 || gridLevelsPerSide > 20) {
+        return res.status(400).json({
+          error: 'Invalid gridLevelsPerSide. Must be an integer between 1 and 20.'
+        });
+      }
+    }
+
     // Validate recoveryFactor if provided
     if (recoveryFactor !== undefined && recoveryFactor !== null) {
       if (isNaN(recoveryFactor) || recoveryFactor <= 0) {
@@ -894,6 +904,9 @@ app.post('/strategy/update-config', async (req, res) => {
     }
     if (gridSize !== undefined && gridSize !== null) {
       updateConfig.gridSize = gridSize;
+    }
+    if (gridLevelsPerSide !== undefined && gridLevelsPerSide !== null) {
+      updateConfig.gridLevelsPerSide = gridLevelsPerSide;
     }
     if (recoveryFactor !== undefined && recoveryFactor !== null) {
       updateConfig.recoveryFactor = recoveryFactor;

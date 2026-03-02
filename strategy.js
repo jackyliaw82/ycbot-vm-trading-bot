@@ -111,10 +111,20 @@ class TradingStrategy {
 
     // Grid trading state variables
     this.gridSize = 0.003; // Grid step size as decimal (e.g., 0.003 = 0.3%)
-    this.highestFavorablePrice = null; // Highest price reached for LONG positions
-    this.lowestFavorablePrice = null; // Lowest price reached for SHORT positions
-    this.trailingReversalActive = false; // Whether trailing is currently active
-    this.ticksMovedInFavor = 0; // Accumulated ticks moved in favorable direction
+    this.gridLevelsPerSide = 5; // Number of grid levels on each side of anchor (1–20)
+    this.anchorPrice = null; // Price recorded at strategy start; centre of the grid
+    this.gridMode = 'WITHIN'; // 'WITHIN' | 'OUT_OF_GRID'
+    this.gridBaseSize = null; // Current base size used for grid level sizing (recalculated after OOG reset)
+    this.gridLevels = []; // 2*gridLevelsPerSide objects: {levelIndex, direction, price, state, positionSize}
+    this.lastProcessedPrice = null; // Previous tick price — used for crossing detection
+
+    // Out-of-grid state
+    this.outOfGridDirection = null; // 'LONG' | 'SHORT' — direction of consolidated OOG position
+    this.outOfGridConsolidatedSize = null; // Total size (USDT) of the OOG consolidated position
+    this.outOfGridConsolidatedQuantity = null; // Total quantity (base asset) of the OOG consolidated position
+    this.outOfGridTranchesRemaining = 0; // gridLevelsPerSide → 0 as tranches are TP'd
+    this.outOfGridTrancheTakenFlags = new Array(this.gridLevelsPerSide).fill(false); // Which tranches have been executed
+    this.outOfGridPhase = null; // 'INITIAL' (at reversal level) | 'REENTRY' (crossed back to Level 5)
 
     // New Order Type and Direction states
     this.orderType = 'MARKET'; // 'LIMIT' | 'MARKET'
@@ -429,10 +439,18 @@ class TradingStrategy {
         circuitBreakerTimestamp: this.circuitBreakerTimestamp,
         // Grid trading state
         gridSize: this.gridSize,
-        highestFavorablePrice: this.highestFavorablePrice,
-        lowestFavorablePrice: this.lowestFavorablePrice,
-        trailingReversalActive: this.trailingReversalActive,
-        ticksMovedInFavor: this.ticksMovedInFavor,
+        gridLevelsPerSide: this.gridLevelsPerSide,
+        anchorPrice: this.anchorPrice,
+        gridMode: this.gridMode,
+        gridBaseSize: this.gridBaseSize,
+        gridLevels: this.gridLevels,
+        // Out-of-grid state
+        outOfGridDirection: this.outOfGridDirection,
+        outOfGridConsolidatedSize: this.outOfGridConsolidatedSize,
+        outOfGridConsolidatedQuantity: this.outOfGridConsolidatedQuantity,
+        outOfGridTranchesRemaining: this.outOfGridTranchesRemaining,
+        outOfGridTrancheTakenFlags: this.outOfGridTrancheTakenFlags,
+        outOfGridPhase: this.outOfGridPhase,
       };
 
       // Filter out undefined values and validate numeric fields to prevent Firestore errors
@@ -446,8 +464,7 @@ class TradingStrategy {
         'breakevenPrice', 'finalTpPrice', 'breakevenPercentage', 'finalTpPercentage',
         'buyLimitPrice', 'sellLimitPrice', 'initialWalletBalance', 'profitPercentage',
         'maxAllowableLoss', 'customFinalTpLong', 'customFinalTpShort', 'desiredProfitUSDT',
-        'gridSize', 'highestFavorablePrice', 'lowestFavorablePrice',
-        'ticksMovedInFavor'
+        'gridSize', 'gridLevelsPerSide', 'anchorPrice', 'gridBaseSize', 'outOfGridConsolidatedSize', 'outOfGridConsolidatedQuantity'
       ];
 
       for (const key in rawData) {
@@ -669,10 +686,19 @@ class TradingStrategy {
 
         // Load Grid trading state
         this.gridSize = this._validateNumericValue(data.gridSize, 'gridSize', 0.003);
-        this.highestFavorablePrice = this._validateNumericValue(data.highestFavorablePrice, 'highestFavorablePrice', null);
-        this.lowestFavorablePrice = this._validateNumericValue(data.lowestFavorablePrice, 'lowestFavorablePrice', null);
-        this.trailingReversalActive = data.trailingReversalActive !== undefined ? data.trailingReversalActive : false;
-        this.ticksMovedInFavor = this._validateNumericValue(data.ticksMovedInFavor, 'ticksMovedInFavor', 0);
+        this.gridLevelsPerSide = (Number.isInteger(data.gridLevelsPerSide) && data.gridLevelsPerSide >= 1)
+          ? data.gridLevelsPerSide : 5;
+        this.anchorPrice = this._validateNumericValue(data.anchorPrice, 'anchorPrice', null);
+        this.gridMode = data.gridMode || 'WITHIN';
+        this.gridBaseSize = this._validateNumericValue(data.gridBaseSize, 'gridBaseSize', null);
+        this.gridLevels = Array.isArray(data.gridLevels) ? data.gridLevels : [];
+        // Load out-of-grid state
+        this.outOfGridDirection = data.outOfGridDirection || null;
+        this.outOfGridConsolidatedSize = this._validateNumericValue(data.outOfGridConsolidatedSize, 'outOfGridConsolidatedSize', null);
+        this.outOfGridConsolidatedQuantity = this._validateNumericValue(data.outOfGridConsolidatedQuantity, 'outOfGridConsolidatedQuantity', null);
+        this.outOfGridTranchesRemaining = typeof data.outOfGridTranchesRemaining === 'number' ? data.outOfGridTranchesRemaining : 0;
+        this.outOfGridTrancheTakenFlags = Array.isArray(data.outOfGridTrancheTakenFlags) ? data.outOfGridTrancheTakenFlags : new Array(this.gridLevelsPerSide).fill(false);
+        this.outOfGridPhase = data.outOfGridPhase || null;
 
         await this._getExchangeInfo(this.symbol); // Use the new method to fetch and cache exchange info
 
@@ -1436,11 +1462,6 @@ class TradingStrategy {
         this.reversalLevel = this.shortReversalLevel;
         this.initialReversalLevel = this.shortReversalLevel;
         await this.addLog(`Initial LONG position established. Entry: ${this._formatPrice(this.entryLevel)}, Long Reversal Level: ${this._formatPrice(this.longReversalLevel)}, Short Reversal Level: ${this._formatPrice(this.shortReversalLevel)} (fixed range), Grid Size: ${(this.gridSize * 100).toFixed(2)}%.`);
-
-        // Initialize price tracking for LONG position
-        this.highestFavorablePrice = this.positionEntryPrice;
-        this.trailingReversalActive = true;
-        this.ticksMovedInFavor = 0;
       } else if (this.currentPosition === 'SHORT') {
         this.shortReversalLevel = this.positionEntryPrice;
         this.longReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, true);
@@ -1449,11 +1470,6 @@ class TradingStrategy {
         this.reversalLevel = this.longReversalLevel;
         this.initialReversalLevel = this.longReversalLevel;
         await this.addLog(`Initial SHORT position established. Entry: ${this._formatPrice(this.entryLevel)}, Short Reversal Level: ${this._formatPrice(this.shortReversalLevel)}, Long Reversal Level: ${this._formatPrice(this.longReversalLevel)} (fixed range), Grid Size: ${(this.gridSize * 100).toFixed(2)}%.`);
-
-        // Initialize price tracking for SHORT position
-        this.lowestFavorablePrice = this.positionEntryPrice;
-        this.trailingReversalActive = true;
-        this.ticksMovedInFavor = 0;
       }
     }
 
@@ -2555,8 +2571,15 @@ class TradingStrategy {
       return;
     }
 
-    // Only execute trading logic if strategy is running AND position exists
-    if (!this.isRunning || this.currentPosition === 'NONE') {
+    // Only execute trading logic if strategy is running
+    if (!this.isRunning) {
+      return;
+    }
+
+    // ===== Grid Initialization — first price tick after strategy starts =====
+    if (this.anchorPrice === null) {
+      await this.initializeGrid(currentPrice);
+      this.lastProcessedPrice = currentPrice;
       return;
     }
 
@@ -2625,55 +2648,18 @@ class TradingStrategy {
       return;
     }
 
-    // ===== 2.4. Grid Price Tracking =====
-    // Track highest/lowest favorable price for position monitoring
-    if (this.currentPosition !== 'NONE' && this.positionEntryPrice !== null) {
-      if (this.currentPosition === 'LONG' && this.activeMode === 'SUPPORT_ZONE') {
-        if (this.highestFavorablePrice === null) {
-          this.highestFavorablePrice = this.positionEntryPrice;
-        }
-        if (currentPrice > this.highestFavorablePrice) {
-          this.highestFavorablePrice = currentPrice;
-          this.ticksMovedInFavor = this._calculateTicksBetween(this.positionEntryPrice, this.highestFavorablePrice);
-        }
-      } else if (this.currentPosition === 'SHORT' && this.activeMode === 'RESISTANCE_ZONE') {
-        if (this.lowestFavorablePrice === null) {
-          this.lowestFavorablePrice = this.positionEntryPrice;
-        }
-        if (currentPrice < this.lowestFavorablePrice) {
-          this.lowestFavorablePrice = currentPrice;
-          this.ticksMovedInFavor = this._calculateTicksBetween(this.positionEntryPrice, this.lowestFavorablePrice);
-        }
+    // ===== 3. Grid Price Crossing Logic =====
+    const prevPrice = this.lastProcessedPrice;
+    if (prevPrice !== null && prevPrice !== currentPrice) {
+      if (this.gridMode === 'WITHIN') {
+        await this._processGridCrossings(prevPrice, currentPrice);
+      } else if (this.gridMode === 'OUT_OF_GRID') {
+        await this._processOutOfGridCrossings(prevPrice, currentPrice);
       }
     }
 
-    // ===== 3. Real Position Reversal Logic =====
-    // Use fixed reversal levels for reversal trigger (calculated once at initial position)
-    if (this.currentPosition !== 'NONE' && this.activeMode !== 'NONE' && this.fixedReversalLevelsCalculated) {
-      let shouldHandleReversal = false;
-      let triggeredReversalLevel = null;
-
-      if (this.activeMode === 'RESISTANCE_ZONE') {
-        // SHORT positions in Resistance Zone: reverse when price hits longReversalLevel (above)
-        if (this.currentPosition === 'SHORT' && currentPrice >= this.longReversalLevel) {
-          shouldHandleReversal = true;
-          triggeredReversalLevel = this.longReversalLevel;
-        }
-      } else if (this.activeMode === 'SUPPORT_ZONE') {
-        // LONG positions in Support Zone: reverse when price hits shortReversalLevel (below)
-        if (this.currentPosition === 'LONG' && currentPrice <= this.shortReversalLevel) {
-          shouldHandleReversal = true;
-          triggeredReversalLevel = this.shortReversalLevel;
-        }
-      }
-
-      if (shouldHandleReversal) {
-        await this.addLog(`===== POSITION REVERSAL =====`);
-        await this.addLog(`Price hit Fixed Reversal Level: ${this._formatPrice(triggeredReversalLevel)}. Closing remaining position.`);
-        await this._handleDirectReversal(currentPrice);
-        return;
-      }
-    }
+    // Update last processed price for next tick
+    this.lastProcessedPrice = currentPrice;
   }
 
   // Handle direct reversal
@@ -2757,18 +2743,10 @@ class TradingStrategy {
         if (newPosition === 'LONG') {
           this.reversalLevel = this.shortReversalLevel;
           this.initialReversalLevel = this.shortReversalLevel;
-          this.highestFavorablePrice = this.positionEntryPrice;
-          this.lowestFavorablePrice = null;
-          this.trailingReversalActive = true;
-          this.ticksMovedInFavor = 0;
           await this.addLog(`Reversal #${this.reversalCount}: LONG position opened at ${this._formatPrice(this.entryLevel)}. Will reverse at Short Reversal Level: ${this._formatPrice(this.shortReversalLevel)} (fixed).`);
         } else if (newPosition === 'SHORT') {
           this.reversalLevel = this.longReversalLevel;
           this.initialReversalLevel = this.longReversalLevel;
-          this.highestFavorablePrice = null;
-          this.lowestFavorablePrice = this.positionEntryPrice;
-          this.trailingReversalActive = true;
-          this.ticksMovedInFavor = 0;
           await this.addLog(`Reversal #${this.reversalCount}: SHORT position opened at ${this._formatPrice(this.entryLevel)}. Will reverse at Long Reversal Level: ${this._formatPrice(this.longReversalLevel)} (fixed).`);
         }
 
@@ -2797,6 +2775,485 @@ class TradingStrategy {
       this.isTradingSequenceInProgress = false;
     }
   }
+
+  // ===================================================================
+  // GRID TRADING SYSTEM — Core Methods
+  // ===================================================================
+
+  // Initialize the 10-level grid on the first price tick after strategy start.
+  async initializeGrid(currentPrice) {
+    this.anchorPrice = currentPrice;
+    this.gridBaseSize = this.initialBasePositionSizeUSDT;
+
+    // Reversal levels sit beyond Level 5 on each side, derived from anchor.
+    // shortReversalLevel (above anchor) → OG_TRIGGER_S (open SHORT consolidated)
+    // longReversalLevel  (below anchor) → OG_TRIGGER_L (open LONG consolidated)
+    this.shortReversalLevel = this._calculateAdjustedPrice(currentPrice, this.reversalLevelPercentage, true);
+    this.longReversalLevel  = this._calculateAdjustedPrice(currentPrice, this.reversalLevelPercentage, false);
+    this.fixedReversalLevelsCalculated = true;
+    this.reversalLevel = this.shortReversalLevel;
+    this.initialReversalLevel = this.shortReversalLevel;
+
+    this.gridLevels = this._buildGridLevels(this.anchorPrice, this.gridBaseSize, this.gridSize);
+    this.gridMode = 'WITHIN';
+
+    if (!this.strategyStartTime) {
+      this.strategyStartTime = new Date();
+    }
+
+    await this.addLog(`===== GRID INITIALIZED =====`);
+    await this.addLog(`Anchor: ${this._formatPrice(this.anchorPrice)}, Grid Size: ${(this.gridSize * 100).toFixed(2)}%, Base Size: ${this._formatNotional(this.gridBaseSize)} USDT`);
+    await this.addLog(`OOG SHORT trigger: ${this._formatPrice(this.shortReversalLevel)}, OOG LONG trigger: ${this._formatPrice(this.longReversalLevel)}`);
+    const longLevels  = this.gridLevels.filter(l => l.direction === 'LONG').map(l => `L${l.levelIndex}@${this._formatPrice(l.price)}`).join(', ');
+    const shortLevels = this.gridLevels.filter(l => l.direction === 'SHORT').map(l => `S${l.levelIndex}@${this._formatPrice(l.price)}`).join(', ');
+    await this.addLog(`LONG  levels (below anchor): ${longLevels}`);
+    await this.addLog(`SHORT levels (above anchor): ${shortLevels}`);
+    await this.saveState();
+  }
+
+  // Build grid level objects from anchor, baseSize, and gridSize decimal.
+  _buildGridLevels(anchorPrice, baseSize, gridSize) {
+    const levels = [];
+    const levelSize = baseSize / this.gridLevelsPerSide;
+    const stepPct = gridSize * 100; // Convert decimal to percentage for _calculateAdjustedPrice
+
+    for (let n = 1; n <= this.gridLevelsPerSide; n++) {
+      levels.push({
+        levelIndex: n,
+        direction: 'SHORT',
+        price: this._calculateAdjustedPrice(anchorPrice, n * stepPct, true),
+        state: 'EMPTY',
+        positionSize: levelSize,
+        positionQuantity: null,
+      });
+      levels.push({
+        levelIndex: n,
+        direction: 'LONG',
+        price: this._calculateAdjustedPrice(anchorPrice, n * stepPct, false),
+        state: 'EMPTY',
+        positionSize: levelSize,
+        positionQuantity: null,
+      });
+    }
+    return levels;
+  }
+
+  // Open a single grid position (BUY for LONG, SELL for SHORT).
+  async _openGridPosition(level, currentPrice) {
+    const side = level.direction === 'LONG' ? 'BUY' : 'SELL';
+    try {
+      const quantity = await this._calculateAdjustedQuantity(this.symbol, level.positionSize);
+      await this.addLog(`Grid: Opening ${level.direction} L${level.levelIndex} @ ~${this._formatPrice(level.price)} — size ${this._formatNotional(level.positionSize)} USDT, qty ${quantity}.`);
+      await this.placeMarketOrder(this.symbol, side, quantity, level.direction);
+      level.state = 'POSITION_OPEN';
+      level.positionQuantity = quantity;
+      const eventType = `WG_OPEN_${level.direction === 'LONG' ? 'L' : 'S'}${level.levelIndex}`;
+      await this.saveStrategyFlowEvent(eventType, level.direction, currentPrice, quantity, null, null, null, null);
+    } catch (error) {
+      await this.addLog(`ERROR: Failed to open grid ${level.direction} L${level.levelIndex}: ${error.message}`);
+      throw error;
+    }
+  }
+
+  // Close a single grid position (SELL for LONG, BUY for SHORT).
+  async _closeGridPosition(level, currentPrice, eventType) {
+    const closeSide = level.direction === 'LONG' ? 'SELL' : 'BUY';
+    const quantity = level.positionQuantity;
+
+    if (!quantity || quantity <= 0) {
+      await this.addLog(`WARNING: No stored quantity for grid ${level.direction} L${level.levelIndex}, resetting state only.`);
+      level.state = 'EMPTY';
+      level.positionQuantity = null;
+      return;
+    }
+
+    try {
+      await this.addLog(`Grid: Closing ${level.direction} L${level.levelIndex} (TP), qty ${quantity}.`);
+      await this.placeMarketOrder(this.symbol, closeSide, quantity, level.direction);
+      level.state = 'EMPTY';
+      level.positionQuantity = null;
+      if (eventType) {
+        await this.saveStrategyFlowEvent(eventType, level.direction, currentPrice, quantity, null, null, null, null);
+      }
+    } catch (error) {
+      await this.addLog(`ERROR: Failed to close grid ${level.direction} L${level.levelIndex}: ${error.message}`);
+      throw error;
+    }
+  }
+
+  // Close all POSITION_OPEN grid levels in two batched market orders (one per side).
+  async _closeAllGridPositions() {
+    let totalLongQty = 0;
+    let totalShortQty = 0;
+
+    for (const level of this.gridLevels) {
+      if (level.state === 'POSITION_OPEN' && level.positionQuantity > 0) {
+        if (level.direction === 'LONG') totalLongQty += level.positionQuantity;
+        else totalShortQty += level.positionQuantity;
+      }
+    }
+
+    if (totalLongQty > 0) {
+      const qty = this.roundQuantity(totalLongQty);
+      await this.addLog(`OOG: Closing all LONG grid positions (total qty ${qty}).`);
+      await this.placeMarketOrder(this.symbol, 'SELL', qty, 'LONG');
+    }
+    if (totalShortQty > 0) {
+      const qty = this.roundQuantity(totalShortQty);
+      await this.addLog(`OOG: Closing all SHORT grid positions (total qty ${qty}).`);
+      await this.placeMarketOrder(this.symbol, 'BUY', qty, 'SHORT');
+    }
+
+    for (const level of this.gridLevels) {
+      level.state = 'EMPTY';
+      level.positionQuantity = null;
+    }
+  }
+
+  // Process within-grid price crossings for one price tick.
+  async _processGridCrossings(prevPrice, currentPrice) {
+    if (this.isTradingSequenceInProgress) return;
+
+    const movingDown = currentPrice < prevPrice;
+    const movingUp   = currentPrice > prevPrice;
+
+    // OOG trigger checks (highest priority — before any level crossings)
+    if (movingUp && this.shortReversalLevel !== null && prevPrice < this.shortReversalLevel && currentPrice >= this.shortReversalLevel) {
+      this.isTradingSequenceInProgress = true;
+      await this.addLog(`===== OOG TRIGGER: SHORT (price ${this._formatPrice(currentPrice)} hit ${this._formatPrice(this.shortReversalLevel)}) =====`);
+      try { await this._triggerOutOfGrid('SHORT', currentPrice); }
+      finally { this.isTradingSequenceInProgress = false; }
+      return;
+    }
+    if (movingDown && this.longReversalLevel !== null && prevPrice > this.longReversalLevel && currentPrice <= this.longReversalLevel) {
+      this.isTradingSequenceInProgress = true;
+      await this.addLog(`===== OOG TRIGGER: LONG (price ${this._formatPrice(currentPrice)} hit ${this._formatPrice(this.longReversalLevel)}) =====`);
+      try { await this._triggerOutOfGrid('LONG', currentPrice); }
+      finally { this.isTradingSequenceInProgress = false; }
+      return;
+    }
+
+    if (movingDown) {
+      // Downward: check LONG levels (closest to anchor first = highest price first)
+      const longLevels = this.gridLevels
+        .filter(l => l.direction === 'LONG')
+        .sort((a, b) => b.price - a.price);
+
+      for (const level of longLevels) {
+        if (prevPrice > level.price && currentPrice <= level.price) {
+          if (this.isTradingSequenceInProgress) break;
+          this.isTradingSequenceInProgress = true;
+          const mirrorShort = this.gridLevels.find(l => l.direction === 'SHORT' && l.levelIndex === level.levelIndex);
+          try {
+            const actions = [];
+            if (mirrorShort && mirrorShort.state === 'POSITION_OPEN') {
+              actions.push(this._closeGridPosition(mirrorShort, currentPrice, `WG_TP_S${level.levelIndex}`));
+            }
+            if (level.state === 'EMPTY') {
+              actions.push(this._openGridPosition(level, currentPrice));
+            }
+            if (actions.length > 0) {
+              await Promise.all(actions);
+              await this.saveState();
+            }
+          } catch (error) {
+            await this.addLog(`ERROR: Grid crossing at LONG L${level.levelIndex}: ${error.message}`);
+          } finally {
+            this.isTradingSequenceInProgress = false;
+          }
+        }
+      }
+    } else if (movingUp) {
+      // Upward: check SHORT levels (closest to anchor first = lowest price first)
+      const shortLevels = this.gridLevels
+        .filter(l => l.direction === 'SHORT')
+        .sort((a, b) => a.price - b.price);
+
+      for (const level of shortLevels) {
+        if (prevPrice < level.price && currentPrice >= level.price) {
+          if (this.isTradingSequenceInProgress) break;
+          this.isTradingSequenceInProgress = true;
+          const mirrorLong = this.gridLevels.find(l => l.direction === 'LONG' && l.levelIndex === level.levelIndex);
+          try {
+            const actions = [];
+            if (mirrorLong && mirrorLong.state === 'POSITION_OPEN') {
+              actions.push(this._closeGridPosition(mirrorLong, currentPrice, `WG_TP_L${level.levelIndex}`));
+            }
+            if (level.state === 'EMPTY') {
+              actions.push(this._openGridPosition(level, currentPrice));
+            }
+            if (actions.length > 0) {
+              await Promise.all(actions);
+              await this.saveState();
+            }
+          } catch (error) {
+            await this.addLog(`ERROR: Grid crossing at SHORT S${level.levelIndex}: ${error.message}`);
+          } finally {
+            this.isTradingSequenceInProgress = false;
+          }
+        }
+      }
+    }
+  }
+
+  // Trigger out-of-grid mode: close all grid positions, open consolidated position with dynamic sizing.
+  async _triggerOutOfGrid(direction, currentPrice) {
+    await this._closeAllGridPositions();
+
+    this.reversalCount++;
+    const shouldApplyDynamic = this._shouldApplyDynamicSizing();
+    if (shouldApplyDynamic) {
+      this.positionSizeUSDT = await this._calculateDynamicPositionSize();
+      this.lastDynamicSizingReversalCount = this.reversalCount;
+      await this.addLog(`OOG: Dynamic sizing applied — ${this._formatNotional(this.positionSizeUSDT)} USDT.`);
+    }
+
+    const consolidatedSize = this.positionSizeUSDT;
+    const side = direction === 'SHORT' ? 'SELL' : 'BUY';
+    const quantity = await this._calculateAdjustedQuantity(this.symbol, consolidatedSize);
+
+    await this.addLog(`OOG: Opening ${direction} consolidated — ${this._formatNotional(consolidatedSize)} USDT, qty ${quantity}.`);
+    await this.placeMarketOrder(this.symbol, side, quantity, direction);
+
+    this.gridMode = 'OUT_OF_GRID';
+    this.outOfGridDirection = direction;
+    this.outOfGridConsolidatedSize = consolidatedSize;
+    this.outOfGridConsolidatedQuantity = quantity;
+    this.outOfGridTranchesRemaining = this.gridLevelsPerSide;
+    this.outOfGridTrancheTakenFlags = new Array(this.gridLevelsPerSide).fill(false);
+    this.outOfGridPhase = 'INITIAL';
+    this.currentPosition = direction;
+
+    const eventType = direction === 'SHORT' ? 'OG_TRIGGER_S' : 'OG_TRIGGER_L';
+    await this.saveStrategyFlowEvent(eventType, direction, currentPrice, quantity, null, null, null, null);
+    await this.saveState();
+  }
+
+  // Process out-of-grid price crossings for one tick (INITIAL and REENTRY phases).
+  async _processOutOfGridCrossings(prevPrice, currentPrice) {
+    if (this.isTradingSequenceInProgress) return;
+
+    const movingDown = currentPrice < prevPrice;
+    const movingUp   = currentPrice > prevPrice;
+
+    if (this.outOfGridPhase === 'INITIAL') {
+      // INITIAL: wait for price to cross the outermost level of the OPPOSITE direction.
+      // SHORT consolidated (from SHORT reversal above anchor) → wait for LONG Level N downward crossing.
+      if (this.outOfGridDirection === 'SHORT' && movingDown) {
+        const longLN = this.gridLevels.find(l => l.direction === 'LONG' && l.levelIndex === this.gridLevelsPerSide);
+        if (longLN && prevPrice > longLN.price && currentPrice <= longLN.price) {
+          this.isTradingSequenceInProgress = true;
+          await this.addLog(`OOG REENTRY_L: Price ${this._formatPrice(currentPrice)} crossed LONG Level ${this.gridLevelsPerSide} @ ${this._formatPrice(longLN.price)}.`);
+          try { await this._reenterGrid('LONG', currentPrice); }
+          finally { this.isTradingSequenceInProgress = false; }
+          return;
+        }
+      }
+      // LONG consolidated (from LONG reversal below anchor) → wait for SHORT Level N upward crossing.
+      if (this.outOfGridDirection === 'LONG' && movingUp) {
+        const shortLN = this.gridLevels.find(l => l.direction === 'SHORT' && l.levelIndex === this.gridLevelsPerSide);
+        if (shortLN && prevPrice < shortLN.price && currentPrice >= shortLN.price) {
+          this.isTradingSequenceInProgress = true;
+          await this.addLog(`OOG REENTRY_S: Price ${this._formatPrice(currentPrice)} crossed SHORT Level ${this.gridLevelsPerSide} @ ${this._formatPrice(shortLN.price)}.`);
+          try { await this._reenterGrid('SHORT', currentPrice); }
+          finally { this.isTradingSequenceInProgress = false; }
+          return;
+        }
+      }
+    } else if (this.outOfGridPhase === 'REENTRY') {
+      if (this.outOfGridDirection === 'LONG') {
+        // LONG consolidated in REENTRY: tranches fire as price moves UP toward anchor.
+        // Opposite reversal: if price drops back to LONG reversal level, restart OOG SHORT.
+        if (movingDown && this.longReversalLevel !== null && prevPrice > this.longReversalLevel && currentPrice <= this.longReversalLevel) {
+          this.isTradingSequenceInProgress = true;
+          await this.addLog(`OOG REENTRY LONG: price hit LONG reversal level → restarting OOG SHORT.`);
+          try {
+            const remainingQty = this.roundQuantity((this.outOfGridTranchesRemaining / this.gridLevelsPerSide) * (this.outOfGridConsolidatedQuantity || 0));
+            if (remainingQty > 0) {
+              await this.placeMarketOrder(this.symbol, 'SELL', remainingQty, 'LONG');
+            }
+            await this._triggerOutOfGrid('SHORT', currentPrice);
+          } finally { this.isTradingSequenceInProgress = false; }
+          return;
+        }
+        if (movingUp) {
+          await this._processLongReentryTranches(prevPrice, currentPrice);
+        }
+      } else if (this.outOfGridDirection === 'SHORT') {
+        // SHORT consolidated in REENTRY: tranches fire as price moves DOWN toward anchor.
+        // Opposite reversal: if price rises back to SHORT reversal level, restart OOG LONG.
+        if (movingUp && this.shortReversalLevel !== null && prevPrice < this.shortReversalLevel && currentPrice >= this.shortReversalLevel) {
+          this.isTradingSequenceInProgress = true;
+          await this.addLog(`OOG REENTRY SHORT: price hit SHORT reversal level → restarting OOG LONG.`);
+          try {
+            const remainingQty = this.roundQuantity((this.outOfGridTranchesRemaining / this.gridLevelsPerSide) * (this.outOfGridConsolidatedQuantity || 0));
+            if (remainingQty > 0) {
+              await this.placeMarketOrder(this.symbol, 'BUY', remainingQty, 'SHORT');
+            }
+            await this._triggerOutOfGrid('LONG', currentPrice);
+          } finally { this.isTradingSequenceInProgress = false; }
+          return;
+        }
+        if (movingDown) {
+          await this._processShortReentryTranches(prevPrice, currentPrice);
+        }
+      }
+    }
+  }
+
+  // Flip OOG consolidated position at Level 5 crossings (INITIAL → REENTRY transition).
+  async _reenterGrid(newDirection, currentPrice) {
+    const oldDirection = this.outOfGridDirection;
+    const closeSide = oldDirection === 'LONG' ? 'SELL' : 'BUY';
+    const openSide  = newDirection === 'LONG' ? 'BUY' : 'SELL';
+
+    const closeQty = this.roundQuantity(this.outOfGridConsolidatedQuantity || 0);
+    if (closeQty > 0) {
+      await this.addLog(`OOG REENTRY: Closing ${oldDirection} consolidated (qty ${closeQty}).`);
+      await this.placeMarketOrder(this.symbol, closeSide, closeQty, oldDirection);
+    }
+
+    const newQty = await this._calculateAdjustedQuantity(this.symbol, this.outOfGridConsolidatedSize);
+    await this.addLog(`OOG REENTRY: Opening ${newDirection} consolidated at same size ${this._formatNotional(this.outOfGridConsolidatedSize)} USDT, qty ${newQty}.`);
+    await this.placeMarketOrder(this.symbol, openSide, newQty, newDirection);
+
+    this.outOfGridDirection = newDirection;
+    this.outOfGridConsolidatedQuantity = newQty;
+    this.outOfGridTranchesRemaining = this.gridLevelsPerSide;
+    this.outOfGridTrancheTakenFlags = new Array(this.gridLevelsPerSide).fill(false);
+    this.outOfGridPhase = 'REENTRY';
+    this.currentPosition = newDirection;
+
+    const eventType = newDirection === 'LONG' ? 'OG_REENTRY_L' : 'OG_REENTRY_S';
+    await this.saveStrategyFlowEvent(eventType, newDirection, currentPrice, newQty, null, null, null, null);
+    await this.saveState();
+  }
+
+  // Fire LONG consolidated tranche TPs as price moves UP from LONG Level 5 toward anchor.
+  // Tranche sequence: L4 → L3 → L2 → L1 → anchor (OG_TP_L1 through OG_TP_L5).
+  async _processLongReentryTranches(prevPrice, currentPrice) {
+    const n = this.gridLevelsPerSide;
+    const trancheTargets = [];
+    for (let i = 0; i < n - 1; i++) {
+      const levelIndex = n - 1 - i; // n-1, n-2, …, 1
+      trancheTargets.push({
+        idx: i,
+        suffix: String(i + 1),
+        getPrice: ((li) => () => this.gridLevels.find(l => l.direction === 'LONG' && l.levelIndex === li)?.price)(levelIndex),
+      });
+    }
+    trancheTargets.push({ idx: n - 1, suffix: String(n), getPrice: () => this.anchorPrice });
+
+    for (const t of trancheTargets) {
+      if (this.outOfGridTrancheTakenFlags[t.idx]) continue;
+      const targetPrice = t.getPrice();
+      if (!targetPrice) continue;
+
+      if (prevPrice < targetPrice && currentPrice >= targetPrice) {
+        if (this.isTradingSequenceInProgress) break;
+        this.isTradingSequenceInProgress = true;
+        try {
+          const trancheQty = this.roundQuantity((this.outOfGridConsolidatedQuantity || 0) / this.gridLevelsPerSide);
+          if (trancheQty > 0) {
+            await this.addLog(`OOG LONG tranche ${t.suffix}: TP at ${this._formatPrice(targetPrice)}, closing ${trancheQty} qty.`);
+            await this.placeMarketOrder(this.symbol, 'SELL', trancheQty, 'LONG');
+          }
+          this.outOfGridTrancheTakenFlags[t.idx] = true;
+          this.outOfGridTranchesRemaining = Math.max(0, this.outOfGridTranchesRemaining - 1);
+          this.reversalCount++;
+          await this.saveStrategyFlowEvent(`OG_TP_L${t.suffix}`, 'LONG', currentPrice, trancheQty, null, null, null, null);
+
+          if (this.outOfGridTranchesRemaining === 0) {
+            await this._exitOutOfGridMode();
+          } else {
+            await this.saveState();
+          }
+        } catch (error) {
+          await this.addLog(`ERROR: OOG LONG tranche ${t.suffix}: ${error.message}`);
+        } finally {
+          this.isTradingSequenceInProgress = false;
+        }
+        if (this.gridMode === 'WITHIN') break;
+      }
+    }
+  }
+
+  // Fire SHORT consolidated tranche TPs as price moves DOWN from SHORT Level 5 toward anchor.
+  // Tranche sequence: S(N-1) → … → S1 → anchor (OG_TP_S1 through OG_TP_S{N}).
+  async _processShortReentryTranches(prevPrice, currentPrice) {
+    const n = this.gridLevelsPerSide;
+    const trancheTargets = [];
+    for (let i = 0; i < n - 1; i++) {
+      const levelIndex = n - 1 - i; // n-1, n-2, …, 1
+      trancheTargets.push({
+        idx: i,
+        suffix: String(i + 1),
+        getPrice: ((li) => () => this.gridLevels.find(l => l.direction === 'SHORT' && l.levelIndex === li)?.price)(levelIndex),
+      });
+    }
+    trancheTargets.push({ idx: n - 1, suffix: String(n), getPrice: () => this.anchorPrice });
+
+    for (const t of trancheTargets) {
+      if (this.outOfGridTrancheTakenFlags[t.idx]) continue;
+      const targetPrice = t.getPrice();
+      if (!targetPrice) continue;
+
+      if (prevPrice > targetPrice && currentPrice <= targetPrice) {
+        if (this.isTradingSequenceInProgress) break;
+        this.isTradingSequenceInProgress = true;
+        try {
+          const trancheQty = this.roundQuantity((this.outOfGridConsolidatedQuantity || 0) / this.gridLevelsPerSide);
+          if (trancheQty > 0) {
+            await this.addLog(`OOG SHORT tranche ${t.suffix}: TP at ${this._formatPrice(targetPrice)}, closing ${trancheQty} qty.`);
+            await this.placeMarketOrder(this.symbol, 'BUY', trancheQty, 'SHORT');
+          }
+          this.outOfGridTrancheTakenFlags[t.idx] = true;
+          this.outOfGridTranchesRemaining = Math.max(0, this.outOfGridTranchesRemaining - 1);
+          this.reversalCount++;
+          await this.saveStrategyFlowEvent(`OG_TP_S${t.suffix}`, 'SHORT', currentPrice, trancheQty, null, null, null, null);
+
+          if (this.outOfGridTranchesRemaining === 0) {
+            await this._exitOutOfGridMode();
+          } else {
+            await this.saveState();
+          }
+        } catch (error) {
+          await this.addLog(`ERROR: OOG SHORT tranche ${t.suffix}: ${error.message}`);
+        } finally {
+          this.isTradingSequenceInProgress = false;
+        }
+        if (this.gridMode === 'WITHIN') break;
+      }
+    }
+  }
+
+  // Exit OOG mode: recalculate grid with updated base size, return to WITHIN mode.
+  async _exitOutOfGridMode() {
+    const newBaseSize = this.outOfGridConsolidatedSize || this.gridBaseSize || this.initialBasePositionSizeUSDT;
+    this.gridBaseSize = newBaseSize;
+    this.initialBasePositionSizeUSDT = newBaseSize;
+    this.positionSizeUSDT = newBaseSize;
+
+    // Rebuild all 10 grid levels around the fixed anchor, using the new base size.
+    this.gridLevels = this._buildGridLevels(this.anchorPrice, this.gridBaseSize, this.gridSize);
+
+    this.outOfGridDirection = null;
+    this.outOfGridConsolidatedSize = null;
+    this.outOfGridConsolidatedQuantity = null;
+    this.outOfGridTranchesRemaining = 0;
+    this.outOfGridTrancheTakenFlags = new Array(this.gridLevelsPerSide).fill(false);
+    this.outOfGridPhase = null;
+    this.currentPosition = 'NONE';
+    this.gridMode = 'WITHIN';
+
+    await this.addLog(`OOG RESET: Returned to WITHIN grid. New base size: ${this._formatNotional(this.gridBaseSize)} USDT. Grid levels recalculated.`);
+    await this.saveStrategyFlowEvent('OG_RESET', 'BOTH', this.anchorPrice, 0, null, null, null, null);
+    await this.saveState();
+  }
+
+  // ===================================================================
+  // END GRID TRADING SYSTEM
+  // ===================================================================
 
   async start(config = {}) {
     await this.addLog(`Hey bro! Starting strategy.. Good luck!🤞`);
@@ -3064,11 +3521,6 @@ class TradingStrategy {
               await this.addLog(`Fixed Reversal Levels - Long: ${this._formatPrice(this.longReversalLevel)}, Short: ${this._formatPrice(this.shortReversalLevel)}.`);
             }
 
-            // LONG position in Support Zone: Initialize price tracking
-            this.highestFavorablePrice = this.positionEntryPrice;
-            this.trailingReversalActive = true;
-            this.ticksMovedInFavor = 0;
-
             // Log initial position immediately after confirmation
             await this.addLog(`Initial ${this.currentPosition} position established. Entry: ${this._formatPrice(this.positionEntryPrice)}, Size: ${this._formatNotional(this.positionSize)}, Qty: ${this._formatQuantity(this.entryPositionQuantity)}. Mode: ${this.activeMode}.`);
 
@@ -3126,11 +3578,6 @@ class TradingStrategy {
               await this.addLog(`Entry Level updated: ${this._formatPrice(initialEntryLevel)} -> ${this._formatPrice(this.entryLevel)} (actual fill price).`);
               await this.addLog(`Fixed Reversal Levels - Short: ${this._formatPrice(this.shortReversalLevel)}, Long: ${this._formatPrice(this.longReversalLevel)}.`);
             }
-
-            // SHORT position in Resistance Zone: Initialize price tracking
-            this.lowestFavorablePrice = this.positionEntryPrice;
-            this.trailingReversalActive = true;
-            this.ticksMovedInFavor = 0;
 
             // Log initial position immediately after confirmation
             await this.addLog(`Initial ${this.currentPosition} position established. Entry: ${this._formatPrice(this.positionEntryPrice)}, Size: ${this._formatNotional(this.positionSize)}, Qty: ${this._formatQuantity(this.entryPositionQuantity)}. Mode: ${this.activeMode}.`);
@@ -3430,16 +3877,12 @@ class TradingStrategy {
           this.shortReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, false);
           this.reversalLevel = this.shortReversalLevel;
           this.initialReversalLevel = this.shortReversalLevel;
-          this.highestFavorablePrice = this.positionEntryPrice;
-          this.ticksMovedInFavor = 0;
           await this.addLog(`Fixed reversal levels recalculated - Long: ${this._formatPrice(this.longReversalLevel)} (unchanged), Short: ${this._formatPrice(oldShortLevel)} -> ${this._formatPrice(this.shortReversalLevel)}.`);
         } else if (this.currentPosition === 'SHORT') {
           this.shortReversalLevel = this.positionEntryPrice;
           this.longReversalLevel = this._calculateAdjustedPrice(this.positionEntryPrice, this.reversalLevelPercentage, true);
           this.reversalLevel = this.longReversalLevel;
           this.initialReversalLevel = this.longReversalLevel;
-          this.lowestFavorablePrice = this.positionEntryPrice;
-          this.ticksMovedInFavor = 0;
           await this.addLog(`Fixed reversal levels recalculated - Short: ${this._formatPrice(this.shortReversalLevel)} (unchanged), Long: ${this._formatPrice(oldLongLevel)} -> ${this._formatPrice(this.longReversalLevel)}.`);
         }
       }
@@ -3450,6 +3893,13 @@ class TradingStrategy {
       const oldValue = this.gridSize;
       this.gridSize = newConfig.gridSize;
       await this.addLog(`Updated Grid Size from ${(oldValue * 100).toFixed(2)}% to ${(this.gridSize * 100).toFixed(2)}%.`);
+    }
+
+    // Update Grid Levels Per Side if provided
+    if (newConfig.gridLevelsPerSide !== undefined && newConfig.gridLevelsPerSide !== null) {
+      const oldValue = this.gridLevelsPerSide;
+      this.gridLevelsPerSide = newConfig.gridLevelsPerSide;
+      await this.addLog(`Updated Grid Levels Per Side from ${oldValue} to ${this.gridLevelsPerSide}.`);
     }
 
     // Update specific config parameters
@@ -3682,11 +4132,6 @@ class TradingStrategy {
             await this.addLog(`Restart: Entry Level: ${this._formatPrice(this.entryLevel)}, Will reverse at Short Level: ${this._formatPrice(this.shortReversalLevel)} (fixed), Grid Size: ${(this.gridSize * 100).toFixed(2)}%.`);
           }
 
-          // LONG position: Initialize continuous trailing
-          this.highestFavorablePrice = this.positionEntryPrice;
-          this.trailingReversalActive = true;
-          this.ticksMovedInFavor = 0;
-
           await this.addLog(`Restart: ${this.currentPosition} position established. Entry: ${this._formatPrice(this.positionEntryPrice)}, Size: ${this._formatNotional(this.positionSize)}, Qty: ${this._formatQuantity(this.entryPositionQuantity)}. Mode: ${this.activeMode}.`);
 
           // Update trade sequence
@@ -3737,11 +4182,6 @@ class TradingStrategy {
             this.initialReversalLevel = this.longReversalLevel;
             await this.addLog(`Restart: Entry Level: ${this._formatPrice(this.entryLevel)}, Will reverse at Long Level: ${this._formatPrice(this.longReversalLevel)} (fixed), Grid Size: ${(this.gridSize * 100).toFixed(2)}%.`);
           }
-
-          // SHORT position: Initialize continuous trailing
-          this.lowestFavorablePrice = this.positionEntryPrice;
-          this.trailingReversalActive = true;
-          this.ticksMovedInFavor = 0;
 
           await this.addLog(`Restart: ${this.currentPosition} position established. Entry: ${this._formatPrice(this.positionEntryPrice)}, Size: ${this._formatNotional(this.positionSize)}, Qty: ${this._formatQuantity(this.entryPositionQuantity)}. Mode: ${this.activeMode}.`);
 
@@ -4368,24 +4808,20 @@ class TradingStrategy {
         accumulatedTradingFees: this.accumulatedTradingFees,
         currentPositionQuantity: this.currentPositionQuantity,
       },
-      // Trailing reversal level state
-      trailingState: {
-        active: this.trailingReversalActive,
-        highestFavorablePrice: this.highestFavorablePrice,
-        lowestFavorablePrice: this.lowestFavorablePrice,
-        ticksMovedInFavor: this.ticksMovedInFavor,
-      },
-      // Middle level trailing state
-      middleLevelPrice: this.middleLevelPrice,
-      middleLevelReached: this.middleLevelReached,
-      trailingLockPrice: this.middleLevelReached ? this.middleLevelPrice : null,
       // Grid trading state
       gridState: {
         gridSize: this.gridSize,
-        initialReversalLevel: this.initialReversalLevel,
-        highestFavorablePrice: this.highestFavorablePrice,
-        lowestFavorablePrice: this.lowestFavorablePrice,
-        ticksMovedInFavor: this.ticksMovedInFavor,
+        gridLevelsPerSide: this.gridLevelsPerSide,
+        anchorPrice: this.anchorPrice,
+        gridMode: this.gridMode,
+        gridBaseSize: this.gridBaseSize,
+        gridLevels: this.gridLevels,
+        outOfGridDirection: this.outOfGridDirection,
+        outOfGridConsolidatedSize: this.outOfGridConsolidatedSize,
+        outOfGridConsolidatedQuantity: this.outOfGridConsolidatedQuantity,
+        outOfGridTranchesRemaining: this.outOfGridTranchesRemaining,
+        outOfGridTrancheTakenFlags: this.outOfGridTrancheTakenFlags,
+        outOfGridPhase: this.outOfGridPhase,
       },
       // Virtual position state
       virtualPositionState: {
