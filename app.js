@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import TradingStrategy from './strategy.js';
+import { AiHedgeStrategy } from './ai-hedge-strategy.js';
 import http from 'http';
 import { Firestore, Timestamp, FieldValue } from '@google-cloud/firestore';
 import { initializeFirebaseAdmin } from './pushNotificationHelper.js';
@@ -101,916 +101,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Start strategy endpoint
-app.post('/strategy/start', async (req, res) => {
-  if (isUpdating) {
-    return res.status(503).json({
-      error: 'VM is currently updating to a new version. Please wait and try again shortly.',
-      code: 'VM_UPDATING',
-      targetVersion
-    });
-  }
-
-  try {
-    const { profileId, gcpProxyUrl, sharedVmProxyGcfUrl, config, userId } = req.body;
-
-    if (!profileId || !gcpProxyUrl || !sharedVmProxyGcfUrl || !config) {
-      console.error('Missing required parameters for /strategy/start');
-      return res.status(400).json({ error: 'profileId, gcpProxyUrl, sharedVmProxyGcfUrl, and config are required.' });
-    }
-
-    if (!userId) {
-      console.error('Missing userId for balance validation');
-      return res.status(400).json({ error: 'userId is required for balance validation.' });
-    }
-
-    const requiredCapital = config.positionSizeUSDT || 0;
-    if (requiredCapital <= 0) {
-      return res.status(400).json({ error: 'Invalid initial capital for balance validation.' });
-    }
-
-    // Validate trading mode if provided
-    if (config.tradingMode !== undefined && config.tradingMode !== null) {
-      if (!['AGGRESSIVE', 'NORMAL', 'CONSERVATIVE'].includes(config.tradingMode)) {
-        return res.status(400).json({ error: 'Invalid tradingMode. Must be AGGRESSIVE, NORMAL, or CONSERVATIVE.' });
-      }
-    }
-
-    // Validate gridSize if provided
-    if (config.gridSize !== undefined && config.gridSize !== null) {
-      if (isNaN(config.gridSize) || config.gridSize <= 0 || config.gridSize > 0.1) {
-        return res.status(400).json({ error: 'Invalid gridSize. Must be a positive number no greater than 0.1 (10%).' });
-      }
-    }
-
-    // PRE-START VALIDATION 1: Validate Reload Balance (for platform fees)
-    // This balance is checked to ensure the user can cover platform fees
-    const walletRef = firestore.collection('users').doc(userId).collection('wallets').doc('default');
-    const walletDoc = await walletRef.get();
-
-    if (!walletDoc.exists) {
-      return res.status(400).json({
-        error: 'Reload wallet not found. Please reload your account first.',
-        code: 'WALLET_NOT_FOUND'
-      });
-    }
-
-    const reloadBalance = walletDoc.data()?.balance || 0;
-    if (reloadBalance <= 0) {
-      return res.status(400).json({
-        error: `Insufficient Reload Balance. You have ${precisionFormatter.formatNotional(reloadBalance)} USDT. Please reload your wallet to cover platform fees.`,
-        code: 'INSUFFICIENT_RELOAD_BALANCE',
-        reloadBalance,
-        requiredCapital
-      });
-    }
-
-    // PRE-START VALIDATION 2: Validate Binance Futures Balance (for trading capital)
-    // This balance is checked BEFORE the strategy starts to ensure sufficient trading capital
-    try {
-      const headers = {
-        'Content-Type': 'application/json',
-        'X-User-Id': profileId,
-      };
-
-      const binanceAccountResponse = await fetch(sharedVmProxyGcfUrl, {
-        method: 'POST',
-        headers: headers,
-        body: JSON.stringify({
-          endpoint: '/fapi/v2/account',
-          method: 'GET',
-          params: {},
-          signed: true,
-          apiType: 'futures',
-          profileBinanceApiGcfUrl: gcpProxyUrl,
-        }),
-      });
-
-      if (!binanceAccountResponse.ok) {
-        const errorData = await binanceAccountResponse.json().catch(() => ({}));
-        console.error('Failed to fetch Binance Futures Balance:', errorData);
-        return res.status(400).json({
-          error: 'Failed to fetch Binance Futures Balance. Please check your API credentials and try again.',
-          code: 'BINANCE_ACCOUNT_FETCH_FAILED'
-        });
-      }
-
-      const binanceAccountInfo = await binanceAccountResponse.json();
-      const futuresBalance = parseFloat(binanceAccountInfo.totalWalletBalance || 0);
-
-      if (futuresBalance < requiredCapital) {
-        return res.status(400).json({
-          error: `Insufficient Binance Futures Balance. You have ${precisionFormatter.formatNotional(futuresBalance)} USDT in your Binance Futures account but need ${precisionFormatter.formatNotional(requiredCapital)} USDT. Please deposit more USDT to your Binance Futures account.`,
-          code: 'INSUFFICIENT_FUTURES_BALANCE',
-          futuresBalance,
-          requiredCapital
-        });
-      }
-
-      console.log(`✓ Binance Futures Balance validated: ${precisionFormatter.formatNotional(futuresBalance)} USDT >= ${precisionFormatter.formatNotional(requiredCapital)} USDT`);
-    } catch (error) {
-      console.error('Error validating Binance Futures Balance:', error);
-      return res.status(500).json({
-        error: 'Failed to validate Binance Futures Balance. Please try again.',
-        code: 'BINANCE_VALIDATION_ERROR'
-      });
-    }
-
-    let existingStrategyIdForProfile = null;
-    for (const [sId, strategy] of activeStrategies.entries()) {
-      if (strategy.profileId === profileId && strategy.isRunning) {
-        existingStrategyIdForProfile = sId;
-        break;
-      }
-    }
-
-    if (existingStrategyIdForProfile) {
-      console.error(`Strategy for profile ${profileId} (strategyId: ${existingStrategyIdForProfile}) is already running`);
-      return res.status(400).json({
-        error: `Strategy for profile ${profileId} is already running`,
-        strategyId: existingStrategyIdForProfile
-      });
-    }
-
-    const strategy = new TradingStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
-    strategy.userId = userId;
-    const strategyId = await strategy.start(config);
-
-    activeStrategies.set(strategyId, strategy);
-
-    console.log(`✓ Strategy ${strategyId} started successfully. Reload Balance: ${reloadBalance} USDT | Futures Balance validated: ${requiredCapital} USDT`);
-    res.json({
-      success: true,
-      strategyId,
-      message: 'Ycbot trading strategy started successfully',
-      balancesValidated: true,
-      reloadBalance,
-      futuresBalanceValidated: requiredCapital
-    });
-  } catch (error) {
-    console.error('Failed to start strategy:', error);
-    console.error('Full error object for /strategy/start:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
-    res.status(500).json({
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// Stop strategy endpoint
-app.post('/strategy/stop', async (req, res) => {
-  try {
-    const { strategyId } = req.body;
-
-    if (!strategyId) {
-      return res.status(400).json({ error: 'strategyId is required.' });
-    }
-
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !strategy.isRunning) {
-      return res.status(400).json({
-        error: `No strategy is currently running with ID ${strategyId}`
-      });
-    }
-
-    // Set stopping status in Firestore immediately
-    await firestore.collection('strategies').doc(strategyId).update({
-      stoppingStatus: 'in_progress',
-      stoppingStartedAt: Timestamp.now()
-    });
-
-    // Respond immediately to prevent timeout
-    res.json({
-      success: true,
-      stopping: true,
-      message: 'Strategy stop initiated',
-      strategyId
-    });
-
-    // Continue with stop operations asynchronously
-    setImmediate(async () => {
-      try {
-        // Wrap stop operation with timeout protection
-        const stopPromise = strategy.stop();
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Stop operation timeout')), 45000)
-        );
-
-        await Promise.race([stopPromise, timeoutPromise]);
-        activeStrategies.delete(strategyId);
-
-        if (updateAvailable && activeStrategies.size === 0 && !isUpdating) {
-          console.log(`All strategies stopped. Triggering pending self-update to ${targetVersion}...`);
-          triggerSelfUpdate().catch(err => console.error('Post-stop self-update failed:', err));
-        }
-
-        const strategyDoc = await firestore.collection('strategies').doc(strategyId).get();
-        if (!strategyDoc.exists) {
-          console.warn(`Strategy ${strategyId} not found in Firestore, skipping fee calculation`);
-          await firestore.collection('strategies').doc(strategyId).update({
-            stoppingStatus: 'completed',
-            stoppingCompletedAt: Timestamp.now()
-          });
-          return;
-        }
-
-        const strategyData = strategyDoc.data();
-        const finalPnL = strategyData.totalPnL || 0;
-        const userId = strategy.userId || strategyData.userId;
-        const profileId = strategy.profileId || strategyData.profileId;
-
-        if (!userId) {
-          console.error(`UserId not found for strategy ${strategyId}, skipping fee calculation`);
-          await firestore.collection('strategies').doc(strategyId).update({
-            stoppingStatus: 'completed',
-            stoppingCompletedAt: Timestamp.now()
-          });
-          return;
-        }
-
-        let feeResult = null;
-        if (finalPnL > 0) {
-          const FEE_PERCENTAGE = 0.15;
-          const feeAmount = Math.round(finalPnL * FEE_PERCENTAGE * 100) / 100;
-          const feeId = firestore.collection('temp').doc().id;
-
-          const strategyFee = {
-            feeId,
-            strategyId,
-            userId,
-            profileId,
-            initialPnL: 0,
-            finalPnL,
-            feeAmount,
-            feePercentage: FEE_PERCENTAGE,
-            calculatedAt: Timestamp.now(),
-            status: 'calculated',
-          };
-
-          await firestore.collection('strategy_fees').doc(feeId).set(strategyFee);
-
-          const walletRef = firestore.collection('users').doc(userId).collection('wallets').doc('default');
-          const walletDoc = await walletRef.get();
-
-          if (!walletDoc.exists) {
-            console.error(`Wallet not found for user ${userId}, fee calculated but not deducted`);
-            feeResult = {
-              feeCalculated: true,
-              feeAmount,
-              feeDeducted: false,
-              reason: 'Wallet not found'
-            };
-          } else {
-            const currentBalance = walletDoc.data()?.balance || 0;
-            let deductAmount = feeAmount;
-            let feeStatus = 'deducted';
-
-            if (currentBalance < feeAmount) {
-              deductAmount = currentBalance;
-              feeStatus = 'insufficient_balance';
-              console.warn(`Insufficient balance for full fee. Available: ${currentBalance}, Required: ${feeAmount}`);
-            }
-
-            const newBalance = Math.max(0, currentBalance - deductAmount);
-            const now = Timestamp.now();
-
-            await walletRef.update({
-              balance: newBalance,
-              updatedAt: now,
-              lastTransactionAt: now,
-            });
-
-            const transactionId = firestore.collection('temp').doc().id;
-            const transactionRef = walletRef.collection('transactions').doc(transactionId);
-            await transactionRef.set({
-              transactionId,
-              type: 'debit',
-              amount: deductAmount,
-              balanceBefore: currentBalance,
-              balanceAfter: newBalance,
-              reason: 'platform_fee',
-              relatedResourceType: 'strategy',
-              relatedResourceId: strategyId,
-              createdAt: now,
-            });
-
-            await firestore.collection('strategy_fees').doc(feeId).update({
-              status: feeStatus,
-              deductedAt: now,
-              balanceBefore: currentBalance,
-              balanceAfter: newBalance,
-            });
-
-            if (deductAmount > 0) {
-              const earningId = firestore.collection('temp').doc().id;
-              await firestore.collection('platform_earnings').doc(earningId).set({
-                earningId,
-                feeId,
-                strategyId,
-                userId,
-                amount: deductAmount,
-                collectedAt: now,
-                source: 'performance_fee',
-              });
-            }
-
-            console.log(`Performance fee of ${precisionFormatter.formatNotional(deductAmount)} USDT deducted from user ${userId}. Status: ${feeStatus}`);
-
-            feeResult = {
-              feeCalculated: true,
-              feeAmount,
-              feeDeducted: true,
-              deductedAmount: deductAmount,
-              newBalance,
-              status: feeStatus
-            };
-          }
-        } else {
-          console.log(`Strategy ${strategyId} ended with non-positive PnL (${finalPnL}). No fee charged.`);
-          feeResult = {
-            feeCalculated: false,
-            finalPnL,
-            reason: 'Non-positive PnL'
-          };
-        }
-
-        // Mark as completed
-        await firestore.collection('strategies').doc(strategyId).update({
-          stoppingStatus: 'completed',
-          stoppingCompletedAt: Timestamp.now()
-        });
-
-        console.log(`Strategy ${strategyId} stopped successfully. Fee result:`, feeResult);
-      } catch (error) {
-        console.error(`Error in async stop operation for strategy ${strategyId}:`, error);
-        // Mark as error but still consider it stopped
-        await firestore.collection('strategies').doc(strategyId).update({
-          stoppingStatus: 'error',
-          stoppingError: error.message,
-          stoppingCompletedAt: Timestamp.now()
-        }).catch(err => console.error('Failed to update stopping status:', err));
-      }
-    });
-  } catch (error) {
-    console.error('Error stopping strategy:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Restart strategy endpoint
-app.post('/strategy/restart', async (req, res) => {
-  try {
-    const { strategyId, newConfig } = req.body;
-
-    if (!strategyId) {
-      return res.status(400).json({ error: 'strategyId is required.' });
-    }
-
-    if (!newConfig) {
-      return res.status(400).json({ error: 'newConfig is required.' });
-    }
-
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !strategy.isRunning) {
-      return res.status(400).json({
-        error: `No strategy is currently running with ID ${strategyId}`
-      });
-    }
-
-    console.log(`Restarting strategy ${strategyId} with new configuration...`);
-
-    const { realizedPnL, tradingFee } = await strategy.closeCurrentPosition();
-
-    // Wait for position to become NONE before proceeding (similar to reversal logic)
-    if (strategy.currentPosition !== 'NONE') {
-      console.log(`Waiting for position to become NONE after closing...`);
-      await strategy._waitForPositionChange('NONE');
-      console.log(`Position confirmed as NONE. Proceeding with restart.`);
-      // Add a small delay to ensure the position state is fully settled
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-
-    await strategy.cancelAllOrders();
-
-    // Validate and update accumulated values - ensure they're valid numbers
-    const validRealizedPnL = (typeof realizedPnL === 'number' && Number.isFinite(realizedPnL)) ? realizedPnL : 0;
-    const validTradingFee = (typeof tradingFee === 'number' && Number.isFinite(tradingFee)) ? tradingFee : 0;
-
-    strategy.accumulatedRealizedPnL += validRealizedPnL;
-    strategy.accumulatedTradingFees += validTradingFee;
-
-    // Additional validation after addition to prevent NaN propagation
-    if (!Number.isFinite(strategy.accumulatedRealizedPnL)) {
-      console.warn(`[${strategyId}] accumulatedRealizedPnL became invalid after update, resetting to 0`);
-      strategy.accumulatedRealizedPnL = 0;
-    }
-    if (!Number.isFinite(strategy.accumulatedTradingFees)) {
-      console.warn(`[${strategyId}] accumulatedTradingFees became invalid after update, resetting to 0`);
-      strategy.accumulatedTradingFees = 0;
-    }
-
-    console.log(`Position closed. PnL: ${precisionFormatter.formatNotional(validRealizedPnL)}, Fee: ${precisionFormatter.formatNotional(validTradingFee)}`);
-    console.log(`New accumulated PnL: ${precisionFormatter.formatNotional(strategy.accumulatedRealizedPnL)}, Total fees: ${precisionFormatter.formatNotional(strategy.accumulatedTradingFees)}`);
-
-    // Reset BE level and Final TP level (will be recalculated when new position opens)
-    strategy.breakevenPrice = null;
-    strategy.finalTpPrice = null;
-    strategy.breakevenPercentage = null;
-    strategy.finalTpPercentage = null;
-    strategy.customFinalTpLevel = null;
-    strategy.tpAtBreakeven = false;
-    strategy.finalTpActive = false;
-    strategy.finalTpOrderSent = false;
-
-    // Reset fixed reversal levels (will be recalculated from new entry price)
-    strategy.fixedReversalLevelsCalculated = false;
-    strategy.longReversalLevel = null;
-    strategy.shortReversalLevel = null;
-
-    await strategy.updateConfig(newConfig);
-
-    // Execute initial orders after config update (for both MARKET and LIMIT orders)
-    let orderExecutionResult = null;
-    try {
-      orderExecutionResult = await strategy.executeInitialOrdersAfterRestart();
-      console.log(`Initial orders executed after restart: ${JSON.stringify(orderExecutionResult)}`);
-    } catch (orderError) {
-      console.error(`Failed to execute initial orders after restart: ${orderError.message}`);
-      // Don't fail the entire restart - log the error and continue
-      orderExecutionResult = { success: false, error: orderError.message };
-    }
-
-    const strategyRef = firestore.collection('strategies').doc(strategyId);
-    const strategyDoc = await strategyRef.get();
-
-    if (strategyDoc.exists) {
-      // Clean configSnapshot by removing undefined values
-      const cleanedConfigSnapshot = {};
-      for (const key in newConfig) {
-        if (newConfig[key] !== undefined) {
-          cleanedConfigSnapshot[key] = newConfig[key];
-        }
-      }
-
-      const restartEvent = {
-        timestamp: Timestamp.now(),
-        reason: 'manual_restart',
-        configSnapshot: cleanedConfigSnapshot,
-        realizedPnLAtRestart: validRealizedPnL,
-        tradingFeeAtRestart: validTradingFee,
-      };
-
-      const currentData = strategyDoc.data();
-      const restartEvents = currentData.restartEvents || [];
-      restartEvents.push(restartEvent);
-
-      // Build update object dynamically, only including defined values
-      // Explicitly validate accumulated values before saving
-      const updateData = {
-        restartEvents,
-        lastRestartTime: Timestamp.now(),
-        accumulatedRealizedPnL: Number.isFinite(strategy.accumulatedRealizedPnL) ? strategy.accumulatedRealizedPnL : 0,
-        accumulatedTradingFees: Number.isFinite(strategy.accumulatedTradingFees) ? strategy.accumulatedTradingFees : 0,
-        // Reset BE and Final TP levels
-        breakevenPrice: null,
-        finalTpPrice: null,
-        breakevenPercentage: null,
-        finalTpPercentage: null,
-        customFinalTpLevel: null,
-        tpAtBreakeven: false,
-        // Reset fixed reversal levels
-        fixedReversalLevelsCalculated: false,
-        longReversalLevel: null,
-        shortReversalLevel: null,
-      };
-
-      // Only add fields if they have defined values
-      if (newConfig.orderType !== undefined) {
-        updateData.orderType = newConfig.orderType;
-      } else if (currentData.orderType !== undefined) {
-        updateData.orderType = currentData.orderType;
-      }
-
-      if (newConfig.supportZoneEnabled !== undefined) {
-        updateData.supportZoneEnabled = newConfig.supportZoneEnabled;
-      } else if (currentData.supportZoneEnabled !== undefined) {
-        updateData.supportZoneEnabled = currentData.supportZoneEnabled;
-      }
-
-      if (newConfig.resistanceZoneEnabled !== undefined) {
-        updateData.resistanceZoneEnabled = newConfig.resistanceZoneEnabled;
-      } else if (currentData.resistanceZoneEnabled !== undefined) {
-        updateData.resistanceZoneEnabled = currentData.resistanceZoneEnabled;
-      }
-
-      // Handle limit prices: explicitly set to null for disabled zones in MARKET mode
-      const finalOrderType = updateData.orderType || strategy.orderType;
-      const finalSupportEnabled = updateData.supportZoneEnabled ?? strategy.supportZoneEnabled;
-      const finalResistanceEnabled = updateData.resistanceZoneEnabled ?? strategy.resistanceZoneEnabled;
-
-      if (finalOrderType === 'MARKET') {
-        // For MARKET orders, clear the limit price for the disabled zone
-        if (finalSupportEnabled && !finalResistanceEnabled) {
-          // Support zone enabled (LONG) - set sell limit price to null
-          updateData.buyLimitPrice = newConfig.buyLimitPrice !== undefined ? newConfig.buyLimitPrice : currentData.buyLimitPrice;
-          updateData.sellLimitPrice = null;
-        } else if (finalResistanceEnabled && !finalSupportEnabled) {
-          // Resistance zone enabled (SHORT) - set buy limit price to null
-          updateData.buyLimitPrice = null;
-          updateData.sellLimitPrice = newConfig.sellLimitPrice !== undefined ? newConfig.sellLimitPrice : currentData.sellLimitPrice;
-        }
-      } else {
-        // For LIMIT orders, use provided values or fallback to current values
-        if (newConfig.buyLimitPrice !== undefined) {
-          updateData.buyLimitPrice = newConfig.buyLimitPrice;
-        } else if (currentData.buyLimitPrice !== undefined) {
-          updateData.buyLimitPrice = currentData.buyLimitPrice;
-        }
-
-        if (newConfig.sellLimitPrice !== undefined) {
-          updateData.sellLimitPrice = newConfig.sellLimitPrice;
-        } else if (currentData.sellLimitPrice !== undefined) {
-          updateData.sellLimitPrice = currentData.sellLimitPrice;
-        }
-      }
-
-      if (newConfig.initialBasePositionSizeUSDT !== undefined) {
-        updateData.initialBasePositionSizeUSDT = newConfig.initialBasePositionSizeUSDT;
-      } else if (currentData.initialBasePositionSizeUSDT !== undefined) {
-        updateData.initialBasePositionSizeUSDT = currentData.initialBasePositionSizeUSDT;
-      }
-
-      await strategyRef.update(updateData);
-    }
-
-    res.json({
-      success: true,
-      message: `Strategy ${strategyId} restarted successfully`,
-      accumulatedRealizedPnL: strategy.accumulatedRealizedPnL,
-      accumulatedTradingFees: strategy.accumulatedTradingFees,
-      strategyStartTime: strategy.strategyStartTime,
-      initialBasePositionSizeUSDT: strategy.initialBasePositionSizeUSDT,
-      orderType: strategy.orderType,
-      supportZoneEnabled: strategy.supportZoneEnabled,
-      resistanceZoneEnabled: strategy.resistanceZoneEnabled,
-      buyLimitPrice: strategy.buyLimitPrice,
-      sellLimitPrice: strategy.sellLimitPrice,
-      orderExecution: orderExecutionResult, // Include order execution result
-      currentPosition: strategy.currentPosition, // Include current position state
-    });
-  } catch (error) {
-    console.error('Failed to restart strategy:', error);
-    res.status(500).json({
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// Update strategy levels endpoint
-app.post('/strategy/update-levels', async (req, res) => {
-  try {
-    // MODIFIED: Removed supportLevel and resistanceLevel from req.body
-    const { strategyId, reversalThreshold, enableSupport, enableResistance } = req.body; 
-
-    if (!strategyId) {
-      return res.status(400).json({ error: 'strategyId is required.' });
-    }
-
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !strategy.isRunning) {
-      return res.status(400).json({
-        error: `No strategy is currently running with ID ${strategyId} to update levels.`
-      });
-    }
-
-    // Basic validation for enable flags remains
-    // REMOVED: Validation for supportLevel and resistanceLevel
-    if (enableSupport && (reversalThreshold === null || reversalThreshold === undefined)) {
-      return res.status(400).json({
-        error: 'Reversal threshold is required when support is enabled.'
-      });
-    }
-    if (enableResistance && (reversalThreshold === null || reversalThreshold === undefined)) {
-      return res.status(400).json({
-        error: 'Reversal threshold is required when resistance is enabled'
-      });
-    }
-
-    // Pass the new configuration to the strategy instance
-    await strategy.updateLevels({
-      reversalThreshold, // MODIFIED: Pass reversalThreshold instead of support/resistance levels
-      enableSupport,
-      enableResistance
-    });
-
-    res.json({
-      success: true,
-      message: `Strategy levels for ${strategyId} updated successfully.`
-    });
-  } catch (error) {
-    console.error('Failed to update strategy levels:', error);
-    res.status(500).json({
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// NEW: Endpoint to update strategy configuration (e.g., initialBasePositionSizeUSDT, newMaxExposureUSDT, customFinalTpLong, customFinalTpShort, tpAtBreakeven, Advanced Settings)
-app.post('/strategy/update-config', async (req, res) => {
-  try {
-    const {
-      strategyId,
-      initialBasePositionSizeUSDT,
-      newMaxExposureUSDT,
-      customFinalTpLong,
-      customFinalTpShort,
-      tpAtBreakeven,
-      desiredProfitUSDT,
-      tradingMode,
-      priceType,
-      reversalLevelPercentage,
-      gridSize,
-      gridLevelsPerSide,
-      recoveryFactor,
-      recoveryDistance,
-    } = req.body; // Expect strategyId and optional config fields
-
-    if (!strategyId) {
-      return res.status(400).json({ error: 'strategyId is required.' });
-    }
-
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !strategy.isRunning) {
-      return res.status(400).json({
-        error: `No strategy is currently running with ID ${strategyId} to update configuration.`
-      });
-    }
-
-    // Validate initialBasePositionSizeUSDT if provided
-    if (initialBasePositionSizeUSDT !== undefined && initialBasePositionSizeUSDT !== null) {
-      if (isNaN(initialBasePositionSizeUSDT) || initialBasePositionSizeUSDT <= 0) {
-        return res.status(400).json({
-          error: 'Invalid initialBasePositionSizeUSDT provided.'
-        });
-      }
-    }
-
-    // Validate newMaxExposureUSDT if provided
-    if (newMaxExposureUSDT !== undefined && newMaxExposureUSDT !== null) {
-      if (isNaN(newMaxExposureUSDT) || newMaxExposureUSDT <= 0) {
-        return res.status(400).json({
-          error: 'Invalid newMaxExposureUSDT provided. Must be a positive number.'
-        });
-      }
-    }
-
-    // Validate customFinalTpLong if provided (expects a price value for LONG positions)
-    // Allow null to reset to auto-calculation
-    if (customFinalTpLong !== undefined && customFinalTpLong !== null) {
-      if (isNaN(customFinalTpLong) || customFinalTpLong <= 0) {
-        return res.status(400).json({
-          error: 'Invalid customFinalTpLong provided. Must be a positive price value.'
-        });
-      }
-    }
-
-    // Validate customFinalTpShort if provided (expects a price value for SHORT positions)
-    // Allow null to reset to auto-calculation
-    if (customFinalTpShort !== undefined && customFinalTpShort !== null) {
-      if (isNaN(customFinalTpShort) || customFinalTpShort <= 0) {
-        return res.status(400).json({
-          error: 'Invalid customFinalTpShort provided. Must be a positive price value.'
-        });
-      }
-    }
-
-    // Validate tpAtBreakeven if provided
-    if (tpAtBreakeven !== undefined && tpAtBreakeven !== null) {
-      if (typeof tpAtBreakeven !== 'boolean') {
-        return res.status(400).json({
-          error: 'Invalid tpAtBreakeven provided. Must be a boolean value.'
-        });
-      }
-    }
-
-    // Validate desiredProfitUSDT if provided
-    if (desiredProfitUSDT !== undefined && desiredProfitUSDT !== null) {
-      if (isNaN(desiredProfitUSDT) || desiredProfitUSDT <= 0) {
-        return res.status(400).json({
-          error: 'Invalid desiredProfitUSDT provided. Must be a positive number.'
-        });
-      }
-    }
-
-    // Validate tradingMode if provided
-    if (tradingMode !== undefined && tradingMode !== null) {
-      const validModes = ['AGGRESSIVE', 'NORMAL', 'CONSERVATIVE'];
-      if (!validModes.includes(tradingMode)) {
-        return res.status(400).json({
-          error: 'Invalid tradingMode. Must be AGGRESSIVE, NORMAL, or CONSERVATIVE.'
-        });
-      }
-    }
-
-    // Validate priceType if provided
-    if (priceType !== undefined && priceType !== null) {
-      const validTypes = ['LAST', 'MARK'];
-      if (!validTypes.includes(priceType)) {
-        return res.status(400).json({
-          error: 'Invalid priceType. Must be LAST or MARK.'
-        });
-      }
-    }
-
-    // Validate reversalLevelPercentage if provided
-    if (reversalLevelPercentage !== undefined && reversalLevelPercentage !== null) {
-      if (isNaN(reversalLevelPercentage) || reversalLevelPercentage <= 0) {
-        return res.status(400).json({
-          error: 'Invalid reversalLevelPercentage. Must be a positive number.'
-        });
-      }
-    }
-
-    // Validate gridSize if provided
-    if (gridSize !== undefined && gridSize !== null) {
-      if (isNaN(gridSize) || gridSize <= 0 || gridSize > 0.1) {
-        return res.status(400).json({
-          error: 'Invalid gridSize. Must be a positive number no greater than 0.1 (10%).'
-        });
-      }
-    }
-
-    // Validate gridLevelsPerSide if provided
-    if (gridLevelsPerSide !== undefined && gridLevelsPerSide !== null) {
-      if (!Number.isInteger(gridLevelsPerSide) || gridLevelsPerSide < 1 || gridLevelsPerSide > 20) {
-        return res.status(400).json({
-          error: 'Invalid gridLevelsPerSide. Must be an integer between 1 and 20.'
-        });
-      }
-    }
-
-    // Validate recoveryFactor if provided
-    if (recoveryFactor !== undefined && recoveryFactor !== null) {
-      if (isNaN(recoveryFactor) || recoveryFactor <= 0) {
-        return res.status(400).json({
-          error: 'Invalid recoveryFactor. Must be a positive number.'
-        });
-      }
-    }
-
-    // Validate recoveryDistance if provided
-    if (recoveryDistance !== undefined && recoveryDistance !== null) {
-      if (isNaN(recoveryDistance) || recoveryDistance <= 0) {
-        return res.status(400).json({
-          error: 'Invalid recoveryDistance. Must be a positive number.'
-        });
-      }
-    }
-
-    // Build update config object
-    const updateConfig = {};
-    if (initialBasePositionSizeUSDT !== undefined && initialBasePositionSizeUSDT !== null) {
-      updateConfig.initialBasePositionSizeUSDT = initialBasePositionSizeUSDT;
-    }
-    if (newMaxExposureUSDT !== undefined && newMaxExposureUSDT !== null) {
-      updateConfig.newMaxExposureUSDT = newMaxExposureUSDT;
-    }
-    // Handle customFinalTpLong: allow null to reset to auto-calculation
-    if (customFinalTpLong !== undefined) {
-      updateConfig.customFinalTpLong = customFinalTpLong;
-    }
-    // Handle customFinalTpShort: allow null to reset to auto-calculation
-    if (customFinalTpShort !== undefined) {
-      updateConfig.customFinalTpShort = customFinalTpShort;
-    }
-    if (tpAtBreakeven !== undefined && tpAtBreakeven !== null) {
-      updateConfig.tpAtBreakeven = tpAtBreakeven;
-    }
-    // Handle desiredProfitUSDT: allow null to clear target
-    if (desiredProfitUSDT !== undefined) {
-      updateConfig.desiredProfitUSDT = desiredProfitUSDT;
-    }
-    // Add Advanced Settings fields
-    if (tradingMode !== undefined && tradingMode !== null) {
-      updateConfig.tradingMode = tradingMode;
-    }
-    if (priceType !== undefined && priceType !== null) {
-      updateConfig.priceType = priceType;
-    }
-    if (reversalLevelPercentage !== undefined && reversalLevelPercentage !== null) {
-      updateConfig.reversalLevelPercentage = reversalLevelPercentage;
-    }
-    if (gridSize !== undefined && gridSize !== null) {
-      updateConfig.gridSize = gridSize;
-    }
-    if (gridLevelsPerSide !== undefined && gridLevelsPerSide !== null) {
-      updateConfig.gridLevelsPerSide = gridLevelsPerSide;
-    }
-    if (recoveryFactor !== undefined && recoveryFactor !== null) {
-      updateConfig.recoveryFactor = recoveryFactor;
-    }
-    if (recoveryDistance !== undefined && recoveryDistance !== null) {
-      updateConfig.recoveryDistance = recoveryDistance;
-    }
-
-    await strategy.updateConfig(updateConfig);
-
-    res.json({
-      success: true,
-      message: `Strategy configuration for ${strategyId} updated successfully.`
-    });
-  } catch (error) {
-    console.error('Failed to update strategy config:', error);
-    res.status(500).json({
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// Get strategy status endpoint
-app.get('/strategy/status', async (req, res) => {
-  try {
-    const { strategyId } = req.query; // Get strategyId from query params
-
-    if (!strategyId) {
-      return res.status(400).json({ error: 'strategyId is required.' });
-    }
-
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy) {
-      return res.json({
-        isRunning: false,
-        strategy: null
-      });
-    }
-
-    const status = await strategy.getStatus();
-
-    // Helper function to validate and sanitize numeric values
-    const sanitizeNumber = (value, defaultValue = null) => {
-      if (value === null || value === undefined) return defaultValue;
-      if (typeof value === 'number' && Number.isFinite(value)) return value;
-      return defaultValue;
-    };
-
-    res.json({
-      isRunning: strategy.isRunning,
-      strategyId: strategy.strategyId,
-      strategy: status,
-      currentState: {
-        currentPosition: strategy.currentPosition,
-        thresholdLevel: strategy.thresholdLevel,
-        thresholdType: strategy.thresholdType,
-        positionEntryPrice: sanitizeNumber(strategy.positionEntryPrice),
-        positionSize: sanitizeNumber(strategy.positionSize),
-        currentPrice: sanitizeNumber(strategy.currentPrice),
-        positionPnL: sanitizeNumber(strategy.positionPnL),
-        totalPnL: sanitizeNumber(strategy.totalPnL),
-        accumulatedRealizedPnL: sanitizeNumber(strategy.accumulatedRealizedPnL, 0),
-        accumulatedTradingFees: sanitizeNumber(strategy.accumulatedTradingFees, 0),
-        currentPositionQuantity: sanitizeNumber(strategy.currentPositionQuantity),
-      }
-    });
-  } catch (error) {
-    console.error('Failed to get strategy status:', error);
-    res.status(500).json({
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// New endpoint to save PnL to Firestore
-app.post('/strategy/save-pnl', async (req, res) => {
-  try {
-    const { strategyId } = req.body; // Expect strategyId
-
-    if (!strategyId) {
-      return res.status(400).json({ error: 'strategyId is required.' });
-    }
-
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !strategy.isRunning) {
-      return res.status(400).json({
-        error: `No strategy is currently running with ID ${strategyId} to save PnL.`
-      });
-    }
-    await strategy.saveState();
-    res.json({
-      success: true,
-      message: `Current PnL and strategy state for ${strategyId} saved to Firestore.`
-    });
-  } catch (error) {
-    console.error('Failed to save PnL to Firestore:', error);
-    res.status(500).json({
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
+// Generic Firestore query endpoints (used by AI hedge strategy)
 
 // New endpoint to fetch strategy-specific trades
 app.get('/strategy/:strategyId/trades', async (req, res) => {
@@ -1163,53 +254,6 @@ app.get('/strategies/:strategyId', async (req, res) => {
     res.json(formattedData);
   } catch (error) {
     console.error('Failed to fetch strategy details:', error);
-    res.status(500).json({
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// Resume strategy endpoint
-app.post('/strategy/resume/:strategyId', async (req, res) => {
-  try {
-    const { strategyId } = req.params;
-    const { gcpProxyUrl } = req.body; // Expect gcpProxyUrl in body for resume
-
-    if (!gcpProxyUrl) {
-      return res.status(400).json({ error: 'gcpProxyUrl is required to resume a strategy.' });
-    }
-
-    if (activeStrategies.has(strategyId) && activeStrategies.get(strategyId).isRunning) {
-      return res.status(400).json({
-        error: `Strategy with ID ${strategyId} is already running`
-      });
-    }
-
-    const strategy = new TradingStrategy(gcpProxyUrl); // Initialize with provided GCF URL
-    strategy.strategyId = strategyId; // Set strategyId for the instance
-    
-    const loaded = await strategy.loadState(strategyId);
-    if (!loaded) {
-      return res.status(404).json({
-        error: 'Strategy not found'
-      });
-    }
-
-    strategy.isRunning = true;
-    strategy.connectRealtimeWebSocket(); // Connect real-time WS
-    strategy.connectUserDataStream(); // Connect user data WS
-    await strategy.addLog('🔄 Ycbot strategy resumed from saved state (manual resume)');
-    await strategy.saveState();
-    activeStrategies.set(strategyId, strategy); // Add to map
-
-    res.json({
-      success: true,
-      strategyId,
-      message: 'Ycbot strategy resumed successfully'
-    });
-  } catch (error) {
-    console.error('Failed to resume strategy:', error);
     res.status(500).json({
       error: error.message,
       timestamp: new Date().toISOString()
@@ -1868,6 +912,135 @@ async function reportVersionOnStartup(retryCount = 0) {
     }
   }
 }
+
+// ─── AI Hedge Strategy Endpoints ─────────────────────────────────────────────
+
+// Start AI hedge strategy
+app.post('/ai-hedge/start', async (req, res) => {
+  if (isUpdating) {
+    return res.status(503).json({ error: 'VM is currently updating.', code: 'VM_UPDATING' });
+  }
+
+  try {
+    const { profileId, gcpProxyUrl, sharedVmProxyGcfUrl, config, userId } = req.body;
+
+    if (!profileId || !gcpProxyUrl || !sharedVmProxyGcfUrl || !config) {
+      return res.status(400).json({ error: 'profileId, gcpProxyUrl, sharedVmProxyGcfUrl, and config are required.' });
+    }
+
+    // Check if any strategy is already running for this profile
+    for (const [sId, strategy] of activeStrategies.entries()) {
+      if (strategy.profileId === profileId && strategy.isRunning) {
+        return res.status(400).json({
+          error: `A strategy for profile ${profileId} is already running`,
+          strategyId: sId
+        });
+      }
+    }
+
+    const strategy = new AiHedgeStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
+    strategy.userId = userId;
+    await strategy.start(config);
+
+    activeStrategies.set(strategy.strategyId, strategy);
+
+    console.log(`✓ AI Hedge Strategy ${strategy.strategyId} started.`);
+    res.json({
+      success: true,
+      strategyId: strategy.strategyId,
+      message: 'AI Hedge Strategy started successfully',
+    });
+  } catch (error) {
+    console.error('Failed to start AI Hedge Strategy:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Stop AI hedge strategy
+app.post('/ai-hedge/stop', async (req, res) => {
+  try {
+    const { strategyId } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AiHedgeStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No AI Hedge strategy running with ID ${strategyId}` });
+    }
+
+    res.json({ success: true, stopping: true, message: 'AI Hedge Strategy stop initiated', strategyId });
+
+    setImmediate(async () => {
+      try {
+        await strategy.stop('manual');
+        activeStrategies.delete(strategyId);
+      } catch (error) {
+        console.error(`Error stopping AI Hedge Strategy ${strategyId}:`, error);
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get AI hedge strategy status
+app.get('/ai-hedge/status', (req, res) => {
+  const { strategyId } = req.query;
+
+  if (strategyId) {
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AiHedgeStrategy)) {
+      return res.status(404).json({ error: `AI Hedge strategy ${strategyId} not found.` });
+    }
+    return res.json(strategy.getStatus());
+  }
+
+  // Return all AI hedge strategies
+  const hedgeStrategies = {};
+  activeStrategies.forEach((strategy, sId) => {
+    if (strategy instanceof AiHedgeStrategy) {
+      hedgeStrategies[sId] = strategy.getStatus();
+    }
+  });
+
+  res.json({ strategies: hedgeStrategies, count: Object.keys(hedgeStrategies).length });
+});
+
+// Manually trigger AI replan
+app.post('/ai-hedge/replan', async (req, res) => {
+  try {
+    const { strategyId } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AiHedgeStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running AI Hedge strategy with ID ${strategyId}` });
+    }
+
+    await strategy.manualReplan();
+    res.json({ success: true, message: 'Replan triggered', strategyId });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get AI plan history
+app.get('/ai-hedge/plan-history', async (req, res) => {
+  try {
+    const { strategyId, limit: queryLimit } = req.query;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+
+    const planLimit = parseInt(queryLimit) || 20;
+    const plansRef = firestore.collection('strategies').doc(strategyId).collection('aiPlans');
+    const snapshot = await plansRef.orderBy('timestamp', 'desc').limit(planLimit).get();
+
+    const plans = [];
+    snapshot.forEach(doc => plans.push({ id: doc.id, ...doc.data() }));
+
+    res.json({ plans, count: plans.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // Start the server
 server.listen(PORT, async () => {
