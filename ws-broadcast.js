@@ -62,6 +62,20 @@ class WsBroadcast {
   }
 
   /**
+   * Push AI plan update — same signature as WsRelayClient.
+   */
+  pushPlanUpdate(strategyId, planData) {
+    this._broadcast({ type: 'plan_update', strategyId, data: planData });
+  }
+
+  /**
+   * Push flow event — same signature as WsRelayClient.
+   */
+  pushFlowEvent(strategyId, eventData) {
+    this._broadcast({ type: 'flow_event', strategyId, data: eventData });
+  }
+
+  /**
    * Push health data.
    */
   pushHealth(healthData) {

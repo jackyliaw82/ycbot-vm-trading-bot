@@ -2,12 +2,15 @@ import express from 'express';
 import cors from 'cors';
 import { AiHedgeStrategy } from './ai-hedge-strategy.js';
 import http from 'http';
+import { WebSocketServer } from 'ws';
 import { Firestore, Timestamp, FieldValue } from '@google-cloud/firestore';
 import { initializeFirebaseAdmin } from './pushNotificationHelper.js';
+import admin from 'firebase-admin';
 import { precisionFormatter } from './precisionUtils.js';
 import { execFile } from 'child_process';
 import { readFileSync } from 'fs';
 import os from 'os';
+import wsBroadcast from './ws-broadcast.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -75,6 +78,113 @@ const activeStrategies = new Map();
 
 // Create HTTP server
 const server = http.createServer(app);
+
+// ─── WebSocket Server (direct frontend connections via nginx) ────────────────
+
+const PING_INTERVAL_MS = 25000;
+const PONG_TIMEOUT_MS = 10000;
+
+const wss = new WebSocketServer({ noServer: true });
+wsBroadcast.setWss(wss);
+
+server.on('upgrade', async (request, socket, head) => {
+  const url = new URL(request.url, `http://${request.headers.host}`);
+  if (url.pathname !== '/ws') {
+    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  const token = url.searchParams.get('token');
+  if (!token) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      handleClientConnection(ws, decoded.uid);
+    });
+  } catch (err) {
+    console.error('[WS] Firebase token verification failed:', err.message);
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+  }
+});
+
+function handleClientConnection(ws, uid) {
+  console.log(`[WS] Client connected: ${uid}`);
+
+  // Send immediate vm_connected since the client is directly on the VM
+  ws.send(JSON.stringify({ type: 'vm_connected', timestamp: Date.now() }));
+
+  // Send current health snapshot
+  const healthData = buildHealthPayload();
+  ws.send(JSON.stringify({ type: 'health', data: healthData }));
+
+  // Ping/pong keepalive
+  let pongTimeout = null;
+  const pingInterval = setInterval(() => {
+    if (ws.readyState !== ws.OPEN) return;
+    ws.send(JSON.stringify({ type: 'ping' }));
+    pongTimeout = setTimeout(() => {
+      console.log(`[WS] Pong timeout for ${uid} — terminating`);
+      ws.terminate();
+    }, PONG_TIMEOUT_MS);
+  }, PING_INTERVAL_MS);
+
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw);
+      if (msg.type === 'pong' && pongTimeout) {
+        clearTimeout(pongTimeout);
+        pongTimeout = null;
+      }
+    } catch {}
+  });
+
+  ws.on('close', () => {
+    console.log(`[WS] Client disconnected: ${uid}`);
+    clearInterval(pingInterval);
+    if (pongTimeout) clearTimeout(pongTimeout);
+  });
+
+  ws.on('error', (err) => {
+    console.error(`[WS] Error for ${uid}:`, err.message);
+  });
+}
+
+function buildHealthPayload() {
+  const strategiesStatus = {};
+  activeStrategies.forEach((strategy, strategyId) => {
+    strategiesStatus[strategyId] = {
+      strategyRunning: strategy.isRunning,
+      realtimeWsConnected: strategy.realtimeWsConnected,
+      userDataWsConnected: strategy.userDataWsConnected,
+      profileId: strategy.profileId,
+    };
+  });
+  return {
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    activeStrategiesCount: activeStrategies.size,
+    strategies: strategiesStatus,
+    vmInstanceHealthy: true,
+    botVersion: BOT_VERSION,
+    updateAvailable,
+    targetVersion,
+    isUpdating,
+  };
+}
+
+// Periodic health broadcast to all connected WebSocket clients
+setInterval(() => {
+  if (wss.clients.size > 0) {
+    wsBroadcast.pushHealth(buildHealthPayload());
+  }
+}, 10000);
 
 // Health check endpoint
 app.get('/health', (req, res) => {
