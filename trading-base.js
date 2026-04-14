@@ -2,6 +2,7 @@ import { Firestore, Timestamp } from '@google-cloud/firestore';
 import WebSocket from 'ws';
 import fetch from 'node-fetch';
 import { precisionFormatter } from './precisionUtils.js';
+import wsBroadcast from './ws-broadcast.js';
 
 // Constants for WebSocket reconnection
 const INITIAL_RECONNECT_DELAY_MS = 1000;
@@ -158,6 +159,11 @@ class TradingBase {
       'WebSocket client disconnected for logs'
     ];
 
+    // Broadcast log to connected WebSocket clients
+    if (this.strategyId) {
+      wsBroadcast.pushLog(this.strategyId, logEntry, now.toISOString());
+    }
+
     if (this.strategyId && !this.willBeDeleted && this.logsCollectionRef &&
         !messagesToFilter.some(filterMsg => message.includes(filterMsg))) {
       try {
@@ -187,11 +193,15 @@ class TradingBase {
       return;
     }
     try {
-      await this.tradesCollectionRef.add({
+      const tradeData = {
         ...tradeDetails,
         timestamp: new Date(),
         strategyId: this.strategyId,
-      });
+      };
+      await this.tradesCollectionRef.add(tradeData);
+
+      // Broadcast trade to connected WebSocket clients
+      wsBroadcast.pushTrade(this.strategyId, tradeData);
     } catch (error) {
       console.error(`Failed to save trade to Firestore: ${error.message}`);
     }
