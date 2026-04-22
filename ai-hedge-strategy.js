@@ -49,6 +49,9 @@ class AiHedgeStrategy extends TradingBase {
     this.positionSizeUSDT = 0;
     this.leverage = DEFAULT_LEVERAGE;
     this.maxPositionSizeUSDT = 0;
+    // Raw config inputs (for display in Active Config panel; positionSize/desiredProfit are derived)
+    this.initialHedgeMultiplier = null;
+    this.profitPercent = null;
 
     // Trade tracking
     this.tradeCount = 0;
@@ -104,6 +107,8 @@ class AiHedgeStrategy extends TradingBase {
     this.desiredProfitUSDT = config.desiredProfitUSDT || null;
     this.priceType = config.priceType || 'MARK';
     this.maxPositionSizeUSDT = config.maxPositionSizeUSDT || (this.positionSizeUSDT * 20);
+    this.initialHedgeMultiplier = config.initialHedgeMultiplier ?? null;
+    this.profitPercent = config.profitPercent ?? null;
 
     const anthropicApiKey = await this._fetchAnthropicApiKey();
     const aiModel = config.aiModel || 'claude-sonnet-4-6';
@@ -750,6 +755,8 @@ class AiHedgeStrategy extends TradingBase {
       maxPositionSizeUSDT: this.maxPositionSizeUSDT,
       leverage: this.leverage,
       priceType: this.priceType,
+      initialHedgeMultiplier: this.initialHedgeMultiplier,
+      profitPercent: this.profitPercent,
       activePlan: this.activePlan ? { analysis: this.activePlan.analysis, actionAbove: this.activePlan.actionAbove, actionBelow: this.activePlan.actionBelow, probabilityAssessment: this.activePlan.probabilityAssessment } : null,
       tradeCount: this.tradeCount,
       planHistoryCount: this.planHistory.length,
