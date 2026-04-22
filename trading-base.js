@@ -59,8 +59,13 @@ class TradingBase {
     // WebSocket handles
     this.realtimeWs = null;
     this.userDataWs = null;
+    this.liquidationWs = null;
     this.listenKey = null;
     this.listenKeyRefreshInterval = null;
+
+    // Liquidation stream state (replaces deprecated /fapi/v1/allForceOrders REST)
+    this._liqEvents = []; // rolling buffer: [{ side: 'SELL'|'BUY', notional, ts }]
+    this._liqWsLastConnectedAt = null; // stale-data guard
 
     // Position tracking (primary — backward compatible)
     this.currentPosition = 'NONE';
@@ -104,13 +109,16 @@ class TradingBase {
     // WebSocket connection statuses
     this.realtimeWsConnected = false;
     this.userDataWsConnected = false;
+    this.liquidationWsConnected = false;
 
     // Reconnection state
     this.realtimeReconnectAttempts = 0;
     this.userDataReconnectAttempts = 0;
+    this.liquidationReconnectAttempts = 0;
     this.listenKeyRetryAttempts = 0;
     this.realtimeReconnectTimeout = null;
     this.userDataReconnectTimeout = null;
+    this.liquidationReconnectTimeout = null;
     this.isUserDataReconnecting = false;
 
     // Heartbeat timeouts/intervals
@@ -118,6 +126,8 @@ class TradingBase {
     this.realtimeWsPingInterval = null;
     this.userDataWsPingTimeout = null;
     this.userDataWsPingInterval = null;
+    this.liquidationWsPingTimeout = null;
+    this.liquidationWsPingInterval = null;
 
     // Pending orders
     this.pendingOrders = new Map();
@@ -423,10 +433,20 @@ class TradingBase {
 
   async setPositionMode(dualSidePosition) {
     try {
+      // Pre-flight check: avoid the noisy -4059 "no need to change" error
+      // from Binance when the account is already in the requested mode.
+      const current = await this.getPositionMode();
+      const currentDual = current?.dualSidePosition === true || current?.dualSidePosition === 'true';
+      if (currentDual === dualSidePosition) {
+        await this.addLog(`Pos. mode already ${dualSidePosition ? 'Hedge' : 'One-way'}.`);
+        return { dualSidePosition };
+      }
+
       const result = await this.makeProxyRequest('/fapi/v1/positionSide/dual', 'POST', { dualSidePosition }, true, 'futures');
       await this.addLog(`Position mode set to ${dualSidePosition ? 'Hedge' : 'One-way'}.`);
       return result;
     } catch (error) {
+      // Defensive: covers a race where mode changes between GET and POST.
       if (error.message.includes('-4059') && error.message.includes('No need to change position side')) {
         await this.addLog(`Pos. mode already ${dualSidePosition ? 'Hedge' : 'One-way'}.`);
         return { dualSidePosition };
@@ -913,8 +933,11 @@ class TradingBase {
         }
 
         await this.saveTrade({
+          tradeId: order.t,                      // Binance trade ID — unique per fill (differs across partial fills of one order)
           orderId: order.i,
           symbol: order.s,
+          side: order.S,                        // 'BUY' or 'SELL'
+          positionSide: orderPositionSide,       // 'LONG' or 'SHORT'
           time: order.T,
           price: tradePrice,
           qty: tradeQty,
@@ -944,65 +967,222 @@ class TradingBase {
 
   /**
    * Handle ACCOUNT_UPDATE events — position state updates from exchange.
+   *
+   * Mirrors each per-side update into both the legacy internal fields
+   * (_longEntryPrice / _shortEntryPrice / ...) and the structured per-side
+   * objects (longPosition / shortPosition) that the AI hedge strategy,
+   * frontend, risk guard, and status payload all read from. This makes the
+   * WS push the primary source of truth for position state — REST polling
+   * becomes a reconciliation fallback only.
    */
   async _handleAccountUpdate(positions) {
-    const positionUpdate = positions.find(p => p.s === this.symbol);
-    if (!positionUpdate) return;
+    const symbolUpdates = positions.filter(p => p.s === this.symbol);
+    if (symbolUpdates.length === 0) return;
 
-    const positionAmount = parseFloat(positionUpdate.pa);
-    const entryPrice = parseFloat(positionUpdate.ep);
-    const positionSide = positionUpdate.ps; // 'LONG', 'SHORT', or 'BOTH'
+    for (const positionUpdate of symbolUpdates) {
+      const positionAmount = parseFloat(positionUpdate.pa);
+      const entryPrice = parseFloat(positionUpdate.ep);
+      const unrealizedPnl = parseFloat(positionUpdate.up || 0);
+      const positionSide = positionUpdate.ps; // 'LONG', 'SHORT', or 'BOTH'
 
-    if (positionAmount === 0) {
-      // Position closed on this side
-      if (positionSide === 'LONG') {
-        this._longEntryPrice = null;
-        this._longPositionSize = null;
-      } else if (positionSide === 'SHORT') {
-        this._shortEntryPrice = null;
-        this._shortPositionSize = null;
-      } else {
-        this._longEntryPrice = null;
-        this._longPositionSize = null;
-        this._shortEntryPrice = null;
-        this._shortPositionSize = null;
-      }
-
-      // If neither side has position, set to NONE
-      if (this._longEntryPrice === null && this._shortEntryPrice === null) {
-        if (this.currentPositionQuantity !== null && this.currentPositionQuantity > 0) {
-          this.lastPositionQuantity = this.currentPositionQuantity;
+      if (positionAmount === 0) {
+        // Position closed on this side
+        if (positionSide === 'LONG') {
+          this._longEntryPrice = null;
+          this._longPositionSize = null;
+          this.longPosition = null;
+        } else if (positionSide === 'SHORT') {
+          this._shortEntryPrice = null;
+          this._shortPositionSize = null;
+          this.shortPosition = null;
+        } else {
+          this._longEntryPrice = null;
+          this._longPositionSize = null;
+          this._shortEntryPrice = null;
+          this._shortPositionSize = null;
+          this.longPosition = null;
+          this.shortPosition = null;
         }
-        if (this.positionEntryPrice !== null) {
-          this.lastPositionEntryPrice = this.positionEntryPrice;
+
+        // If neither side has position, set to NONE
+        if (this._longEntryPrice === null && this._shortEntryPrice === null) {
+          if (this.currentPositionQuantity !== null && this.currentPositionQuantity > 0) {
+            this.lastPositionQuantity = this.currentPositionQuantity;
+          }
+          if (this.positionEntryPrice !== null) {
+            this.lastPositionEntryPrice = this.positionEntryPrice;
+          }
+          this.currentPosition = 'NONE';
+          this.positionEntryPrice = null;
+          this.currentPositionQuantity = null;
+          this.positionSize = null;
         }
-        this.currentPosition = 'NONE';
-        this.positionEntryPrice = null;
-        this.currentPositionQuantity = null;
-        this.positionSize = null;
+      } else if (positionAmount > 0) {
+        const qty = Math.abs(positionAmount);
+        const notional = qty * entryPrice;
+        this.currentPosition = 'LONG';
+        this.positionEntryPrice = entryPrice;
+        this.currentPositionQuantity = qty;
+        this.positionSize = notional;
+        this.lastPositionQuantity = qty;
+        this.lastPositionEntryPrice = entryPrice;
+        this._longEntryPrice = entryPrice;
+        this._longPositionSize = notional;
+        this.longPosition = { entryPrice, quantity: qty, notional, unrealizedPnl };
+      } else if (positionAmount < 0) {
+        const qty = Math.abs(positionAmount);
+        const notional = qty * entryPrice;
+        this.currentPosition = 'SHORT';
+        this.positionEntryPrice = entryPrice;
+        this.currentPositionQuantity = qty;
+        this.positionSize = notional;
+        this.lastPositionQuantity = qty;
+        this.lastPositionEntryPrice = entryPrice;
+        this._shortEntryPrice = entryPrice;
+        this._shortPositionSize = notional;
+        this.shortPosition = { entryPrice, quantity: qty, notional, unrealizedPnl };
       }
-    } else if (positionAmount > 0) {
-      this.currentPosition = 'LONG';
-      this.positionEntryPrice = entryPrice;
-      this.currentPositionQuantity = Math.abs(positionAmount);
-      this.positionSize = Math.abs(positionAmount) * entryPrice;
-      this.lastPositionQuantity = Math.abs(positionAmount);
-      this.lastPositionEntryPrice = entryPrice;
-      this._longEntryPrice = entryPrice;
-      this._longPositionSize = Math.abs(positionAmount) * entryPrice;
-    } else if (positionAmount < 0) {
-      this.currentPosition = 'SHORT';
-      this.positionEntryPrice = entryPrice;
-      this.currentPositionQuantity = Math.abs(positionAmount);
-      this.positionSize = Math.abs(positionAmount) * entryPrice;
-      this.lastPositionQuantity = Math.abs(positionAmount);
-      this.lastPositionEntryPrice = entryPrice;
-      this._shortEntryPrice = entryPrice;
-      this._shortPositionSize = Math.abs(positionAmount) * entryPrice;
+    }
+
+    // Recompute derived hedge metrics after all per-side updates in this event
+    if (this.longPosition && this.shortPosition) {
+      this.hedgeGap = this.shortPosition.entryPrice - this.longPosition.entryPrice;
+      const minQty = Math.min(this.longPosition.quantity, this.shortPosition.quantity);
+      this.lockedProfit = this.hedgeGap * minQty;
+    } else {
+      this.hedgeGap = 0;
+      this.lockedProfit = 0;
     }
 
     this.lastPositionUpdateFromWebSocket = Date.now();
     this.positionUpdatedViaWebSocket = true;
+  }
+
+  // ─── WebSocket: Liquidation stream ─────────────────────────────────────────
+  // Replaces deprecated GET /fapi/v1/allForceOrders REST endpoint.
+  // Aggregates forceOrder events into a 15m rolling buffer consumed by ai-market-context.
+
+  connectLiquidationWebSocket() {
+    if (this.liquidationReconnectTimeout) clearTimeout(this.liquidationReconnectTimeout);
+    if (this.liquidationWsPingInterval) clearInterval(this.liquidationWsPingInterval);
+    if (this.liquidationWsPingTimeout) clearTimeout(this.liquidationWsPingTimeout);
+    if (this.liquidationWs) this.liquidationWs.close();
+
+    const wsBaseUrl = this.isTestnet === true
+      ? 'wss://stream.binance.com/ws'
+      : 'wss://fstream.binance.com/ws';
+    const stream = `${this.symbol.toLowerCase()}@forceOrder`;
+
+    this.liquidationWs = new WebSocket(`${wsBaseUrl}/${stream}`);
+
+    this.liquidationWs.on('open', async () => {
+      await this.addLog('[WebSocket] Liquidation WS connected.');
+      this.liquidationWsConnected = true;
+      this._liqWsLastConnectedAt = Date.now();
+      this.liquidationReconnectAttempts = 0;
+      if (this.liquidationReconnectTimeout) clearTimeout(this.liquidationReconnectTimeout);
+
+      this.liquidationWsPingInterval = setInterval(() => {
+        this.liquidationWs.ping();
+        this.liquidationWsPingTimeout = setTimeout(() => {
+          this.addLog('[WebSocket] Liquidation WS pong timeout. Terminating connection.');
+          this.liquidationWs.terminate();
+        }, PONG_TIMEOUT_MS);
+      }, PING_INTERVAL_MS);
+    });
+
+    this.liquidationWs.on('pong', () => {
+      if (this.liquidationWsPingTimeout) {
+        clearTimeout(this.liquidationWsPingTimeout);
+        this.liquidationWsPingTimeout = null;
+      }
+    });
+
+    this.liquidationWs.on('message', (data) => {
+      try {
+        const message = JSON.parse(data.toString());
+        if (message.e !== 'forceOrder' || !message.o) return;
+        const o = message.o;
+        const avgPrice = parseFloat(o.ap);
+        const filledQty = parseFloat(o.z);
+        if (!isFinite(avgPrice) || !isFinite(filledQty) || filledQty <= 0) return;
+        this._liqEvents.push({
+          side: o.S, // 'SELL' = long liquidated, 'BUY' = short liquidated
+          notional: avgPrice * filledQty,
+          ts: o.T || Date.now(),
+        });
+      } catch (error) {
+        console.error(`Error processing liquidation message: ${error.message}`);
+      }
+    });
+
+    this.liquidationWs.on('error', (error) => {
+      console.error(`Liquidation WebSocket error: ${error.message}`);
+    });
+
+    this.liquidationWs.on('close', async () => {
+      this.liquidationWsConnected = false;
+      await this.addLog('[WebSocket] Liquidation WebSocket closed.');
+      if (this.liquidationWsPingInterval) clearInterval(this.liquidationWsPingInterval);
+      if (this.liquidationWsPingTimeout) clearTimeout(this.liquidationWsPingTimeout);
+
+      if (this.isRunning) {
+        this.liquidationReconnectAttempts++;
+        if (this.liquidationReconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+          const delay = Math.min(MAX_RECONNECT_DELAY_MS, INITIAL_RECONNECT_DELAY_MS * Math.pow(2, this.liquidationReconnectAttempts - 1));
+          await this.addLog(`[WebSocket] Liquidation WS disconnected. Scheduling reconnect in ${delay / 1000}s (Attempt ${this.liquidationReconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+          this.liquidationReconnectTimeout = setTimeout(() => {
+            this.connectLiquidationWebSocket();
+          }, delay);
+        } else {
+          await this.addLog(`ERROR: [CONNECTION_ERROR] Max Liquidation WS reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached.`);
+        }
+      }
+    });
+  }
+
+  // Returns { longLiqVolume15m, shortLiqVolume15m, liqDominance, cascadeActive } or null.
+  // ai-market-context adds isAbnormal on top using its own threshold.
+  getLiquidationSnapshot() {
+    // Never connected yet — no data at all
+    if (!this._liqWsLastConnectedAt) return null;
+
+    // Disconnected and stale beyond our comfort window → don't let AI trust an empty/old buffer
+    if (!this.liquidationWsConnected && (Date.now() - this._liqWsLastConnectedAt > 5 * 60 * 1000)) {
+      return null;
+    }
+
+    const cutoff = Date.now() - 15 * 60 * 1000;
+    if (this._liqEvents.length > 0 && this._liqEvents[0].ts < cutoff) {
+      this._liqEvents = this._liqEvents.filter(e => e.ts >= cutoff);
+    }
+
+    let longLiqVolume15m = 0;
+    let shortLiqVolume15m = 0;
+    const timestamps = [];
+
+    for (const evt of this._liqEvents) {
+      if (evt.side === 'SELL') longLiqVolume15m += evt.notional;
+      else if (evt.side === 'BUY') shortLiqVolume15m += evt.notional;
+      timestamps.push(evt.ts);
+    }
+
+    let liqDominance = 'BALANCED';
+    if (longLiqVolume15m > shortLiqVolume15m * 2) liqDominance = 'LONG';
+    else if (shortLiqVolume15m > longLiqVolume15m * 2) liqDominance = 'SHORT';
+
+    let cascadeActive = false;
+    if (timestamps.length >= 10) {
+      timestamps.sort((a, b) => a - b);
+      for (let i = 0; i <= timestamps.length - 10; i++) {
+        if (timestamps[i + 9] - timestamps[i] <= 2 * 60 * 1000) {
+          cascadeActive = true;
+          break;
+        }
+      }
+    }
+
+    return { longLiqVolume15m, shortLiqVolume15m, liqDominance, cascadeActive };
   }
 
   // ─── ListenKey management ──────────────────────────────────────────────────
@@ -1137,8 +1317,11 @@ class TradingBase {
     if (this.realtimeWsPingTimeout) clearTimeout(this.realtimeWsPingTimeout);
     if (this.userDataWsPingInterval) clearInterval(this.userDataWsPingInterval);
     if (this.userDataWsPingTimeout) clearTimeout(this.userDataWsPingTimeout);
+    if (this.liquidationWsPingInterval) clearInterval(this.liquidationWsPingInterval);
+    if (this.liquidationWsPingTimeout) clearTimeout(this.liquidationWsPingTimeout);
     if (this.realtimeReconnectTimeout) clearTimeout(this.realtimeReconnectTimeout);
     if (this.userDataReconnectTimeout) clearTimeout(this.userDataReconnectTimeout);
+    if (this.liquidationReconnectTimeout) clearTimeout(this.liquidationReconnectTimeout);
     if (this.listenKeyRefreshInterval) clearInterval(this.listenKeyRefreshInterval);
     this._stopWebSocketHealthMonitoring();
 
@@ -1152,9 +1335,17 @@ class TradingBase {
       this.userDataWs.close();
       this.userDataWs = null;
     }
+    if (this.liquidationWs) {
+      this.liquidationWs.removeAllListeners();
+      this.liquidationWs.close();
+      this.liquidationWs = null;
+    }
 
     this.realtimeWsConnected = false;
     this.userDataWsConnected = false;
+    this.liquidationWsConnected = false;
+    this._liqEvents = [];
+    this._liqWsLastConnectedAt = null;
   }
 
   // ─── Abstract methods (must be implemented by subclasses) ──────────────────

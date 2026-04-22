@@ -115,7 +115,16 @@ server.on('upgrade', async (request, socket, head) => {
 });
 
 function handleClientConnection(ws, uid) {
-  console.log(`[WS] Client connected: ${uid}`);
+  const connectedAt = Date.now();
+  let connectLogged = false;
+
+  // Defer the "connected" log — skip logging churny short-lived sockets
+  // (common on mobile when backgrounded tabs flap). Only log if the client
+  // stays connected >5s, indicating a real session.
+  const connectLogTimer = setTimeout(() => {
+    connectLogged = true;
+    console.log(`[WS] Client connected: ${uid}`);
+  }, 5000);
 
   // Send immediate vm_connected since the client is directly on the VM
   ws.send(JSON.stringify({ type: 'vm_connected', timestamp: Date.now() }));
@@ -145,10 +154,20 @@ function handleClientConnection(ws, uid) {
     } catch {}
   });
 
-  ws.on('close', () => {
-    console.log(`[WS] Client disconnected: ${uid}`);
+  ws.on('close', (code) => {
+    clearTimeout(connectLogTimer);
     clearInterval(pingInterval);
     if (pongTimeout) clearTimeout(pongTimeout);
+
+    // Log disconnect only if the matching connect was logged, OR if the
+    // close code is unexpected (not a normal/abnormal close). Codes 1000
+    // (normal), 1001 (going away), 1006 (abnormal, typical on mobile
+    // suspend) are expected and get suppressed for short-lived sockets.
+    const expected = code === 1000 || code === 1001 || code === 1006;
+    if (connectLogged || !expected) {
+      const aliveSec = Math.round((Date.now() - connectedAt) / 1000);
+      console.log(`[WS] Client disconnected: ${uid} (alive ${aliveSec}s, code ${code})`);
+    }
   });
 
   ws.on('error', (err) => {
@@ -179,10 +198,16 @@ function buildHealthPayload() {
   };
 }
 
-// Periodic health broadcast to all connected WebSocket clients
+// Periodic health + strategy_update broadcast to all connected WebSocket clients
 setInterval(() => {
   if (wss.clients.size > 0) {
     wsBroadcast.pushHealth(buildHealthPayload());
+    // Send full strategy status for each active strategy (drives frontend UI updates)
+    activeStrategies.forEach((strategy, strategyId) => {
+      if (strategy.isRunning && typeof strategy.getStatus === 'function') {
+        wsBroadcast.pushStrategyUpdate(strategyId, strategy.getStatus());
+      }
+    });
   }
 }, 10000);
 
@@ -1038,9 +1063,9 @@ app.post('/ai-hedge/start', async (req, res) => {
       return res.status(400).json({ error: 'profileId, gcpProxyUrl, sharedVmProxyGcfUrl, and config are required.' });
     }
 
-    // Check if any strategy is already running for this profile
+    // Check if any strategy already exists for this profile (running or starting)
     for (const [sId, strategy] of activeStrategies.entries()) {
-      if (strategy.profileId === profileId && strategy.isRunning) {
+      if (strategy.profileId === profileId) {
         return res.status(400).json({
           error: `A strategy for profile ${profileId} is already running`,
           strategyId: sId
@@ -1050,15 +1075,33 @@ app.post('/ai-hedge/start', async (req, res) => {
 
     const strategy = new AiHedgeStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
     strategy.userId = userId;
-    await strategy.start(config);
 
-    activeStrategies.set(strategy.strategyId, strategy);
+    // Generate strategyId HERE (before start()) so it's available immediately
+    const strategyId = `ai_hedge_${profileId}_${Date.now()}`;
+    strategy.strategyId = strategyId;
 
-    console.log(`✓ AI Hedge Strategy ${strategy.strategyId} started.`);
+    // Mark as running IMMEDIATELY so /health reports it and frontend transitions
+    strategy.isRunning = true;
+
+    // Register so /health and /status can track it
+    activeStrategies.set(strategyId, strategy);
+
+    // Unregister on any stop path (manual, TP, capital protection, etc.)
+    strategy.onStopComplete = () => activeStrategies.delete(strategyId);
+
+    // Respond immediately — strategy starts in background
+    console.log(`✓ AI Hedge Strategy ${strategyId} starting (non-blocking)...`);
     res.json({
       success: true,
-      strategyId: strategy.strategyId,
-      message: 'AI Hedge Strategy started successfully',
+      strategyId,
+      message: 'AI Hedge Strategy starting',
+    });
+
+    // Start strategy in background — errors are logged, not sent to client
+    strategy.start(config).catch((error) => {
+      console.error(`Failed to start AI Hedge Strategy ${strategyId}:`, error);
+      strategy.isRunning = false;
+      activeStrategies.delete(strategyId);
     });
   } catch (error) {
     console.error('Failed to start AI Hedge Strategy:', error);

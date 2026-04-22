@@ -1,110 +1,104 @@
 /**
  * AiPlanExecutor — monitors trigger prices and executes AI plan actions.
  *
- * Translates AI-generated plan actions into real Binance orders
- * using the TradingBase infrastructure.
+ * Dual-action model: each plan has one action ABOVE and one BELOW current price.
+ * When one triggers, the other is cancelled and a fresh plan is requested.
+ *
+ * Supports OPEN_HEDGE (Phase 1) which opens both LONG and SHORT simultaneously,
+ * and ADD/CUT actions (Phase 2) for DCA.
  */
 class AiPlanExecutor {
   constructor(strategy) {
-    this.strategy = strategy; // Reference to AiHedgeStrategy (extends TradingBase)
-
-    // Active plan state
+    this.strategy = strategy;
     this.activePlan = null;
-    this.selectedPlanKey = null;
-    this.pendingActions = []; // Actions from the selected plan, sorted by trigger price
+    this.pendingActions = []; // Two actions: one ABOVE, one BELOW
   }
 
   /**
-   * Install a new plan and prepare trigger monitoring.
-   * @param {object} plan — the validated AI plan
-   * @param {string} selectedPlanKey — 'planA', 'planB', or 'planC'
+   * Install a new dual-action plan.
    */
-  setActivePlan(plan, selectedPlanKey = 'planA') {
+  setActivePlan(plan) {
     this.activePlan = plan;
-    this.selectedPlanKey = `plan${selectedPlanKey}`;
+    this.pendingActions = [];
 
-    const selectedPlan = plan[this.selectedPlanKey];
-    if (selectedPlan && selectedPlan.actions) {
-      // Clone actions and mark as pending
-      this.pendingActions = selectedPlan.actions.map(a => ({
-        ...a,
-        executed: false,
-      }));
-    } else {
-      this.pendingActions = [];
+    if (plan.actionAbove) {
+      this.pendingActions.push({ ...plan.actionAbove, direction: 'ABOVE', executed: false });
+    }
+    if (plan.actionBelow) {
+      this.pendingActions.push({ ...plan.actionBelow, direction: 'BELOW', executed: false });
     }
   }
 
   /**
-   * Check if any action's trigger price has been crossed.
-   * Called on every price tick from handleRealtimePrice().
-   *
-   * @param {number} prevPrice — previous tick price
-   * @param {number} currentPrice — current tick price
-   * @returns {{ action, planKey } | null} — the triggered action, or null
+   * Check if any action's trigger is already satisfied at plan install time.
+   * ABOVE triggers when price >= trigger, BELOW when price <= trigger.
+   */
+  checkImmediateTriggers(currentPrice) {
+    if (!this.pendingActions || this.pendingActions.length === 0) return null;
+
+    for (const action of this.pendingActions) {
+      if (action.executed || !action.triggerPrice) continue;
+
+      let triggered = false;
+      if (action.direction === 'ABOVE') triggered = currentPrice >= action.triggerPrice;
+      else if (action.direction === 'BELOW') triggered = currentPrice <= action.triggerPrice;
+
+      if (triggered) {
+        action.executed = true;
+        for (const other of this.pendingActions) {
+          if (other !== action) other.executed = true;
+        }
+        return { action, direction: action.direction };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Check if any action's trigger has been crossed on a price tick.
+   * ABOVE triggers on upward cross, BELOW triggers on downward cross.
    */
   checkTriggers(prevPrice, currentPrice) {
     if (!this.pendingActions || this.pendingActions.length === 0) return null;
 
     for (const action of this.pendingActions) {
-      if (action.executed) continue;
-
-      const triggerPrice = action.triggerPrice;
-      if (!triggerPrice) continue;
+      if (action.executed || !action.triggerPrice) continue;
 
       let triggered = false;
-
-      // Determine trigger direction based on action type
-      switch (action.type) {
-        case 'ADD_LONG':
-        case 'CUT_SHORT':
-          // Trigger when price drops TO or BELOW the trigger price
-          triggered = prevPrice > triggerPrice && currentPrice <= triggerPrice;
-          break;
-
-        case 'ADD_SHORT':
-        case 'CUT_LONG':
-          // Trigger when price rises TO or ABOVE the trigger price
-          triggered = prevPrice < triggerPrice && currentPrice >= triggerPrice;
-          break;
-
-        case 'TP_LONG':
-          // Take profit LONG — trigger when price rises above
-          triggered = prevPrice < triggerPrice && currentPrice >= triggerPrice;
-          break;
-
-        case 'TP_SHORT':
-          // Take profit SHORT — trigger when price drops below
-          triggered = prevPrice > triggerPrice && currentPrice <= triggerPrice;
-          break;
-
-        case 'CLOSE_HEDGE':
-          // Close hedge — trigger in either direction
-          triggered = (prevPrice < triggerPrice && currentPrice >= triggerPrice) ||
-                      (prevPrice > triggerPrice && currentPrice <= triggerPrice);
-          break;
+      if (action.direction === 'ABOVE') {
+        triggered = prevPrice < action.triggerPrice && currentPrice >= action.triggerPrice;
+      } else if (action.direction === 'BELOW') {
+        triggered = prevPrice > action.triggerPrice && currentPrice <= action.triggerPrice;
       }
 
       if (triggered) {
         action.executed = true;
-        return { action, planKey: this.selectedPlanKey };
+        for (const other of this.pendingActions) {
+          if (other !== action) other.executed = true;
+        }
+        return { action, direction: action.direction };
       }
     }
-
     return null;
   }
 
   /**
-   * Execute a triggered action by placing orders through TradingBase.
-   *
-   * @param {object} action — the action to execute
-   * @returns {object} — execution result
+   * Execute a triggered action.
    */
   async executeAction(action) {
     const strategy = this.strategy;
     const symbol = strategy.symbol;
 
-    // Calculate quantity from sizeUSDT if not provided
+    if (action.type === 'HOLD') {
+      await strategy.addLog(`[AI] HOLD: ${action.reason || 'waiting for better conditions'}`);
+      return { status: 'HOLD' };
+    }
+
+    if (action.type === 'OPEN_HEDGE') {
+      return await this._executeOpenHedge(action);
+    }
+
+    // Calculate quantity from sizeUSDT
     let quantity = action.quantity;
     if (!quantity && action.sizeUSDT) {
       quantity = await strategy._calculateAdjustedQuantity(symbol, action.sizeUSDT, action.triggerPrice);
@@ -112,94 +106,73 @@ class AiPlanExecutor {
     if (!quantity || quantity <= 0) {
       throw new Error(`Cannot execute ${action.type}: quantity is ${quantity}`);
     }
-
-    // Round quantity
     quantity = strategy.roundQuantity(quantity);
 
     let result;
 
     switch (action.type) {
       case 'ADD_LONG':
-        // BUY to open/add LONG
         result = await strategy.placeMarketOrder(symbol, 'BUY', quantity, 'LONG');
         await strategy.addLog(`[AI] ADD_LONG: Bought ${quantity} @ market (target: ${strategy._formatPrice(action.triggerPrice)})`);
         break;
 
       case 'ADD_SHORT':
-        // SELL to open/add SHORT
         result = await strategy.placeMarketOrder(symbol, 'SELL', quantity, 'SHORT');
         await strategy.addLog(`[AI] ADD_SHORT: Sold ${quantity} @ market (target: ${strategy._formatPrice(action.triggerPrice)})`);
         break;
 
       case 'CUT_LONG':
-        // SELL to reduce/close LONG
         result = await strategy.placeMarketOrder(symbol, 'SELL', quantity, 'LONG');
         await strategy.addLog(`[AI] CUT_LONG: Sold ${quantity} LONG @ market`);
         break;
 
       case 'CUT_SHORT':
-        // BUY to reduce/close SHORT
         result = await strategy.placeMarketOrder(symbol, 'BUY', quantity, 'SHORT');
         await strategy.addLog(`[AI] CUT_SHORT: Bought ${quantity} SHORT @ market`);
         break;
-
-      case 'TP_LONG':
-        // SELL to take profit on LONG
-        result = await strategy.placeMarketOrder(symbol, 'SELL', quantity, 'LONG');
-        await strategy.addLog(`[AI] TP_LONG: Took profit, sold ${quantity} LONG @ market`);
-        break;
-
-      case 'TP_SHORT':
-        // BUY to take profit on SHORT
-        result = await strategy.placeMarketOrder(symbol, 'BUY', quantity, 'SHORT');
-        await strategy.addLog(`[AI] TP_SHORT: Took profit, bought ${quantity} SHORT @ market`);
-        break;
-
-      case 'CLOSE_HEDGE': {
-        // Close both sides completely
-        const positions = await strategy.detectHedgePositions();
-
-        if (positions.long && positions.long.quantity > 0) {
-          const longQty = strategy.roundQuantity(positions.long.quantity);
-          await strategy.placeMarketOrder(symbol, 'SELL', longQty, 'LONG');
-          await strategy.addLog(`[AI] CLOSE_HEDGE: Closed LONG ${longQty}`);
-        }
-        if (positions.short && positions.short.quantity > 0) {
-          const shortQty = strategy.roundQuantity(positions.short.quantity);
-          await strategy.placeMarketOrder(symbol, 'BUY', shortQty, 'SHORT');
-          await strategy.addLog(`[AI] CLOSE_HEDGE: Closed SHORT ${shortQty}`);
-        }
-
-        result = { status: 'HEDGE_CLOSED' };
-        break;
-      }
 
       default:
         throw new Error(`Unknown action type: ${action.type}`);
     }
 
-    // Record action in risk guard
-    if (strategy.riskGuard) {
-      strategy.riskGuard.recordAction();
-    }
-
+    if (strategy.riskGuard) strategy.riskGuard.recordAction();
     return result;
   }
 
   /**
-   * Get the current state of pending actions.
+   * Execute OPEN_HEDGE: place both LONG and SHORT simultaneously at market price.
    */
+  async _executeOpenHedge(action) {
+    const strategy = this.strategy;
+    const symbol = strategy.symbol;
+
+    const longQty = await strategy._calculateAdjustedQuantity(symbol, action.longSizeUSDT, action.triggerPrice);
+    const shortQty = await strategy._calculateAdjustedQuantity(symbol, action.shortSizeUSDT, action.triggerPrice);
+
+    if (!longQty || longQty <= 0) throw new Error(`OPEN_HEDGE: invalid LONG quantity from ${action.longSizeUSDT} USDT`);
+    if (!shortQty || shortQty <= 0) throw new Error(`OPEN_HEDGE: invalid SHORT quantity from ${action.shortSizeUSDT} USDT`);
+
+    const roundedLongQty = strategy.roundQuantity(longQty);
+    const roundedShortQty = strategy.roundQuantity(shortQty);
+
+    await strategy.addLog(`[AI] OPEN_HEDGE: Opening LONG ${roundedLongQty} (${action.longSizeUSDT} USDT) + SHORT ${roundedShortQty} (${action.shortSizeUSDT} USDT) @ market`);
+
+    // Place both orders — LONG first, then SHORT immediately after
+    const longResult = await strategy.placeMarketOrder(symbol, 'BUY', roundedLongQty, 'LONG');
+    const shortResult = await strategy.placeMarketOrder(symbol, 'SELL', roundedShortQty, 'SHORT');
+
+    if (strategy.riskGuard) strategy.riskGuard.recordAction();
+
+    return { status: 'HEDGE_OPENED', longResult, shortResult };
+  }
+
   getPendingActions() {
     return this.pendingActions.filter(a => !a.executed);
   }
 
-  /**
-   * Clear all pending actions (e.g., when a new plan is installed).
-   */
   clearActions() {
     this.pendingActions = [];
     this.activePlan = null;
-    this.selectedPlanKey = null;
   }
 }
 

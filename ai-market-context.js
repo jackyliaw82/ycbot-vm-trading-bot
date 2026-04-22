@@ -1,57 +1,119 @@
+// Abnormality thresholds — metric is included in AI prompt only when exceeded
+const OI_CHANGE_1H_THRESHOLD = 2;          // |oiChange1h| > 2%
+const LIQ_VOLUME_15M_THRESHOLD = 1000000;  // total liqs > $1M in 15m
+const VOLUME_RATIO_HIGH = 3.0;             // current candle vol > 3x average
+const VOLUME_RATIO_LOW = 0.3;              // current candle vol < 0.3x average
+const TAKER_RATIO_HIGH = 1.5;              // buyers dominate
+const TAKER_RATIO_LOW = 0.6;               // sellers dominate
+
 /**
  * AiMarketContext — builds market context for AI plan generation.
  *
- * Gathers current price, positions, recent candles, ATR volatility,
- * and assembles them into the context object the AI planner needs.
+ * Gathers: price candles (5m/15m/1h), ATR volatility, support/resistance,
+ * OI change, taker ratio, global L/S ratio, funding rate, liquidations,
+ * relative volume, and margin info.
  */
 class AiMarketContext {
   constructor(strategy) {
-    this.strategy = strategy; // Reference to AiHedgeStrategy (extends TradingBase)
+    this.strategy = strategy;
 
     // 5m candle cache
     this._cachedCandles = null;
     this._candleCacheTime = 0;
-    this._candleCacheTTL = 5 * 60 * 1000; // 5 minutes
+    this._candleCacheTTL = 5 * 60 * 1000;
 
-    // 15m candle cache (for ATR)
+    // 15m candle cache (for ATR + initial S/R)
     this._cached15mCandles = null;
     this._candle15mCacheTime = 0;
-    this._candle15mCacheTTL = 15 * 60 * 1000; // 15 minutes
+    this._candle15mCacheTTL = 15 * 60 * 1000;
+
+    // 1h candle cache (for broader trend)
+    this._cached1hCandles = null;
+    this._candle1hCacheTime = 0;
+    this._candle1hCacheTTL = 30 * 60 * 1000;
+
+    // Funding rate cache
+    this._cachedFundingRate = null;
+    this._fundingRateCacheTime = 0;
+    this._fundingRateCacheTTL = 5 * 60 * 1000;
+
+    // OI history cache
+    this._cachedOIHistory = null;
+    this._oiCacheTime = 0;
+    this._oiCacheTTL = 5 * 60 * 1000;
+
+    // Taker buy/sell ratio cache
+    this._cachedTakerRatio = null;
+    this._takerRatioCacheTime = 0;
+    this._takerRatioCacheTTL = 5 * 60 * 1000;
+
+    // Global long/short account ratio cache
+    this._cachedGlobalLSRatio = null;
+    this._globalLSRatioCacheTime = 0;
+    this._globalLSRatioCacheTTL = 5 * 60 * 1000;
   }
 
   /**
    * Build the full context object for the AI planner.
-   * @param {object} strategyState — current state from the hedge strategy
-   * @returns {object} — context ready for AiPlanner.generatePlan()
    */
   async buildContext(strategyState) {
     const {
+      phase,
       longPosition,
       shortPosition,
       hedgeGap,
       lockedProfit,
+      totalPnL,
       desiredProfitUSDT,
-      breakeven,
       effectiveTarget,
       walletBalance,
       positionSizeUSDT,
+      minNotional,
       accumulatedRealizedPnL,
       accumulatedTradingFees,
       previousPlan,
       planHistory,
+      firstPositionPrice,
     } = strategyState;
 
-    // Fetch candles and calculate ATR in parallel
-    const [recentCandles, volatility] = await Promise.all([
+    // Fetch all market data in parallel
+    const [recentCandles, candles15m, volatility, fundingRate, marginInfo, hourlyTrend, oiChange, liquidations, globalLSRatio] = await Promise.all([
       this._getRecentCandles(),
+      this._get15mCandles(),
       this._getVolatility(),
+      this._getFundingRate(longPosition, shortPosition),
+      this._getMarginInfo(),
+      this._getHourlyTrend(),
+      this._getOIChange(),
+      this._getLiquidations(),
+      this._getGlobalLSRatio(),
     ]);
+
+    // Compute price direction from candles for taker ratio divergence detection
+    let priceDirection = null;
+    if (recentCandles && recentCandles.length >= 2) {
+      const firstClose = recentCandles[0].close;
+      const lastClose = recentCandles[recentCandles.length - 1].close;
+      priceDirection = lastClose > firstClose ? 'UP' : 'DOWN';
+    }
+
+    // Taker ratio depends on price direction
+    const takerRatio = await this._getTakerRatio(priceDirection);
+
+    // Volume ratio computed from already-fetched candles (no API call)
+    const volumeRatio = this._getVolumeRatio(recentCandles);
+
+    // S/R levels from 15m and 5m candles
+    const supportResistance15m = this._computeSRLevels(candles15m, 5);
+    const supportResistance5m = this._computeSRLevels(recentCandles, 3);
 
     return {
       symbol: this.strategy.symbol,
       currentPrice: this.strategy.currentPrice,
+      phase: phase || 'INITIAL',
       walletBalance: walletBalance || 0,
       positionSizeUSDT: positionSizeUSDT || 0,
+      minNotional: minNotional || 5,
       maxPositionSizeUSDT: this.strategy.maxPositionSizeUSDT || 0,
 
       longPosition: longPosition ? {
@@ -70,120 +132,85 @@ class AiMarketContext {
 
       hedgeGap: hedgeGap || 0,
       lockedProfit: lockedProfit || 0,
+      totalPnL: totalPnL || 0,
       desiredProfitUSDT: desiredProfitUSDT || null,
-      breakeven: breakeven || 0,
       effectiveTarget: effectiveTarget || null,
+      firstPositionPrice: firstPositionPrice || null,
 
       accumulatedRealizedPnL: accumulatedRealizedPnL || 0,
       accumulatedTradingFees: accumulatedTradingFees || 0,
 
       volatility,
       recentCandles,
+      candles15m,
+      fundingRate,
+      marginInfo,
+      hourlyTrend,
+      oiChange,
+      liquidations,
+      volumeRatio,
+      takerRatio,
+      globalLSRatio,
+      supportResistance15m,
+      supportResistance5m,
       previousPlan: previousPlan || null,
       planHistory: planHistory || [],
     };
   }
 
-  /**
-   * Calculate ATR-based volatility from 15-minute candles.
-   * @returns {{ atr: number, atrPercent: number, interpretation: string }}
-   */
+  // ——— ATR Volatility ————————————————————————————————————————————————————
+
   async _getVolatility() {
     try {
       const candles = await this._get15mCandles();
       if (!candles || candles.length < 15) {
         return { atr: 0, atrPercent: 0, interpretation: 'unknown' };
       }
-
-      const atrData = this._calculateATR(candles, 14);
-      return atrData;
+      return this._calculateATR(candles, 14);
     } catch (error) {
       console.error(`Failed to calculate ATR: ${error.message}`);
       return { atr: 0, atrPercent: 0, interpretation: 'unknown' };
     }
   }
 
-  /**
-   * Calculate ATR (Average True Range) from candle data.
-   * @param {Array} candles — array of { open, high, low, close } objects
-   * @param {number} period — ATR period (default 14)
-   * @returns {{ atr: number, atrPercent: number, interpretation: string }}
-   */
   _calculateATR(candles, period = 14) {
     if (candles.length < period + 1) {
       return { atr: 0, atrPercent: 0, interpretation: 'unknown' };
     }
 
-    // Calculate True Range for each candle (starting from index 1)
     const trueRanges = [];
     for (let i = 1; i < candles.length; i++) {
       const high = candles[i].high;
       const low = candles[i].low;
       const prevClose = candles[i - 1].close;
-
-      const tr = Math.max(
-        high - low,
-        Math.abs(high - prevClose),
-        Math.abs(low - prevClose)
-      );
+      const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
       trueRanges.push(tr);
     }
 
-    // Calculate ATR as SMA of last `period` true ranges
     const recentTR = trueRanges.slice(-period);
     const atr = recentTR.reduce((sum, tr) => sum + tr, 0) / recentTR.length;
-
     const currentPrice = this.strategy.currentPrice || candles[candles.length - 1].close;
     const atrPercent = (atr / currentPrice) * 100;
 
-    // Interpret volatility level
     let interpretation;
-    if (atrPercent < 0.5) {
-      interpretation = 'low';
-    } else if (atrPercent < 1.0) {
-      interpretation = 'moderate';
-    } else if (atrPercent < 2.0) {
-      interpretation = 'high';
-    } else {
-      interpretation = 'extreme';
-    }
+    if (atrPercent < 0.5) interpretation = 'low';
+    else if (atrPercent < 1.0) interpretation = 'moderate';
+    else if (atrPercent < 2.0) interpretation = 'high';
+    else interpretation = 'extreme';
 
     return { atr, atrPercent, interpretation };
   }
 
-  /**
-   * Fetch recent 15-minute candles from Binance (for ATR calculation).
-   * Results are cached for 15 minutes.
-   */
+  // ——— Candle Fetchers ——————————————————————————————————————————————————
+
   async _get15mCandles() {
     const now = Date.now();
     if (this._cached15mCandles && (now - this._candle15mCacheTime) < this._candle15mCacheTTL) {
       return this._cached15mCandles;
     }
-
     try {
-      const klines = await this.strategy.makeProxyRequest(
-        '/fapi/v1/klines',
-        'GET',
-        {
-          symbol: this.strategy.symbol,
-          interval: '15m',
-          limit: 100,
-        },
-        false,
-        'futures'
-      );
-
-      this._cached15mCandles = klines.map(k => ({
-        openTime: k[0],
-        open: parseFloat(k[1]),
-        high: parseFloat(k[2]),
-        low: parseFloat(k[3]),
-        close: parseFloat(k[4]),
-        volume: parseFloat(k[5]),
-        closeTime: k[6],
-      }));
-
+      const klines = await this.strategy.makeProxyRequest('/fapi/v1/klines', 'GET', { symbol: this.strategy.symbol, interval: '15m', limit: 100 }, false, 'futures');
+      this._cached15mCandles = this._parseKlines(klines);
       this._candle15mCacheTime = now;
       return this._cached15mCandles;
     } catch (error) {
@@ -192,55 +219,338 @@ class AiMarketContext {
     }
   }
 
-  /**
-   * Fetch recent 5-minute candles from Binance.
-   * Results are cached for 5 minutes to avoid excessive API calls.
-   */
   async _getRecentCandles() {
     const now = Date.now();
     if (this._cachedCandles && (now - this._candleCacheTime) < this._candleCacheTTL) {
       return this._cachedCandles;
     }
-
     try {
-      const klines = await this.strategy.makeProxyRequest(
-        '/fapi/v1/klines',
-        'GET',
-        {
-          symbol: this.strategy.symbol,
-          interval: '5m',
-          limit: 100,
-        },
-        false,
-        'futures'
-      );
-
-      this._cachedCandles = klines.map(k => ({
-        openTime: k[0],
-        open: parseFloat(k[1]),
-        high: parseFloat(k[2]),
-        low: parseFloat(k[3]),
-        close: parseFloat(k[4]),
-        volume: parseFloat(k[5]),
-        closeTime: k[6],
-      }));
-
+      const klines = await this.strategy.makeProxyRequest('/fapi/v1/klines', 'GET', { symbol: this.strategy.symbol, interval: '5m', limit: 100 }, false, 'futures');
+      this._cachedCandles = this._parseKlines(klines);
       this._candleCacheTime = now;
       return this._cachedCandles;
     } catch (error) {
-      console.error(`Failed to fetch candles: ${error.message}`);
-      return this._cachedCandles || []; // Return stale cache or empty
+      console.error(`Failed to fetch 5m candles: ${error.message}`);
+      return this._cachedCandles || [];
     }
   }
 
-  /**
-   * Invalidate all candle caches (e.g., after a significant event).
-   */
+  async _get1hCandles() {
+    const now = Date.now();
+    if (this._cached1hCandles && (now - this._candle1hCacheTime) < this._candle1hCacheTTL) {
+      return this._cached1hCandles;
+    }
+    try {
+      const klines = await this.strategy.makeProxyRequest('/fapi/v1/klines', 'GET', { symbol: this.strategy.symbol, interval: '1h', limit: 168 }, false, 'futures');
+      this._cached1hCandles = this._parseKlines(klines);
+      this._candle1hCacheTime = now;
+      return this._cached1hCandles;
+    } catch (error) {
+      console.error(`Failed to fetch 1h candles: ${error.message}`);
+      return this._cached1hCandles || [];
+    }
+  }
+
+  _parseKlines(klines) {
+    return klines.map(k => ({
+      openTime: k[0],
+      open: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      low: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+      volume: parseFloat(k[5]),
+      closeTime: k[6],
+    }));
+  }
+
+  // ——— Support & Resistance ————————————————————————————————————————————
+
+  _computeSRLevels(candles, lookback = 5) {
+    const currentPrice = this.strategy.currentPrice || 0;
+    if (!currentPrice || !candles || candles.length < lookback * 2 + 1) return null;
+
+    const swings = this._findSwingLevels(candles, lookback);
+
+    const supports = swings.supports
+      .filter(p => p < currentPrice)
+      .sort((a, b) => b - a)
+      .filter((s, i, arr) => i === 0 || Math.abs(s - arr[i - 1]) / arr[i - 1] > 0.001)
+      .slice(0, 3)
+      .map(p => ({ price: p }));
+
+    const resistances = swings.resistances
+      .filter(p => p > currentPrice)
+      .sort((a, b) => a - b)
+      .filter((r, i, arr) => i === 0 || Math.abs(r - arr[i - 1]) / arr[i - 1] > 0.001)
+      .slice(0, 3)
+      .map(p => ({ price: p }));
+
+    return { supports, resistances };
+  }
+
+  _findSwingLevels(candles, lookback = 5) {
+    const supports = [];
+    const resistances = [];
+    for (let i = lookback; i < candles.length - lookback; i++) {
+      const window = candles.slice(i - lookback, i + lookback + 1);
+      const isSwingLow = window.every((c, j) => j === lookback || c.low >= candles[i].low);
+      const isSwingHigh = window.every((c, j) => j === lookback || c.high <= candles[i].high);
+      if (isSwingLow) supports.push(candles[i].low);
+      if (isSwingHigh) resistances.push(candles[i].high);
+    }
+    return { supports, resistances };
+  }
+
+  // ——— Funding Rate ————————————————————————————————————————————————————
+
+  async _getFundingRate(longPosition, shortPosition) {
+    const now = Date.now();
+    if (this._cachedFundingRate && (now - this._fundingRateCacheTime) < this._fundingRateCacheTTL) {
+      return this._enrichFundingRate(this._cachedFundingRate, longPosition, shortPosition);
+    }
+    try {
+      const premiumIndex = await this.strategy.makeProxyRequest('/fapi/v1/premiumIndex', 'GET', { symbol: this.strategy.symbol }, false, 'futures');
+      const rate = parseFloat(premiumIndex.lastFundingRate);
+      const nextFundingTimeMs = parseInt(premiumIndex.nextFundingTime);
+      const hoursUntilFunding = Math.max(0, (nextFundingTimeMs - now) / (1000 * 60 * 60));
+      const nextFundingTime = `in ${Math.floor(hoursUntilFunding)}h ${Math.floor((hoursUntilFunding % 1) * 60)}m`;
+
+      this._cachedFundingRate = { rate, nextFundingTime, nextFundingTimeMs };
+      this._fundingRateCacheTime = now;
+      return this._enrichFundingRate(this._cachedFundingRate, longPosition, shortPosition);
+    } catch (error) {
+      console.error(`Failed to fetch funding rate: ${error.message}`);
+      return null;
+    }
+  }
+
+  _enrichFundingRate(cached, longPosition, shortPosition) {
+    const longNotional = longPosition?.notional || 0;
+    const shortNotional = shortPosition?.notional || 0;
+    let estimatedHourlyCost = null;
+    if (longNotional > 0 || shortNotional > 0) {
+      const netFundingPer8h = cached.rate * (longNotional - shortNotional);
+      estimatedHourlyCost = netFundingPer8h / 8;
+    }
+    return { rate: cached.rate, nextFundingTime: cached.nextFundingTime, estimatedHourlyCost };
+  }
+
+  // ——— Margin Info —————————————————————————————————————————————————————
+
+  async _getMarginInfo() {
+    try {
+      const accountInfo = await this.strategy.makeProxyRequest('/fapi/v2/account', 'GET', {}, true, 'futures');
+      const totalMarginBalance = parseFloat(accountInfo.totalMarginBalance);
+      const totalMaintMargin = parseFloat(accountInfo.totalMaintMargin);
+      const availableBalance = parseFloat(accountInfo.availableBalance);
+      const totalPositionInitialMargin = parseFloat(accountInfo.totalPositionInitialMargin);
+
+      const marginUsagePercent = totalMarginBalance > 0 ? (totalPositionInitialMargin / totalMarginBalance) * 100 : 0;
+      let liquidationDistance = null;
+      if (totalMaintMargin > 0 && totalMarginBalance > 0) {
+        liquidationDistance = ((1 - totalMaintMargin / totalMarginBalance) * 100);
+      }
+      return { marginUsagePercent, availableBalance, liquidationDistance };
+    } catch (error) {
+      console.error(`Failed to fetch margin info: ${error.message}`);
+      return null;
+    }
+  }
+
+  // ——— Hourly Trend ———————————————————————————————————————————————————
+
+  async _getHourlyTrend() {
+    try {
+      const candles = await this._get1hCandles();
+      if (!candles || candles.length < 20) return null;
+
+      const closes = candles.map(c => c.close);
+      const sma20 = closes.slice(-20).reduce((sum, c) => sum + c, 0) / 20;
+      const currentPrice = this.strategy.currentPrice || closes[closes.length - 1];
+      const priceVsSma = ((currentPrice - sma20) / sma20) * 100;
+
+      let direction;
+      if (priceVsSma > 1.0) direction = 'BULLISH';
+      else if (priceVsSma > 0.2) direction = 'MILDLY BULLISH';
+      else if (priceVsSma > -0.2) direction = 'NEUTRAL';
+      else if (priceVsSma > -1.0) direction = 'MILDLY BEARISH';
+      else direction = 'BEARISH';
+
+      const high = Math.max(...candles.map(c => c.high));
+      const low = Math.min(...candles.map(c => c.low));
+      const change = ((closes[closes.length - 1] - candles[0].close) / candles[0].close) * 100;
+
+      return { direction, priceVsSma, high, low, change };
+    } catch (error) {
+      console.error(`Failed to calculate hourly trend: ${error.message}`);
+      return null;
+    }
+  }
+
+  // ——— Open Interest Change ——————————————————————————————————————————
+
+  async _getOIChange() {
+    const now = Date.now();
+    if (this._cachedOIHistory && (now - this._oiCacheTime) < this._oiCacheTTL) {
+      return this._cachedOIHistory;
+    }
+    try {
+      const data = await this.strategy.makeProxyRequest('/futures/data/openInterestHist', 'GET', { symbol: this.strategy.symbol, period: '5m', limit: 12 }, false, 'futures');
+      if (!data || data.length < 3) return null;
+
+      const latest = parseFloat(data[data.length - 1].sumOpenInterestValue);
+      const secondLatest = parseFloat(data[data.length - 2].sumOpenInterestValue);
+      const oldest = parseFloat(data[0].sumOpenInterestValue);
+
+      const oiChange5m = ((latest - secondLatest) / secondLatest) * 100;
+      const oiChange1h = ((latest - oldest) / oldest) * 100;
+
+      const last3 = data.slice(-3).map(d => parseFloat(d.sumOpenInterestValue));
+      let oiTrend = 'FLAT';
+      if (last3[2] > last3[1] && last3[1] > last3[0]) oiTrend = 'RISING';
+      else if (last3[2] < last3[1] && last3[1] < last3[0]) oiTrend = 'FALLING';
+
+      const result = { oiChange5m, oiChange1h, oiTrend, isAbnormal: Math.abs(oiChange1h) > OI_CHANGE_1H_THRESHOLD };
+      this._cachedOIHistory = result;
+      this._oiCacheTime = now;
+      return result;
+    } catch (error) {
+      console.error(`Failed to fetch OI history: ${error.message}`);
+      return null;
+    }
+  }
+
+  // ——— Liquidations —————————————————————————————————————————————————
+  // Data source: in-memory buffer in trading-base.js fed by the <symbol>@forceOrder WS stream.
+  // See connectLiquidationWebSocket() + getLiquidationSnapshot() in trading-base.js.
+
+  async _getLiquidations() {
+    const snap = this.strategy.getLiquidationSnapshot();
+    if (!snap) return null;
+    const totalVol = snap.longLiqVolume15m + snap.shortLiqVolume15m;
+    return {
+      ...snap,
+      isAbnormal: totalVol > LIQ_VOLUME_15M_THRESHOLD || snap.cascadeActive,
+    };
+  }
+
+  // ——— Relative Volume Ratio ————————————————————————————————————————
+
+  _getVolumeRatio(recentCandles) {
+    if (!recentCandles || recentCandles.length < 21) return null;
+
+    const avgWindow = recentCandles.slice(-21, -1);
+    const avgVolume = avgWindow.reduce((sum, c) => sum + c.volume, 0) / avgWindow.length;
+    if (avgVolume === 0) return null;
+
+    const latestVolume = recentCandles[recentCandles.length - 1].volume;
+    const volumeRatio = latestVolume / avgVolume;
+
+    const last5 = recentCandles.slice(-5);
+    const aboveAvgCount = last5.filter(c => c.volume > avgVolume).length;
+    let volumeTrend = 'STABLE';
+    if (aboveAvgCount >= 3) volumeTrend = 'RISING';
+    else if (last5.filter(c => c.volume < avgVolume * 0.5).length >= 3) volumeTrend = 'FALLING';
+
+    return { volumeRatio, volumeTrend, isAbnormal: volumeRatio > VOLUME_RATIO_HIGH || volumeRatio < VOLUME_RATIO_LOW };
+  }
+
+  // ——— Taker Buy/Sell Ratio ————————————————————————————————————————
+
+  async _getTakerRatio(priceDirection) {
+    const now = Date.now();
+    if (this._cachedTakerRatio && (now - this._takerRatioCacheTime) < this._takerRatioCacheTTL) {
+      const cached = { ...this._cachedTakerRatio };
+      cached.divergence = this._checkTakerDivergence(cached.takerRatio, priceDirection);
+      cached.isAbnormal = cached.takerRatio > TAKER_RATIO_HIGH || cached.takerRatio < TAKER_RATIO_LOW || cached.divergence;
+      return cached;
+    }
+    try {
+      const data = await this.strategy.makeProxyRequest('/futures/data/takerlongshortRatio', 'GET', { symbol: this.strategy.symbol, period: '5m', limit: 6 }, false, 'futures');
+      if (!data || data.length < 2) return null;
+
+      const takerRatio = parseFloat(data[data.length - 1].buySellRatio);
+      const firstHalf = data.slice(0, 3).map(d => parseFloat(d.buySellRatio));
+      const secondHalf = data.slice(-3).map(d => parseFloat(d.buySellRatio));
+      const firstAvg = firstHalf.reduce((s, v) => s + v, 0) / firstHalf.length;
+      const secondAvg = secondHalf.reduce((s, v) => s + v, 0) / secondHalf.length;
+
+      let takerTrend = 'STABLE';
+      if (secondAvg > firstAvg * 1.1) takerTrend = 'BUYING_INCREASING';
+      else if (secondAvg < firstAvg * 0.9) takerTrend = 'SELLING_INCREASING';
+
+      const divergence = this._checkTakerDivergence(takerRatio, priceDirection);
+      const result = { takerRatio, takerTrend, divergence, isAbnormal: takerRatio > TAKER_RATIO_HIGH || takerRatio < TAKER_RATIO_LOW || divergence };
+      this._cachedTakerRatio = result;
+      this._takerRatioCacheTime = now;
+      return result;
+    } catch (error) {
+      console.error(`Failed to fetch taker ratio: ${error.message}`);
+      return null;
+    }
+  }
+
+  _checkTakerDivergence(takerRatio, priceDirection) {
+    if (!priceDirection) return false;
+    return (priceDirection === 'UP' && takerRatio < 0.8) || (priceDirection === 'DOWN' && takerRatio > 1.2);
+  }
+
+  // ——— Global Long/Short Account Ratio ——————————————————————————————
+
+  async _getGlobalLSRatio() {
+    const now = Date.now();
+    if (this._cachedGlobalLSRatio && (now - this._globalLSRatioCacheTime) < this._globalLSRatioCacheTTL) {
+      return this._cachedGlobalLSRatio;
+    }
+    try {
+      const data = await this.strategy.makeProxyRequest('/futures/data/globalLongShortAccountRatio', 'GET', { symbol: this.strategy.symbol, period: '5m', limit: 6 }, false, 'futures');
+      if (!data || data.length < 2) return null;
+
+      const latest = data[data.length - 1];
+      const longAccount = parseFloat(latest.longAccount);
+      const shortAccount = parseFloat(latest.shortAccount);
+      const longShortRatio = parseFloat(latest.longShortRatio);
+
+      // Trend: compare first half vs second half
+      const firstHalf = data.slice(0, 3).map(d => parseFloat(d.longShortRatio));
+      const secondHalf = data.slice(-3).map(d => parseFloat(d.longShortRatio));
+      const firstAvg = firstHalf.reduce((s, v) => s + v, 0) / firstHalf.length;
+      const secondAvg = secondHalf.reduce((s, v) => s + v, 0) / secondHalf.length;
+
+      let trend = 'STABLE';
+      if (secondAvg > firstAvg * 1.05) trend = 'MORE_LONGS';
+      else if (secondAvg < firstAvg * 0.95) trend = 'MORE_SHORTS';
+
+      // Extreme positioning (contrarian signal)
+      const isExtreme = longAccount > 0.65 || shortAccount > 0.65;
+
+      const result = { longAccount, shortAccount, longShortRatio, trend, isExtreme };
+      this._cachedGlobalLSRatio = result;
+      this._globalLSRatioCacheTime = now;
+      return result;
+    } catch (error) {
+      console.error(`Failed to fetch global L/S ratio: ${error.message}`);
+      return null;
+    }
+  }
+
+  // ——— Cache Management ————————————————————————————————————————————
+
   invalidateCache() {
     this._cachedCandles = null;
     this._candleCacheTime = 0;
     this._cached15mCandles = null;
     this._candle15mCacheTime = 0;
+    this._cached1hCandles = null;
+    this._candle1hCacheTime = 0;
+    this._cachedFundingRate = null;
+    this._fundingRateCacheTime = 0;
+    this._cachedOIHistory = null;
+    this._oiCacheTime = 0;
+    this._cachedTakerRatio = null;
+    this._takerRatioCacheTime = 0;
+    this._cachedGlobalLSRatio = null;
+    this._globalLSRatioCacheTime = 0;
   }
 }
 

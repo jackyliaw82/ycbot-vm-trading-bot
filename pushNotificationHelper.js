@@ -141,30 +141,24 @@ export async function sendPushNotification(userId, notificationData) {
     }
 
     const message = {
-      notification: {
+      // Data-only payload: prevents Android FCM from auto-displaying the
+      // notification in addition to the service worker's showNotification call.
+      data: {
+        ...data,
         title: title,
         body: body,
       },
-      data: data,
       tokens: tokens,
-      // Add android specific config for better reliability
       android: {
         priority: 'high',
-        notification: {
-          channelId: 'trading_alerts',
-          priority: 'high',
-        },
       },
-      // Add APNS config for iOS
       apns: {
+        headers: { 'apns-priority': '10' },
         payload: {
           aps: {
-            alert: {
-              title: title,
-              body: body,
-            },
-            badge: 1,
+            'content-available': 1,
             sound: 'default',
+            badge: 1,
           },
         },
       },
