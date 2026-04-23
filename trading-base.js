@@ -13,6 +13,12 @@ const MAX_RECONNECT_ATTEMPTS = 25;
 const PING_INTERVAL_MS = 30000;
 const PONG_TIMEOUT_MS = 10000;
 
+// Stream-stall watchdog. Price streams (@markPrice@1s / @ticker) push ~1 msg/sec,
+// so 15s of silence is a confident anomaly. Liquidations are sporadic; 5m is safe.
+const STALE_TICK_THRESHOLD_MS = 15000;
+const LIQUIDATION_STALE_THRESHOLD_MS = 5 * 60 * 1000;
+const STALE_WATCHDOG_INTERVAL_MS = 5000;
+
 // Default leverage
 const DEFAULT_LEVERAGE = 50;
 
@@ -128,6 +134,24 @@ class TradingBase {
     this.userDataWsPingInterval = null;
     this.liquidationWsPingTimeout = null;
     this.liquidationWsPingInterval = null;
+
+    // Stream-stall watchdog state
+    this.realtimeWsStaleWatcher = null;
+    this.liquidationWsStaleWatcher = null;
+    this.lastRealtimeTickAt = 0;
+    this.lastLiquidationTickAt = 0;
+
+    // Diagnostic tracing (temporary — see plan: silent WS stall investigation)
+    this._realtimeWsIdCounter = 0;
+    this._userDataWsIdCounter = 0;
+    this._liquidationWsIdCounter = 0;
+    this._realtimeMessagesSeen = 0;
+    this._userDataMessagesSeen = 0;
+    this._liquidationMessagesSeen = 0;
+
+    // User-data reconcile flag: set by attemptUserDataReconnection so the next
+    // connectUserDataStream() open handler triggers a REST position sync.
+    this._needsUserDataReconcileOnOpen = false;
 
     // Pending orders
     this.pendingOrders = new Map();
@@ -470,6 +494,35 @@ class TradingBase {
     }
   }
 
+  // Liquidation price lives on /fapi/v2/positionRisk, not /fapi/v2/account.
+  // Returns a map keyed by positionSide ('LONG' / 'SHORT') with numeric liq prices.
+  async getPositionRiskMap() {
+    try {
+      const rows = await this.makeProxyRequest(
+        '/fapi/v2/positionRisk',
+        'GET',
+        { symbol: this.symbol },
+        true,
+        'futures'
+      );
+      const out = { LONG: null, SHORT: null };
+      if (Array.isArray(rows)) {
+        for (const row of rows) {
+          if (row.symbol !== this.symbol) continue;
+          const side = row.positionSide;
+          const liq = parseFloat(row.liquidationPrice);
+          if (side === 'LONG' || side === 'SHORT') {
+            out[side] = (isFinite(liq) && liq > 0) ? liq : null;
+          }
+        }
+      }
+      return out;
+    } catch (error) {
+      console.error(`Failed to get position risk: ${error.message}`);
+      return { LONG: null, SHORT: null };
+    }
+  }
+
   async getAllOpenOrders(symbol) {
     try {
       return (await this.makeProxyRequest('/fapi/v1/openOrders', 'GET', { symbol }, true, 'futures')) || [];
@@ -558,7 +611,10 @@ class TradingBase {
    * this returns a clean object with both sides.
    */
   async detectHedgePositions() {
-    const positions = await this.getCurrentPositions();
+    const [positions, riskMap] = await Promise.all([
+      this.getCurrentPositions(),
+      this.getPositionRiskMap(),
+    ]);
     const longPos = positions.find(p => parseFloat(p.positionAmt) > 0);
     const shortPos = positions.find(p => parseFloat(p.positionAmt) < 0);
 
@@ -568,12 +624,14 @@ class TradingBase {
         quantity: Math.abs(parseFloat(longPos.positionAmt)),
         notional: Math.abs(parseFloat(longPos.notional)),
         unrealizedPnl: parseFloat(longPos.unRealizedProfit || 0),
+        liquidationPrice: riskMap.LONG,
       } : null,
       short: shortPos ? {
         entryPrice: parseFloat(shortPos.entryPrice),
         quantity: Math.abs(parseFloat(shortPos.positionAmt)),
         notional: Math.abs(parseFloat(shortPos.notional)),
         unrealizedPnl: parseFloat(shortPos.unRealizedProfit || 0),
+        liquidationPrice: riskMap.SHORT,
       } : null,
     };
 
@@ -728,6 +786,8 @@ class TradingBase {
     if (this.realtimeReconnectTimeout) clearTimeout(this.realtimeReconnectTimeout);
     if (this.realtimeWsPingInterval) clearInterval(this.realtimeWsPingInterval);
     if (this.realtimeWsPingTimeout) clearTimeout(this.realtimeWsPingTimeout);
+    if (this.realtimeWsStaleWatcher) clearInterval(this.realtimeWsStaleWatcher);
+    const prevReadyState = this.realtimeWs?.readyState ?? 'null';
     if (this.realtimeWs) this.realtimeWs.close();
 
     const wsBaseUrl = this.isTestnet === true
@@ -738,12 +798,19 @@ class TradingBase {
       ? `${this.symbol.toLowerCase()}@ticker`
       : `${this.symbol.toLowerCase()}@markPrice@1s`;
 
-    this.realtimeWs = new WebSocket(`${wsBaseUrl}/${tickerStream}`);
+    const wsUrl = `${wsBaseUrl}/${tickerStream}`;
+    const wsId = ++this._realtimeWsIdCounter;
+    this._realtimeMessagesSeen = 0;
+    this.addLog(`[DIAG] connectRealtimeWebSocket called. prevReadyState=${prevReadyState}, newWsId=${wsId}, url=${wsUrl}`);
+    this.realtimeWs = new WebSocket(wsUrl);
+    const currentWs = this.realtimeWs;
 
     this.realtimeWs.on('open', async () => {
+      await this.addLog(`[DIAG] WS ${wsId} OPEN`);
       await this.addLog('[WebSocket] Real-time price WS connected.');
       this.realtimeWsConnected = true;
       this.realtimeReconnectAttempts = 0;
+      this.lastRealtimeTickAt = Date.now();
       if (this.realtimeReconnectTimeout) clearTimeout(this.realtimeReconnectTimeout);
 
       this.realtimeWsPingInterval = setInterval(() => {
@@ -753,6 +820,18 @@ class TradingBase {
           this.realtimeWs.terminate();
         }, PONG_TIMEOUT_MS);
       }, PING_INTERVAL_MS);
+
+      // Stream-stall watchdog: if no price message arrives within STALE_TICK_THRESHOLD_MS
+      // while the socket reports connected, terminate — the existing close handler then
+      // schedules reconnect with the normal backoff.
+      this.realtimeWsStaleWatcher = setInterval(async () => {
+        if (!this.realtimeWsConnected) return;
+        const silentFor = Date.now() - this.lastRealtimeTickAt;
+        if (silentFor > STALE_TICK_THRESHOLD_MS) {
+          await this.addLog(`WARN: Real-time price stream stalled — no tick in ${Math.round(silentFor / 1000)}s (wsId=${wsId}). Terminating for reconnect.`);
+          try { currentWs.terminate(); } catch (_) { /* ignore */ }
+        }
+      }, STALE_WATCHDOG_INTERVAL_MS);
     });
 
     this.realtimeWs.on('pong', () => {
@@ -765,6 +844,12 @@ class TradingBase {
     this.realtimeWs.on('message', async (data) => {
       try {
         const message = JSON.parse(data.toString());
+        this.lastRealtimeTickAt = Date.now();
+        // Log only the first 3 messages per socket for diagnostics, then silent.
+        if (this._realtimeMessagesSeen < 3) {
+          this._realtimeMessagesSeen++;
+          await this.addLog(`[DIAG] WS ${wsId} MESSAGE #${this._realtimeMessagesSeen} e=${message.e}`);
+        }
         if (this.priceType === 'LAST' && message.e === '24hrTicker') {
           await this.handleRealtimePrice(parseFloat(message.c));
         } else if (this.priceType === 'MARK' && message.e === 'markPriceUpdate') {
@@ -772,18 +857,22 @@ class TradingBase {
         }
       } catch (error) {
         console.error(`Error processing price message: ${error.message}`);
+        await this.addLog(`ERROR: [WS_MESSAGE] Price message handler failed: ${error.message}`);
       }
     });
 
-    this.realtimeWs.on('error', (error) => {
+    this.realtimeWs.on('error', async (error) => {
       console.error(`Price WebSocket error: ${error.message}`);
+      await this.addLog(`ERROR: [WS_ERROR] Price WebSocket error (wsId=${wsId}): ${error.message}`);
     });
 
     this.realtimeWs.on('close', async (code, reason) => {
       this.realtimeWsConnected = false;
+      await this.addLog(`[DIAG] WS ${wsId} CLOSE code=${code} reason=${reason || 'none'}`);
       await this.addLog('[WebSocket] Real-time price WebSocket closed.');
       if (this.realtimeWsPingInterval) clearInterval(this.realtimeWsPingInterval);
       if (this.realtimeWsPingTimeout) clearTimeout(this.realtimeWsPingTimeout);
+      if (this.realtimeWsStaleWatcher) clearInterval(this.realtimeWsStaleWatcher);
 
       if (this.isRunning) {
         this.realtimeReconnectAttempts++;
@@ -822,9 +911,14 @@ class TradingBase {
       ? 'wss://stream.binance.com/ws'
       : 'wss://fstream.binance.com/ws';
 
-    this.userDataWs = new WebSocket(`${wsBaseUrl}/${this.listenKey}`);
+    const userDataUrl = `${wsBaseUrl}/${this.listenKey}`;
+    const wsId = ++this._userDataWsIdCounter;
+    this._userDataMessagesSeen = 0;
+    this.addLog(`[DIAG] connectUserDataStream called. newWsId=${wsId}`);
+    this.userDataWs = new WebSocket(userDataUrl);
 
     this.userDataWs.on('open', async () => {
+      await this.addLog(`[DIAG] User Data WS ${wsId} OPEN`);
       await this.addLog('[WebSocket] User Data WS connected.');
       this.userDataWsConnected = true;
       this.userDataReconnectAttempts = 0;
@@ -837,6 +931,13 @@ class TradingBase {
           this.userDataWs.terminate();
         }, PONG_TIMEOUT_MS);
       }, PING_INTERVAL_MS);
+
+      // Reconcile on reconnect — pull latest positions via REST to catch any
+      // ACCOUNT_UPDATE or ORDER_TRADE_UPDATE events missed during the outage window.
+      if (this._needsUserDataReconcileOnOpen) {
+        this._needsUserDataReconcileOnOpen = false;
+        await this._reconcilePositionsAfterUserDataReconnect();
+      }
     });
 
     this.userDataWs.on('pong', () => {
@@ -849,6 +950,11 @@ class TradingBase {
     this.userDataWs.on('message', async (data) => {
       try {
         const message = JSON.parse(data.toString());
+
+        if (this._userDataMessagesSeen < 3) {
+          this._userDataMessagesSeen++;
+          await this.addLog(`[DIAG] User Data WS ${wsId} MESSAGE #${this._userDataMessagesSeen} e=${message.e}`);
+        }
 
         // ORDER_TRADE_UPDATE — trade fills, PnL, fees
         if (message.e === 'ORDER_TRADE_UPDATE' && message.o.s === this.symbol) {
@@ -872,6 +978,7 @@ class TradingBase {
 
     this.userDataWs.on('close', async (code, reason) => {
       this.userDataWsConnected = false;
+      await this.addLog(`[DIAG] User Data WS ${wsId} CLOSE code=${code} reason=${reason || 'none'}`);
       await this.addLog(`[WebSocket] User Data Stream WebSocket closed. Code: ${code}, Reason: ${reason || 'none'}, isRunning: ${this.isRunning}`);
 
       if (this.userDataWsPingInterval) clearInterval(this.userDataWsPingInterval);
@@ -1028,7 +1135,9 @@ class TradingBase {
         this.lastPositionEntryPrice = entryPrice;
         this._longEntryPrice = entryPrice;
         this._longPositionSize = notional;
-        this.longPosition = { entryPrice, quantity: qty, notional, unrealizedPnl };
+        // Preserve last-known liquidationPrice from REST; WS events don't carry it.
+        const prevLongLiq = this.longPosition?.liquidationPrice ?? null;
+        this.longPosition = { entryPrice, quantity: qty, notional, unrealizedPnl, liquidationPrice: prevLongLiq };
       } else if (positionAmount < 0) {
         const qty = Math.abs(positionAmount);
         const notional = qty * entryPrice;
@@ -1040,7 +1149,8 @@ class TradingBase {
         this.lastPositionEntryPrice = entryPrice;
         this._shortEntryPrice = entryPrice;
         this._shortPositionSize = notional;
-        this.shortPosition = { entryPrice, quantity: qty, notional, unrealizedPnl };
+        const prevShortLiq = this.shortPosition?.liquidationPrice ?? null;
+        this.shortPosition = { entryPrice, quantity: qty, notional, unrealizedPnl, liquidationPrice: prevShortLiq };
       }
     }
 
@@ -1058,6 +1168,42 @@ class TradingBase {
     this.positionUpdatedViaWebSocket = true;
   }
 
+  /**
+   * Reconcile position state from REST after a user-data WS reconnect.
+   * Catches any ACCOUNT_UPDATE / ORDER_TRADE_UPDATE events that fired while
+   * the socket was disconnected. Maps the REST /fapi/v2/positionRisk response
+   * shape into the ACCOUNT_UPDATE shape expected by _handleAccountUpdate().
+   */
+  async _reconcilePositionsAfterUserDataReconnect() {
+    try {
+      const rows = await this.makeProxyRequest(
+        '/fapi/v2/positionRisk',
+        'GET',
+        { symbol: this.symbol },
+        true,
+        'futures'
+      );
+      if (!Array.isArray(rows)) return;
+
+      const mapped = rows
+        .filter(r => r.symbol === this.symbol && (r.positionSide === 'LONG' || r.positionSide === 'SHORT'))
+        .map(r => ({
+          s: r.symbol,
+          pa: r.positionAmt,
+          ep: r.entryPrice,
+          up: r.unRealizedProfit || '0',
+          ps: r.positionSide,
+        }));
+
+      if (mapped.length > 0) {
+        await this.addLog('[Reconcile] Syncing position state from REST after User Data WS reconnect...');
+        await this._handleAccountUpdate(mapped);
+      }
+    } catch (error) {
+      await this.addLog(`WARN: [Reconcile] Failed to reconcile positions after reconnect: ${error.message}`);
+    }
+  }
+
   // ─── WebSocket: Liquidation stream ─────────────────────────────────────────
   // Replaces deprecated GET /fapi/v1/allForceOrders REST endpoint.
   // Aggregates forceOrder events into a 15m rolling buffer consumed by ai-market-context.
@@ -1066,6 +1212,7 @@ class TradingBase {
     if (this.liquidationReconnectTimeout) clearTimeout(this.liquidationReconnectTimeout);
     if (this.liquidationWsPingInterval) clearInterval(this.liquidationWsPingInterval);
     if (this.liquidationWsPingTimeout) clearTimeout(this.liquidationWsPingTimeout);
+    if (this.liquidationWsStaleWatcher) clearInterval(this.liquidationWsStaleWatcher);
     if (this.liquidationWs) this.liquidationWs.close();
 
     const wsBaseUrl = this.isTestnet === true
@@ -1073,12 +1220,18 @@ class TradingBase {
       : 'wss://fstream.binance.com/ws';
     const stream = `${this.symbol.toLowerCase()}@forceOrder`;
 
+    const wsId = ++this._liquidationWsIdCounter;
+    this._liquidationMessagesSeen = 0;
+    this.addLog(`[DIAG] connectLiquidationWebSocket called. newWsId=${wsId}`);
     this.liquidationWs = new WebSocket(`${wsBaseUrl}/${stream}`);
+    const currentWs = this.liquidationWs;
 
     this.liquidationWs.on('open', async () => {
+      await this.addLog(`[DIAG] Liquidation WS ${wsId} OPEN`);
       await this.addLog('[WebSocket] Liquidation WS connected.');
       this.liquidationWsConnected = true;
       this._liqWsLastConnectedAt = Date.now();
+      this.lastLiquidationTickAt = Date.now();
       this.liquidationReconnectAttempts = 0;
       if (this.liquidationReconnectTimeout) clearTimeout(this.liquidationReconnectTimeout);
 
@@ -1089,6 +1242,18 @@ class TradingBase {
           this.liquidationWs.terminate();
         }, PONG_TIMEOUT_MS);
       }, PING_INTERVAL_MS);
+
+      // Stale-tick watchdog on liquidation stream. Liquidations are sporadic,
+      // so threshold is 5 minutes — long enough to avoid false alarms in quiet
+      // markets, short enough that a silent-stall is caught before it matters.
+      this.liquidationWsStaleWatcher = setInterval(async () => {
+        if (!this.liquidationWsConnected) return;
+        const silentFor = Date.now() - this.lastLiquidationTickAt;
+        if (silentFor > LIQUIDATION_STALE_THRESHOLD_MS) {
+          await this.addLog(`WARN: Liquidation stream stalled — no event in ${Math.round(silentFor / 1000)}s (wsId=${wsId}). Terminating for reconnect.`);
+          try { currentWs.terminate(); } catch (_) { /* ignore */ }
+        }
+      }, STALE_WATCHDOG_INTERVAL_MS);
     });
 
     this.liquidationWs.on('pong', () => {
@@ -1098,9 +1263,14 @@ class TradingBase {
       }
     });
 
-    this.liquidationWs.on('message', (data) => {
+    this.liquidationWs.on('message', async (data) => {
       try {
         const message = JSON.parse(data.toString());
+        this.lastLiquidationTickAt = Date.now();
+        if (this._liquidationMessagesSeen < 3) {
+          this._liquidationMessagesSeen++;
+          await this.addLog(`[DIAG] Liquidation WS ${wsId} MESSAGE #${this._liquidationMessagesSeen} e=${message.e}`);
+        }
         if (message.e !== 'forceOrder' || !message.o) return;
         const o = message.o;
         const avgPrice = parseFloat(o.ap);
@@ -1113,18 +1283,22 @@ class TradingBase {
         });
       } catch (error) {
         console.error(`Error processing liquidation message: ${error.message}`);
+        await this.addLog(`ERROR: [WS_MESSAGE] Liquidation message handler failed: ${error.message}`);
       }
     });
 
-    this.liquidationWs.on('error', (error) => {
+    this.liquidationWs.on('error', async (error) => {
       console.error(`Liquidation WebSocket error: ${error.message}`);
+      await this.addLog(`ERROR: [WS_ERROR] Liquidation WebSocket error (wsId=${wsId}): ${error.message}`);
     });
 
-    this.liquidationWs.on('close', async () => {
+    this.liquidationWs.on('close', async (code, reason) => {
       this.liquidationWsConnected = false;
+      await this.addLog(`[DIAG] Liquidation WS ${wsId} CLOSE code=${code} reason=${reason || 'none'}`);
       await this.addLog('[WebSocket] Liquidation WebSocket closed.');
       if (this.liquidationWsPingInterval) clearInterval(this.liquidationWsPingInterval);
       if (this.liquidationWsPingTimeout) clearTimeout(this.liquidationWsPingTimeout);
+      if (this.liquidationWsStaleWatcher) clearInterval(this.liquidationWsStaleWatcher);
 
       if (this.isRunning) {
         this.liquidationReconnectAttempts++;
@@ -1243,6 +1417,10 @@ class TradingBase {
 
       if (!this.listenKey) throw new Error('Failed to obtain listenKey');
 
+      // Flag the next connectUserDataStream() open handler to run a REST
+      // reconcile — catches any ACCOUNT_UPDATE / ORDER_TRADE_UPDATE events that
+      // fired while the socket was down.
+      this._needsUserDataReconcileOnOpen = true;
       this.connectUserDataStream();
 
       this.listenKeyRefreshInterval = setInterval(async () => {
@@ -1315,10 +1493,12 @@ class TradingBase {
   cleanupWebSockets() {
     if (this.realtimeWsPingInterval) clearInterval(this.realtimeWsPingInterval);
     if (this.realtimeWsPingTimeout) clearTimeout(this.realtimeWsPingTimeout);
+    if (this.realtimeWsStaleWatcher) clearInterval(this.realtimeWsStaleWatcher);
     if (this.userDataWsPingInterval) clearInterval(this.userDataWsPingInterval);
     if (this.userDataWsPingTimeout) clearTimeout(this.userDataWsPingTimeout);
     if (this.liquidationWsPingInterval) clearInterval(this.liquidationWsPingInterval);
     if (this.liquidationWsPingTimeout) clearTimeout(this.liquidationWsPingTimeout);
+    if (this.liquidationWsStaleWatcher) clearInterval(this.liquidationWsStaleWatcher);
     if (this.realtimeReconnectTimeout) clearTimeout(this.realtimeReconnectTimeout);
     if (this.userDataReconnectTimeout) clearTimeout(this.userDataReconnectTimeout);
     if (this.liquidationReconnectTimeout) clearTimeout(this.liquidationReconnectTimeout);

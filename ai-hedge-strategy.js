@@ -451,6 +451,15 @@ class AiHedgeStrategy extends TradingBase {
         await this.addLog('Using fallback plan.');
       }
 
+      // Freeze the microstructure inputs the AI actually consumed onto the plan,
+      // so the frontend can show users exactly what the model saw (live data
+      // keeps ticking after the plan is made).
+      plan.microstructureSnapshot = this._lastMicrostructure
+        ? { ...this._lastMicrostructure }
+        : null;
+      plan.volatilitySnapshot = this._lastVolatility ? { ...this._lastVolatility } : null;
+      plan.plannedAt = new Date().toISOString();
+
       // Install plan
       this.activePlan = plan;
       this.executor.setActivePlan(plan);
@@ -518,6 +527,11 @@ class AiHedgeStrategy extends TradingBase {
           volatility: this._lastVolatility,
           phase: this.phase,
         }, 'AI error');
+        fallback.microstructureSnapshot = this._lastMicrostructure
+          ? { ...this._lastMicrostructure }
+          : null;
+        fallback.volatilitySnapshot = this._lastVolatility ? { ...this._lastVolatility } : null;
+        fallback.plannedAt = new Date().toISOString();
         this.activePlan = fallback;
         this.executor.setActivePlan(fallback);
         this.executionState = 'EXECUTING_PLAN';
@@ -713,7 +727,15 @@ class AiHedgeStrategy extends TradingBase {
     if (!this.strategyId) return;
     try {
       await this.firestore.collection('strategies').doc(this.strategyId).collection('aiPlans').add({
-        plan: { analysis: plan.analysis, actionAbove: plan.actionAbove, actionBelow: plan.actionBelow, probabilityAssessment: plan.probabilityAssessment },
+        plan: {
+          analysis: plan.analysis,
+          actionAbove: plan.actionAbove,
+          actionBelow: plan.actionBelow,
+          probabilityAssessment: plan.probabilityAssessment,
+          microstructureSnapshot: plan.microstructureSnapshot ?? null,
+          volatilitySnapshot: plan.volatilitySnapshot ?? null,
+          plannedAt: plan.plannedAt ?? null,
+        },
         outcome: outcome ? { action: outcome.action, direction: outcome.direction, price: outcome.price, longPosition: outcome.longPosition, shortPosition: outcome.shortPosition } : null,
         timestamp: new Date(),
       });
@@ -757,7 +779,15 @@ class AiHedgeStrategy extends TradingBase {
       priceType: this.priceType,
       initialHedgeMultiplier: this.initialHedgeMultiplier,
       profitPercent: this.profitPercent,
-      activePlan: this.activePlan ? { analysis: this.activePlan.analysis, actionAbove: this.activePlan.actionAbove, actionBelow: this.activePlan.actionBelow, probabilityAssessment: this.activePlan.probabilityAssessment } : null,
+      activePlan: this.activePlan ? {
+        analysis: this.activePlan.analysis,
+        actionAbove: this.activePlan.actionAbove,
+        actionBelow: this.activePlan.actionBelow,
+        probabilityAssessment: this.activePlan.probabilityAssessment,
+        microstructureSnapshot: this.activePlan.microstructureSnapshot ?? null,
+        volatilitySnapshot: this.activePlan.volatilitySnapshot ?? null,
+        plannedAt: this.activePlan.plannedAt ?? null,
+      } : null,
       tradeCount: this.tradeCount,
       planHistoryCount: this.planHistory.length,
       realtimeWsConnected: this.realtimeWsConnected,
