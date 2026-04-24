@@ -95,7 +95,7 @@ if [ "$NEEDS_RESTART" = false ]; then
 fi
 
 log "Restarting bot via PM2..."
-sudo pm2 restart ycbot 2>&1 | tee -a "$LOG_FILE"
+sudo pm2 restart /opt/vm-bot/ecosystem.config.cjs --update-env 2>&1 | tee -a "$LOG_FILE"
 
 log "Verifying bot health after restart..."
 ATTEMPT=0
@@ -127,7 +127,7 @@ if [ "$HEALTHY" = false ]; then
     npm install --production 2>&1 | tee -a "$LOG_FILE"
   fi
 
-  sudo pm2 restart ycbot 2>&1 | tee -a "$LOG_FILE"
+  sudo pm2 restart /opt/vm-bot/ecosystem.config.cjs --update-env 2>&1 | tee -a "$LOG_FILE"
   log "Rollback complete. Bot restored to ${PREV_COMMIT:0:8}."
 
   sleep 5
