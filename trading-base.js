@@ -19,6 +19,19 @@ const STALE_TICK_THRESHOLD_MS = 15000;
 const LIQUIDATION_STALE_THRESHOLD_MS = 5 * 60 * 1000;
 const STALE_WATCHDOG_INTERVAL_MS = 5000;
 
+// REST polling fallback for the price feed. If the watchdog terminates the price
+// WS REST_FALLBACK_THRESHOLD times within REST_FALLBACK_WINDOW_MS, we treat
+// the WS path as broken (Binance ban / network issue) and switch to polling
+// /fapi/v1/premiumIndex via the GCF proxy (which has its own clean egress IP).
+// Trading continues at degraded latency. A background interval retries WS every
+// BACKGROUND_WS_RETRY_INTERVAL_MS — when a real message arrives within
+// BACKGROUND_WS_RETRY_DURATION_MS, we exit fallback and resume WS.
+const REST_FALLBACK_THRESHOLD = 3;
+const REST_FALLBACK_WINDOW_MS = 2 * 60 * 1000;
+const REST_POLL_INTERVAL_MS = 1000;
+const BACKGROUND_WS_RETRY_INTERVAL_MS = 60 * 1000;
+const BACKGROUND_WS_RETRY_DURATION_MS = 10 * 1000;
+
 // Default leverage
 const DEFAULT_LEVERAGE = 50;
 
@@ -140,6 +153,14 @@ class TradingBase {
     this.liquidationWsStaleWatcher = null;
     this.lastRealtimeTickAt = 0;
     this.lastLiquidationTickAt = 0;
+
+    // REST polling fallback state for the price feed
+    this.streamMode = 'WS'; // 'WS' | 'REST_FALLBACK'
+    this._consecutiveStalls = 0;
+    this._firstStallAt = null;
+    this._restPollInterval = null;
+    this._backgroundWsRetryInterval = null;
+    this._backgroundWsRetryInProgress = false;
 
     // Diagnostic tracing (temporary — see plan: silent WS stall investigation)
     this._realtimeWsIdCounter = 0;
@@ -823,13 +844,31 @@ class TradingBase {
 
       // Stream-stall watchdog: if no price message arrives within STALE_TICK_THRESHOLD_MS
       // while the socket reports connected, terminate — the existing close handler then
-      // schedules reconnect with the normal backoff.
+      // schedules reconnect with the normal backoff. Also tracks consecutive stalls so
+      // we can switch to REST polling fallback when WS is persistently broken.
       this.realtimeWsStaleWatcher = setInterval(async () => {
         if (!this.realtimeWsConnected) return;
         const silentFor = Date.now() - this.lastRealtimeTickAt;
         if (silentFor > STALE_TICK_THRESHOLD_MS) {
           await this.addLog(`WARN: Real-time price stream stalled — no tick in ${Math.round(silentFor / 1000)}s (wsId=${wsId}). Terminating for reconnect.`);
+
+          // Track stall window: count consecutive stalls within REST_FALLBACK_WINDOW_MS.
+          const now = Date.now();
+          if (this._firstStallAt === null || now - this._firstStallAt > REST_FALLBACK_WINDOW_MS) {
+            this._firstStallAt = now;
+            this._consecutiveStalls = 1;
+          } else {
+            this._consecutiveStalls++;
+          }
+
           try { currentWs.terminate(); } catch (_) { /* ignore */ }
+
+          // If we've stalled too many times in the window AND we're still in WS mode,
+          // switch to REST polling fallback. The close handler that follows will see
+          // streamMode === 'REST_FALLBACK' and skip auto-reconnect.
+          if (this.streamMode === 'WS' && this._consecutiveStalls >= REST_FALLBACK_THRESHOLD) {
+            await this._enterRestFallbackMode();
+          }
         }
       }, STALE_WATCHDOG_INTERVAL_MS);
     });
@@ -845,6 +884,13 @@ class TradingBase {
       try {
         const message = JSON.parse(data.toString());
         this.lastRealtimeTickAt = Date.now();
+
+        // Reset stall tracking — we got real data, so the WS path is healthy.
+        if (this._consecutiveStalls > 0 || this._firstStallAt !== null) {
+          this._consecutiveStalls = 0;
+          this._firstStallAt = null;
+        }
+
         // Log only the first 3 messages per socket for diagnostics, then silent.
         if (this._realtimeMessagesSeen < 3) {
           this._realtimeMessagesSeen++;
@@ -874,6 +920,10 @@ class TradingBase {
       if (this.realtimeWsPingTimeout) clearTimeout(this.realtimeWsPingTimeout);
       if (this.realtimeWsStaleWatcher) clearInterval(this.realtimeWsStaleWatcher);
 
+      // In REST fallback mode, the background WS retry loop owns reconnect attempts.
+      // Skip the normal close-handler reconnect to avoid duplicating connections.
+      if (this.streamMode === 'REST_FALLBACK') return;
+
       if (this.isRunning) {
         this.realtimeReconnectAttempts++;
         if (this.realtimeReconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
@@ -887,6 +937,124 @@ class TradingBase {
         }
       }
     });
+  }
+
+  // ─── REST polling fallback for price feed ──────────────────────────────────
+  // Activated when the watchdog detects REST_FALLBACK_THRESHOLD consecutive
+  // stalls within REST_FALLBACK_WINDOW_MS. Polls /fapi/v1/premiumIndex via the
+  // GCF proxy (clean egress IP) and feeds prices to handleRealtimePrice().
+  // A background interval retries WS every BACKGROUND_WS_RETRY_INTERVAL_MS;
+  // when WS recovers, we exit fallback automatically.
+
+  async _enterRestFallbackMode() {
+    if (this.streamMode === 'REST_FALLBACK') return;
+    this.streamMode = 'REST_FALLBACK';
+    await this.addLog(`[MODE] Switching to REST polling fallback (${REST_FALLBACK_THRESHOLD} consecutive stalls in <${Math.round(REST_FALLBACK_WINDOW_MS / 1000)}s). Trading continues at degraded latency.`);
+
+    // Cancel any pending WS reconnect — fallback owns the price feed now.
+    if (this.realtimeReconnectTimeout) {
+      clearTimeout(this.realtimeReconnectTimeout);
+      this.realtimeReconnectTimeout = null;
+    }
+    this.realtimeReconnectAttempts = 0;
+
+    // Start REST polling for the mark price.
+    this._restPollInterval = setInterval(async () => {
+      if (this.streamMode !== 'REST_FALLBACK' || !this.isRunning) return;
+      try {
+        const data = await this.makeProxyRequest(
+          '/fapi/v1/premiumIndex',
+          'GET',
+          { symbol: this.symbol },
+          false,
+          'futures'
+        );
+        if (data && data.markPrice) {
+          this.lastRealtimeTickAt = Date.now();
+          await this.handleRealtimePrice(parseFloat(data.markPrice));
+        }
+      } catch (error) {
+        // Don't log every poll error — would flood logs. Watchdog-style: log
+        // only periodically by counting failures.
+        if (!this._restPollErrorCount) this._restPollErrorCount = 0;
+        this._restPollErrorCount++;
+        if (this._restPollErrorCount % 30 === 1) {
+          await this.addLog(`WARN: [REST_FALLBACK] poll error (#${this._restPollErrorCount}): ${error.message}`);
+        }
+      }
+    }, REST_POLL_INTERVAL_MS);
+
+    // Start the background WS retry loop.
+    this._backgroundWsRetryInterval = setInterval(async () => {
+      if (this.streamMode !== 'REST_FALLBACK' || !this.isRunning) return;
+      if (this._backgroundWsRetryInProgress) return;
+      this._backgroundWsRetryInProgress = true;
+      try {
+        await this._tryRestoreWsFromFallback();
+      } finally {
+        this._backgroundWsRetryInProgress = false;
+      }
+    }, BACKGROUND_WS_RETRY_INTERVAL_MS);
+  }
+
+  async _tryRestoreWsFromFallback() {
+    const wsBaseUrl = this.isTestnet === true
+      ? 'wss://stream.binance.com/ws'
+      : 'wss://fstream.binance.com/ws';
+    const tickerStream = this.priceType === 'LAST'
+      ? `${this.symbol.toLowerCase()}@ticker`
+      : `${this.symbol.toLowerCase()}@markPrice@1s`;
+    const testUrl = `${wsBaseUrl}/${tickerStream}`;
+
+    const testWs = new WebSocket(testUrl);
+    let gotMessage = false;
+
+    testWs.on('message', (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.e === 'markPriceUpdate' || msg.e === '24hrTicker') {
+          gotMessage = true;
+        }
+      } catch (_) { /* ignore parse errors */ }
+    });
+
+    // Suppress noise — don't let test WS errors trip alerts.
+    testWs.on('error', () => { /* ignore */ });
+
+    // Wait up to BACKGROUND_WS_RETRY_DURATION_MS for any qualifying message.
+    await new Promise(resolve => setTimeout(resolve, BACKGROUND_WS_RETRY_DURATION_MS));
+
+    if (gotMessage) {
+      try { testWs.terminate(); } catch (_) { /* ignore */ }
+      await this._exitRestFallbackMode();
+    } else {
+      try { testWs.terminate(); } catch (_) { /* ignore */ }
+    }
+  }
+
+  async _exitRestFallbackMode() {
+    if (this.streamMode !== 'REST_FALLBACK') return;
+    await this.addLog(`[MODE] WS feed recovered. Exiting REST fallback.`);
+
+    // Stop polling and background retry.
+    if (this._restPollInterval) {
+      clearInterval(this._restPollInterval);
+      this._restPollInterval = null;
+    }
+    if (this._backgroundWsRetryInterval) {
+      clearInterval(this._backgroundWsRetryInterval);
+      this._backgroundWsRetryInterval = null;
+    }
+    this._restPollErrorCount = 0;
+
+    // Reset state for fresh WS lifecycle.
+    this.streamMode = 'WS';
+    this._consecutiveStalls = 0;
+    this._firstStallAt = null;
+    this.realtimeReconnectAttempts = 0;
+
+    // Re-establish a proper WS connection via the normal connect path.
+    this.connectRealtimeWebSocket();
   }
 
   // ─── WebSocket: User Data Stream ───────────────────────────────────────────
@@ -1503,6 +1671,8 @@ class TradingBase {
     if (this.userDataReconnectTimeout) clearTimeout(this.userDataReconnectTimeout);
     if (this.liquidationReconnectTimeout) clearTimeout(this.liquidationReconnectTimeout);
     if (this.listenKeyRefreshInterval) clearInterval(this.listenKeyRefreshInterval);
+    if (this._restPollInterval) clearInterval(this._restPollInterval);
+    if (this._backgroundWsRetryInterval) clearInterval(this._backgroundWsRetryInterval);
     this._stopWebSocketHealthMonitoring();
 
     if (this.realtimeWs) {
