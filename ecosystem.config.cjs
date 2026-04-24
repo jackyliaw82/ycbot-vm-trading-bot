@@ -10,7 +10,11 @@ module.exports = {
       NODE_ENV: 'production',
       PORT: 3000,
       GOOGLE_APPLICATION_CREDENTIALS: '/opt/vm-bot/service-account-key.json',
-      GOOGLE_CLOUD_PROJECT_ID: 'ycbot-6f336'
+      GOOGLE_CLOUD_PROJECT_ID: 'ycbot-6f336',
+      // Phase 2: route all Binance WS through the shared ycbot-ws-relay. VM IP
+      // never talks directly to Binance, avoiding the IP-reputation class of
+      // bans. Leave unset to fall back to direct Binance.
+      RELAY_WS_URL: 'ws://34.21.150.209:8080/ws'
     },
     error_file: './logs/err.log',
     out_file: './logs/out.log',

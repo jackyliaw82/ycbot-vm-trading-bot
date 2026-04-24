@@ -16,7 +16,10 @@ const PONG_TIMEOUT_MS = 10000;
 // Stream-stall watchdog. Price streams (@markPrice@1s / @ticker) push ~1 msg/sec,
 // so 15s of silence is a confident anomaly. Liquidations are sporadic; 5m is safe.
 const STALE_TICK_THRESHOLD_MS = 15000;
-const LIQUIDATION_STALE_THRESHOLD_MS = 5 * 60 * 1000;
+// Liquidations are sporadic by nature — quiet markets can go many minutes
+// without any forceOrder events. 15 min strikes the balance between catching
+// real stream stalls and avoiding false positives during calm periods.
+const LIQUIDATION_STALE_THRESHOLD_MS = 15 * 60 * 1000;
 const STALE_WATCHDOG_INTERVAL_MS = 5000;
 
 // REST polling fallback for the price feed. If the watchdog terminates the price
@@ -801,6 +804,24 @@ class TradingBase {
     });
   }
 
+  // ─── WebSocket base URL ────────────────────────────────────────────────────
+  //
+  // If RELAY_WS_URL is set (e.g. ws://34.142.xxx.xxx:8080/ws), WS connections
+  // route through the ycbot-ws-relay service instead of directly to Binance.
+  // The relay preserves the same path structure after the base, so all three
+  // connect* methods just swap the prefix.
+  //
+  // Without RELAY_WS_URL, fall back to direct Binance fstream (or spot testnet
+  // for isTestnet runs). This keeps backwards compatibility for any deploy
+  // that hasn't pointed at a relay yet.
+
+  _getWsBaseUrl() {
+    if (process.env.RELAY_WS_URL) return process.env.RELAY_WS_URL;
+    return this.isTestnet === true
+      ? 'wss://stream.binance.com/ws'
+      : 'wss://fstream.binance.com/ws';
+  }
+
   // ─── WebSocket: Real-time price ────────────────────────────────────────────
 
   connectRealtimeWebSocket() {
@@ -811,9 +832,7 @@ class TradingBase {
     const prevReadyState = this.realtimeWs?.readyState ?? 'null';
     if (this.realtimeWs) this.realtimeWs.close();
 
-    const wsBaseUrl = this.isTestnet === true
-      ? 'wss://stream.binance.com/ws'
-      : 'wss://fstream.binance.com/ws';
+    const wsBaseUrl = this._getWsBaseUrl();
 
     const tickerStream = this.priceType === 'LAST'
       ? `${this.symbol.toLowerCase()}@ticker`
@@ -998,9 +1017,7 @@ class TradingBase {
   }
 
   async _tryRestoreWsFromFallback() {
-    const wsBaseUrl = this.isTestnet === true
-      ? 'wss://stream.binance.com/ws'
-      : 'wss://fstream.binance.com/ws';
+    const wsBaseUrl = this._getWsBaseUrl();
     const tickerStream = this.priceType === 'LAST'
       ? `${this.symbol.toLowerCase()}@ticker`
       : `${this.symbol.toLowerCase()}@markPrice@1s`;
@@ -1075,9 +1092,7 @@ class TradingBase {
       this.userDataWs.close(1000, 'Intentional reconnection');
     }
 
-    const wsBaseUrl = this.isTestnet === true
-      ? 'wss://stream.binance.com/ws'
-      : 'wss://fstream.binance.com/ws';
+    const wsBaseUrl = this._getWsBaseUrl();
 
     const userDataUrl = `${wsBaseUrl}/${this.listenKey}`;
     const wsId = ++this._userDataWsIdCounter;
@@ -1383,9 +1398,7 @@ class TradingBase {
     if (this.liquidationWsStaleWatcher) clearInterval(this.liquidationWsStaleWatcher);
     if (this.liquidationWs) this.liquidationWs.close();
 
-    const wsBaseUrl = this.isTestnet === true
-      ? 'wss://stream.binance.com/ws'
-      : 'wss://fstream.binance.com/ws';
+    const wsBaseUrl = this._getWsBaseUrl();
     const stream = `${this.symbol.toLowerCase()}@forceOrder`;
 
     const wsId = ++this._liquidationWsIdCounter;
