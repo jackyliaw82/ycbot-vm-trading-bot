@@ -76,6 +76,32 @@ startupStatus.phase = 'ready';
 // Global map to store active strategy instances, keyed by strategyId
 const activeStrategies = new Map();
 
+// ─── Wallet snapshot ─────────────────────────────────────────────────────────
+// Periodically write the user's total futures wallet balance to Firestore so
+// the frontend's balance sparkline can show real history instead of a synthetic
+// random-walk. Hourly cadence is plenty for a 24h sparkline (24 points).
+// Tied to strategy lifecycle: starts on strategy start (after start() resolves
+// so wallet is reachable), stops on onStopComplete. When no strategy is running
+// the bot doesn't snapshot — that's the limitation; sparkline will only have
+// data points from active trading sessions.
+const WALLET_SNAPSHOT_INTERVAL_MS = 60 * 60 * 1000;
+
+async function _snapshotWallet(strategy) {
+  if (!strategy?.userId) return;
+  try {
+    const balance = await strategy.getWalletBalance();
+    await firestore.collection('users').doc(strategy.userId)
+      .collection('wallet-history').add({
+        ts: Date.now(),
+        totalUsdt: balance,
+        strategyId: strategy.strategyId || null,
+      });
+    console.log(`[WALLET-SNAPSHOT] uid=${strategy.userId} total=$${Number(balance).toFixed(2)}`);
+  } catch (err) {
+    console.warn(`[WALLET-SNAPSHOT] failed for uid=${strategy.userId}: ${err.message}`);
+  }
+}
+
 // ─── Warm subscription manager ───────────────────────────────────────────────
 // Holds a single WS subscription to the relay for the symbol the user has
 // currently selected on the config page. Purpose: keep the relay's upstream
@@ -1162,8 +1188,19 @@ app.post('/ai-hedge/start', async (req, res) => {
     // Register so /health and /status can track it
     activeStrategies.set(strategyId, strategy);
 
+    // Wallet snapshot lifecycle — initial snapshot after start() resolves, then hourly.
+    let walletSnapshotInterval = null;
+
     // Unregister on any stop path (manual, TP, capital protection, etc.)
-    strategy.onStopComplete = () => activeStrategies.delete(strategyId);
+    strategy.onStopComplete = () => {
+      if (walletSnapshotInterval) {
+        clearInterval(walletSnapshotInterval);
+        walletSnapshotInterval = null;
+      }
+      // Final snapshot to capture end-of-session balance
+      _snapshotWallet(strategy).catch(() => { /* logged inside */ });
+      activeStrategies.delete(strategyId);
+    };
 
     // Respond immediately — strategy starts in background
     console.log(`✓ AI Hedge Strategy ${strategyId} starting (non-blocking)...`);
@@ -1174,11 +1211,20 @@ app.post('/ai-hedge/start', async (req, res) => {
     });
 
     // Start strategy in background — errors are logged, not sent to client
-    strategy.start(config).catch((error) => {
-      console.error(`Failed to start AI Hedge Strategy ${strategyId}:`, error);
-      strategy.isRunning = false;
-      activeStrategies.delete(strategyId);
-    });
+    strategy.start(config)
+      .then(() => {
+        // Initial snapshot now that wallet is fetchable, then hourly cadence
+        _snapshotWallet(strategy).catch(() => { /* logged inside */ });
+        walletSnapshotInterval = setInterval(
+          () => _snapshotWallet(strategy).catch(() => { /* logged inside */ }),
+          WALLET_SNAPSHOT_INTERVAL_MS
+        );
+      })
+      .catch((error) => {
+        console.error(`Failed to start AI Hedge Strategy ${strategyId}:`, error);
+        strategy.isRunning = false;
+        activeStrategies.delete(strategyId);
+      });
   } catch (error) {
     console.error('Failed to start AI Hedge Strategy:', error);
     res.status(500).json({ error: error.message });
