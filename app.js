@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { AiHedgeStrategy } from './ai-hedge-strategy.js';
 import http from 'http';
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, WebSocket as WsClient } from 'ws';
 import { Firestore, Timestamp, FieldValue } from '@google-cloud/firestore';
 import { initializeFirebaseAdmin } from './pushNotificationHelper.js';
 import admin from 'firebase-admin';
@@ -75,6 +75,64 @@ startupStatus.phase = 'ready';
 
 // Global map to store active strategy instances, keyed by strategyId
 const activeStrategies = new Map();
+
+// ─── Warm subscription manager ───────────────────────────────────────────────
+// Holds a single WS subscription to the relay for the symbol the user has
+// currently selected on the config page. Purpose: keep the relay's upstream
+// for that symbol hot so when the user clicks Start, the strategy WS inherits
+// a hot upstream and gets messages immediately (no cold-start REST fallback).
+// Server-level state — not tied to any strategy instance.
+let warmWs = null;
+let warmSymbol = null;
+let warmReconnectTimeout = null;
+const WARM_RECONNECT_DELAY_MS = 5_000;
+
+function _getWarmStreamUrl(symbolUpper) {
+  const base = process.env.RELAY_WS_URL || 'wss://fstream.binance.com/ws';
+  return `${base}/${symbolUpper.toLowerCase()}@markPrice@1s`;
+}
+
+function _closeWarmWs(reason) {
+  if (warmReconnectTimeout) {
+    clearTimeout(warmReconnectTimeout);
+    warmReconnectTimeout = null;
+  }
+  if (warmWs) {
+    try { warmWs.removeAllListeners(); } catch (_) { /* ignore */ }
+    try { warmWs.close(); } catch (_) { /* ignore */ }
+    console.log(`[WARM] Closed subscription (was ${warmSymbol}) — reason: ${reason}`);
+    warmWs = null;
+  }
+}
+
+function _openWarmWs(symbolUpper) {
+  const url = _getWarmStreamUrl(symbolUpper);
+  console.log(`[WARM] Opening subscription: ${symbolUpper} → ${url}`);
+  const ws = new WsClient(url);
+  warmWs = ws;
+  warmSymbol = symbolUpper;
+
+  ws.on('open', () => {
+    console.log(`[WARM] Subscription open: ${symbolUpper}`);
+  });
+
+  // Discard messages — this connection exists only to keep the relay's upstream warm.
+  ws.on('message', () => { /* intentional no-op */ });
+
+  ws.on('error', (err) => {
+    console.warn(`[WARM] Subscription error (${symbolUpper}): ${err.message}`);
+  });
+
+  ws.on('close', (code, reason) => {
+    console.log(`[WARM] Subscription closed (${symbolUpper}, code=${code}, reason=${reason ? reason.toString() : 'none'})`);
+    if (warmWs === ws && warmSymbol === symbolUpper) {
+      warmWs = null;
+      warmReconnectTimeout = setTimeout(() => {
+        if (warmSymbol === symbolUpper) _openWarmWs(symbolUpper);
+      }, WARM_RECONNECT_DELAY_MS);
+    }
+  });
+}
 
 // Create HTTP server
 const server = http.createServer(app);
@@ -1051,6 +1109,24 @@ async function reportVersionOnStartup(retryCount = 0) {
 // ─── AI Hedge Strategy Endpoints ─────────────────────────────────────────────
 
 // Start AI hedge strategy
+// Pre-warm the relay's upstream for a symbol the user has selected on the config
+// page but hasn't started a strategy on yet. Idempotent — calling with the same
+// symbol while already-warmed is a no-op. Switching symbols closes the previous
+// warm subscription and opens a new one.
+app.post('/ai-hedge/prepare-symbol', (req, res) => {
+  const { symbol } = req.body || {};
+  if (!symbol || typeof symbol !== 'string') {
+    return res.status(400).json({ error: 'symbol is required' });
+  }
+  const normalized = symbol.toUpperCase();
+  if (warmSymbol === normalized && warmWs && warmWs.readyState === WsClient.OPEN) {
+    return res.json({ ok: true, alreadyWarm: true, symbol: normalized });
+  }
+  _closeWarmWs('switching symbol');
+  _openWarmWs(normalized);
+  return res.json({ ok: true, symbol: normalized });
+});
+
 app.post('/ai-hedge/start', async (req, res) => {
   if (isUpdating) {
     return res.status(503).json({ error: 'VM is currently updating.', code: 'VM_UPDATING' });
