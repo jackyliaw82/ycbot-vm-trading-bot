@@ -841,11 +841,17 @@ class TradingBase {
     const wsUrl = `${wsBaseUrl}/${tickerStream}`;
     const wsId = ++this._realtimeWsIdCounter;
     this._realtimeMessagesSeen = 0;
+    // Tracks whether this specific WS instance ever transitioned to OPEN. Used in
+    // the close handler to distinguish "stalled after open" (existing watchdog
+    // already counts this) from "couldn't even open" (relay unreachable / network
+    // outage / kernel routing block) — both should count toward REST fallback.
+    let wsEverOpened = false;
     this.addLog(`[DIAG] connectRealtimeWebSocket called. prevReadyState=${prevReadyState}, newWsId=${wsId}, url=${wsUrl}`);
     this.realtimeWs = new WebSocket(wsUrl);
     const currentWs = this.realtimeWs;
 
     this.realtimeWs.on('open', async () => {
+      wsEverOpened = true;
       await this.addLog(`[DIAG] WS ${wsId} OPEN`);
       await this.addLog('[WebSocket] Real-time price WS connected.');
       this.realtimeWsConnected = true;
@@ -938,6 +944,25 @@ class TradingBase {
       if (this.realtimeWsPingInterval) clearInterval(this.realtimeWsPingInterval);
       if (this.realtimeWsPingTimeout) clearTimeout(this.realtimeWsPingTimeout);
       if (this.realtimeWsStaleWatcher) clearInterval(this.realtimeWsStaleWatcher);
+
+      // Connect-failure path: WS never reached OPEN (relay unreachable, route blocked,
+      // DNS broken, etc). Existing stall watchdog only counts post-open silence, so
+      // these failures wouldn't trigger REST fallback on their own. Count them into
+      // the same window so REST fallback engages when the WS path is genuinely down.
+      if (!wsEverOpened && this.streamMode === 'WS' && this.isRunning) {
+        const now = Date.now();
+        if (this._firstStallAt === null || now - this._firstStallAt > REST_FALLBACK_WINDOW_MS) {
+          this._firstStallAt = now;
+          this._consecutiveStalls = 1;
+        } else {
+          this._consecutiveStalls++;
+        }
+        if (this._consecutiveStalls >= REST_FALLBACK_THRESHOLD) {
+          await this._enterRestFallbackMode();
+          // _enterRestFallbackMode sets streamMode = 'REST_FALLBACK' — the early
+          // return below now kicks in and skips the standard reconnect loop.
+        }
+      }
 
       // In REST fallback mode, the background WS retry loop owns reconnect attempts.
       // Skip the normal close-handler reconnect to avoid duplicating connections.
