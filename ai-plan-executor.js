@@ -109,30 +109,44 @@ class AiPlanExecutor {
     quantity = strategy.roundQuantity(quantity);
 
     let result;
+    let restSide = null;
+    let restPositionSide = null;
 
     switch (action.type) {
       case 'ADD_LONG':
         result = await strategy.placeMarketOrder(symbol, 'BUY', quantity, 'LONG');
+        restSide = 'BUY'; restPositionSide = 'LONG';
         await strategy.addLog(`[AI] ADD_LONG: Bought ${quantity} @ market (target: ${strategy._formatPrice(action.triggerPrice)})`);
         break;
 
       case 'ADD_SHORT':
         result = await strategy.placeMarketOrder(symbol, 'SELL', quantity, 'SHORT');
+        restSide = 'SELL'; restPositionSide = 'SHORT';
         await strategy.addLog(`[AI] ADD_SHORT: Sold ${quantity} @ market (target: ${strategy._formatPrice(action.triggerPrice)})`);
         break;
 
       case 'CUT_LONG':
         result = await strategy.placeMarketOrder(symbol, 'SELL', quantity, 'LONG');
+        restSide = 'SELL'; restPositionSide = 'LONG';
         await strategy.addLog(`[AI] CUT_LONG: Sold ${quantity} LONG @ market`);
         break;
 
       case 'CUT_SHORT':
         result = await strategy.placeMarketOrder(symbol, 'BUY', quantity, 'SHORT');
+        restSide = 'BUY'; restPositionSide = 'SHORT';
         await strategy.addLog(`[AI] CUT_SHORT: Bought ${quantity} SHORT @ market`);
         break;
 
       default:
         throw new Error(`Unknown action type: ${action.type}`);
+    }
+
+    // Save trade record from REST response — this is the reliable path. The
+    // user-data WS-based saveTrade in trading-base._handleOrderTradeUpdate stays
+    // as the primary for fee/PnL accumulation, but if user-data WS is silent
+    // (relay silent-stuck or otherwise), at least the chart marker gets a record.
+    if (result && restSide && restPositionSide) {
+      await strategy._saveTradeFromOrderResult(result, symbol, restSide, restPositionSide);
     }
 
     if (strategy.riskGuard) strategy.riskGuard.recordAction();
@@ -160,6 +174,10 @@ class AiPlanExecutor {
     // Place both orders — LONG first, then SHORT immediately after
     const longResult = await strategy.placeMarketOrder(symbol, 'BUY', roundedLongQty, 'LONG');
     const shortResult = await strategy.placeMarketOrder(symbol, 'SELL', roundedShortQty, 'SHORT');
+
+    // Save trade records from REST responses (reliable path; see executeAction)
+    if (longResult) await strategy._saveTradeFromOrderResult(longResult, symbol, 'BUY', 'LONG');
+    if (shortResult) await strategy._saveTradeFromOrderResult(shortResult, symbol, 'SELL', 'SHORT');
 
     if (strategy.riskGuard) strategy.riskGuard.recordAction();
 

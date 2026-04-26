@@ -265,6 +265,42 @@ class TradingBase {
     }
   }
 
+  /**
+   * REST-fallback trade save. Called by the executor right after each successful
+   * placeMarketOrder so the chart gets a marker even when the user-data WS path
+   * (which produces fee/PnL-rich per-fill records) misses events.
+   *
+   * Aggregated per-order rather than per-fill — tradeId is left null because
+   * Binance Futures REST doesn't expose per-fill IDs. The frontend chart dedupes
+   * by candle so duplicate records (one from REST here, plus zero-or-more from
+   * user-data WS) collapse to a single visible marker.
+   */
+  async _saveTradeFromOrderResult(orderResult, symbol, side, positionSide) {
+    if (!orderResult || !orderResult.orderId) return;
+    try {
+      const price = parseFloat(orderResult.avgPrice) || this.currentPrice || 0;
+      const qty = parseFloat(orderResult.executedQty) || 0;
+      await this.saveTrade({
+        tradeId: null,                  // REST doesn't expose per-fill IDs
+        orderId: orderResult.orderId,
+        symbol,
+        side,
+        positionSide,
+        time: orderResult.updateTime || orderResult.transactTime || Date.now(),
+        price,
+        qty,
+        quoteQty: price * qty,
+        realizedPnl: 0,                 // REST response doesn't expose this; tracked by WS path
+        commission: 0,                  // same — tracked by WS path
+        commissionAsset: 'USDT',
+        role: 'Taker',                  // market orders are always taker
+        source: 'rest',                 // marks origin; WS-saved records have no `source` field
+      });
+    } catch (error) {
+      console.error(`Failed to save REST trade record: ${error.message}`);
+    }
+  }
+
   async deleteSubcollection(collectionRef, subcollectionName) {
     try {
       const batchSize = 500;
