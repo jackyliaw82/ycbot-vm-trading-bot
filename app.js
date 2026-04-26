@@ -328,7 +328,11 @@ app.get('/strategy/:strategyId/trades', async (req, res) => {
     const { strategyId } = req.params;
     // Hardcode Firestore project ID and database ID
     const tradesRef = firestore.collection('strategies').doc(strategyId).collection('trades');
-    const snapshot = await tradesRef.orderBy('time', 'desc').get(); // Order by trade time (Binance trade time)
+    // Use `timestamp` (always set in saveTrade via `new Date()`) rather than `time`
+    // (Binance order.T) — Firestore.orderBy implicitly filters out docs that lack
+    // the field, and with `ignoreUndefinedProperties: true` an undefined order.T
+    // would have produced docs without a `time` field, hiding them from the query.
+    const snapshot = await tradesRef.orderBy('timestamp', 'desc').get();
     
     const trades = snapshot.docs.map(doc => ({
       id: doc.id, // Document ID

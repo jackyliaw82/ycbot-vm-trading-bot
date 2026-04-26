@@ -1253,7 +1253,8 @@ class TradingBase {
           symbol: order.s,
           side: order.S,                        // 'BUY' or 'SELL'
           positionSide: orderPositionSide,       // 'LONG' or 'SHORT'
-          time: order.T,
+          time: order.T || Date.now(),           // Fall back to local clock if Binance omits T — `ignoreUndefinedProperties: true` would otherwise strip the field and break orderBy queries
+
           price: tradePrice,
           qty: tradeQty,
           quoteQty: tradePrice * tradeQty,
