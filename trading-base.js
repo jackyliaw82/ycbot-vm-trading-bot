@@ -842,20 +842,29 @@ class TradingBase {
 
   // ─── WebSocket base URL ────────────────────────────────────────────────────
   //
-  // If RELAY_WS_URL is set (e.g. ws://34.142.xxx.xxx:8080/ws), WS connections
-  // route through the ycbot-ws-relay service instead of directly to Binance.
-  // The relay preserves the same path structure after the base, so all three
-  // connect* methods just swap the prefix.
+  // If RELAY_WS_URL is set (e.g. ws://34.142.xxx.xxx:8080/ws), MARKET-data WS
+  // connections route through the ycbot-ws-relay so Binance only ever sees the
+  // relay's static IP — keeps user-VM IPs out of Binance's market-data IP-rep
+  // tracking and avoids the full re-architecture if a user-VM IP gets banned.
   //
-  // Without RELAY_WS_URL, fall back to direct Binance fstream (or spot testnet
-  // for isTestnet runs). This keeps backwards compatibility for any deploy
-  // that hasn't pointed at a relay yet.
+  // USER-DATA WS deliberately bypasses the relay even when RELAY_WS_URL is set.
+  // User-data is auth'd by listenKey (account-bound, not IP-bound), so there's
+  // no IP-rep concern there. Routing it through the relay introduced a silent-
+  // stuck failure mode where the relay's upstream stayed open but Binance never
+  // pushed ORDER_TRADE_UPDATE / ACCOUNT_UPDATE events through it (12+ hour run
+  // produced zero events, breaking saveTrade and PnL/fee accumulation). Direct
+  // bot → Binance restores the pre-v1.0.4 behavior for this stream type only.
+  //
+  // Without RELAY_WS_URL, both market and user-data fall back to direct Binance
+  // — backwards-compatible with any deploy that hasn't pointed at a relay yet.
 
-  _getWsBaseUrl() {
-    if (process.env.RELAY_WS_URL) return process.env.RELAY_WS_URL;
-    return this.isTestnet === true
+  _getWsBaseUrl(streamType = 'market') {
+    const directBase = this.isTestnet === true
       ? 'wss://stream.binance.com/ws'
       : 'wss://fstream.binance.com/ws';
+    if (streamType === 'userdata') return directBase;
+    if (process.env.RELAY_WS_URL) return process.env.RELAY_WS_URL;
+    return directBase;
   }
 
   // ─── WebSocket: Real-time price ────────────────────────────────────────────
@@ -1153,7 +1162,8 @@ class TradingBase {
       this.userDataWs.close(1000, 'Intentional reconnection');
     }
 
-    const wsBaseUrl = this._getWsBaseUrl();
+    // User-data bypasses the relay — see _getWsBaseUrl() for rationale.
+    const wsBaseUrl = this._getWsBaseUrl('userdata');
 
     const userDataUrl = `${wsBaseUrl}/${this.listenKey}`;
     const wsId = ++this._userDataWsIdCounter;
