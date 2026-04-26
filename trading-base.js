@@ -34,6 +34,14 @@ const REST_FALLBACK_WINDOW_MS = 2 * 60 * 1000;
 const REST_POLL_INTERVAL_MS = 1000;
 const BACKGROUND_WS_RETRY_INTERVAL_MS = 60 * 1000;
 const BACKGROUND_WS_RETRY_DURATION_MS = 10 * 1000;
+// Throttled visibility log inside the silent probe loop — emit one
+// "still trying" line every Nth probe so the user sees the recovery
+// is alive without flooding when the outage lasts hours.
+const BACKGROUND_WS_RETRY_LOG_EVERY = 10;
+// Slow background retry for the liquidation WS once the standard 25-attempt
+// backoff stage gives up. Sporadic stream + non-blocking for execution → 5 min
+// is a healthy cadence (vs. 60s for the price probe).
+const LIQUIDATION_BACKGROUND_RETRY_INTERVAL_MS = 5 * 60 * 1000;
 
 // Default leverage
 const DEFAULT_LEVERAGE = 50;
@@ -164,6 +172,12 @@ class TradingBase {
     this._restPollInterval = null;
     this._backgroundWsRetryInterval = null;
     this._backgroundWsRetryInProgress = false;
+    this._wsProbeAttempts = 0;
+
+    // Liquidation WS background retry — kicks in after the standard 25-attempt
+    // backoff stage exhausts itself. Slow cadence; informational stream so we
+    // don't need aggressive recovery, just eventual recovery.
+    this._liquidationBackgroundRetry = null;
 
     // Diagnostic tracing (temporary — see plan: silent WS stall investigation)
     this._realtimeWsIdCounter = 0;
@@ -1087,6 +1101,7 @@ class TradingBase {
   }
 
   async _tryRestoreWsFromFallback() {
+    this._wsProbeAttempts++;
     const wsBaseUrl = this._getWsBaseUrl();
     const tickerStream = this.priceType === 'LAST'
       ? `${this.symbol.toLowerCase()}@ticker`
@@ -1116,6 +1131,12 @@ class TradingBase {
       await this._exitRestFallbackMode();
     } else {
       try { testWs.terminate(); } catch (_) { /* ignore */ }
+      // Throttled visibility — confirm the bot is still actively retrying.
+      if (this._wsProbeAttempts % BACKGROUND_WS_RETRY_LOG_EVERY === 0) {
+        const everyMin = Math.round(BACKGROUND_WS_RETRY_INTERVAL_MS / 1000);
+        const nextMin = Math.round(BACKGROUND_WS_RETRY_LOG_EVERY * BACKGROUND_WS_RETRY_INTERVAL_MS / 60000);
+        await this.addLog(`[MODE] REST fallback active — WS probe still trying every ${everyMin}s (attempt #${this._wsProbeAttempts}). Will report again in ${nextMin} min if still down.`);
+      }
     }
   }
 
@@ -1128,6 +1149,7 @@ class TradingBase {
       clearInterval(this._restPollInterval);
       this._restPollInterval = null;
     }
+    this._wsProbeAttempts = 0;
     if (this._backgroundWsRetryInterval) {
       clearInterval(this._backgroundWsRetryInterval);
       this._backgroundWsRetryInterval = null;
@@ -1487,6 +1509,11 @@ class TradingBase {
       this.lastLiquidationTickAt = Date.now();
       this.liquidationReconnectAttempts = 0;
       if (this.liquidationReconnectTimeout) clearTimeout(this.liquidationReconnectTimeout);
+      // Cancel the slow background retry — standard backoff handles it from here.
+      if (this._liquidationBackgroundRetry) {
+        clearInterval(this._liquidationBackgroundRetry);
+        this._liquidationBackgroundRetry = null;
+      }
 
       this.liquidationWsPingInterval = setInterval(() => {
         this.liquidationWs.ping();
@@ -1562,7 +1589,25 @@ class TradingBase {
             this.connectLiquidationWebSocket();
           }, delay);
         } else {
-          await this.addLog(`ERROR: [CONNECTION_ERROR] Max Liquidation WS reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached.`);
+          // Standard backoff exhausted. Liquidation has no REST fallback (Binance
+          // does not expose live liquidations via REST), so just keep poking the
+          // WS forever at a slow cadence. On a successful reconnect, the on('open')
+          // handler resets liquidationReconnectAttempts to 0 and the standard
+          // backoff is available again from the next failure.
+          if (!this._liquidationBackgroundRetry) {
+            const everyMin = Math.round(LIQUIDATION_BACKGROUND_RETRY_INTERVAL_MS / 60000);
+            await this.addLog(`ERROR: [CONNECTION_ERROR] Max Liquidation WS reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Switching to background retry every ${everyMin} min.`);
+            this._liquidationBackgroundRetry = setInterval(() => {
+              if (!this.isRunning) {
+                clearInterval(this._liquidationBackgroundRetry);
+                this._liquidationBackgroundRetry = null;
+                return;
+              }
+              // Reset so the standard backoff schedule applies fresh from the next call.
+              this.liquidationReconnectAttempts = 0;
+              this.connectLiquidationWebSocket();
+            }, LIQUIDATION_BACKGROUND_RETRY_INTERVAL_MS);
+          }
         }
       }
     });
@@ -1758,6 +1803,11 @@ class TradingBase {
     if (this.listenKeyRefreshInterval) clearInterval(this.listenKeyRefreshInterval);
     if (this._restPollInterval) clearInterval(this._restPollInterval);
     if (this._backgroundWsRetryInterval) clearInterval(this._backgroundWsRetryInterval);
+    if (this._liquidationBackgroundRetry) {
+      clearInterval(this._liquidationBackgroundRetry);
+      this._liquidationBackgroundRetry = null;
+    }
+    this._wsProbeAttempts = 0;
     this._stopWebSocketHealthMonitoring();
 
     if (this.realtimeWs) {
