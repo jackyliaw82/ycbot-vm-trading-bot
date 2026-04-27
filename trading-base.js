@@ -14,12 +14,11 @@ const PING_INTERVAL_MS = 30000;
 const PONG_TIMEOUT_MS = 10000;
 
 // Stream-stall watchdog. Price streams (@markPrice@1s / @ticker) push ~1 msg/sec,
-// so 15s of silence is a confident anomaly. Liquidations are sporadic; 5m is safe.
+// so 15s of silence is a confident anomaly. The liquidation WS gets no stall
+// watchdog — forceOrder is inherently sporadic for a single symbol; relying on
+// ping/pong (every 30s with 10s pong timeout) is sufficient for stuck-stream
+// detection without false-positive teardowns during quiet markets.
 const STALE_TICK_THRESHOLD_MS = 15000;
-// Liquidations are sporadic by nature — quiet markets can go many minutes
-// without any forceOrder events. 15 min strikes the balance between catching
-// real stream stalls and avoiding false positives during calm periods.
-const LIQUIDATION_STALE_THRESHOLD_MS = 15 * 60 * 1000;
 const STALE_WATCHDOG_INTERVAL_MS = 5000;
 
 // REST polling fallback for the price feed. If the watchdog terminates the price
@@ -159,11 +158,9 @@ class TradingBase {
     this.liquidationWsPingTimeout = null;
     this.liquidationWsPingInterval = null;
 
-    // Stream-stall watchdog state
+    // Stream-stall watchdog state (price feed only; liquidation has no watchdog)
     this.realtimeWsStaleWatcher = null;
-    this.liquidationWsStaleWatcher = null;
     this.lastRealtimeTickAt = 0;
-    this.lastLiquidationTickAt = 0;
 
     // REST polling fallback state for the price feed
     this.streamMode = 'WS'; // 'WS' | 'REST_FALLBACK'
@@ -1489,7 +1486,6 @@ class TradingBase {
     if (this.liquidationReconnectTimeout) clearTimeout(this.liquidationReconnectTimeout);
     if (this.liquidationWsPingInterval) clearInterval(this.liquidationWsPingInterval);
     if (this.liquidationWsPingTimeout) clearTimeout(this.liquidationWsPingTimeout);
-    if (this.liquidationWsStaleWatcher) clearInterval(this.liquidationWsStaleWatcher);
     if (this.liquidationWs) this.liquidationWs.close();
 
     const wsBaseUrl = this._getWsBaseUrl();
@@ -1523,17 +1519,9 @@ class TradingBase {
         }, PONG_TIMEOUT_MS);
       }, PING_INTERVAL_MS);
 
-      // Stale-tick watchdog on liquidation stream. Liquidations are sporadic,
-      // so threshold is 5 minutes — long enough to avoid false alarms in quiet
-      // markets, short enough that a silent-stall is caught before it matters.
-      this.liquidationWsStaleWatcher = setInterval(async () => {
-        if (!this.liquidationWsConnected) return;
-        const silentFor = Date.now() - this.lastLiquidationTickAt;
-        if (silentFor > LIQUIDATION_STALE_THRESHOLD_MS) {
-          await this.addLog(`WARN: Liquidation stream stalled — no event in ${Math.round(silentFor / 1000)}s (wsId=${wsId}). Terminating for reconnect.`);
-          try { currentWs.terminate(); } catch (_) { /* ignore */ }
-        }
-      }, STALE_WATCHDOG_INTERVAL_MS);
+      // No stale-tick watchdog on liquidation stream — forceOrder is inherently
+      // sporadic for a single symbol. Ping/pong (above) handles stuck-stream
+      // detection without false-positive teardowns during quiet markets.
     });
 
     this.liquidationWs.on('pong', () => {
@@ -1578,7 +1566,6 @@ class TradingBase {
       await this.addLog('[WebSocket] Liquidation WebSocket closed.');
       if (this.liquidationWsPingInterval) clearInterval(this.liquidationWsPingInterval);
       if (this.liquidationWsPingTimeout) clearTimeout(this.liquidationWsPingTimeout);
-      if (this.liquidationWsStaleWatcher) clearInterval(this.liquidationWsStaleWatcher);
 
       if (this.isRunning) {
         this.liquidationReconnectAttempts++;
@@ -1796,7 +1783,6 @@ class TradingBase {
     if (this.userDataWsPingTimeout) clearTimeout(this.userDataWsPingTimeout);
     if (this.liquidationWsPingInterval) clearInterval(this.liquidationWsPingInterval);
     if (this.liquidationWsPingTimeout) clearTimeout(this.liquidationWsPingTimeout);
-    if (this.liquidationWsStaleWatcher) clearInterval(this.liquidationWsStaleWatcher);
     if (this.realtimeReconnectTimeout) clearTimeout(this.realtimeReconnectTimeout);
     if (this.userDataReconnectTimeout) clearTimeout(this.userDataReconnectTimeout);
     if (this.liquidationReconnectTimeout) clearTimeout(this.liquidationReconnectTimeout);

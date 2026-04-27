@@ -119,7 +119,11 @@ The strategy auto-stops when totalPnL >= effectiveTarget. You do not need to pla
 
 ## RISK CONSTRAINTS
 - Max imbalance ratio: 5:1. Above this → CUT-only mode (see above)
-- Each action's sizeUSDT must be at least the Min Order Size
+- **Minimum size floor**: every \`sizeUSDT\` value (for ADD_LONG, ADD_SHORT, CUT_LONG, CUT_SHORT) AND each leg of OPEN_HEDGE (\`longSizeUSDT\`, \`shortSizeUSDT\`) MUST be at least \`minNotional × 2\`. This rule applies UNIFORMLY to:
+  - the actual sizes you emit in \`actionAbove\` / \`actionBelow\`,
+  - and any sizes you reference in the \`analysis\` field for gap-projection math.
+  If your math wants a smaller size, round UP to this \`minNotional × 2\` floor and recompute the projected gap with the floored size. Never include a size below this floor anywhere in your output.
+- **OPEN_HEDGE total = positionSizeUSDT (Phase 1 only)**: \`longSizeUSDT + shortSizeUSDT\` MUST equal \`positionSizeUSDT\` exactly. The 60:40 / 70:30 / 80:20 / 90:10 ratios apply to this TOTAL, not to half of it. Worked example with positionSizeUSDT=1000 and 70:30 favoring SHORT: LONG=300, SHORT=700. Worked example with 90:10 favoring LONG: LONG=900, SHORT=100.
 - Total of both sides must not exceed maxPositionSizeUSDT
 
 ## OUTPUT FORMAT

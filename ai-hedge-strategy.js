@@ -421,23 +421,28 @@ class AiHedgeStrategy extends TradingBase {
         currentPrice: this.currentPrice,
         longPosition: this.longPosition,
         shortPosition: this.shortPosition,
+        positionSizeUSDT: this.positionSizeUSDT,
         phase: this.phase,
       });
 
       if (!validation.valid) {
         await this.addLog(`AI plan rejected: ${validation.reasons.join(', ')}`);
+        // Preserve the rejected plan's probabilityAssessment so the fallback
+        // DCA path can bias its size split using the AI's own conviction.
+        const rejectedBias = plan?.probabilityAssessment || null;
         plan = this.riskGuard.generateFallbackPlan(this.currentPrice, {
           longPosition: this.longPosition,
           shortPosition: this.shortPosition,
           positionSizeUSDT: this.positionSizeUSDT,
           volatility: this._lastVolatility,
           phase: this.phase,
-        }, 'Risk guard rejection');
+        }, 'Risk guard rejection', rejectedBias);
 
         const fallbackValidation = this.riskGuard.validatePlan(plan, {
           currentPrice: this.currentPrice,
           longPosition: this.longPosition,
           shortPosition: this.shortPosition,
+          positionSizeUSDT: this.positionSizeUSDT,
           phase: this.phase,
         });
 

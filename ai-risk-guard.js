@@ -47,7 +47,8 @@ class AiRiskGuard {
    */
   _validateInitialPlan(plan, state) {
     const reasons = [];
-    const { currentPrice } = state;
+    const { currentPrice, positionSizeUSDT } = state;
+    const sizeFloor = this.minNotional * 2;
 
     for (const key of ['actionAbove', 'actionBelow']) {
       const action = plan[key];
@@ -72,18 +73,26 @@ class AiRiskGuard {
         }
       }
 
-      // Min notional for both legs
-      if (action.longSizeUSDT < this.minNotional) {
-        reasons.push(`${key}: longSizeUSDT ${action.longSizeUSDT} below minNotional ${this.minNotional}`);
+      // Min size floor (minNotional × 2 safety margin) for both legs
+      if (action.longSizeUSDT < sizeFloor) {
+        reasons.push(`${key}: longSizeUSDT ${action.longSizeUSDT} below minimum ${sizeFloor} (= minNotional ${this.minNotional} × 2 safety margin)`);
       }
-      if (action.shortSizeUSDT < this.minNotional) {
-        reasons.push(`${key}: shortSizeUSDT ${action.shortSizeUSDT} below minNotional ${this.minNotional}`);
+      if (action.shortSizeUSDT < sizeFloor) {
+        reasons.push(`${key}: shortSizeUSDT ${action.shortSizeUSDT} below minimum ${sizeFloor} (= minNotional ${this.minNotional} × 2 safety margin)`);
       }
 
       // Total size check
       const totalSize = (action.longSizeUSDT || 0) + (action.shortSizeUSDT || 0);
       if (totalSize > this.maxPositionSizeUSDT) {
         reasons.push(`${key}: total ${totalSize} exceeds max ${this.maxPositionSizeUSDT}`);
+      }
+
+      // OPEN_HEDGE total must equal positionSizeUSDT (small tolerance for AI rounding)
+      if (positionSizeUSDT && positionSizeUSDT > 0) {
+        const tolerance = this.minNotional;
+        if (Math.abs(totalSize - positionSizeUSDT) > tolerance) {
+          reasons.push(`${key}: OPEN_HEDGE total ${totalSize.toFixed(2)} must equal positionSizeUSDT ${positionSizeUSDT} (±${tolerance})`);
+        }
       }
     }
 
@@ -122,9 +131,10 @@ class AiRiskGuard {
         }
       }
 
-      // Min order size
-      if (action.sizeUSDT && action.sizeUSDT < this.minNotional) {
-        reasons.push(`${key}: size ${action.sizeUSDT} below minNotional ${this.minNotional}`);
+      // Min size floor (minNotional × 2 safety margin)
+      const sizeFloor = this.minNotional * 2;
+      if (action.sizeUSDT && action.sizeUSDT < sizeFloor) {
+        reasons.push(`${key}: size ${action.sizeUSDT} below minimum ${sizeFloor} (= minNotional ${this.minNotional} × 2 safety margin)`);
       }
 
       // Max position size
@@ -223,26 +233,28 @@ class AiRiskGuard {
   /**
    * Generate a fallback dual-action plan when AI is unavailable.
    */
-  generateFallbackPlan(currentPrice, state, reason = 'AI unavailable') {
+  generateFallbackPlan(currentPrice, state, reason = 'AI unavailable', rejectedProbabilityAssessment = null) {
     const { longPosition, shortPosition, positionSizeUSDT, volatility, phase } = state;
     const atrPercent = (volatility && volatility.atrPercent > 0.3) ? volatility.atrPercent : 0.3;
     const gridStep = currentPrice * (atrPercent / 100);
 
     if (phase === 'INITIAL') {
+      // Apply minNotional × 2 floor to each leg in the fallback OPEN_HEDGE.
+      const floor = this.minNotional * 2;
       return {
         analysis: `Fallback INITIAL plan — ${reason}. Using ATR-based grid entries.`,
         actionAbove: {
           type: 'OPEN_HEDGE',
           triggerPrice: currentPrice + gridStep,
-          longSizeUSDT: positionSizeUSDT * 0.4,
-          shortSizeUSDT: positionSizeUSDT * 0.6,
+          longSizeUSDT: Math.max(positionSizeUSDT * 0.4, floor),
+          shortSizeUSDT: Math.max(positionSizeUSDT * 0.6, floor),
           reason: 'Fallback: OPEN_HEDGE above with 60:40 SHORT-heavy',
         },
         actionBelow: {
           type: 'OPEN_HEDGE',
           triggerPrice: currentPrice - gridStep,
-          longSizeUSDT: positionSizeUSDT * 0.6,
-          shortSizeUSDT: positionSizeUSDT * 0.4,
+          longSizeUSDT: Math.max(positionSizeUSDT * 0.6, floor),
+          shortSizeUSDT: Math.max(positionSizeUSDT * 0.4, floor),
           reason: 'Fallback: OPEN_HEDGE below with 60:40 LONG-heavy',
         },
         probabilityAssessment: { higherChance: 'ABOVE', confidence: 'low', reasoning: 'Fallback plan' },
@@ -256,17 +268,46 @@ class AiRiskGuard {
       actionAbove = { type: 'HOLD', reason: 'Fallback: no positions' };
       actionBelow = { type: 'HOLD', reason: 'Fallback: no positions' };
     } else {
+      // Split posSize between the two DCA legs. If the rejected AI plan carried a
+      // probabilityAssessment, bias the split using the AI's own ratio ladder
+      // (60:40 / 70:30 / 80:20). If no AI signal, 50:50 neutral.
+      const floor = this.minNotional * 2;
+      let shortRatio = 0.5;
+      let longRatio = 0.5;
+      let biasNote = 'no AI signal — neutral 50:50';
+
+      if (rejectedProbabilityAssessment && rejectedProbabilityAssessment.higherChance) {
+        const conf = rejectedProbabilityAssessment.confidence || 'low';
+        const skew = conf === 'high' ? 0.30 : conf === 'medium' ? 0.20 : 0.10;
+        if (rejectedProbabilityAssessment.higherChance === 'ABOVE') {
+          // Bullish bias → bigger ADD_LONG (catch dip if price retraces),
+          // smaller ADD_SHORT (don't fight up-move).
+          longRatio = 0.5 + skew;
+          shortRatio = 0.5 - skew;
+        } else if (rejectedProbabilityAssessment.higherChance === 'BELOW') {
+          // Bearish bias → bigger ADD_SHORT (fade rally at resistance),
+          // smaller ADD_LONG (don't catch falling knife).
+          shortRatio = 0.5 + skew;
+          longRatio = 0.5 - skew;
+        }
+        biasNote = `AI bias ${rejectedProbabilityAssessment.higherChance}/${conf} → ${(longRatio * 100).toFixed(0)}:${(shortRatio * 100).toFixed(0)} LONG:SHORT`;
+      }
+
+      // Apply minNotional × 2 floor on each leg.
+      const shortSize = Math.max(positionSizeUSDT * shortRatio, floor);
+      const longSize = Math.max(positionSizeUSDT * longRatio, floor);
+
       actionAbove = {
         type: 'ADD_SHORT',
         triggerPrice: currentPrice + gridStep * 2,
-        sizeUSDT: positionSizeUSDT,
-        reason: 'Fallback: DCA SHORT above (2x ATR)',
+        sizeUSDT: shortSize,
+        reason: `Fallback: DCA SHORT above (2x ATR) — ${biasNote}`,
       };
       actionBelow = {
         type: 'ADD_LONG',
         triggerPrice: currentPrice - gridStep * 2,
-        sizeUSDT: positionSizeUSDT,
-        reason: 'Fallback: DCA LONG below (2x ATR)',
+        sizeUSDT: longSize,
+        reason: `Fallback: DCA LONG below (2x ATR) — ${biasNote}`,
       };
     }
 
