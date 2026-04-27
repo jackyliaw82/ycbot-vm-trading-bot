@@ -141,12 +141,13 @@ class AiPlanExecutor {
         throw new Error(`Unknown action type: ${action.type}`);
     }
 
-    // Save trade record from REST response — this is the reliable path. The
-    // user-data WS-based saveTrade in trading-base._handleOrderTradeUpdate stays
-    // as the primary for fee/PnL accumulation, but if user-data WS is silent
-    // (relay silent-stuck or otherwise), at least the chart marker gets a record.
-    if (result && restSide && restPositionSide) {
-      await strategy._saveTradeFromOrderResult(result, symbol, restSide, restPositionSide);
+    // Schedule deferred REST fallback. If the user-data WS path saves trade
+    // records for this orderId within REST_FALLBACK_DELAY_MS, the fallback
+    // skips quietly. If WS misses, the fallback fetches /fapi/v1/userTrades
+    // and writes proper per-fill records (with tradeId, qty, price, commission)
+    // and accumulates the fees + realized PnL.
+    if (result && result.orderId && restSide && restPositionSide) {
+      strategy._scheduleRestFallback(result.orderId, symbol, restSide, restPositionSide);
     }
 
     if (strategy.riskGuard) strategy.riskGuard.recordAction();
@@ -175,9 +176,9 @@ class AiPlanExecutor {
     const longResult = await strategy.placeMarketOrder(symbol, 'BUY', roundedLongQty, 'LONG');
     const shortResult = await strategy.placeMarketOrder(symbol, 'SELL', roundedShortQty, 'SHORT');
 
-    // Save trade records from REST responses (reliable path; see executeAction)
-    if (longResult) await strategy._saveTradeFromOrderResult(longResult, symbol, 'BUY', 'LONG');
-    if (shortResult) await strategy._saveTradeFromOrderResult(shortResult, symbol, 'SELL', 'SHORT');
+    // Schedule deferred REST fallback for each leg (see executeAction for rationale)
+    if (longResult && longResult.orderId) strategy._scheduleRestFallback(longResult.orderId, symbol, 'BUY', 'LONG');
+    if (shortResult && shortResult.orderId) strategy._scheduleRestFallback(shortResult.orderId, symbol, 'SELL', 'SHORT');
 
     if (strategy.riskGuard) strategy.riskGuard.recordAction();
 

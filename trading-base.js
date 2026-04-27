@@ -42,6 +42,15 @@ const BACKGROUND_WS_RETRY_LOG_EVERY = 10;
 // is a healthy cadence (vs. 60s for the price probe).
 const LIQUIDATION_BACKGROUND_RETRY_INTERVAL_MS = 5 * 60 * 1000;
 
+// Trade-record fallback. After each market order we wait this long for the
+// user-data WS path to save the trade record itself. If the orderId hasn't
+// been marked as handled by the WS path within the wait window, REST fallback
+// fires GET /fapi/v1/userTrades to recover the actual fills (qty, price,
+// commission, tradeId). The dedup window is the same value plus a margin so
+// a slow WS event arriving after the fallback ran can't double-count.
+const REST_FALLBACK_DELAY_MS = 5000;
+const REST_FALLBACK_DEDUP_WINDOW_MS = 60_000;
+
 // Default leverage
 const DEFAULT_LEVERAGE = 50;
 
@@ -171,6 +180,13 @@ class TradingBase {
     this._backgroundWsRetryInProgress = false;
     this._wsProbeAttempts = 0;
 
+    // Trade-record dedup. WS path (_handleOrderTradeUpdate) marks orderIds
+    // it has saved trades for; REST fallback (_scheduleRestFallback) checks
+    // this map before fetching/saving so the two paths never double-count.
+    this._wsHandledOrderIds = new Map(); // orderId → timestamp
+    this._restFallbackCount = 0;
+    this._lastUserDataMessageAt = 0;
+
     // Liquidation WS background retry — kicks in after the standard 25-attempt
     // backoff stage exhausts itself. Slow cadence; informational stream so we
     // don't need aggressive recovery, just eventual recovery.
@@ -277,38 +293,99 @@ class TradingBase {
   }
 
   /**
-   * REST-fallback trade save. Called by the executor right after each successful
-   * placeMarketOrder so the chart gets a marker even when the user-data WS path
-   * (which produces fee/PnL-rich per-fill records) misses events.
+   * Deferred REST fallback. The user-data WS path (_handleOrderTradeUpdate) is
+   * primary — it carries exact commission and per-fill tradeId. This fallback
+   * fires REST_FALLBACK_DELAY_MS after order placement; if the WS path has
+   * already saved trades for this orderId, it does nothing. Otherwise it
+   * fetches GET /fapi/v1/userTrades to recover the actual fills and saves
+   * proper trade records (with tradeId, qty, price, commission) plus
+   * accumulates fees and realized PnL.
    *
-   * Aggregated per-order rather than per-fill — tradeId is left null because
-   * Binance Futures REST doesn't expose per-fill IDs. The frontend chart dedupes
-   * by candle so duplicate records (one from REST here, plus zero-or-more from
-   * user-data WS) collapse to a single visible marker.
+   * Dedup uses _wsHandledOrderIds (WS marks orderId after each saveTrade).
+   * REST fallback re-checks before each per-fill save and once more before
+   * accumulating, so a WS event arriving mid-fallback can't double-count.
    */
-  async _saveTradeFromOrderResult(orderResult, symbol, side, positionSide) {
-    if (!orderResult || !orderResult.orderId) return;
-    try {
-      const price = parseFloat(orderResult.avgPrice) || this.currentPrice || 0;
-      const qty = parseFloat(orderResult.executedQty) || 0;
-      await this.saveTrade({
-        tradeId: null,                  // REST doesn't expose per-fill IDs
-        orderId: orderResult.orderId,
-        symbol,
-        side,
-        positionSide,
-        time: orderResult.updateTime || orderResult.transactTime || Date.now(),
-        price,
-        qty,
-        quoteQty: price * qty,
-        realizedPnl: 0,                 // REST response doesn't expose this; tracked by WS path
-        commission: 0,                  // same — tracked by WS path
-        commissionAsset: 'USDT',
-        role: 'Taker',                  // market orders are always taker
-        source: 'rest',                 // marks origin; WS-saved records have no `source` field
-      });
-    } catch (error) {
-      console.error(`Failed to save REST trade record: ${error.message}`);
+  _scheduleRestFallback(orderId, symbol, side, positionSide) {
+    if (!orderId) return;
+    setTimeout(async () => {
+      const wsHandledAt = this._wsHandledOrderIds.get(orderId);
+      if (wsHandledAt && Date.now() - wsHandledAt < REST_FALLBACK_DEDUP_WINDOW_MS) {
+        return; // WS got there first — nothing to do
+      }
+      try {
+        const fills = await this.makeProxyRequest(
+          '/fapi/v1/userTrades',
+          'GET',
+          { symbol, orderId, limit: 50 },
+          true,
+          'futures'
+        );
+        if (!Array.isArray(fills) || fills.length === 0) {
+          await this.addLog(`WARN: [REST-FALLBACK] order ${orderId}: WS missed and userTrades returned no fills`);
+          return;
+        }
+
+        let totalCommission = 0;
+        let totalRealizedPnl = 0;
+        let lastCommissionAsset = 'USDT';
+
+        for (const fill of fills) {
+          // Re-check dedup per-fill in case WS arrived mid-loop.
+          if (this._wsHandledOrderIds.get(orderId)) break;
+          const commission = parseFloat(fill.commission) || 0;
+          const realizedPnl = parseFloat(fill.realizedPnl) || 0;
+          totalCommission += commission;
+          totalRealizedPnl += realizedPnl;
+          lastCommissionAsset = fill.commissionAsset || 'USDT';
+          await this.saveTrade({
+            tradeId: fill.id,
+            orderId: fill.orderId,
+            symbol: fill.symbol,
+            side: fill.side,
+            positionSide: fill.positionSide || positionSide,
+            time: fill.time || Date.now(),
+            price: parseFloat(fill.price) || 0,
+            qty: parseFloat(fill.qty) || 0,
+            quoteQty: parseFloat(fill.quoteQty) || 0,
+            commission,
+            commissionAsset: lastCommissionAsset,
+            realizedPnl,
+            isBuyer: fill.buyer,
+            isMaker: fill.maker,
+            role: fill.maker ? 'Maker' : 'Taker',
+            source: 'rest-fallback',
+          });
+        }
+
+        // Accumulate ONCE outside the loop, only if WS still hasn't handled it.
+        if (!this._wsHandledOrderIds.get(orderId)) {
+          if (totalCommission > 0) {
+            this.accumulatedTradingFees += totalCommission;
+            if (positionSide === 'LONG') this.longTradingFees += totalCommission;
+            else if (positionSide === 'SHORT') this.shortTradingFees += totalCommission;
+          }
+          if (totalRealizedPnl !== 0) {
+            this.accumulatedRealizedPnL += totalRealizedPnl;
+            if (positionSide === 'LONG') this.longAccumulatedRealizedPnL += totalRealizedPnl;
+            else if (positionSide === 'SHORT') this.shortAccumulatedRealizedPnL += totalRealizedPnl;
+          }
+          // Mark so a slow WS event can't re-double-count later.
+          this._wsHandledOrderIds.set(orderId, Date.now());
+          this._restFallbackCount++;
+          await this.addLog(`[REST-FALLBACK] order ${orderId}: WS missed for ${REST_FALLBACK_DELAY_MS / 1000}s — recovered ${fills.length} fill(s) via REST. fees=${totalCommission.toFixed(4)} ${lastCommissionAsset}, realizedPnl=${totalRealizedPnl.toFixed(4)}`);
+        }
+      } catch (error) {
+        await this.addLog(`ERROR: [REST-FALLBACK] order ${orderId}: ${error.message}`);
+      } finally {
+        this._pruneWsHandledMap();
+      }
+    }, REST_FALLBACK_DELAY_MS);
+  }
+
+  _pruneWsHandledMap() {
+    const cutoff = Date.now() - 5 * 60 * 1000;
+    for (const [oid, ts] of this._wsHandledOrderIds) {
+      if (ts < cutoff) this._wsHandledOrderIds.delete(oid);
     }
   }
 
@@ -1223,6 +1300,7 @@ class TradingBase {
     this.userDataWs.on('message', async (data) => {
       try {
         const message = JSON.parse(data.toString());
+        this._lastUserDataMessageAt = Date.now();
 
         if (this._userDataMessagesSeen < 3) {
           this._userDataMessagesSeen++;
@@ -1329,6 +1407,10 @@ class TradingBase {
           isBuyer: order.S === 'BUY',
           role: order.m ? 'Maker' : 'Taker',
         });
+
+        // Mark this orderId as handled by the WS path so the deferred REST
+        // fallback (scheduled at order placement) skips its userTrades fetch.
+        this._wsHandledOrderIds.set(order.i, Date.now());
       }
     }
 
@@ -1749,6 +1831,16 @@ class TradingBase {
       }
       if (!this.realtimeWsConnected) {
         await this.addLog('WARNING: [Health Check] Real-time Price WebSocket is DISCONNECTED.');
+      }
+      // Silent-stuck detection on user-data WS: alive=true but no events for
+      // 30+ min while a strategy with open positions is running. Open positions
+      // generate ACCOUNT_UPDATE on margin/PnL ticks, so 30 min of silence is
+      // anomalous and likely indicates the WS is connected-but-not-delivering.
+      if (this.userDataWsConnected && this.isRunning && (this.longPosition || this.shortPosition) && this._lastUserDataMessageAt > 0) {
+        const wsSilentMs = Date.now() - this._lastUserDataMessageAt;
+        if (wsSilentMs > 30 * 60 * 1000) {
+          await this.addLog(`WARN: [Health Check] User-data WS connected but silent for ${Math.round(wsSilentMs / 60000)} min while positions are open. REST fallback handled ${this._restFallbackCount} order(s) so far.`);
+        }
       }
     }, 5 * 60 * 1000);
   }
