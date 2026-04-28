@@ -25,18 +25,18 @@ const STALE_WATCHDOG_INTERVAL_MS = 5000;
 // WS REST_FALLBACK_THRESHOLD times within REST_FALLBACK_WINDOW_MS, we treat
 // the WS path as broken (Binance ban / network issue) and switch to polling
 // /fapi/v1/premiumIndex via the GCF proxy (which has its own clean egress IP).
-// Trading continues at degraded latency. A background interval retries WS every
-// BACKGROUND_WS_RETRY_INTERVAL_MS — when a real message arrives within
-// BACKGROUND_WS_RETRY_DURATION_MS, we exit fallback and resume WS.
+// Trading continues at degraded latency. While in fallback, a single long-lived
+// monitor WS stays subscribed to the price stream — first qualifying message
+// exits fallback. Reconnect uses exponential backoff capped at
+// MONITOR_WS_MAX_RECONNECT_DELAY_MS so a throttled or down relay can't generate
+// connect-storms. Heartbeat log every MONITOR_WS_HEARTBEAT_LOG_MS confirms
+// the monitor is alive without flooding during multi-hour outages.
 const REST_FALLBACK_THRESHOLD = 3;
 const REST_FALLBACK_WINDOW_MS = 2 * 60 * 1000;
 const REST_POLL_INTERVAL_MS = 1000;
-const BACKGROUND_WS_RETRY_INTERVAL_MS = 60 * 1000;
-const BACKGROUND_WS_RETRY_DURATION_MS = 10 * 1000;
-// Throttled visibility log inside the silent probe loop — emit one
-// "still trying" line every Nth probe so the user sees the recovery
-// is alive without flooding when the outage lasts hours.
-const BACKGROUND_WS_RETRY_LOG_EVERY = 10;
+const MONITOR_WS_INITIAL_RECONNECT_DELAY_MS = 5 * 1000;
+const MONITOR_WS_MAX_RECONNECT_DELAY_MS = 5 * 60 * 1000;
+const MONITOR_WS_HEARTBEAT_LOG_MS = 10 * 60 * 1000;
 // Slow background retry for the liquidation WS once the standard 25-attempt
 // backoff stage gives up. Sporadic stream + non-blocking for execution → 5 min
 // is a healthy cadence (vs. 60s for the price probe).
@@ -176,9 +176,13 @@ class TradingBase {
     this._consecutiveStalls = 0;
     this._firstStallAt = null;
     this._restPollInterval = null;
-    this._backgroundWsRetryInterval = null;
-    this._backgroundWsRetryInProgress = false;
-    this._wsProbeAttempts = 0;
+    this._monitorWs = null;
+    this._monitorWsReconnectAttempts = 0;
+    this._monitorWsReconnectTimeout = null;
+    this._monitorWsHeartbeatTimer = null;
+    this._monitorWsPingInterval = null;
+    this._monitorWsPongTimeout = null;
+    this._monitorWsOpenedAt = 0;
 
     // Trade-record dedup. WS path (_handleOrderTradeUpdate) marks orderIds
     // it has saved trades for; REST fallback (_scheduleRestFallback) checks
@@ -1120,8 +1124,8 @@ class TradingBase {
   // Activated when the watchdog detects REST_FALLBACK_THRESHOLD consecutive
   // stalls within REST_FALLBACK_WINDOW_MS. Polls /fapi/v1/premiumIndex via the
   // GCF proxy (clean egress IP) and feeds prices to handleRealtimePrice().
-  // A background interval retries WS every BACKGROUND_WS_RETRY_INTERVAL_MS;
-  // when WS recovers, we exit fallback automatically.
+  // A long-lived monitor WS (see _openMonitorWs) watches for stream recovery;
+  // first qualifying message exits fallback automatically.
 
   async _enterRestFallbackMode() {
     if (this.streamMode === 'REST_FALLBACK') return;
@@ -1161,73 +1165,159 @@ class TradingBase {
       }
     }, REST_POLL_INTERVAL_MS);
 
-    // Start the background WS retry loop.
-    this._backgroundWsRetryInterval = setInterval(async () => {
-      if (this.streamMode !== 'REST_FALLBACK' || !this.isRunning) return;
-      if (this._backgroundWsRetryInProgress) return;
-      this._backgroundWsRetryInProgress = true;
-      try {
-        await this._tryRestoreWsFromFallback();
-      } finally {
-        this._backgroundWsRetryInProgress = false;
-      }
-    }, BACKGROUND_WS_RETRY_INTERVAL_MS);
+    // Open the long-lived monitor WS that watches for WS recovery.
+    this._openMonitorWs();
   }
 
-  async _tryRestoreWsFromFallback() {
-    this._wsProbeAttempts++;
+  // ─── Monitor WS during REST fallback ───────────────────────────────────────
+  // Single long-lived subscription to the price stream. First qualifying
+  // message exits fallback. Active ping/pong detects silent-stuck connections
+  // (a throttled WS looks identical to a healthy-but-quiet one). Reconnect
+  // uses exponential backoff so a down/throttled relay can't churn connections.
+
+  _openMonitorWs() {
+    if (this.streamMode !== 'REST_FALLBACK' || !this.isRunning) return;
+
+    // Defensive: if a previous monitor WS exists, close it cleanly first.
+    this._closeMonitorWs({ silent: true });
+
     const wsBaseUrl = this._getWsBaseUrl();
     const tickerStream = this.priceType === 'LAST'
       ? `${this.symbol.toLowerCase()}@ticker`
       : `${this.symbol.toLowerCase()}@markPrice@1s`;
-    const testUrl = `${wsBaseUrl}/${tickerStream}`;
+    const wsUrl = `${wsBaseUrl}/${tickerStream}`;
 
-    const testWs = new WebSocket(testUrl);
-    let gotMessage = false;
+    let ws;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (err) {
+      this._scheduleMonitorReconnect();
+      return;
+    }
+    this._monitorWs = ws;
+    this._monitorWsOpenedAt = Date.now();
 
-    testWs.on('message', (data) => {
+    ws.on('open', async () => {
+      if (this._monitorWsReconnectAttempts > 0) {
+        await this.addLog(`[MODE] Monitor WS reconnected after ${this._monitorWsReconnectAttempts} attempt(s); waiting for first message to exit fallback.`);
+      } else {
+        await this.addLog(`[MODE] Monitor WS opened on ${tickerStream}; will exit REST fallback on first message.`);
+      }
+      this._monitorWsReconnectAttempts = 0;
+      this._startMonitorHeartbeatLog();
+      this._startMonitorPingLoop(ws);
+    });
+
+    ws.on('pong', () => {
+      if (this._monitorWsPongTimeout) {
+        clearTimeout(this._monitorWsPongTimeout);
+        this._monitorWsPongTimeout = null;
+      }
+    });
+
+    ws.on('message', async (data) => {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.e === 'markPriceUpdate' || msg.e === '24hrTicker') {
-          gotMessage = true;
+          // _exitRestFallbackMode → _closeMonitorWs() removes listeners before
+          // .close() fires, so this close won't recurse into reconnect.
+          await this._exitRestFallbackMode();
         }
       } catch (_) { /* ignore parse errors */ }
     });
 
-    // Suppress noise — don't let test WS errors trip alerts.
-    testWs.on('error', () => { /* ignore */ });
+    ws.on('error', () => { /* close handler owns retry */ });
 
-    // Wait up to BACKGROUND_WS_RETRY_DURATION_MS for any qualifying message.
-    await new Promise(resolve => setTimeout(resolve, BACKGROUND_WS_RETRY_DURATION_MS));
-
-    if (gotMessage) {
-      try { testWs.terminate(); } catch (_) { /* ignore */ }
-      await this._exitRestFallbackMode();
-    } else {
-      try { testWs.terminate(); } catch (_) { /* ignore */ }
-      // Throttled visibility — confirm the bot is still actively retrying.
-      if (this._wsProbeAttempts % BACKGROUND_WS_RETRY_LOG_EVERY === 0) {
-        const everyMin = Math.round(BACKGROUND_WS_RETRY_INTERVAL_MS / 1000);
-        const nextMin = Math.round(BACKGROUND_WS_RETRY_LOG_EVERY * BACKGROUND_WS_RETRY_INTERVAL_MS / 60000);
-        await this.addLog(`[MODE] REST fallback active — WS probe still trying every ${everyMin}s (attempt #${this._wsProbeAttempts}). Will report again in ${nextMin} min if still down.`);
+    ws.on('close', () => {
+      this._stopMonitorPingLoop();
+      this._stopMonitorHeartbeatLog();
+      if (this._monitorWs === ws) this._monitorWs = null;
+      if (this.streamMode === 'REST_FALLBACK' && this.isRunning) {
+        this._scheduleMonitorReconnect();
       }
+    });
+  }
+
+  _startMonitorPingLoop(ws) {
+    this._stopMonitorPingLoop();
+    this._monitorWsPingInterval = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      try { ws.ping(); } catch (_) { /* ignore */ }
+      if (this._monitorWsPongTimeout) clearTimeout(this._monitorWsPongTimeout);
+      this._monitorWsPongTimeout = setTimeout(() => {
+        // No pong → assume silent-stuck. Force-close; close handler reconnects.
+        try { ws.terminate(); } catch (_) { /* ignore */ }
+      }, PONG_TIMEOUT_MS);
+    }, PING_INTERVAL_MS);
+  }
+
+  _stopMonitorPingLoop() {
+    if (this._monitorWsPingInterval) {
+      clearInterval(this._monitorWsPingInterval);
+      this._monitorWsPingInterval = null;
     }
+    if (this._monitorWsPongTimeout) {
+      clearTimeout(this._monitorWsPongTimeout);
+      this._monitorWsPongTimeout = null;
+    }
+  }
+
+  _scheduleMonitorReconnect() {
+    if (this._monitorWsReconnectTimeout) return;
+    this._monitorWsReconnectAttempts++;
+    const delay = Math.min(
+      MONITOR_WS_MAX_RECONNECT_DELAY_MS,
+      MONITOR_WS_INITIAL_RECONNECT_DELAY_MS * Math.pow(2, this._monitorWsReconnectAttempts - 1)
+    );
+    this._monitorWsReconnectTimeout = setTimeout(() => {
+      this._monitorWsReconnectTimeout = null;
+      this._openMonitorWs();
+    }, delay);
+  }
+
+  _startMonitorHeartbeatLog() {
+    this._stopMonitorHeartbeatLog();
+    this._monitorWsHeartbeatTimer = setInterval(async () => {
+      if (this.streamMode !== 'REST_FALLBACK') return;
+      const upMin = Math.round((Date.now() - this._monitorWsOpenedAt) / 60000);
+      await this.addLog(`[MODE] REST fallback active — monitor WS listening (open ${upMin} min, no recovery message yet).`);
+    }, MONITOR_WS_HEARTBEAT_LOG_MS);
+  }
+
+  _stopMonitorHeartbeatLog() {
+    if (this._monitorWsHeartbeatTimer) {
+      clearInterval(this._monitorWsHeartbeatTimer);
+      this._monitorWsHeartbeatTimer = null;
+    }
+  }
+
+  _closeMonitorWs({ silent = false } = {}) {
+    if (this._monitorWsReconnectTimeout) {
+      clearTimeout(this._monitorWsReconnectTimeout);
+      this._monitorWsReconnectTimeout = null;
+    }
+    this._stopMonitorHeartbeatLog();
+    this._stopMonitorPingLoop();
+    if (this._monitorWs) {
+      try {
+        this._monitorWs.removeAllListeners();
+        this._monitorWs.close();
+      } catch (_) { /* ignore */ }
+      this._monitorWs = null;
+    }
+    if (!silent) this._monitorWsReconnectAttempts = 0;
   }
 
   async _exitRestFallbackMode() {
     if (this.streamMode !== 'REST_FALLBACK') return;
     await this.addLog(`[MODE] WS feed recovered. Exiting REST fallback.`);
 
-    // Stop polling and background retry.
+    // Stop polling and tear down the monitor WS.
     if (this._restPollInterval) {
       clearInterval(this._restPollInterval);
       this._restPollInterval = null;
     }
-    this._wsProbeAttempts = 0;
-    if (this._backgroundWsRetryInterval) {
-      clearInterval(this._backgroundWsRetryInterval);
-      this._backgroundWsRetryInterval = null;
-    }
+    this._closeMonitorWs();
     this._restPollErrorCount = 0;
 
     // Reset state for fresh WS lifecycle.
@@ -1880,12 +1970,11 @@ class TradingBase {
     if (this.liquidationReconnectTimeout) clearTimeout(this.liquidationReconnectTimeout);
     if (this.listenKeyRefreshInterval) clearInterval(this.listenKeyRefreshInterval);
     if (this._restPollInterval) clearInterval(this._restPollInterval);
-    if (this._backgroundWsRetryInterval) clearInterval(this._backgroundWsRetryInterval);
+    this._closeMonitorWs();
     if (this._liquidationBackgroundRetry) {
       clearInterval(this._liquidationBackgroundRetry);
       this._liquidationBackgroundRetry = null;
     }
-    this._wsProbeAttempts = 0;
     this._stopWebSocketHealthMonitoring();
 
     if (this.realtimeWs) {
