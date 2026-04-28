@@ -393,6 +393,113 @@ class TradingBase {
     }
   }
 
+  /**
+   * Synchronous fill recovery for a specific orderId. Used by stop() to ensure
+   * the closing trades' realized PnL + fees are accumulated before reading the
+   * final Net PnL — bypasses the 5s grace period of _scheduleRestFallback.
+   *
+   * Idempotent: returns immediately if WS path already handled this orderId.
+   * If WS missed, polls order status (every 250ms, max 5s) until FILLED, then
+   * fetches /fapi/v1/userTrades and accumulates fees + realized PnL exactly
+   * like _scheduleRestFallback does. Marks orderId in _wsHandledOrderIds so a
+   * late-arriving WS event or the deferred timer can't double-count.
+   */
+  async _recoverOrderSync(orderId, symbol, positionSide) {
+    if (!orderId) return;
+
+    // Already handled by WS path? Fast no-op.
+    const wsHandledAt = this._wsHandledOrderIds.get(orderId);
+    if (wsHandledAt && Date.now() - wsHandledAt < REST_FALLBACK_DEDUP_WINDOW_MS) {
+      return;
+    }
+
+    // Poll order status until FILLED (or terminal non-fill state).
+    const statusDeadline = Date.now() + 5_000;
+    const statusPollMs = 250;
+    let order = null;
+    while (Date.now() < statusDeadline) {
+      // Late WS arrival short-circuits the loop.
+      if (this._wsHandledOrderIds.get(orderId)) return;
+      try {
+        order = await this.makeProxyRequest('/fapi/v1/order', 'GET', { symbol, orderId }, true, 'futures');
+        if (order && (order.status === 'FILLED' || order.status === 'PARTIALLY_FILLED')) break;
+        if (order && (order.status === 'CANCELED' || order.status === 'EXPIRED' || order.status === 'REJECTED')) {
+          await this.addLog(`[STOP-RECOVER] order ${orderId} terminated as ${order.status} — no fills to recover`);
+          return;
+        }
+      } catch (err) {
+        await this.addLog(`WARN: [STOP-RECOVER] order ${orderId} status query failed: ${err.message}`);
+      }
+      await new Promise(r => setTimeout(r, statusPollMs));
+    }
+
+    // Re-check dedup after status poll — WS may have arrived during the wait.
+    if (this._wsHandledOrderIds.get(orderId)) return;
+
+    // Fetch trade details + accumulate fees + realized PnL.
+    try {
+      const fills = await this.makeProxyRequest(
+        '/fapi/v1/userTrades',
+        'GET',
+        { symbol, orderId, limit: 50 },
+        true,
+        'futures'
+      );
+      if (!Array.isArray(fills) || fills.length === 0) {
+        await this.addLog(`WARN: [STOP-RECOVER] order ${orderId}: no fills returned by userTrades`);
+        return;
+      }
+
+      let totalCommission = 0;
+      let totalRealizedPnl = 0;
+      let lastCommissionAsset = 'USDT';
+
+      for (const fill of fills) {
+        if (this._wsHandledOrderIds.get(orderId)) break;
+        const commission = parseFloat(fill.commission) || 0;
+        const realizedPnl = parseFloat(fill.realizedPnl) || 0;
+        totalCommission += commission;
+        totalRealizedPnl += realizedPnl;
+        lastCommissionAsset = fill.commissionAsset || 'USDT';
+        await this.saveTrade({
+          tradeId: fill.id,
+          orderId: fill.orderId,
+          symbol: fill.symbol,
+          side: fill.side,
+          positionSide: fill.positionSide || positionSide,
+          time: fill.time || Date.now(),
+          price: parseFloat(fill.price) || 0,
+          qty: parseFloat(fill.qty) || 0,
+          quoteQty: parseFloat(fill.quoteQty) || 0,
+          commission,
+          commissionAsset: lastCommissionAsset,
+          realizedPnl,
+          isBuyer: fill.buyer,
+          isMaker: fill.maker,
+          role: fill.maker ? 'Maker' : 'Taker',
+          source: 'stop-sync-recover',
+        });
+      }
+
+      if (!this._wsHandledOrderIds.get(orderId)) {
+        if (totalCommission > 0) {
+          this.accumulatedTradingFees += totalCommission;
+          if (positionSide === 'LONG') this.longTradingFees += totalCommission;
+          else if (positionSide === 'SHORT') this.shortTradingFees += totalCommission;
+        }
+        if (totalRealizedPnl !== 0) {
+          this.accumulatedRealizedPnL += totalRealizedPnl;
+          if (positionSide === 'LONG') this.longAccumulatedRealizedPnL += totalRealizedPnl;
+          else if (positionSide === 'SHORT') this.shortAccumulatedRealizedPnL += totalRealizedPnl;
+        }
+        this._wsHandledOrderIds.set(orderId, Date.now());
+        await this.addLog(`[STOP-RECOVER] order ${orderId}: recovered ${fills.length} fill(s) via REST. fees=${totalCommission.toFixed(4)} ${lastCommissionAsset}, realizedPnl=${totalRealizedPnl.toFixed(4)}`);
+      }
+    } catch (err) {
+      await this.addLog(`ERROR: [STOP-RECOVER] order ${orderId}: ${err.message}`);
+    }
+  }
+
   async deleteSubcollection(collectionRef, subcollectionName) {
     try {
       const batchSize = 500;

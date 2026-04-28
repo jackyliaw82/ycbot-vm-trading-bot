@@ -215,6 +215,8 @@ class AiHedgeStrategy extends TradingBase {
     await this.addLog(`Stopping AI Hedge Strategy. Reason: ${reason}`);
 
     // Close positions if not already closed
+    let longCloseOrderId = null;
+    let shortCloseOrderId = null;
     if (reason !== 'hedge_closed') {
       try {
         await this._refreshHedgePositions();
@@ -222,17 +224,37 @@ class AiHedgeStrategy extends TradingBase {
         if (this.longPosition && this.longPosition.quantity > 0) {
           const qty = this.roundQuantity(this.longPosition.quantity);
           await this.addLog(`Closing LONG: SELL ${qty}`);
-          await this.placeMarketOrder(this.symbol, 'SELL', qty, 'LONG');
+          const result = await this.placeMarketOrder(this.symbol, 'SELL', qty, 'LONG');
+          longCloseOrderId = result?.orderId;
         }
         if (this.shortPosition && this.shortPosition.quantity > 0) {
           const qty = this.roundQuantity(this.shortPosition.quantity);
           await this.addLog(`Closing SHORT: BUY ${qty}`);
-          await this.placeMarketOrder(this.symbol, 'BUY', qty, 'SHORT');
+          const result = await this.placeMarketOrder(this.symbol, 'BUY', qty, 'SHORT');
+          shortCloseOrderId = result?.orderId;
         }
+      } catch (err) {
+        await this.addLog(`ERROR: Failed to close positions: ${err.message}`);
+      }
 
-        await new Promise(r => setTimeout(r, 3000));
+      // Synchronously recover the closing fills before reading PnL accumulators.
+      // Each call is idempotent — fast no-op when WS path already handled the
+      // orderId, otherwise polls status to FILLED then fetches userTrades.
+      // Replaces the previous blind 3s wait, which was shorter than the WS-
+      // miss safety net and let silent-stuck WS drop closing PnL from the modal.
+      try {
+        if (longCloseOrderId) {
+          await this._recoverOrderSync(longCloseOrderId, this.symbol, 'LONG');
+        }
+        if (shortCloseOrderId) {
+          await this._recoverOrderSync(shortCloseOrderId, this.symbol, 'SHORT');
+        }
+      } catch (err) {
+        await this.addLog(`ERROR: Closing-trade fill recovery failed: ${err.message}`);
+      }
+
+      try {
         await this._refreshHedgePositions();
-
         const longRem = this.longPosition?.quantity || 0;
         const shortRem = this.shortPosition?.quantity || 0;
         if (longRem > 0 || shortRem > 0) {
@@ -241,7 +263,7 @@ class AiHedgeStrategy extends TradingBase {
           await this.addLog('All positions closed.');
         }
       } catch (err) {
-        await this.addLog(`ERROR: Failed to close positions: ${err.message}`);
+        await this.addLog(`ERROR: Failed to verify position closure: ${err.message}`);
       }
     }
 
