@@ -14,7 +14,7 @@ module.exports = {
       // Phase 2: route all Binance WS through the shared ycbot-ws-relay. VM IP
       // never talks directly to Binance, avoiding the IP-reputation class of
       // bans. Leave unset to fall back to direct Binance.
-      RELAY_WS_URL: 'ws://34.21.150.209:8080/ws'
+      RELAY_WS_URL: 'ws://34.126.80.106:8080/ws'
     },
     error_file: './logs/err.log',
     out_file: './logs/out.log',
