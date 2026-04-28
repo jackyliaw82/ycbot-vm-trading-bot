@@ -959,6 +959,20 @@ class TradingBase {
     return directBase;
   }
 
+  // Build a market-stream WS URL. When connecting through the relay AND a
+  // RELAY_AUTH_TOKEN is configured, append it as a query param. Direct-Binance
+  // URLs (relay unset) are returned untouched — Binance has no auth concept
+  // for market data and would reject a stray ?token=.
+  _buildRelayWsUrl(stream) {
+    const baseUrl = this._getWsBaseUrl();
+    const url = `${baseUrl}/${stream}`;
+    const token = process.env.RELAY_AUTH_TOKEN;
+    if (token && process.env.RELAY_WS_URL) {
+      return `${url}?token=${encodeURIComponent(token)}`;
+    }
+    return url;
+  }
+
   // ─── WebSocket: Real-time price ────────────────────────────────────────────
 
   connectRealtimeWebSocket() {
@@ -969,13 +983,11 @@ class TradingBase {
     const prevReadyState = this.realtimeWs?.readyState ?? 'null';
     if (this.realtimeWs) this.realtimeWs.close();
 
-    const wsBaseUrl = this._getWsBaseUrl();
-
     const tickerStream = this.priceType === 'LAST'
       ? `${this.symbol.toLowerCase()}@ticker`
       : `${this.symbol.toLowerCase()}@markPrice@1s`;
 
-    const wsUrl = `${wsBaseUrl}/${tickerStream}`;
+    const wsUrl = this._buildRelayWsUrl(tickerStream);
     const wsId = ++this._realtimeWsIdCounter;
     this._realtimeMessagesSeen = 0;
     // Tracks whether this specific WS instance ever transitioned to OPEN. Used in
@@ -1181,11 +1193,10 @@ class TradingBase {
     // Defensive: if a previous monitor WS exists, close it cleanly first.
     this._closeMonitorWs({ silent: true });
 
-    const wsBaseUrl = this._getWsBaseUrl();
     const tickerStream = this.priceType === 'LAST'
       ? `${this.symbol.toLowerCase()}@ticker`
       : `${this.symbol.toLowerCase()}@markPrice@1s`;
-    const wsUrl = `${wsBaseUrl}/${tickerStream}`;
+    const wsUrl = this._buildRelayWsUrl(tickerStream);
 
     let ws;
     try {
@@ -1660,13 +1671,12 @@ class TradingBase {
     if (this.liquidationWsPingTimeout) clearTimeout(this.liquidationWsPingTimeout);
     if (this.liquidationWs) this.liquidationWs.close();
 
-    const wsBaseUrl = this._getWsBaseUrl();
     const stream = `${this.symbol.toLowerCase()}@forceOrder`;
 
     const wsId = ++this._liquidationWsIdCounter;
     this._liquidationMessagesSeen = 0;
     this.addLog(`[DIAG] connectLiquidationWebSocket called. newWsId=${wsId}`);
-    this.liquidationWs = new WebSocket(`${wsBaseUrl}/${stream}`);
+    this.liquidationWs = new WebSocket(this._buildRelayWsUrl(stream));
     const currentWs = this.liquidationWs;
 
     this.liquidationWs.on('open', async () => {
