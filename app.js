@@ -164,7 +164,12 @@ const WARM_RECONNECT_DELAY_MS = 5_000;
 
 function _getWarmStreamUrl(symbolUpper) {
   const base = process.env.RELAY_WS_URL || 'wss://fstream.binance.com/ws';
-  return `${base}/${symbolUpper.toLowerCase()}@markPrice@1s`;
+  const url = `${base}/${symbolUpper.toLowerCase()}@markPrice@1s`;
+  const token = process.env.RELAY_AUTH_TOKEN;
+  if (token && process.env.RELAY_WS_URL) {
+    return `${url}?token=${encodeURIComponent(token)}`;
+  }
+  return url;
 }
 
 function _closeWarmWs(reason) {
