@@ -71,6 +71,55 @@ startupStatus.firestoreReady = true;
 startupStatus.phase = 'initializing_firebase';
 initializeFirebaseAdmin();
 startupStatus.firebaseReady = true;
+
+// ─── Relay auth token ────────────────────────────────────────────────────────
+// Per-VM token stored in Firestore at relay_auth_tokens/{uid.toLowerCase()}.
+// Backend writes it at provision time; ycbot-ws-relay validates incoming
+// `?token=...` against the same collection. We fetch it here once at boot and
+// expose via process.env.RELAY_AUTH_TOKEN so trading-base.js _buildRelayWsUrl
+// can pick it up. If RELAY_AUTH_TOKEN is already set (local dev / manual
+// override), we trust it and skip the lookup.
+async function loadRelayAuthToken() {
+  if (process.env.RELAY_AUTH_TOKEN) {
+    console.log('[RELAY-AUTH] RELAY_AUTH_TOKEN already set in env; skipping Firestore lookup');
+    return;
+  }
+  let instanceName;
+  try {
+    const res = await fetch(
+      'http://metadata.google.internal/computeMetadata/v1/instance/name',
+      { headers: { 'Metadata-Flavor': 'Google' }, signal: AbortSignal.timeout(2000) }
+    );
+    if (!res.ok) throw new Error(`metadata HTTP ${res.status}`);
+    instanceName = (await res.text()).trim();
+  } catch (err) {
+    console.warn(`[RELAY-AUTH] Could not read instance name from GCP metadata (${err.message}); bot will connect to relay without a token`);
+    return;
+  }
+  if (!instanceName.startsWith('vm-user-')) {
+    console.warn(`[RELAY-AUTH] Instance name '${instanceName}' does not match vm-user-* pattern; skipping token lookup`);
+    return;
+  }
+  const docId = instanceName.slice('vm-user-'.length);
+  try {
+    const doc = await firestore.collection('relay_auth_tokens').doc(docId).get();
+    if (!doc.exists) {
+      console.warn(`[RELAY-AUTH] No token doc at relay_auth_tokens/${docId} — bot will be rejected by relay until backend provisions one`);
+      return;
+    }
+    const { token } = doc.data();
+    if (!token) {
+      console.warn(`[RELAY-AUTH] Token doc relay_auth_tokens/${docId} exists but has no 'token' field`);
+      return;
+    }
+    process.env.RELAY_AUTH_TOKEN = token;
+    console.log(`[RELAY-AUTH] Loaded token for uid=${docId} (${token.length} chars) from Firestore`);
+  } catch (err) {
+    console.error(`[RELAY-AUTH] Failed to load token from Firestore: ${err.message}`);
+  }
+}
+await loadRelayAuthToken();
+
 startupStatus.phase = 'ready';
 
 // Global map to store active strategy instances, keyed by strategyId

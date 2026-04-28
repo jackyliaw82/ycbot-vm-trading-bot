@@ -14,13 +14,10 @@ module.exports = {
       // Phase 2: route all Binance WS through the shared ycbot-ws-relay. VM IP
       // never talks directly to Binance, avoiding the IP-reputation class of
       // bans. Leave unset to fall back to direct Binance.
-      RELAY_WS_URL: 'ws://34.126.80.106:8080/ws',
-      // Shared-secret token for relay auth. SET VIA SHELL ENV — never hardcode
-      // here (repo is public). Must match RELAY_AUTH_TOKEN on the relay VM.
-      // Example deploy step:
-      //   export RELAY_AUTH_TOKEN=$(cat /etc/ycbot-relay-token)
-      //   pm2 restart ecosystem.config.cjs --update-env
-      RELAY_AUTH_TOKEN: process.env.RELAY_AUTH_TOKEN
+      RELAY_WS_URL: 'ws://34.126.80.106:8080/ws'
+      // RELAY_AUTH_TOKEN is fetched at runtime by app.js loadRelayAuthToken()
+      // from Firestore (relay_auth_tokens/<uid>). No env var needed in PROD.
+      // Local dev: export RELAY_AUTH_TOKEN=... to skip the Firestore lookup.
     },
     error_file: './logs/err.log',
     out_file: './logs/out.log',
