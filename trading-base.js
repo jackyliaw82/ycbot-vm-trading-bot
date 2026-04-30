@@ -191,6 +191,13 @@ class TradingBase {
     this._restFallbackCount = 0;
     this._lastUserDataMessageAt = 0;
 
+    // In-flight REST-fallback timers. Populated by _scheduleRestFallback,
+    // removed when the timer fires. stop() iterates this to synchronously
+    // recover any order whose deferred 5s timer hasn't fired yet — otherwise
+    // the modal's Net PnL would understate fees of any add-trade placed in
+    // the last 5s before the strategy stopped.
+    this._pendingRestFallback = new Map(); // orderId → { symbol, positionSide }
+
     // Liquidation WS background retry — kicks in after the standard 25-attempt
     // backoff stage exhausts itself. Slow cadence; informational stream so we
     // don't need aggressive recovery, just eventual recovery.
@@ -311,9 +318,11 @@ class TradingBase {
    */
   _scheduleRestFallback(orderId, symbol, side, positionSide) {
     if (!orderId) return;
+    this._pendingRestFallback.set(orderId, { symbol, positionSide });
     setTimeout(async () => {
       const wsHandledAt = this._wsHandledOrderIds.get(orderId);
       if (wsHandledAt && Date.now() - wsHandledAt < REST_FALLBACK_DEDUP_WINDOW_MS) {
+        this._pendingRestFallback.delete(orderId);
         return; // WS got there first — nothing to do
       }
       try {
@@ -381,6 +390,7 @@ class TradingBase {
       } catch (error) {
         await this.addLog(`ERROR: [REST-FALLBACK] order ${orderId}: ${error.message}`);
       } finally {
+        this._pendingRestFallback.delete(orderId);
         this._pruneWsHandledMap();
       }
     }, REST_FALLBACK_DELAY_MS);

@@ -237,12 +237,21 @@ class AiHedgeStrategy extends TradingBase {
         await this.addLog(`ERROR: Failed to close positions: ${err.message}`);
       }
 
-      // Synchronously recover the closing fills before reading PnL accumulators.
+      // Synchronously recover fills for:
+      //  (a) any pre-stop in-flight order whose deferred 5s REST-fallback timer
+      //      hasn't fired yet (e.g. an ADD trade placed in the last 5s before
+      //      stop), and
+      //  (b) the closing orders just placed above.
       // Each call is idempotent — fast no-op when WS path already handled the
       // orderId, otherwise polls status to FILLED then fetches userTrades.
-      // Replaces the previous blind 3s wait, which was shorter than the WS-
-      // miss safety net and let silent-stuck WS drop closing PnL from the modal.
+      // Without (a), the modal's Net PnL would understate the last add-trade's
+      // fees by ~0.005 USDT per fill. Without (b), the closing PnL itself
+      // would be missed when user-data WS is silent-stuck.
       try {
+        const pending = Array.from(this._pendingRestFallback.entries());
+        for (const [oid, meta] of pending) {
+          await this._recoverOrderSync(oid, meta.symbol, meta.positionSide);
+        }
         if (longCloseOrderId) {
           await this._recoverOrderSync(longCloseOrderId, this.symbol, 'LONG');
         }
@@ -250,7 +259,7 @@ class AiHedgeStrategy extends TradingBase {
           await this._recoverOrderSync(shortCloseOrderId, this.symbol, 'SHORT');
         }
       } catch (err) {
-        await this.addLog(`ERROR: Closing-trade fill recovery failed: ${err.message}`);
+        await this.addLog(`ERROR: Pending-fill recovery failed: ${err.message}`);
       }
 
       try {
@@ -387,6 +396,13 @@ class AiHedgeStrategy extends TradingBase {
   // ——— AI plan management ——————————————————————————————————————————————
 
   async _requestNewPlan(reason = 'execution_complete') {
+    // Skip if the strategy is stopping or already stopped — the plan would
+    // never execute (handleRealtimePrice short-circuits on !isRunning) and
+    // the Anthropic API call would still bill. Also avoids the misleading
+    // "AI Plan installed" log appearing after the stopped notification.
+    if (this.isStopping || !this.isRunning) {
+      return;
+    }
     const now = Date.now();
     if (now - this._lastReplanTime < this._replanCooldownMs) return;
     this._lastReplanTime = now;
