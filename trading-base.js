@@ -1066,14 +1066,29 @@ class TradingBase {
   //
   // Without RELAY_WS_URL, both market and user-data fall back to direct Binance
   // — backwards-compatible with any deploy that hasn't pointed at a relay yet.
+  //
+  // Binance Futures WS routing (per docs, 2026):
+  //   /market — market data (markPrice, ticker, kline, aggTrade, forceOrder)
+  //   /private — user-data (listenKey)
+  //   /public — high-frequency public (not used here)
+  // Connections without a routed path only receive Public-endpoint data, which
+  // is why bare `/ws/<stream>` for market streams silently delivers no frames
+  // (SUBSCRIBE acks, no data). Spot endpoint (stream.binance.com) does NOT
+  // require this — spot testnet still uses /ws.
 
   _getWsBaseUrl(streamType = 'market') {
-    const directBase = this.isTestnet === true
-      ? 'wss://stream.binance.com/ws'
-      : 'wss://fstream.binance.com/ws';
-    if (streamType === 'userdata') return directBase;
+    // Spot testnet uses unprefixed /ws (no routing requirement).
+    if (this.isTestnet === true) {
+      return 'wss://stream.binance.com/ws';
+    }
+    // Futures production: routed paths are required for market and user-data.
+    if (streamType === 'userdata') {
+      return 'wss://fstream.binance.com/private/ws';
+    }
+    // Market: prefer the relay (which itself uses /market routing internally).
     if (process.env.RELAY_WS_URL) return process.env.RELAY_WS_URL;
-    return directBase;
+    // Direct fallback to Binance with /market routing.
+    return 'wss://fstream.binance.com/market/ws';
   }
 
   // Build a market-stream WS URL. When connecting through the relay AND a
