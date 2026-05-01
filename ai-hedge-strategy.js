@@ -6,6 +6,15 @@ import { AiRiskGuard, FEE_RATE } from './ai-risk-guard.js';
 import { AiMarketContext } from './ai-market-context.js';
 import fetch from 'node-fetch';
 
+// Per-model pricing in USD per million tokens. Sourced from Anthropic published
+// rates. Cache write 5m = 1.25× input rate; cache read = 0.1× input rate.
+// Used to compute end-of-strategy AI usage cost — kept here so a model change
+// only requires updating this table.
+const MODEL_PRICING = {
+  'claude-sonnet-4-6': { input: 3.0,  output: 15.0, cacheWrite5m: 3.75,  cacheRead: 0.30 },
+  'claude-opus-4-7':   { input: 15.0, output: 75.0, cacheWrite5m: 18.75, cacheRead: 1.50 },
+};
+
 function formatDuration(ms) {
   if (!ms || ms < 0) return 'N/A';
   const days = Math.floor(ms / (1000 * 60 * 60 * 24));
@@ -111,10 +120,10 @@ class AiHedgeStrategy extends TradingBase {
     this.profitPercent = config.profitPercent ?? null;
 
     const anthropicApiKey = await this._fetchAnthropicApiKey();
-    const aiModel = config.aiModel || 'claude-sonnet-4-6';
+    this.aiModel = config.aiModel || 'claude-sonnet-4-6';
 
     await this.addLog(`Starting AI Hedge Strategy for ${this.symbol}...`);
-    await this.addLog(`Config: posSize=${this.positionSizeUSDT} USDT, leverage=${this.leverage}x, maxPos=${this.maxPositionSizeUSDT} USDT, model=${aiModel}`);
+    await this.addLog(`Config: posSize=${this.positionSizeUSDT} USDT, leverage=${this.leverage}x, maxPos=${this.maxPositionSizeUSDT} USDT, model=${this.aiModel}`);
 
     try {
       await this.setLeverage(this.symbol, this.leverage);
@@ -145,7 +154,7 @@ class AiHedgeStrategy extends TradingBase {
     });
 
     this.marketContext = new AiMarketContext(this);
-    this.planner = new AiPlanner(anthropicApiKey, aiModel);
+    this.planner = new AiPlanner(anthropicApiKey, this.aiModel);
     this.executor = new AiPlanExecutor(this);
 
     this.isRunning = true;
@@ -296,13 +305,23 @@ class AiHedgeStrategy extends TradingBase {
     await this.saveState();
     this.isStopping = false;
 
-    // Log AI token usage summary
+    // Log AI token usage summary. Rates come from MODEL_PRICING (above) keyed
+    // by this.aiModel. Cache write/read tokens default to 0 since prompt
+    // caching is disabled in v1.0.25 — but keep the math defensive in case
+    // it's ever re-enabled or the API returns nonzero values.
     const u = this.aiTokenUsage;
     if (u.planCount > 0) {
-      const inputCost = (u.inputTokens / 1_000_000) * 3.00;
-      const outputCost = (u.outputTokens / 1_000_000) * 15.00;
-      const totalCost = inputCost + outputCost;
-      await this.addLog(`AI Usage: ${u.planCount} plans, ${u.inputTokens.toLocaleString()} input + ${u.outputTokens.toLocaleString()} output tokens (cache: ${u.cacheRead.toLocaleString()} read). Est. cost: $${totalCost.toFixed(4)}`);
+      const rates = MODEL_PRICING[this.aiModel] || MODEL_PRICING['claude-sonnet-4-6'];
+      const inputCost      = (u.inputTokens   || 0) / 1_000_000 * rates.input;
+      const outputCost     = (u.outputTokens  || 0) / 1_000_000 * rates.output;
+      const cacheWriteCost = (u.cacheCreation || 0) / 1_000_000 * rates.cacheWrite5m;
+      const cacheReadCost  = (u.cacheRead     || 0) / 1_000_000 * rates.cacheRead;
+      const totalCost = inputCost + outputCost + cacheWriteCost + cacheReadCost;
+      await this.addLog(
+        `AI Usage: ${u.planCount} plans, ${u.inputTokens.toLocaleString()} input + ${u.outputTokens.toLocaleString()} output ` +
+        `(cache write: ${u.cacheCreation.toLocaleString()}, read: ${u.cacheRead.toLocaleString()}). ` +
+        `Est. cost (${this.aiModel}): $${totalCost.toFixed(4)}`
+      );
     }
 
     await this.addLog('AI Hedge Strategy stopped.');

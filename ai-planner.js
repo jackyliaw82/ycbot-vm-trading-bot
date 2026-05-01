@@ -192,7 +192,7 @@ class AiPlanner {
         const response = await this.client.messages.create({
           model: this.model,
           max_tokens: 2048,
-          system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+          system: SYSTEM_PROMPT,
           messages: [{ role: 'user', content: userMessage }],
         });
 
