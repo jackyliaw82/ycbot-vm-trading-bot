@@ -48,7 +48,7 @@ const LIQUIDATION_BACKGROUND_RETRY_INTERVAL_MS = 5 * 60 * 1000;
 // fires GET /fapi/v1/userTrades to recover the actual fills (qty, price,
 // commission, tradeId). The dedup window is the same value plus a margin so
 // a slow WS event arriving after the fallback ran can't double-count.
-const REST_FALLBACK_DELAY_MS = 5000;
+const REST_FALLBACK_DELAY_MS = 3000;
 const REST_FALLBACK_DEDUP_WINDOW_MS = 60_000;
 
 // Default leverage
@@ -148,6 +148,15 @@ class TradingBase {
     this.realtimeWsConnected = false;
     this.userDataWsConnected = false;
     this.liquidationWsConnected = false;
+
+    // User-data WS health flag (separate from .Connected — flips on pong-driven
+    // close events to gate L2 REST fallback. Default true so the initial open
+    // doesn't fire a misleading "unhealthy → healthy" transition log.
+    this._userDataWsHealthy = true;
+
+    // Periodic L3 reconciliation: timestamp of the last full userTrades sweep.
+    // Initialized null; first run covers strategy-start to now.
+    this._lastReconciliationAt = null;
 
     // Reconnection state
     this.realtimeReconnectAttempts = 0;
@@ -294,7 +303,16 @@ class TradingBase {
         timestamp: new Date(),
         strategyId: this.strategyId,
       };
-      await this.tradesCollectionRef.add(tradeData);
+      // Idempotent write: use Binance tradeId as the doc ID. Same fill saved
+      // twice (e.g. VM restart triggering L3 reconciliation rediscovery) just
+      // overwrites the existing doc instead of creating duplicates. Falls
+      // back to add() only if tradeId is missing (defensive — should never
+      // happen since all save paths pass tradeId).
+      if (tradeDetails.tradeId !== undefined && tradeDetails.tradeId !== null) {
+        await this.tradesCollectionRef.doc(String(tradeDetails.tradeId)).set(tradeData, { merge: true });
+      } else {
+        await this.tradesCollectionRef.add(tradeData);
+      }
 
       // Broadcast trade to connected WebSocket clients
       wsBroadcast.pushTrade(this.strategyId, tradeData);
@@ -318,6 +336,11 @@ class TradingBase {
    */
   _scheduleRestFallback(orderId, symbol, side, positionSide) {
     if (!orderId) return;
+    // L2: only schedule when WS is known unhealthy at placement time. When WS
+    // is healthy, trust L1 (ORDER_TRADE_UPDATE) to deliver. If L1 silently
+    // misses, L3 (_reconcileRecentTrades, runs every 30 min after listenKey
+    // refresh) catches the missed fill within 30 min.
+    if (this._userDataWsHealthy) return;
     this._pendingRestFallback.set(orderId, { symbol, positionSide });
     setTimeout(async () => {
       const wsHandledAt = this._wsHandledOrderIds.get(orderId);
@@ -394,6 +417,91 @@ class TradingBase {
         this._pruneWsHandledMap();
       }
     }, REST_FALLBACK_DELAY_MS);
+  }
+
+  /**
+   * L3: periodic reconciliation against userTrades. Hooked into listenKey
+   * refresh success path so it runs every 30 min on the same cadence. Sweeps
+   * fills since _lastReconciliationAt; for any orderId not in
+   * _wsHandledOrderIds, recovers the trade record + accumulators.
+   *
+   * Idempotent against L1 and L2 via _wsHandledOrderIds dedup map AND
+   * idempotent against duplicate Firestore writes via saveTrade's
+   * tradeId-as-doc-ID write (set+merge instead of add).
+   */
+  async _reconcileRecentTrades() {
+    if (!this.isRunning) return;
+    if (!this.symbol) return;
+    const startTime = this._lastReconciliationAt
+      || (this.strategyStartTime ? new Date(this.strategyStartTime).getTime() : Date.now() - 30 * 60 * 1000);
+    const endTime = Date.now();
+
+    try {
+      const fills = await this.makeProxyRequest(
+        '/fapi/v1/userTrades',
+        'GET',
+        { symbol: this.symbol, startTime, limit: 1000 },
+        true,
+        'futures'
+      );
+      if (!Array.isArray(fills) || fills.length === 0) {
+        this._lastReconciliationAt = endTime;
+        return;
+      }
+
+      let recoveredCount = 0;
+      let recoveredCommission = 0;
+      let recoveredRealizedPnl = 0;
+
+      for (const fill of fills) {
+        if (this._wsHandledOrderIds.has(fill.orderId)) continue;
+
+        const commission = parseFloat(fill.commission) || 0;
+        const realizedPnl = parseFloat(fill.realizedPnl) || 0;
+        const positionSide = fill.positionSide || 'BOTH';
+
+        await this.saveTrade({
+          tradeId: fill.id,
+          orderId: fill.orderId,
+          symbol: fill.symbol,
+          side: fill.side,
+          positionSide,
+          time: fill.time || Date.now(),
+          price: parseFloat(fill.price) || 0,
+          qty: parseFloat(fill.qty) || 0,
+          quoteQty: parseFloat(fill.quoteQty) || 0,
+          commission,
+          commissionAsset: fill.commissionAsset || 'USDT',
+          realizedPnl,
+          isBuyer: fill.buyer,
+          isMaker: fill.maker,
+          role: fill.maker ? 'Maker' : 'Taker',
+          source: 'reconciliation',
+        });
+
+        if (commission > 0) {
+          this.accumulatedTradingFees += commission;
+          if (positionSide === 'LONG') this.longTradingFees += commission;
+          else if (positionSide === 'SHORT') this.shortTradingFees += commission;
+        }
+        if (realizedPnl !== 0) {
+          this.accumulatedRealizedPnL += realizedPnl;
+          if (positionSide === 'LONG') this.longAccumulatedRealizedPnL += realizedPnl;
+          else if (positionSide === 'SHORT') this.shortAccumulatedRealizedPnL += realizedPnl;
+        }
+        this._wsHandledOrderIds.set(fill.orderId, Date.now());
+        recoveredCount++;
+        recoveredCommission += commission;
+        recoveredRealizedPnl += realizedPnl;
+      }
+
+      this._lastReconciliationAt = endTime;
+      if (recoveredCount > 0) {
+        await this.addLog(`[RECONCILE] Recovered ${recoveredCount} fill(s) missed by L1+L2. fees=${recoveredCommission.toFixed(4)}, realizedPnl=${recoveredRealizedPnl.toFixed(4)}`);
+      }
+    } catch (err) {
+      await this.addLog(`ERROR: [RECONCILE] failed: ${err.message}`);
+    }
   }
 
   _pruneWsHandledMap() {
@@ -1504,6 +1612,12 @@ class TradingBase {
       await this.addLog(`[DIAG] User Data WS ${wsId} OPEN`);
       await this.addLog('[WebSocket] User Data WS connected.');
       this.userDataWsConnected = true;
+      // L2 health flag: log only on transition from unhealthy → healthy.
+      // Initial open (was already true from constructor) is silent.
+      if (!this._userDataWsHealthy) {
+        await this.addLog('[USER-DATA-WS] unhealthy → healthy, WS path active');
+        this._userDataWsHealthy = true;
+      }
       this.userDataReconnectAttempts = 0;
       if (this.userDataReconnectTimeout) clearTimeout(this.userDataReconnectTimeout);
 
@@ -1562,6 +1676,11 @@ class TradingBase {
 
     this.userDataWs.on('close', async (code, reason) => {
       this.userDataWsConnected = false;
+      // L2 health flag: log only on transition from healthy → unhealthy.
+      if (this._userDataWsHealthy) {
+        await this.addLog('[USER-DATA-WS] healthy → unhealthy, REST fallback active');
+        this._userDataWsHealthy = false;
+      }
       await this.addLog(`[DIAG] User Data WS ${wsId} CLOSE code=${code} reason=${reason || 'none'}`);
       await this.addLog(`[WebSocket] User Data Stream WebSocket closed. Code: ${code}, Reason: ${reason || 'none'}, isRunning: ${this.isRunning}`);
 
@@ -1979,6 +2098,13 @@ class TradingBase {
         } else if (isRefresh) {
           await this.addLog(`[REST-API] ListenKey refreshed successfully on attempt ${attempt}/${maxAttempts}.`);
           this.listenKeyRetryAttempts = 0;
+          // L3: piggy-back the 30-min reconciliation sweep on the listenKey
+          // refresh cadence. Listenkey refresh succeeding proves REST API is
+          // reachable — natural precondition for the userTrades query.
+          // Fire-and-forget so it doesn't block the refresh return.
+          this._reconcileRecentTrades().catch((err) => {
+            console.error(`[RECONCILE] Background reconciliation error: ${err.message}`);
+          });
           return response;
         }
       } catch (error) {
@@ -2064,16 +2190,13 @@ class TradingBase {
       if (!this.realtimeWsConnected) {
         await this.addLog('WARNING: [Health Check] Real-time Price WebSocket is DISCONNECTED.');
       }
-      // Silent-stuck detection on user-data WS: alive=true but no events for
-      // 30+ min while a strategy with open positions is running. Open positions
-      // generate ACCOUNT_UPDATE on margin/PnL ticks, so 30 min of silence is
-      // anomalous and likely indicates the WS is connected-but-not-delivering.
-      if (this.userDataWsConnected && this.isRunning && (this.longPosition || this.shortPosition) && this._lastUserDataMessageAt > 0) {
-        const wsSilentMs = Date.now() - this._lastUserDataMessageAt;
-        if (wsSilentMs > 30 * 60 * 1000) {
-          await this.addLog(`WARN: [Health Check] User-data WS connected but silent for ${Math.round(wsSilentMs / 60000)} min while positions are open. REST fallback handled ${this._restFallbackCount} order(s) so far.`);
-        }
-      }
+      // Removed in v1.0.24: the 30-min stale-message check on user-data WS.
+      // It produced false-alarm warnings during legitimate quiet periods because
+      // Binance only pushes user-data events on actual position/balance changes
+      // — a healthy hedge with no triggers can be silent for hours. Replaced
+      // by the L1+L2+L3 defense (pong-driven health flag, conditional REST
+      // fallback when unhealthy, periodic 30-min reconciliation) which catches
+      // missed fills without false-alarming.
     }, 5 * 60 * 1000);
   }
 
