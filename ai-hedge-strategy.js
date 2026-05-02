@@ -455,6 +455,7 @@ class AiHedgeStrategy extends TradingBase {
       });
 
       if (context.volatility) this._lastVolatility = context.volatility;
+      if (context.liquidationCaps) this._lastLiquidationCaps = context.liquidationCaps;
       this._lastMicrostructure = {
         oiChange: context.oiChange || null,
         liquidations: context.liquidations || null,
@@ -480,6 +481,8 @@ class AiHedgeStrategy extends TradingBase {
         shortPosition: this.shortPosition,
         positionSizeUSDT: this.positionSizeUSDT,
         phase: this.phase,
+        liquidationCaps: context.liquidationCaps,
+        minLiqDistancePct: context.minLiqDistancePct,
       });
 
       if (!validation.valid) {
@@ -493,6 +496,7 @@ class AiHedgeStrategy extends TradingBase {
           positionSizeUSDT: this.positionSizeUSDT,
           volatility: this._lastVolatility,
           phase: this.phase,
+          liquidationCaps: context.liquidationCaps,
         }, 'Risk guard rejection', rejectedBias);
 
         const fallbackValidation = this.riskGuard.validatePlan(plan, {
@@ -501,6 +505,8 @@ class AiHedgeStrategy extends TradingBase {
           shortPosition: this.shortPosition,
           positionSizeUSDT: this.positionSizeUSDT,
           phase: this.phase,
+          liquidationCaps: context.liquidationCaps,
+          minLiqDistancePct: context.minLiqDistancePct,
         });
 
         if (!fallbackValidation.valid) {
@@ -588,6 +594,7 @@ class AiHedgeStrategy extends TradingBase {
           positionSizeUSDT: this.positionSizeUSDT,
           volatility: this._lastVolatility,
           phase: this.phase,
+          liquidationCaps: this._lastLiquidationCaps,
         }, 'AI error');
         fallback.microstructureSnapshot = this._lastMicrostructure
           ? { ...this._lastMicrostructure }

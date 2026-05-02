@@ -19,8 +19,10 @@ No positions exist yet. Your job:
 2. At each level, set up an OPEN_HEDGE action that opens BOTH legs simultaneously with asymmetric sizing:
    - At resistance: SHORT gets the larger share (price likely bounces down)
    - At support: LONG gets the larger share (price likely bounces up)
-3. Sizing ratios: 60:40, 70:30, 80:20, or 90:10 based on your conviction
-4. When to cap sizing: if microstructure signals are mixed, S/R is weak, or confidence is low, cap the larger side at 60%. Only use 80:20 or 90:10 when multiple signals align strongly.
+3. Sizing ratio: **ALWAYS 60:40** (no conviction-based scaling in Phase 1). The probabilityAssessment field still records conviction for downstream use, but it does NOT change the Phase 1 split.
+4. Concrete split:
+   - At resistance (actionAbove): shortSizeUSDT = positionSizeUSDT × 0.60, longSizeUSDT = positionSizeUSDT × 0.40
+   - At support  (actionBelow): longSizeUSDT  = positionSizeUSDT × 0.60, shortSizeUSDT = positionSizeUSDT × 0.40
 5. Both legs open at the SAME price (gap = 0 initially). DCA will widen the gap.
 
 ### PHASE 2: DCA — Widen the Gap
@@ -37,7 +39,7 @@ Positions exist from Phase 1. Your job:
    - Worked example: if LONG notional 280 > SHORT notional 120, then LONG is the heavier leg → ADD_LONG uses 15m/2x ATR, and ADD_SHORT uses 5m/1x ATR. Do not let this round's sizeUSDT allocation change which timeframe you pick.
 
    **(b) SIZE ALLOCATION — by this-round probability (independent of (a)):**
-   - The higher-probability side gets the LARGER sizeUSDT. Same conviction-based ratios as INITIAL phase (60:40 to 90:10). Same capping rules apply: cap at 60:40 when signals are mixed or S/R is weak.
+   - The higher-probability side gets the LARGER sizeUSDT. Use conviction-based ratios: 60:40 (low confidence), 70:30 (medium), 80:20 to 90:10 (high). Cap at 60:40 when signals are mixed or S/R is weak. (Note: Phase 1 OPEN_HEDGE is hard-locked at 60:40 — these conviction-based ratios apply only to Phase 2 DCA.)
    - The "larger-allocation side" is a separate concept from "heavier leg." E.g. SHORT can be the lighter leg (smaller current notional) AND still receive the larger sizeUSDT this round if SHORT is the higher-probability direction.
 3. The goal is to **widen the hedge gap** — every DCA entry should ideally improve the avg entry for that side
 4. One plan = one ADD_LONG + one ADD_SHORT. Never double-ADD the same side.
@@ -100,7 +102,7 @@ Use ATR (Average True Range) from 15m candles. Leg class is determined by CURREN
 - Heavier leg DCA (larger current notional): use 15m S/R levels, minimum 2x ATR from current price. If no 15m S/R available, use **currentPrice ± 3x ATR** as trigger.
 - In EXTREME volatility: widen further (2x lighter, 4x heavier)
 
-## ASYMMETRIC SIZING (applies to BOTH Phase 1 and Phase 2)
+## ASYMMETRIC SIZING (Phase 2 DCA only — Phase 1 OPEN_HEDGE is hard-locked at 60:40)
 The higher-probability direction gets a LARGER position size:
 - Low confidence: 60:40
 - Medium confidence: 70:30
@@ -114,8 +116,43 @@ The strategy auto-stops when totalPnL >= effectiveTarget. You do not need to pla
 
 ## MARGIN SAFETY
 - If margin usage > 70%: prioritize CUT to free margin
-- If liquidation distance < 3%: CRITICAL — CUT both sides immediately
+- If account liquidation distance < 3%: CRITICAL — CUT both sides immediately
 - Never add when margin usage > 85%
+
+## LIQUIDATION-AWARE SIZING (applies to BOTH Phase 1 and Phase 2)
+Every sizeUSDT decision must respect the liquidation buffer for the leg being ADDED.
+The ABOVE/BELOW asymmetry from FORWARD REASONING means each ADD's liq impact lands
+entirely on one leg — there's no "shared splitting" cushion. Size each side defensively.
+
+### Phase 2 (DCA) — hard ceiling from precomputed caps
+The user message includes a LIQUIDATION-SAFE ADD CAPS section with per-leg
+maxAddLongUSDT and maxAddShortUSDT values. These are HARD ceilings — never emit
+a sizeUSDT above the corresponding cap. Procedure:
+
+1. Compute your normal sizing logic (intended round total + ratio).
+2. For each side: sizeUSDT[side] = min(intended × ratio[side], maxAdd[side]).
+3. If a cap pulls one side below the minNotional × 2 floor, that side becomes
+   HOLD for this plan. Document the reason as "liquidation buffer too tight".
+4. If BOTH sides' caps land below floor, emit HOLD/HOLD with a clear analysis
+   note — wait for the buffer to recover (price moves favourably for the heavier
+   leg) before resuming DCA.
+5. Never silently over-allocate the safer side to compensate when one cap binds.
+
+### Phase 1 (OPEN_HEDGE) — projected liq distance check
+No positions exist yet, so per-leg liq is not yet observable. Estimate the
+post-OPEN_HEDGE liq distance for each leg using:
+
+  initialLiqDistance% ≈ (1 / leverage - 0.005) × 100 + (walletBalance × hedgeOffset / proposedNotional)
+
+where hedgeOffset = abs(longSizeUSDT - shortSizeUSDT) / max(longSizeUSDT, shortSizeUSDT) — a
+balanced 50:50 hedge has near-infinite buffer; the more imbalanced, the closer
+to the bare-leverage liq distance.
+
+If projected distance for either leg falls below the LIQUIDATION-SAFE target
+(see user message for current MIN_LIQ_DISTANCE_PCT), reduce positionSizeUSDT
+for THIS plan — emit longSizeUSDT + shortSizeUSDT < positionSizeUSDT and
+document the reduction in the analysis field. This is the ONLY exception to
+the "must equal positionSizeUSDT exactly" rule below.
 
 ## RISK CONSTRAINTS
 - Max imbalance ratio: 5:1. Above this → CUT-only mode (see above)
@@ -123,7 +160,7 @@ The strategy auto-stops when totalPnL >= effectiveTarget. You do not need to pla
   - the actual sizes you emit in \`actionAbove\` / \`actionBelow\`,
   - and any sizes you reference in the \`analysis\` field for gap-projection math.
   If your math wants a smaller size, round UP to this \`minNotional × 2\` floor and recompute the projected gap with the floored size. Never include a size below this floor anywhere in your output.
-- **OPEN_HEDGE total = positionSizeUSDT (Phase 1 only)**: \`longSizeUSDT + shortSizeUSDT\` MUST equal \`positionSizeUSDT\` exactly. The 60:40 / 70:30 / 80:20 / 90:10 ratios apply to this TOTAL, not to half of it. Worked example with positionSizeUSDT=1000 and 70:30 favoring SHORT: LONG=300, SHORT=700. Worked example with 90:10 favoring LONG: LONG=900, SHORT=100.
+- **OPEN_HEDGE total = positionSizeUSDT (Phase 1 only)**: \`longSizeUSDT + shortSizeUSDT\` MUST equal \`positionSizeUSDT\` exactly, EXCEPT when the LIQUIDATION-AWARE SIZING projection for Phase 1 forces a reduction — in that case the total is whatever keeps both legs' projected liq distance >= MIN_LIQ_DISTANCE_PCT, and the analysis field must explicitly document the reduction and the projected distances. The hard-locked 60:40 ratio applies to whatever TOTAL you end up using, not to half of it. Worked example with positionSizeUSDT=1000 at resistance (no liq reduction): LONG=400 (40%), SHORT=600 (60%). Worked example with positionSizeUSDT=1000 at support (no liq reduction): LONG=600 (60%), SHORT=400 (40%). Worked example with positionSizeUSDT=1000 reduced to 600 by liq projection at resistance: LONG=240 (40%), SHORT=360 (60%) — the 60:40 split still applies, just to the reduced total.
 - Total of both sides must not exceed maxPositionSizeUSDT
 
 ## OUTPUT FORMAT
@@ -297,7 +334,28 @@ class AiPlanner {
       parts.push(`\n## MARGIN STATUS`);
       parts.push(`Usage: ${m.marginUsagePercent.toFixed(1)}%, Available: ${m.availableBalance.toFixed(2)} USDT`);
       if (m.liquidationDistance != null) {
-        parts.push(`Liquidation Distance: ~${m.liquidationDistance.toFixed(1)}%${m.liquidationDistance < 5 ? ' DANGER' : ''}`);
+        parts.push(`Account Liquidation Distance: ~${m.liquidationDistance.toFixed(1)}%${m.liquidationDistance < 5 ? ' DANGER' : ''}`);
+      }
+      // Per-leg liquidation prices (Binance reports separate values in hedge mode)
+      if (m.longLiqPrice != null && m.longLiqDistancePct != null) {
+        parts.push(`LONG Liq Price: ${m.longLiqPrice.toFixed(4)} (distance ${m.longLiqDistancePct.toFixed(2)}% from current)`);
+      }
+      if (m.shortLiqPrice != null && m.shortLiqDistancePct != null) {
+        parts.push(`SHORT Liq Price: ${m.shortLiqPrice.toFixed(4)} (distance ${m.shortLiqDistancePct.toFixed(2)}% from current)`);
+      }
+    }
+
+    // Liquidation-aware sizing caps (Phase 2 hard ceiling per leg)
+    if (context.liquidationCaps && (context.liquidationCaps.maxAddLongUSDT != null || context.liquidationCaps.maxAddShortUSDT != null)) {
+      const c = context.liquidationCaps;
+      parts.push(`\n## LIQUIDATION-SAFE ADD CAPS (target: keep each leg's projected liq distance >= ${context.minLiqDistancePct}%)`);
+      if (c.maxAddLongUSDT != null) {
+        const note = c.maxAddLongUSDT === 0 ? ' — LONG already at/below floor, no further ADD_LONG allowed' : '';
+        parts.push(`Max ADD_LONG (this round): ${c.maxAddLongUSDT.toFixed(2)} USDT${note}`);
+      }
+      if (c.maxAddShortUSDT != null) {
+        const note = c.maxAddShortUSDT === 0 ? ' — SHORT already at/below floor, no further ADD_SHORT allowed' : '';
+        parts.push(`Max ADD_SHORT (this round): ${c.maxAddShortUSDT.toFixed(2)} USDT${note}`);
       }
     }
 

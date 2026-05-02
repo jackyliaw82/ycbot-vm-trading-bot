@@ -6,6 +6,11 @@ const VOLUME_RATIO_LOW = 0.3;              // current candle vol < 0.3x average
 const TAKER_RATIO_HIGH = 1.5;              // buyers dominate
 const TAKER_RATIO_LOW = 0.6;               // sellers dominate
 
+// Liquidation-aware DCA sizing (Phase 2 hard ceiling, Phase 1 soft target).
+// Each ADD must keep that leg's projected liq distance >= MIN_LIQ_DISTANCE_PCT.
+// 8% leaves a meaningful safety margin even with sub-second adverse moves.
+const MIN_LIQ_DISTANCE_PCT = 8;
+
 /**
  * AiMarketContext — builds market context for AI plan generation.
  *
@@ -155,7 +160,62 @@ class AiMarketContext {
       supportResistance5m,
       previousPlan: previousPlan || null,
       planHistory: planHistory || [],
+
+      // Liquidation-aware sizing caps. Computed per-leg from current
+      // liqDistance + leg notional. Phase 1 (no positions) skips this and
+      // uses the leverage-based projection in the system prompt instead.
+      liquidationCaps: this._computeLiquidationCaps(longPosition, shortPosition, marginInfo),
+      minLiqDistancePct: MIN_LIQ_DISTANCE_PCT,
     };
+  }
+
+  /**
+   * Per-leg max safe ADD notional that keeps projected liq distance
+   * >= MIN_LIQ_DISTANCE_PCT. Approximation:
+   *
+   *   projectedLiqDistance ≈ currentLiqDistance × (legNotional / (legNotional + addNotional))
+   *
+   * Solving for the cap:
+   *
+   *   maxAdd = legNotional × (currentLiqDistance - minDistance) / minDistance
+   *
+   * This treats each leg as if its liq buffer scaled inversely with notional —
+   * a conservative simplification of cross-margin behaviour (real-world cross
+   * margin is more forgiving because the opposing leg's PnL helps absorb
+   * adverse moves, but we want a defensive upper bound, not an aggressive one).
+   *
+   * Returns null fields when the leg has no current liq data (e.g. the leg
+   * doesn't exist yet, or Binance hasn't returned a liq price).
+   */
+  _computeLiquidationCaps(longPosition, shortPosition, marginInfo) {
+    if (!marginInfo) return null;
+    const minDist = MIN_LIQ_DISTANCE_PCT;
+
+    let maxAddLongUSDT = null;
+    let maxAddShortUSDT = null;
+
+    const longNotional = longPosition?.notional || 0;
+    const shortNotional = shortPosition?.notional || 0;
+    const longDist = marginInfo.longLiqDistancePct;
+    const shortDist = marginInfo.shortLiqDistancePct;
+
+    if (longNotional > 0 && longDist != null) {
+      if (longDist <= minDist) {
+        // Already at or below floor — no further ADD allowed.
+        maxAddLongUSDT = 0;
+      } else {
+        maxAddLongUSDT = Math.max(0, longNotional * (longDist - minDist) / minDist);
+      }
+    }
+    if (shortNotional > 0 && shortDist != null) {
+      if (shortDist <= minDist) {
+        maxAddShortUSDT = 0;
+      } else {
+        maxAddShortUSDT = Math.max(0, shortNotional * (shortDist - minDist) / minDist);
+      }
+    }
+
+    return { maxAddLongUSDT, maxAddShortUSDT };
   }
 
   // ——— ATR Volatility ————————————————————————————————————————————————————
@@ -339,7 +399,10 @@ class AiMarketContext {
 
   async _getMarginInfo() {
     try {
-      const accountInfo = await this.strategy.makeProxyRequest('/fapi/v2/account', 'GET', {}, true, 'futures');
+      const [accountInfo, riskMap] = await Promise.all([
+        this.strategy.makeProxyRequest('/fapi/v2/account', 'GET', {}, true, 'futures'),
+        this.strategy.getPositionRiskMap(),
+      ]);
       const totalMarginBalance = parseFloat(accountInfo.totalMarginBalance);
       const totalMaintMargin = parseFloat(accountInfo.totalMaintMargin);
       const availableBalance = parseFloat(accountInfo.availableBalance);
@@ -350,7 +413,29 @@ class AiMarketContext {
       if (totalMaintMargin > 0 && totalMarginBalance > 0) {
         liquidationDistance = ((1 - totalMaintMargin / totalMarginBalance) * 100);
       }
-      return { marginUsagePercent, availableBalance, liquidationDistance };
+
+      // Per-leg liquidation prices + distances from current price.
+      // Binance reports a separate liquidationPrice for each side in hedge
+      // mode; we surface both so the AI can size each DCA defensively.
+      const currentPrice = this.strategy.currentPrice;
+      const longLiqPrice = (riskMap?.LONG && riskMap.LONG > 0) ? riskMap.LONG : null;
+      const shortLiqPrice = (riskMap?.SHORT && riskMap.SHORT > 0) ? riskMap.SHORT : null;
+      const longLiqDistancePct = (currentPrice > 0 && longLiqPrice)
+        ? ((currentPrice - longLiqPrice) / currentPrice) * 100
+        : null;
+      const shortLiqDistancePct = (currentPrice > 0 && shortLiqPrice)
+        ? ((shortLiqPrice - currentPrice) / currentPrice) * 100
+        : null;
+
+      return {
+        marginUsagePercent,
+        availableBalance,
+        liquidationDistance,
+        longLiqPrice,
+        shortLiqPrice,
+        longLiqDistancePct,
+        shortLiqDistancePct,
+      };
     } catch (error) {
       console.error(`Failed to fetch margin info: ${error.message}`);
       return null;

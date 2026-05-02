@@ -87,11 +87,14 @@ class AiRiskGuard {
         reasons.push(`${key}: total ${totalSize} exceeds max ${this.maxPositionSizeUSDT}`);
       }
 
-      // OPEN_HEDGE total must equal positionSizeUSDT (small tolerance for AI rounding)
+      // OPEN_HEDGE total must NOT EXCEED positionSizeUSDT (small tolerance for AI rounding).
+      // The AI is allowed to emit a smaller total under the LIQUIDATION-AWARE SIZING
+      // exception (Phase 1 liq projection forces a reduction below positionSizeUSDT) —
+      // we just guard against overspending or accidental zero.
       if (positionSizeUSDT && positionSizeUSDT > 0) {
         const tolerance = this.minNotional;
-        if (Math.abs(totalSize - positionSizeUSDT) > tolerance) {
-          reasons.push(`${key}: OPEN_HEDGE total ${totalSize.toFixed(2)} must equal positionSizeUSDT ${positionSizeUSDT} (±${tolerance})`);
+        if (totalSize > positionSizeUSDT + tolerance) {
+          reasons.push(`${key}: OPEN_HEDGE total ${totalSize.toFixed(2)} exceeds positionSizeUSDT ${positionSizeUSDT} (+${tolerance} tolerance)`);
         }
       }
     }
@@ -142,6 +145,19 @@ class AiRiskGuard {
         const currentTotal = longNotional + shortNotional;
         if (currentTotal + (action.sizeUSDT || 0) > this.maxPositionSizeUSDT) {
           reasons.push(`${key}: would exceed max position size`);
+        }
+      }
+
+      // Liquidation-aware cap (server-side enforcement of the prompt rule).
+      // The AI is told the maxAddLongUSDT / maxAddShortUSDT in the user message;
+      // this guard rejects plans where the AI ignored those caps.
+      const caps = state.liquidationCaps;
+      if (caps) {
+        if (action.type === 'ADD_LONG' && caps.maxAddLongUSDT != null && action.sizeUSDT > caps.maxAddLongUSDT + 0.01) {
+          reasons.push(`${key}: ADD_LONG ${action.sizeUSDT.toFixed(2)} exceeds liquidation-safe cap ${caps.maxAddLongUSDT.toFixed(2)} USDT (LONG liq distance would drop below ${state.minLiqDistancePct}%)`);
+        }
+        if (action.type === 'ADD_SHORT' && caps.maxAddShortUSDT != null && action.sizeUSDT > caps.maxAddShortUSDT + 0.01) {
+          reasons.push(`${key}: ADD_SHORT ${action.sizeUSDT.toFixed(2)} exceeds liquidation-safe cap ${caps.maxAddShortUSDT.toFixed(2)} USDT (SHORT liq distance would drop below ${state.minLiqDistancePct}%)`);
         }
       }
 
@@ -234,7 +250,7 @@ class AiRiskGuard {
    * Generate a fallback dual-action plan when AI is unavailable.
    */
   generateFallbackPlan(currentPrice, state, reason = 'AI unavailable', rejectedProbabilityAssessment = null) {
-    const { longPosition, shortPosition, positionSizeUSDT, volatility, phase } = state;
+    const { longPosition, shortPosition, positionSizeUSDT, volatility, phase, liquidationCaps } = state;
     const atrPercent = (volatility && volatility.atrPercent > 0.3) ? volatility.atrPercent : 0.3;
     const gridStep = currentPrice * (atrPercent / 100);
 
@@ -294,16 +310,38 @@ class AiRiskGuard {
       }
 
       // Apply minNotional × 2 floor on each leg.
-      const shortSize = Math.max(positionSizeUSDT * shortRatio, floor);
-      const longSize = Math.max(positionSizeUSDT * longRatio, floor);
+      let shortSize = Math.max(positionSizeUSDT * shortRatio, floor);
+      let longSize = Math.max(positionSizeUSDT * longRatio, floor);
 
-      actionAbove = {
+      // Apply liquidation-safe caps to fallback DCA sizes too. If a side's
+      // cap would force it below the minNotional floor, that side becomes HOLD
+      // for this plan. The other side stays as ADD with its capped size.
+      let shortHold = false;
+      let longHold = false;
+      if (liquidationCaps) {
+        if (liquidationCaps.maxAddShortUSDT != null && shortSize > liquidationCaps.maxAddShortUSDT) {
+          shortSize = liquidationCaps.maxAddShortUSDT;
+          if (shortSize < floor) shortHold = true;
+        }
+        if (liquidationCaps.maxAddLongUSDT != null && longSize > liquidationCaps.maxAddLongUSDT) {
+          longSize = liquidationCaps.maxAddLongUSDT;
+          if (longSize < floor) longHold = true;
+        }
+      }
+
+      actionAbove = shortHold ? {
+        type: 'HOLD',
+        reason: `Fallback: ADD_SHORT skipped — liquidation buffer too tight (cap < ${floor.toFixed(2)} USDT floor)`,
+      } : {
         type: 'ADD_SHORT',
         triggerPrice: currentPrice + gridStep * 2,
         sizeUSDT: shortSize,
         reason: `Fallback: DCA SHORT above (2x ATR) — ${biasNote}`,
       };
-      actionBelow = {
+      actionBelow = longHold ? {
+        type: 'HOLD',
+        reason: `Fallback: ADD_LONG skipped — liquidation buffer too tight (cap < ${floor.toFixed(2)} USDT floor)`,
+      } : {
         type: 'ADD_LONG',
         triggerPrice: currentPrice - gridStep * 2,
         sizeUSDT: longSize,
