@@ -127,7 +127,17 @@ entirely on one leg — there's no "shared splitting" cushion. Size each side de
 ### Phase 2 (DCA) — hard ceiling from precomputed caps
 The user message includes a LIQUIDATION-SAFE ADD CAPS section with per-leg
 maxAddLongUSDT and maxAddShortUSDT values. These are HARD ceilings — never emit
-a sizeUSDT above the corresponding cap. Procedure:
+a sizeUSDT above the corresponding cap.
+
+**Binding vs non-binding legs**: each cap line is tagged as "binding" or
+"non-binding". A binding leg is on the side that would liquidate under adverse
+movement; its cap is tight. A non-binding leg is the OFFSET side in a
+hedged position — adding to it shrinks net exposure and IMPROVES liq safety.
+Non-binding caps are typically much larger (capped only by max position size).
+This is normal: in cross-margin hedge mode only the dominant net-exposure side
+has real liquidation risk.
+
+Procedure:
 
 1. Compute your normal sizing logic (intended round total + ratio).
 2. For each side: sizeUSDT[side] = min(intended × ratio[side], maxAdd[side]).
@@ -345,16 +355,27 @@ class AiPlanner {
       }
     }
 
-    // Liquidation-aware sizing caps (Phase 2 hard ceiling per leg)
+    // Liquidation-aware sizing caps (Phase 2 hard ceiling per leg).
+    // "binding" = liq price on natural side of current (LONG liq < current, SHORT liq > current);
+    //   that leg has real liquidation risk and the cap reflects how much it can grow before
+    //   projected liq distance drops below MIN_LIQ_DISTANCE_PCT.
+    // "non-binding" = the other side; in cross-margin hedge mode this is the offset leg, where
+    //   adding actually IMPROVES net liq safety. Cap is just the remaining position-size budget.
     if (context.liquidationCaps && (context.liquidationCaps.maxAddLongUSDT != null || context.liquidationCaps.maxAddShortUSDT != null)) {
       const c = context.liquidationCaps;
       parts.push(`\n## LIQUIDATION-SAFE ADD CAPS (target: keep each leg's projected liq distance >= ${context.minLiqDistancePct}%)`);
       if (c.maxAddLongUSDT != null) {
-        const note = c.maxAddLongUSDT === 0 ? ' — LONG already at/below floor, no further ADD_LONG allowed' : '';
+        let note = '';
+        if (c.maxAddLongUSDT === 0) note = ' — LONG already at/below floor, no further ADD_LONG allowed';
+        else if (!c.longBinding) note = ' — non-binding leg (LONG is the offset side; adding here improves net liq safety, capped only by max position size)';
+        else note = ' — binding leg (LONG is the side at downward-liquidation risk)';
         parts.push(`Max ADD_LONG (this round): ${c.maxAddLongUSDT.toFixed(2)} USDT${note}`);
       }
       if (c.maxAddShortUSDT != null) {
-        const note = c.maxAddShortUSDT === 0 ? ' — SHORT already at/below floor, no further ADD_SHORT allowed' : '';
+        let note = '';
+        if (c.maxAddShortUSDT === 0) note = ' — SHORT already at/below floor, no further ADD_SHORT allowed';
+        else if (!c.shortBinding) note = ' — non-binding leg (SHORT is the offset side; adding here improves net liq safety, capped only by max position size)';
+        else note = ' — binding leg (SHORT is the side at upward-liquidation risk)';
         parts.push(`Max ADD_SHORT (this round): ${c.maxAddShortUSDT.toFixed(2)} USDT${note}`);
       }
     }

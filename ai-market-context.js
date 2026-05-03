@@ -171,18 +171,30 @@ class AiMarketContext {
 
   /**
    * Per-leg max safe ADD notional that keeps projected liq distance
-   * >= MIN_LIQ_DISTANCE_PCT. Approximation:
+   * >= MIN_LIQ_DISTANCE_PCT.
    *
-   *   projectedLiqDistance ≈ currentLiqDistance × (legNotional / (legNotional + addNotional))
+   * Two cases per leg:
    *
-   * Solving for the cap:
+   * 1. **Binding leg** — the side whose Binance-reported liq price is on the
+   *    correct side of current price (LONG liq < currentPrice, SHORT liq >
+   *    currentPrice). This is the side that would actually liquidate if price
+   *    moved against it. Cap by the inverse-notional approximation:
+   *      projectedLiqDistance ≈ currentDist × legNotional / (legNotional + addNotional)
+   *      maxAdd = legNotional × (currentDist - minDist) / minDist
    *
-   *   maxAdd = legNotional × (currentLiqDistance - minDistance) / minDistance
+   * 2. **Non-binding leg** — the side whose reported liq is on the WRONG
+   *    side of current price (LONG liq ≥ currentPrice, OR SHORT liq ≤
+   *    currentPrice). This happens in cross-margin hedge mode when both
+   *    legs are open and Binance reports the WALLET's combined liq price
+   *    (which is on the dominant net-exposure side) for both per-side
+   *    entries. The non-binding leg is the OFFSET — adding to it shrinks
+   *    net exposure and IMPROVES liquidation safety, not worsens it.
+   *    Cap only by remaining max-position-size capacity.
    *
-   * This treats each leg as if its liq buffer scaled inversely with notional —
-   * a conservative simplification of cross-margin behaviour (real-world cross
-   * margin is more forgiving because the opposing leg's PnL helps absorb
-   * adverse moves, but we want a defensive upper bound, not an aggressive one).
+   * Without this distinction (v1.0.27 bug), the bot computed a negative
+   * liq distance for the non-binding leg (e.g. SHORT at 84.04 with reported
+   * liq 43.35 → distance = (43.35 - 84.04)/84.04 = -48%) and treated that
+   * as "below the 8% floor", blocking the only safe action. Fixed in v1.0.28.
    *
    * Returns null fields when the leg has no current liq data (e.g. the leg
    * doesn't exist yet, or Binance hasn't returned a liq price).
@@ -190,32 +202,55 @@ class AiMarketContext {
   _computeLiquidationCaps(longPosition, shortPosition, marginInfo) {
     if (!marginInfo) return null;
     const minDist = MIN_LIQ_DISTANCE_PCT;
+    const currentPrice = this.strategy.currentPrice || 0;
+    const maxTotal = this.strategy.maxPositionSizeUSDT || 0;
 
     let maxAddLongUSDT = null;
     let maxAddShortUSDT = null;
+    let longBinding = false;
+    let shortBinding = false;
 
     const longNotional = longPosition?.notional || 0;
     const shortNotional = shortPosition?.notional || 0;
+    const totalNotional = longNotional + shortNotional;
+    const remainingCapacity = Math.max(0, maxTotal - totalNotional);
+
+    const longLiqPrice = marginInfo.longLiqPrice;
+    const shortLiqPrice = marginInfo.shortLiqPrice;
     const longDist = marginInfo.longLiqDistancePct;
     const shortDist = marginInfo.shortLiqDistancePct;
 
-    if (longNotional > 0 && longDist != null) {
-      if (longDist <= minDist) {
-        // Already at or below floor — no further ADD allowed.
-        maxAddLongUSDT = 0;
+    // LONG leg: binding when liq price is BELOW current price (the natural direction).
+    if (longNotional > 0) {
+      longBinding = longLiqPrice != null && longLiqPrice > 0 && currentPrice > 0
+        && longLiqPrice < currentPrice;
+      if (longBinding && longDist != null) {
+        maxAddLongUSDT = longDist <= minDist
+          ? 0
+          : Math.max(0, longNotional * (longDist - minDist) / minDist);
       } else {
-        maxAddLongUSDT = Math.max(0, longNotional * (longDist - minDist) / minDist);
+        // Non-binding (or no data) — fall back to position-size cap only.
+        maxAddLongUSDT = remainingCapacity;
       }
-    }
-    if (shortNotional > 0 && shortDist != null) {
-      if (shortDist <= minDist) {
-        maxAddShortUSDT = 0;
-      } else {
-        maxAddShortUSDT = Math.max(0, shortNotional * (shortDist - minDist) / minDist);
-      }
+      // Always also bounded by remaining capacity, never above it.
+      maxAddLongUSDT = Math.min(maxAddLongUSDT, remainingCapacity);
     }
 
-    return { maxAddLongUSDT, maxAddShortUSDT };
+    // SHORT leg: binding when liq price is ABOVE current price.
+    if (shortNotional > 0) {
+      shortBinding = shortLiqPrice != null && shortLiqPrice > 0 && currentPrice > 0
+        && shortLiqPrice > currentPrice;
+      if (shortBinding && shortDist != null) {
+        maxAddShortUSDT = shortDist <= minDist
+          ? 0
+          : Math.max(0, shortNotional * (shortDist - minDist) / minDist);
+      } else {
+        maxAddShortUSDT = remainingCapacity;
+      }
+      maxAddShortUSDT = Math.min(maxAddShortUSDT, remainingCapacity);
+    }
+
+    return { maxAddLongUSDT, maxAddShortUSDT, longBinding, shortBinding };
   }
 
   // ——— ATR Volatility ————————————————————————————————————————————————————
