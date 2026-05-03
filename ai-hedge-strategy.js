@@ -846,6 +846,7 @@ class AiHedgeStrategy extends TradingBase {
       maxPositionSizeUSDT: this.maxPositionSizeUSDT,
       leverage: this.leverage,
       priceType: this.priceType,
+      aiModel: this.aiModel,
       initialHedgeMultiplier: this.initialHedgeMultiplier,
       profitPercent: this.profitPercent,
       activePlan: this.activePlan ? {
