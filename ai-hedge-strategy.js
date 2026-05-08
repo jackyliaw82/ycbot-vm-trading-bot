@@ -83,6 +83,11 @@ class AiHedgeStrategy extends TradingBase {
     this.lastProcessedPrice = null;
     this._lastReplanTime = 0;
     this._replanCooldownMs = 5000;
+
+    // Paired-mode staleness timer — fires a replan if no fills happen for
+    // STALENESS_TIMEOUT_MS. Cleared on every plan install.
+    this._stalenessTimer = null;
+    this._stalenessTimeoutMs = 4 * 60 * 60 * 1000; // 4 hours
     this.isTradingSequenceInProgress = false;
 
     // Single-leg guard: track price of first ever position
@@ -220,6 +225,7 @@ class AiHedgeStrategy extends TradingBase {
     this.isStopping = true;
     this.isRunning = false;
     this.executionState = 'IDLE';
+    this._clearStalenessTimer();
 
     await this.addLog(`Stopping AI Hedge Strategy. Reason: ${reason}`);
 
@@ -527,39 +533,32 @@ class AiHedgeStrategy extends TradingBase {
         : null;
       plan.volatilitySnapshot = this._lastVolatility ? { ...this._lastVolatility } : null;
       plan.plannedAt = new Date().toISOString();
+      // Attach paired-trigger constants from context so the executor uses
+      // them when clamping shadow qty (rather than its default fallback).
+      if (context.ratioBand) plan.ratioBand = context.ratioBand;
+      if (context.shadowDistance) plan.shadowDistance = context.shadowDistance;
 
       // Install plan
       this.activePlan = plan;
       this.executor.setActivePlan(plan);
       this.executionState = 'EXECUTING_PLAN';
 
-      await this.addLog(`AI Plan installed.`);
+      await this.addLog(`AI Plan installed${plan._schema === 'paired' ? ' [paired-trigger]' : ''}${plan._fellBack ? ' [fell back to legacy]' : ''}.`);
       await this.addLog(`Analysis: ${plan.analysis || 'N/A'}`);
 
-      if (plan.actionAbove) {
-        if (plan.actionAbove.type === 'OPEN_HEDGE') {
-          await this.addLog(`  ABOVE: OPEN_HEDGE at ${this._formatPrice(plan.actionAbove.triggerPrice)} — LONG ${plan.actionAbove.longSizeUSDT} / SHORT ${plan.actionAbove.shortSizeUSDT} USDT`);
-        } else if (plan.actionAbove.type === 'HOLD') {
-          await this.addLog(`  ABOVE: HOLD (${plan.actionAbove.reason})`);
-        } else {
-          await this.addLog(`  ABOVE: ${plan.actionAbove.type} at ${this._formatPrice(plan.actionAbove.triggerPrice)} — ${plan.actionAbove.sizeUSDT} USDT (${plan.actionAbove.reason})`);
-        }
-      }
-      if (plan.actionBelow) {
-        if (plan.actionBelow.type === 'OPEN_HEDGE') {
-          await this.addLog(`  BELOW: OPEN_HEDGE at ${this._formatPrice(plan.actionBelow.triggerPrice)} — LONG ${plan.actionBelow.longSizeUSDT} / SHORT ${plan.actionBelow.shortSizeUSDT} USDT`);
-        } else if (plan.actionBelow.type === 'HOLD') {
-          await this.addLog(`  BELOW: HOLD (${plan.actionBelow.reason})`);
-        } else {
-          await this.addLog(`  BELOW: ${plan.actionBelow.type} at ${this._formatPrice(plan.actionBelow.triggerPrice)} — ${plan.actionBelow.sizeUSDT} USDT (${plan.actionBelow.reason})`);
-        }
+      if (plan._schema === 'paired') {
+        await this._logPairedPlan(plan);
+      } else {
+        await this._logLegacyPlan(plan);
       }
       if (plan.probabilityAssessment) {
         await this.addLog(`  Prob: ${plan.probabilityAssessment.higherChance} (${plan.probabilityAssessment.confidence}) — ${plan.probabilityAssessment.reasoning}`);
       }
 
-      // HOLD replan timer
-      const bothHold = plan.actionAbove?.type === 'HOLD' && plan.actionBelow?.type === 'HOLD';
+      // HOLD replan timer (legacy + paired-with-all-HOLD-primaries)
+      const bothHold = plan._schema === 'paired'
+        ? plan.actionAbove?.primary?.type === 'HOLD' && plan.actionBelow?.primary?.type === 'HOLD'
+        : plan.actionAbove?.type === 'HOLD' && plan.actionBelow?.type === 'HOLD';
       if (bothHold) {
         const minutes = Math.max(15, Math.min(120, plan.holdReplanMinutes || 30));
         this._holdReplanAt = Date.now() + minutes * 60 * 1000;
@@ -567,6 +566,11 @@ class AiHedgeStrategy extends TradingBase {
       } else {
         this._holdReplanAt = null;
       }
+
+      // Paired-mode 4h staleness timer — replan if no fills happen for that long.
+      // Without this, paired plans with no trigger crossings would sit unfilled
+      // indefinitely, even as market state drifts away from where the plan was made.
+      this._resetStalenessTimer();
 
       await this.saveState();
 
@@ -611,62 +615,149 @@ class AiHedgeStrategy extends TradingBase {
     }
   }
 
+  /**
+   * Execute one action and record state. Returns { isHold } so callers can
+   * branch. Used both by _executeTriggeredAction (initial fire) and by the
+   * paired-mode cascade loop (subsequent fires within the same tick).
+   */
+  async _runActionAndRecord(action, direction) {
+    const result = await this.executor.executeAction(action);
+
+    if (action.type === 'HOLD') return { isHold: true };
+
+    this.tradeCount++;
+
+    // Track first position price for single-leg guard
+    if (!this.firstPositionPrice && this.currentPrice) {
+      this.firstPositionPrice = this.currentPrice;
+      if (this.riskGuard) this.riskGuard.firstPositionPrice = this.currentPrice;
+    }
+
+    // Transition from INITIAL to DCA after OPEN_HEDGE
+    if (action.type === 'OPEN_HEDGE') {
+      this.phase = 'DCA';
+      await this.addLog('Phase transition: INITIAL -> DCA');
+    }
+
+    const outcome = {
+      action, direction, result,
+      price: this.currentPrice,
+      timestamp: new Date(),
+      longPosition: this.longPosition ? { ...this.longPosition } : null,
+      shortPosition: this.shortPosition ? { ...this.shortPosition } : null,
+    };
+
+    this.planHistory.push({ plan: this.activePlan, direction, triggeredAction: action, outcome, timestamp: new Date() });
+    await this._savePlanToFirestore(this.activePlan, outcome);
+
+    // Refresh positions. expectNonEmpty: we just placed orders, so if REST
+    // returns null/null it's the Binance /fapi/v2/account propagation race —
+    // retry with short backoff inside _refreshHedgePositions.
+    await this.detectCurrentPosition(true);
+    await this._refreshHedgePositions({ expectNonEmpty: true });
+
+    await this.addLog(
+      `Trade #${this.tradeCount}. ` +
+      `LONG: ${this.longPosition ? this._formatNotional(this.longPosition.notional) + ' @ ' + this._formatPrice(this.longPosition.entryPrice) : 'none'}, ` +
+      `SHORT: ${this.shortPosition ? this._formatNotional(this.shortPosition.notional) + ' @ ' + this._formatPrice(this.shortPosition.entryPrice) : 'none'}, ` +
+      `Gap: ${this._formatPrice(this.hedgeGap)}, P&L: ${this._formatNotional(this.lockedProfit)} USDT`
+    );
+
+    return { isHold: false };
+  }
+
   async _executeTriggeredAction(triggeredAction) {
     const { action, direction } = triggeredAction;
-    await this.addLog(`Executing (${direction}): ${action.type} — ${action.reason}`);
+    await this.addLog(`Executing (${direction}): ${action.type}${action.kind ? ' ' + action.kind : ''} — ${action.reason}`);
 
     try {
-      const result = await this.executor.executeAction(action);
-
-      if (action.type === 'HOLD') {
+      const { isHold } = await this._runActionAndRecord(action, direction);
+      if (isHold) {
         await this._requestNewPlan('execution_complete');
         return;
       }
 
-      this.tradeCount++;
-
-      // Track first position price for single-leg guard
-      if (!this.firstPositionPrice && this.currentPrice) {
-        this.firstPositionPrice = this.currentPrice;
-        if (this.riskGuard) this.riskGuard.firstPositionPrice = this.currentPrice;
+      // Paired-mode cascade: if multiple triggers crossed within the same
+      // tick (e.g. price spike past both shadow_LONG and primary_SHORT on
+      // an upward move), fire all crossed actions in closest-first order
+      // before the AI replans. Without this, only the closest fires per
+      // tick and the rest are canceled by the post-fill replan, costing
+      // legitimate fills during fast moves.
+      if (this.activePlan?._schema === 'paired') {
+        let cascaded;
+        while ((cascaded = this.executor.checkImmediateTriggers(this.currentPrice))) {
+          await this.addLog(`Cascade fill (${cascaded.direction}): ${cascaded.action.type}${cascaded.action.kind ? ' ' + cascaded.action.kind : ''} @ ${this._formatPrice(cascaded.action.triggerPrice)}`);
+          const r = await this._runActionAndRecord(cascaded.action, cascaded.direction);
+          if (r.isHold) break;
+        }
       }
-
-      // Transition from INITIAL to DCA after OPEN_HEDGE
-      if (action.type === 'OPEN_HEDGE') {
-        this.phase = 'DCA';
-        await this.addLog('Phase transition: INITIAL -> DCA');
-      }
-
-      const outcome = {
-        action,
-        direction,
-        result,
-        price: this.currentPrice,
-        timestamp: new Date(),
-        longPosition: this.longPosition ? { ...this.longPosition } : null,
-        shortPosition: this.shortPosition ? { ...this.shortPosition } : null,
-      };
-
-      this.planHistory.push({ plan: this.activePlan, direction, triggeredAction: action, outcome, timestamp: new Date() });
-      await this._savePlanToFirestore(this.activePlan, outcome);
-
-      // Refresh positions. expectNonEmpty: we just placed orders, so if REST
-      // returns null/null it's the Binance /fapi/v2/account propagation race —
-      // retry with short backoff inside _refreshHedgePositions.
-      await this.detectCurrentPosition(true);
-      await this._refreshHedgePositions({ expectNonEmpty: true });
-
-      await this.addLog(
-        `Trade #${this.tradeCount}. ` +
-        `LONG: ${this.longPosition ? this._formatNotional(this.longPosition.notional) + ' @ ' + this._formatPrice(this.longPosition.entryPrice) : 'none'}, ` +
-        `SHORT: ${this.shortPosition ? this._formatNotional(this.shortPosition.notional) + ' @ ' + this._formatPrice(this.shortPosition.entryPrice) : 'none'}, ` +
-        `Gap: ${this._formatPrice(this.hedgeGap)}, P&L: ${this._formatNotional(this.lockedProfit)} USDT`
-      );
 
       await this._requestNewPlan('execution_complete');
     } catch (error) {
       await this.addLog(`ERROR: [TRADING_ERROR] ${action.type}: ${error.message}`);
       await this._requestNewPlan('execution_error');
+    }
+  }
+
+  // ——— Plan logging helpers (schema-aware) ——————————————————————————
+
+  async _logLegacyPlan(plan) {
+    if (plan.actionAbove) {
+      if (plan.actionAbove.type === 'OPEN_HEDGE') {
+        await this.addLog(`  ABOVE: OPEN_HEDGE at ${this._formatPrice(plan.actionAbove.triggerPrice)} — LONG ${plan.actionAbove.longSizeUSDT} / SHORT ${plan.actionAbove.shortSizeUSDT} USDT`);
+      } else if (plan.actionAbove.type === 'HOLD') {
+        await this.addLog(`  ABOVE: HOLD (${plan.actionAbove.reason})`);
+      } else {
+        await this.addLog(`  ABOVE: ${plan.actionAbove.type} at ${this._formatPrice(plan.actionAbove.triggerPrice)} — ${plan.actionAbove.sizeUSDT} USDT (${plan.actionAbove.reason})`);
+      }
+    }
+    if (plan.actionBelow) {
+      if (plan.actionBelow.type === 'OPEN_HEDGE') {
+        await this.addLog(`  BELOW: OPEN_HEDGE at ${this._formatPrice(plan.actionBelow.triggerPrice)} — LONG ${plan.actionBelow.longSizeUSDT} / SHORT ${plan.actionBelow.shortSizeUSDT} USDT`);
+      } else if (plan.actionBelow.type === 'HOLD') {
+        await this.addLog(`  BELOW: HOLD (${plan.actionBelow.reason})`);
+      } else {
+        await this.addLog(`  BELOW: ${plan.actionBelow.type} at ${this._formatPrice(plan.actionBelow.triggerPrice)} — ${plan.actionBelow.sizeUSDT} USDT (${plan.actionBelow.reason})`);
+      }
+    }
+  }
+
+  async _logPairedPlan(plan) {
+    const fmt = (a) => {
+      if (!a || a.type === 'HOLD' || a.type === 'SKIP') return `${a?.type || 'NONE'}${a?.reason ? ' (' + a.reason + ')' : ''}`;
+      return `${a.type} at ${this._formatPrice(a.triggerPrice)} — ${a.qty} ${this.symbol?.replace('USDT', '') || 'qty'}`;
+    };
+    if (plan.actionAbove) {
+      await this.addLog(`  ABOVE primary: ${fmt(plan.actionAbove.primary)}`);
+      await this.addLog(`  ABOVE shadow:  ${fmt(plan.actionAbove.shadow)}`);
+    }
+    if (plan.actionBelow) {
+      await this.addLog(`  BELOW primary: ${fmt(plan.actionBelow.primary)}`);
+      await this.addLog(`  BELOW shadow:  ${fmt(plan.actionBelow.shadow)}`);
+    }
+    if (this.executor?.clampWarnings?.length) {
+      for (const w of this.executor.clampWarnings) {
+        await this.addLog(`  CLAMP ${w.sideKey}.${w.shadowType}: proposed ${w.proposed} → ${w.final} (${w.reason}, max ${w.maxAllowed?.toFixed(4)})`);
+      }
+    }
+  }
+
+  _resetStalenessTimer() {
+    if (this._stalenessTimer) clearTimeout(this._stalenessTimer);
+    this._stalenessTimer = setTimeout(() => {
+      this._stalenessTimer = null;
+      if (!this.isStopping && this.isRunning) {
+        this.addLog(`Staleness timer fired (${(this._stalenessTimeoutMs / 60000).toFixed(0)} min). Requesting fresh plan.`)
+          .catch(() => {});
+        this._requestNewPlan('staleness').catch((e) => console.error(`Staleness replan failed: ${e.message}`));
+      }
+    }, this._stalenessTimeoutMs);
+  }
+
+  _clearStalenessTimer() {
+    if (this._stalenessTimer) {
+      clearTimeout(this._stalenessTimer);
+      this._stalenessTimer = null;
     }
   }
 

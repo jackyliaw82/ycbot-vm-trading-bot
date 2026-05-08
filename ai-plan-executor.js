@@ -12,6 +12,8 @@
  * Supports OPEN_HEDGE (Phase 1) which opens both LONG and SHORT simultaneously,
  * and ADD/CUT actions (Phase 2) for DCA.
  */
+const RATIO_BAND_DEFAULT = { lower: 0.85, upper: 1.15 };
+
 class AiPlanExecutor {
   /**
    * Pure helper: clamp a shadow qty proposal so the post-fill LONG/SHORT
@@ -58,22 +60,96 @@ class AiPlanExecutor {
   constructor(strategy) {
     this.strategy = strategy;
     this.activePlan = null;
-    this.pendingActions = []; // Two actions: one ABOVE, one BELOW
+    this.pendingActions = []; // Legacy: 2 actions. Paired: up to 4 (primary+shadow per side).
+    this.isPairedMode = false; // True iff the active plan uses the v2.0.0 paired schema.
+    this.clampWarnings = []; // Per-cycle log of qty clamps applied at install time.
   }
 
   /**
-   * Install a new dual-action plan.
+   * Install a new plan. Detects schema via plan._schema and unpacks accordingly.
+   * - Legacy: 2 pending actions (one ABOVE, one BELOW), single-fire-cancels-other semantics.
+   * - Paired: up to 4 pending actions (primary + shadow per side), no cross-cancellation
+   *   so price moves through both shadow and primary fire both. Shadow qty is clamped
+   *   here as a final safety net (AI is asked to pre-clamp in Phase D).
    */
   setActivePlan(plan) {
     this.activePlan = plan;
     this.pendingActions = [];
+    this.clampWarnings = [];
+    this.isPairedMode = plan?._schema === 'paired';
 
+    if (this.isPairedMode) {
+      this._installPairedPlan(plan);
+    } else {
+      this._installLegacyPlan(plan);
+    }
+  }
+
+  _installLegacyPlan(plan) {
     if (plan.actionAbove) {
-      this.pendingActions.push({ ...plan.actionAbove, direction: 'ABOVE', executed: false });
+      this.pendingActions.push({ ...plan.actionAbove, direction: 'ABOVE', kind: 'primary', executed: false });
     }
     if (plan.actionBelow) {
-      this.pendingActions.push({ ...plan.actionBelow, direction: 'BELOW', executed: false });
+      this.pendingActions.push({ ...plan.actionBelow, direction: 'BELOW', kind: 'primary', executed: false });
     }
+  }
+
+  _installPairedPlan(plan) {
+    const longQty = this.strategy?.longPosition?.quantity || 0;
+    const shortQty = this.strategy?.shortPosition?.quantity || 0;
+    const ratioBand = plan.ratioBand || RATIO_BAND_DEFAULT;
+
+    const installPair = (sideKey, direction) => {
+      const side = plan[sideKey];
+      if (!side) return;
+
+      // Primary
+      if (side.primary && side.primary.type !== 'HOLD') {
+        this.pendingActions.push({
+          type: side.primary.type,
+          triggerPrice: side.primary.triggerPrice,
+          quantity: side.primary.qty, // qty in SOL (paired schema), not USDT
+          reason: side.primary.reason,
+          direction,
+          kind: 'primary',
+          executed: false,
+        });
+      }
+
+      // Shadow — clamp qty as final safety net before placing
+      if (side.shadow && side.shadow.type !== 'SKIP') {
+        const shadowSide = side.shadow.type === 'ADD_LONG' ? 'shadow_long' : 'shadow_short';
+        const clamp = AiPlanExecutor.clampShadowQty(
+          shadowSide,
+          side.shadow.qty,
+          longQty,
+          shortQty,
+          ratioBand,
+        );
+        if (clamp.wasClamped) {
+          this.clampWarnings.push({
+            sideKey, shadowType: side.shadow.type,
+            proposed: side.shadow.qty, final: clamp.finalQty,
+            reason: clamp.reason, maxAllowed: clamp.maxAllowed,
+          });
+        }
+        if (clamp.finalQty > 0) {
+          this.pendingActions.push({
+            type: side.shadow.type,
+            triggerPrice: side.shadow.triggerPrice,
+            quantity: clamp.finalQty,
+            reason: side.shadow.reason,
+            direction,
+            kind: 'shadow',
+            executed: false,
+            clampInfo: clamp.wasClamped ? { proposed: side.shadow.qty, reason: clamp.reason } : null,
+          });
+        }
+      }
+    };
+
+    installPair('actionAbove', 'ABOVE');
+    installPair('actionBelow', 'BELOW');
   }
 
   /**
@@ -83,7 +159,18 @@ class AiPlanExecutor {
   checkImmediateTriggers(currentPrice) {
     if (!this.pendingActions || this.pendingActions.length === 0) return null;
 
-    for (const action of this.pendingActions) {
+    // Order ABOVE actions ascending (closest-to-current first), BELOW descending
+    // (closest-to-current first). Ensures shadow fires before primary on the
+    // same side when both are crossed by an immediate price-spike at install time.
+    const sorted = [...this.pendingActions].sort((a, b) => {
+      if (a.direction === b.direction) {
+        if (a.direction === 'ABOVE') return a.triggerPrice - b.triggerPrice;  // lower first
+        return b.triggerPrice - a.triggerPrice;                                // higher first
+      }
+      return 0;
+    });
+
+    for (const action of sorted) {
       if (action.executed || !action.triggerPrice) continue;
 
       let triggered = false;
@@ -92,8 +179,14 @@ class AiPlanExecutor {
 
       if (triggered) {
         action.executed = true;
-        for (const other of this.pendingActions) {
-          if (other !== action) other.executed = true;
+        // Legacy: cancel siblings so only one ADD/CUT fires per cycle.
+        // Paired: leave siblings alive — primary on same side, or shadow on
+        // the opposite side, may still fire on subsequent ticks (or right
+        // after this one via the strategy's cascade loop).
+        if (!this.isPairedMode) {
+          for (const other of this.pendingActions) {
+            if (other !== action) other.executed = true;
+          }
         }
         return { action, direction: action.direction };
       }
@@ -108,7 +201,16 @@ class AiPlanExecutor {
   checkTriggers(prevPrice, currentPrice) {
     if (!this.pendingActions || this.pendingActions.length === 0) return null;
 
-    for (const action of this.pendingActions) {
+    // Same closest-first ordering as checkImmediateTriggers.
+    const sorted = [...this.pendingActions].sort((a, b) => {
+      if (a.direction === b.direction) {
+        if (a.direction === 'ABOVE') return a.triggerPrice - b.triggerPrice;
+        return b.triggerPrice - a.triggerPrice;
+      }
+      return 0;
+    });
+
+    for (const action of sorted) {
       if (action.executed || !action.triggerPrice) continue;
 
       let triggered = false;
@@ -120,8 +222,10 @@ class AiPlanExecutor {
 
       if (triggered) {
         action.executed = true;
-        for (const other of this.pendingActions) {
-          if (other !== action) other.executed = true;
+        if (!this.isPairedMode) {
+          for (const other of this.pendingActions) {
+            if (other !== action) other.executed = true;
+          }
         }
         return { action, direction: action.direction };
       }
