@@ -96,6 +96,16 @@ class AiHedgeStrategy extends TradingBase {
     // HOLD replan timer
     this._holdReplanAt = null;
 
+    // Auto-stop hysteresis: require sustained target hit (N consecutive
+    // ticks AND min elapsed duration) before closing out. Defends against
+    // single-tick wicks where a transient unrealized-PnL spike on one leg
+    // would otherwise force a full close at a price that immediately
+    // mean-reverts. Reset to null/0 on any tick where PnL drops below target.
+    this._targetReachedSinceTs = null;
+    this._targetReachedTickCount = 0;
+    this._targetMinTicks = 3;
+    this._targetMinDurationMs = 2500;
+
     // AI token usage tracking
     this.aiTokenUsage = { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheCreation: 0, planCount: 0 };
 
@@ -363,7 +373,9 @@ class AiHedgeStrategy extends TradingBase {
     this.lastProcessedPrice = price;
     this._updateUnrealizedPnL(price);
 
-    // Auto-stop check: totalPnL >= effectiveTarget
+    // Auto-stop check with hysteresis (C3): totalPnL >= effectiveTarget
+    // must hold for N consecutive ticks AND a minimum elapsed duration
+    // before stopping. Single-tick wicks reset the watermark.
     if (this.desiredProfitUSDT && this.phase === 'DCA') {
       const longNotional = this.longPosition?.notional || 0;
       const shortNotional = this.shortPosition?.notional || 0;
@@ -371,9 +383,25 @@ class AiHedgeStrategy extends TradingBase {
       const effectiveTarget = this.desiredProfitUSDT + estimatedClosingFees;
 
       if (this.totalPnL >= effectiveTarget) {
-        await this.addLog(`TARGET REACHED: PnL ${this._formatNotional(this.totalPnL)} >= Target ${this._formatNotional(effectiveTarget)} USDT`);
-        await this.stop('profit_target_reached');
-        return;
+        if (this._targetReachedSinceTs === null) {
+          this._targetReachedSinceTs = Date.now();
+          this._targetReachedTickCount = 1;
+          await this.addLog(`TARGET HIT: PnL ${this._formatNotional(this.totalPnL)} >= Target ${this._formatNotional(effectiveTarget)} — confirming for ${this._targetMinTicks} ticks / ${this._targetMinDurationMs}ms before stop`);
+        } else {
+          this._targetReachedTickCount++;
+        }
+
+        const elapsed = Date.now() - this._targetReachedSinceTs;
+        if (this._targetReachedTickCount >= this._targetMinTicks && elapsed >= this._targetMinDurationMs) {
+          await this.addLog(`TARGET CONFIRMED: PnL ${this._formatNotional(this.totalPnL)} >= Target ${this._formatNotional(effectiveTarget)} sustained ${this._targetReachedTickCount} ticks / ${elapsed}ms`);
+          await this.stop('profit_target_reached');
+          return;
+        }
+      } else if (this._targetReachedSinceTs !== null) {
+        const sustainedFor = Date.now() - this._targetReachedSinceTs;
+        await this.addLog(`TARGET LOST: PnL ${this._formatNotional(this.totalPnL)} < Target ${this._formatNotional(effectiveTarget)} after ${this._targetReachedTickCount} ticks / ${sustainedFor}ms — wick filtered, resetting watermark`);
+        this._targetReachedSinceTs = null;
+        this._targetReachedTickCount = 0;
       }
     }
 
