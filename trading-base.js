@@ -1398,6 +1398,15 @@ class TradingBase {
     }
     this.realtimeReconnectAttempts = 0;
 
+    // M2 staleness thresholds. lastRealtimeTickAt is updated only on
+    // SUCCESSFUL polls in fallback mode, so it's a clean staleness signal.
+    const STALENESS_WARN_MS = 30 * 1000;
+    const STALENESS_BLOCK_MS = 60 * 1000;
+    const STALENESS_HALT_MS = 5 * 60 * 1000;
+    this._priceFeedStale = false;
+    this._restPollErrorCount = 0;
+    this._restPollLastErrorLoggedAt = 0;
+
     // Start REST polling for the mark price.
     this._restPollInterval = setInterval(async () => {
       if (this.streamMode !== 'REST_FALLBACK' || !this.isRunning) return;
@@ -1411,16 +1420,45 @@ class TradingBase {
         );
         if (data && data.markPrice) {
           this.lastRealtimeTickAt = Date.now();
+          if (this._priceFeedStale) {
+            await this.addLog('[REST_FALLBACK] Price feed RECOVERED. Resuming normal operation.');
+            this._priceFeedStale = false;
+            this._restPollErrorCount = 0;
+          }
           await this.handleRealtimePrice(parseFloat(data.markPrice));
         }
       } catch (error) {
-        // Don't log every poll error — would flood logs. Watchdog-style: log
-        // only periodically by counting failures.
-        if (!this._restPollErrorCount) this._restPollErrorCount = 0;
         this._restPollErrorCount++;
-        if (this._restPollErrorCount % 30 === 1) {
-          await this.addLog(`WARN: [REST_FALLBACK] poll error (#${this._restPollErrorCount}): ${error.message}`);
+        // M2: escalating log cadence — log first failure immediately,
+        // then 5th, 15th, 50th, 150th, ... so a sustained outage is
+        // surfaced loudly at the start (when the user can do something
+        // about it) without flooding logs over hours.
+        const c = this._restPollErrorCount;
+        const shouldLog = c === 1 || c === 5 || c === 15 || c === 50 || c % 150 === 0;
+        if (shouldLog) {
+          await this.addLog(`WARN: [REST_FALLBACK] poll error (#${c}): ${error.message}`);
+          this._restPollLastErrorLoggedAt = Date.now();
         }
+      }
+
+      // M2: staleness watchdog. Runs every poll regardless of success/fail.
+      const now = Date.now();
+      const stalenessMs = now - (this.lastRealtimeTickAt || now);
+      if (stalenessMs >= STALENESS_HALT_MS) {
+        // Past the no-trade-anyway threshold. Hard halt — force-stop with
+        // price_feed_dead so the user gets a notification + the positions
+        // are closed cleanly while we still trust the last known prices
+        // for the close-orders to land sensibly.
+        await this.addLog(`ERROR: [REST_FALLBACK] Price feed dead for ${Math.round(stalenessMs / 1000)}s. Halting strategy — positions will be closed.`);
+        this.criticalError = 'price_feed_dead';
+        clearInterval(this._restPollInterval);
+        this._restPollInterval = null;
+        this.stop('price_feed_dead').catch(err => console.error(`[REST_FALLBACK] halt failed: ${err.message}`));
+        return;
+      }
+      if (stalenessMs >= STALENESS_BLOCK_MS && !this._priceFeedStale) {
+        this._priceFeedStale = true;
+        await this.addLog(`ERROR: [REST_FALLBACK] Price feed stale for ${Math.round(stalenessMs / 1000)}s. Trading actions blocked until recovery; will halt at ${STALENESS_HALT_MS / 1000}s if not recovered.`);
       }
     }, REST_POLL_INTERVAL_MS);
 

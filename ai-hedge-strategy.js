@@ -1290,6 +1290,7 @@ class AiHedgeStrategy extends TradingBase {
       realtimeWsConnected: this.realtimeWsConnected,
       userDataWsConnected: this.userDataWsConnected,
       streamMode: this.streamMode || 'WS',
+      priceFeedStale: !!this._priceFeedStale,
       volatility: this._lastVolatility,
       microstructure: this._lastMicrostructure,
       firstPositionPrice: this.firstPositionPrice,
