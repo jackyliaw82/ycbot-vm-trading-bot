@@ -790,7 +790,11 @@ class TradingBase {
     const { minQty, maxQty, stepSize, precision, minNotional } = await this._getExchangeInfo(symbol);
 
     let rawQuantity = positionSizeUSDT / priceUsedForCalculation;
-    let adjustedQuantity = Math.ceil(rawQuantity / stepSize) * stepSize;
+    // Floor (not ceil) to avoid overshooting the intended sizeUSDT — overshoot
+    // can trip max-position / liquidation caps at the boundary, and (critically)
+    // makes CUT actions reject with `-2018 insufficient position`. A small
+    // shortfall is acceptable; a few stepSizes of overshoot is not.
+    let adjustedQuantity = Math.floor(rawQuantity / stepSize) * stepSize;
     adjustedQuantity = parseFloat(adjustedQuantity.toFixed(precision));
 
     if (adjustedQuantity < minQty) adjustedQuantity = minQty;
@@ -798,6 +802,9 @@ class TradingBase {
 
     const notionalValue = adjustedQuantity * priceUsedForCalculation;
     if (notionalValue < minNotional) {
+      // Bump UP to satisfy Binance minNotional — this Math.ceil is intentional
+      // and the only place it's used. The notional floor is a hard exchange
+      // requirement; a tiny overshoot here is preferable to order rejection.
       adjustedQuantity = Math.ceil(minNotional / priceUsedForCalculation / stepSize) * stepSize;
       adjustedQuantity = parseFloat(adjustedQuantity.toFixed(precision));
     }

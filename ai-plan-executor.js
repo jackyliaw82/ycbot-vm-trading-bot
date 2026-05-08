@@ -259,6 +259,30 @@ class AiPlanExecutor {
     }
     quantity = strategy.roundQuantity(quantity);
 
+    // Belt-and-suspenders for CUT actions: even with floor-rounding upstream,
+    // hard-clamp the qty against the actual leg quantity so a CUT can NEVER
+    // exceed what's there. Prevents Binance error `-2018 insufficient position`
+    // which would silently fail the CUT and leave the strategy in deadlock.
+    // The clamped qty is re-rounded (floor) so the request stays on a stepSize
+    // multiple even after clamp.
+    if (action.type === 'CUT_LONG' && strategy.longPosition && strategy.longPosition.quantity > 0) {
+      if (quantity > strategy.longPosition.quantity) {
+        const before = quantity;
+        quantity = strategy.roundQuantity(strategy.longPosition.quantity);
+        await strategy.addLog(`[AI] CUT_LONG clamp: requested ${before} > leg qty ${strategy.longPosition.quantity}, capped at ${quantity}`);
+      }
+    }
+    if (action.type === 'CUT_SHORT' && strategy.shortPosition && strategy.shortPosition.quantity > 0) {
+      if (quantity > strategy.shortPosition.quantity) {
+        const before = quantity;
+        quantity = strategy.roundQuantity(strategy.shortPosition.quantity);
+        await strategy.addLog(`[AI] CUT_SHORT clamp: requested ${before} > leg qty ${strategy.shortPosition.quantity}, capped at ${quantity}`);
+      }
+    }
+    if ((action.type === 'CUT_LONG' || action.type === 'CUT_SHORT') && (!quantity || quantity <= 0)) {
+      throw new Error(`Cannot execute ${action.type}: clamped quantity is ${quantity} (leg has nothing to CUT)`);
+    }
+
     let result;
     let restSide = null;
     let restPositionSide = null;

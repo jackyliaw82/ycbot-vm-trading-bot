@@ -109,12 +109,30 @@ class PrecisionFormatter {
   }
 
   /**
-   * Round quantity to symbol-specific precision (returns number)
+   * Round quantity to symbol-specific stepSize, ALWAYS floored.
+   *
+   * Floor (not banker's rounding via toFixed) is critical for trading correctness:
+   *   - For ADD: rounding UP overshoots intended notional and can trip
+   *     liquidation caps / max-position-size boundaries.
+   *   - For CUT: rounding UP can make the closed qty exceed the leg's actual
+   *     qty → Binance rejects with `-2018 insufficient position` and the
+   *     CUT silently fails (which defeats CUT-driven escalation that breaks
+   *     deadlocks).
+   *
+   * Implementation: floor on the stepSize multiple, then toFixed to clean up
+   * floating-point representation noise (e.g., 1.0049999...).
    */
   roundQuantity(quantity, symbol) {
     if (!symbol || !this.precisionCache[symbol]) return quantity;
-    const precision = this.precisionCache[symbol].quantityPrecision;
-    return parseFloat(quantity.toFixed(precision));
+    const { stepSize, quantityPrecision } = this.precisionCache[symbol];
+    if (typeof stepSize === 'number' && stepSize > 0) {
+      const floored = Math.floor(quantity / stepSize) * stepSize;
+      return parseFloat(floored.toFixed(quantityPrecision));
+    }
+    // Fallback when stepSize is unavailable (shouldn't happen post-cache):
+    // floor by precision instead of toFixed (which is banker's rounding).
+    const factor = Math.pow(10, quantityPrecision);
+    return Math.floor(quantity * factor) / factor;
   }
 
   /**
