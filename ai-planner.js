@@ -69,7 +69,9 @@ Gap projection formulas:
 - For actionBelow (ADD_LONG):  projectedGap = **currentShortAvg** - projectedLongAvg
 
 Rules (applied to each side's single-action projection):
-1. Gap must stay **positive** (or at least >= 0). If projected gap < 0, reject the action and choose a different trigger price or use HOLD.
+1. Gap must stay **positive** (or at least >= 0). If projected gap < 0, reject the action and choose a different trigger price.
+   - If EVERY reachable trigger price on this side projects a negative gap (the side is "gap-flip-blocked"), AND the OTHER side is ALSO blocked (gap-flip / liq cap = 0 / margin > 85%), DO NOT emit HOLD/HOLD — escalate to CUT per **CUT-DRIVEN ESCALATION** below.
+   - If only ONE side is gap-flip-blocked and the other side has a viable ADD, the unblocked side ADDs as normal and the blocked side stays HOLD (single-side HOLD is acceptable; only HOLD/HOLD deadlock triggers CUT).
 2. Gap can shrink slightly but aim to WIDEN it. If an action would shrink the gap by more than 30% vs the current gap, reconsider.
 3. Show both single-action gap projections in the analysis field so the reasoning is transparent. Do NOT compute a combined "both-executed" gap — that scenario never happens.
 
@@ -123,9 +125,44 @@ effectiveTarget = desiredProfit + estimatedClosingFees
 The strategy auto-stops when totalPnL >= effectiveTarget. You do not need to plan CLOSE_HEDGE or TP.
 
 ## MARGIN SAFETY
-- If margin usage > 70%: prioritize CUT to free margin
-- If account liquidation distance < 3%: CRITICAL — CUT both sides immediately
-- Never add when margin usage > 85%
+- If margin usage > 70%: prioritize CUT to free margin.
+- **If margin usage > 85%: HARD RULE — the plan MUST emit at least one CUT action. HOLD/HOLD is FORBIDDEN at margin > 85%. This rule overrides gap preservation, totalPnL-target optimization, and any other consideration. CUT the heavier leg by enough to bring margin usage to ≤ 70%. See CUT-DRIVEN ESCALATION below for sizing.** At 85%+ margin you are one adverse tick from forced liquidation; preservation must yield to active de-risking.
+- If account liquidation distance < 3%: CRITICAL — CUT both sides immediately.
+- Never ADD when margin usage > 85% (the only allowed action types when margin > 85% are CUT_LONG, CUT_SHORT, or HOLD on a side that has nothing to CUT).
+
+## CUT-DRIVEN ESCALATION
+When a rule below requires a CUT, compute \`cutSizeUSDT\` using this formula and emit the appropriate \`CUT_LONG\` or \`CUT_SHORT\` action with that size in the corresponding actionAbove (CUT_SHORT) or actionBelow (CUT_LONG) slot.
+
+**When CUT is required (per the corresponding rule):**
+1. **Liq cap below floor or = 0** on a side (\`maxAddXxxUSDT < minNotional × 2\` or = 0): CUT that **same leg** to recover its liq buffer. Does not require both sides to be blocked.
+2. **Margin > 85%**: CUT the **heavier leg** to free margin. HARD rule — overrides all other considerations.
+3. **Both sides gap-flip-blocked** (every reachable trigger projects negative gap on both ABOVE and BELOW): CUT the **heavier leg** to break the deadlock.
+
+(Imbalance > 5:1 already produces CUT-on-heavier + HOLD-on-lighter via the existing CUT-only mode rule — no escalation needed.)
+
+**CUT sizing formula (for any rule-driven CUT):**
+
+\`\`\`
+target = max(
+  notional needed to restore THIS leg's projected liq distance to 12% (8% MIN_LIQ_DISTANCE_PCT + 4% buffer),
+  notional needed to bring margin usage to ≤ 70%,
+  notional needed to bring imbalance to ≤ 3:1
+)
+
+cutSizeUSDT = clamp(target, minNotional × 2, 0.5 × legNotional)
+\`\`\`
+
+**Worked example** (matches the stuck-strategy log scenario): SHORT notional 1417 USDT, LONG notional 309 USDT, margin 98%, SHORT liq cap = 0, ADD_LONG flips gap on every trigger.
+- Liq-recovery target: ~250 USDT of CUT_SHORT brings SHORT liq distance from 8% → ~12% (rough rule of thumb: cut ~1.5× the gap-to-target).
+- Margin target: cutting 320 USDT of SHORT brings margin from 98% to ~70%.
+- Imbalance target: SHORT must be ≤ 3 × LONG = 927 USDT, so cut ≥ 490 USDT.
+- target = max(250, 320, 490) = 490 USDT.
+- Cap at 50% × 1417 = 708. clamp(490, 10, 708) = 490 USDT.
+- Result: \`{"type":"CUT_SHORT","triggerPrice":<currentPrice>,"sizeUSDT":490,"reason":"..."}\` in actionAbove. actionBelow holds (still gap-flip-blocked) or also CUTs if rule requires.
+
+CUT actions don't need a future trigger price — set \`triggerPrice\` near current price (within ±0.1% of currentPrice) so the executor fires it on the next tick.
+
+**Document in analysis:** which rule(s) triggered the CUT, the three target values, the chosen cutSizeUSDT, and the projected post-CUT margin / liq distance / imbalance.
 
 ## LIQUIDATION-AWARE SIZING (applies to BOTH Phase 1 and Phase 2)
 Every sizeUSDT decision must respect the liquidation buffer for the leg being ADDED.
@@ -149,11 +186,8 @@ Procedure:
 
 1. Compute your normal sizing logic (intended round total + ratio).
 2. For each side: sizeUSDT[side] = min(intended × ratio[side], maxAdd[side]).
-3. If a cap pulls one side below the minNotional × 2 floor, that side becomes
-   HOLD for this plan. Document the reason as "liquidation buffer too tight".
-4. If BOTH sides' caps land below floor, emit HOLD/HOLD with a clear analysis
-   note — wait for the buffer to recover (price moves favourably for the heavier
-   leg) before resuming DCA.
+3. **If a cap pulls one side below the minNotional × 2 floor (or maxAdd is 0), that side does NOT HOLD — it CUTs.** Emit \`CUT_LONG\` or \`CUT_SHORT\` on that **same leg** with sizing per **CUT-DRIVEN ESCALATION**, sufficient to restore that leg's projected liq distance to ≥ 12%. Document the reason as "liquidation buffer too tight — CUT to recover".
+4. **If BOTH sides' caps are below floor, emit CUT on the heavier leg** (per CUT-DRIVEN ESCALATION) and HOLD or also-CUT the lighter leg per its own rule. Do NOT emit HOLD/HOLD when liq caps are blocking both sides — HOLD does nothing to recover the buffer and only delays the inevitable.
 5. Never silently over-allocate the safer side to compensate when one cap binds.
 
 ### Phase 1 (OPEN_HEDGE) — projected liq distance check
@@ -330,6 +364,8 @@ other side. Never assume both sides execute. Gap-projection formulas:
 Rules: gap must stay positive; gap can shrink slightly but aim to widen; show
 single-action gap projections in the analysis field.
 
+**Both-side gap-flip → CUT escalation:** If EVERY reachable trigger on actionAbove projects negative gap AND EVERY reachable trigger on actionBelow also projects negative gap (i.e. the only options would be HOLD/HOLD on primaries), DO NOT emit HOLD/HOLD. Instead, emit CUT on the heavier leg per **CUT-DRIVEN ESCALATION** below. If only ONE side is gap-flip-blocked and the other has a viable ADD, the unblocked side ADDs as normal and the blocked side stays HOLD (single-side HOLD is acceptable).
+
 ## ACTION TYPES (v2.0.0)
 
 ### Phase 1 only:
@@ -337,9 +373,9 @@ single-action gap projections in the analysis field.
 
 ### Phase 2 paired:
 - ADD_LONG / ADD_SHORT — primaries and shadows.
-- CUT_LONG / CUT_SHORT — primary-only when imbalance > 5:1.
+- CUT_LONG / CUT_SHORT — primary-only. Triggered by: (a) imbalance > 5:1 CUT-only mode, (b) liq cap below floor / = 0, (c) margin > 85%, (d) both-side gap-flip deadlock. See CUT-DRIVEN ESCALATION.
 - HOLD — primary-only; AI judges no good entry on this side this cycle.
-- SKIP — shadow-only; band saturated or AI judges shadow unsafe.
+- SKIP — shadow-only; band saturated, AI judges shadow unsafe, or paired-side primary is CUTting (shadow on a CUT side is always SKIP).
 
 ### Direction constraints (paired):
 - actionAbove.primary type ∈ {ADD_SHORT, CUT_SHORT, HOLD}
@@ -365,15 +401,41 @@ Strategy auto-stops at totalPnL >= effectiveTarget. Don't plan TP.
 
 ## MARGIN SAFETY
 - Margin usage > 70%: prioritize CUT to free margin.
+- **Margin usage > 85%: HARD RULE — the plan MUST emit at least one CUT primary. HOLD/HOLD primary is FORBIDDEN at margin > 85%. CUT the heavier leg per CUT-DRIVEN ESCALATION sizing. This rule overrides gap preservation, totalPnL-target optimization, and any other consideration.** At 85%+ margin you are one adverse tick from forced liquidation; preservation must yield to active de-risking.
 - Account liq distance < 3%: CUT both sides immediately.
-- Never ADD when margin usage > 85%.
+- Never ADD when margin usage > 85% (only CUT_* and HOLD on a side with nothing to CUT are allowed).
 
 ## LIQUIDATION-AWARE SIZING (Phase 2)
 The user message includes LIQUIDATION-SAFE ADD CAPS. These are HARD ceilings on USDT
 notional. Convert primary qty to USDT (\`primaryQty × triggerPrice\`); if it exceeds the
-side's cap, cap it. If the cap pulls a side below \`minNotional × 2\`, set that side's
-PRIMARY to HOLD (and SHADOW to SKIP) for this cycle. Document the reason as "liquidation
-buffer too tight".
+side's cap, cap the qty. **If the cap pulls a side below \`minNotional × 2\` (or maxAdd is 0), that side's PRIMARY does NOT HOLD — it CUTs.** Emit \`CUT_LONG\` or \`CUT_SHORT\` on the same leg (with shadow=SKIP), sized per CUT-DRIVEN ESCALATION to recover that leg's projected liq distance to ≥ 12%. Document the reason as "liquidation buffer too tight — CUT to recover".
+
+## CUT-DRIVEN ESCALATION
+When a rule above requires a CUT primary, compute \`cutSize\` (USDT) and emit a CUT_LONG (in actionBelow) or CUT_SHORT (in actionAbove) primary with that size; set the corresponding shadow.type = "SKIP".
+
+**When CUT primary is required:**
+1. **Liq cap below floor or = 0** on a side: CUT that **same leg** (does not require both sides blocked).
+2. **Margin > 85%**: CUT the **heavier leg** (by notional). Hard rule — overrides everything.
+3. **Both primaries gap-flip-blocked** (every reachable trigger projects negative gap on both sides): CUT the **heavier leg**.
+
+(Imbalance > 5:1 already produces CUT-on-heavier + HOLD-on-lighter via the existing CUT-only mode rule — no escalation needed.)
+
+**Sizing formula:**
+
+\`\`\`
+target = max(
+  notional needed to restore THIS leg's projected liq distance to 12% (8% floor + 4% buffer),
+  notional needed to bring margin usage to ≤ 70%,
+  notional needed to bring imbalance to ≤ 3:1
+)
+
+cutSizeUSDT = clamp(target, minNotional × 2, 0.5 × legNotional)
+cutQty = cutSizeUSDT / currentPrice  (rounded to symbol qty step)
+\`\`\`
+
+**For paired schema:** the CUT primary uses the legacy-shape \`triggerPrice\` and \`qty\` (qty in SOL, computed from cutSizeUSDT / currentPrice). Set \`triggerPrice\` near currentPrice (within ±0.1%) so the executor fires it on the next tick. The shadow on the same side is SKIP.
+
+**Document in analysis:** which rule triggered the CUT, the three target values, the chosen cutSizeUSDT, and the projected post-CUT margin / liq distance / imbalance.
 
 ## RISK CONSTRAINTS
 - Max imbalance ratio: 5:1 (notional). Above → CUT-only mode.

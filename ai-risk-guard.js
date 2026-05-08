@@ -452,40 +452,89 @@ class AiRiskGuard {
       let shortSize = Math.max(positionSizeUSDT * shortRatio, floor);
       let longSize = Math.max(positionSizeUSDT * longRatio, floor);
 
-      // Apply liquidation-safe caps to fallback DCA sizes too. If a side's
-      // cap would force it below the minNotional floor, that side becomes HOLD
-      // for this plan. The other side stays as ADD with its capped size.
-      let shortHold = false;
-      let longHold = false;
+      // CUT-DRIVEN ESCALATION (mirrors the v2.0.0 prompt rule). When the AI is
+      // unavailable, the fallback now actively de-risks instead of emitting HOLD:
+      //   - margin > 85% → MUST CUT heavier leg (hard rule)
+      //   - liq cap below min floor on a side → CUT that same side
+      // CUT sizing heuristic: 30% of leg notional, clamped to [floor, 50% × leg].
+      const longNotional = longPosition?.notional || 0;
+      const shortNotional = shortPosition?.notional || 0;
+      const heavierSide = longNotional >= shortNotional ? 'LONG' : 'SHORT';
+      const marginUsage = state.marginInfo?.marginUsagePercent || 0;
+      const marginCut = marginUsage > 85;
+
+      const cutSize = (legNotional) => {
+        if (legNotional <= 0) return 0;
+        const target = legNotional * 0.30;
+        return Math.max(floor, Math.min(target, legNotional * 0.5));
+      };
+
+      // Apply liquidation-safe caps for ADD path
+      let shortCapBound = false;
+      let longCapBound = false;
       if (liquidationCaps) {
-        if (liquidationCaps.maxAddShortUSDT != null && shortSize > liquidationCaps.maxAddShortUSDT) {
-          shortSize = liquidationCaps.maxAddShortUSDT;
-          if (shortSize < floor) shortHold = true;
+        if (liquidationCaps.maxAddShortUSDT != null) {
+          if (shortSize > liquidationCaps.maxAddShortUSDT) shortSize = liquidationCaps.maxAddShortUSDT;
+          if (shortSize < floor) shortCapBound = true;
         }
-        if (liquidationCaps.maxAddLongUSDT != null && longSize > liquidationCaps.maxAddLongUSDT) {
-          longSize = liquidationCaps.maxAddLongUSDT;
-          if (longSize < floor) longHold = true;
+        if (liquidationCaps.maxAddLongUSDT != null) {
+          if (longSize > liquidationCaps.maxAddLongUSDT) longSize = liquidationCaps.maxAddLongUSDT;
+          if (longSize < floor) longCapBound = true;
         }
       }
 
-      actionAbove = shortHold ? {
-        type: 'HOLD',
-        reason: `Fallback: ADD_SHORT skipped — liquidation buffer too tight (cap < ${floor.toFixed(2)} USDT floor)`,
-      } : {
-        type: 'ADD_SHORT',
-        triggerPrice: currentPrice + gridStep * 2,
-        sizeUSDT: shortSize,
-        reason: `Fallback: DCA SHORT above (2x ATR) — ${biasNote}`,
-      };
-      actionBelow = longHold ? {
-        type: 'HOLD',
-        reason: `Fallback: ADD_LONG skipped — liquidation buffer too tight (cap < ${floor.toFixed(2)} USDT floor)`,
-      } : {
-        type: 'ADD_LONG',
-        triggerPrice: currentPrice - gridStep * 2,
-        sizeUSDT: longSize,
-        reason: `Fallback: DCA LONG below (2x ATR) — ${biasNote}`,
-      };
+      // Resolve actionAbove (SHORT side)
+      if (marginCut && heavierSide === 'SHORT' && shortNotional > 0) {
+        actionAbove = {
+          type: 'CUT_SHORT',
+          triggerPrice: currentPrice,
+          sizeUSDT: cutSize(shortNotional),
+          reason: `Fallback: margin ${marginUsage.toFixed(1)}% > 85% — CUT heavier SHORT to free margin (hard rule)`,
+        };
+      } else if (shortCapBound && shortNotional > 0) {
+        actionAbove = {
+          type: 'CUT_SHORT',
+          triggerPrice: currentPrice,
+          sizeUSDT: cutSize(shortNotional),
+          reason: `Fallback: SHORT liq cap below floor (${floor.toFixed(2)} USDT) — CUT to recover liq buffer`,
+        };
+      } else if (shortCapBound) {
+        // Cap-bound but no SHORT to cut (qty 0) → HOLD
+        actionAbove = { type: 'HOLD', reason: `Fallback: ADD_SHORT skipped — liq cap below floor and no SHORT position to CUT` };
+      } else {
+        actionAbove = {
+          type: 'ADD_SHORT',
+          triggerPrice: currentPrice + gridStep * 2,
+          sizeUSDT: shortSize,
+          reason: `Fallback: DCA SHORT above (2x ATR) — ${biasNote}`,
+        };
+      }
+
+      // Resolve actionBelow (LONG side)
+      if (marginCut && heavierSide === 'LONG' && longNotional > 0) {
+        actionBelow = {
+          type: 'CUT_LONG',
+          triggerPrice: currentPrice,
+          sizeUSDT: cutSize(longNotional),
+          reason: `Fallback: margin ${marginUsage.toFixed(1)}% > 85% — CUT heavier LONG to free margin (hard rule)`,
+        };
+      } else if (longCapBound && longNotional > 0) {
+        actionBelow = {
+          type: 'CUT_LONG',
+          triggerPrice: currentPrice,
+          sizeUSDT: cutSize(longNotional),
+          reason: `Fallback: LONG liq cap below floor (${floor.toFixed(2)} USDT) — CUT to recover liq buffer`,
+        };
+      } else if (longCapBound) {
+        actionBelow = { type: 'HOLD', reason: `Fallback: ADD_LONG skipped — liq cap below floor and no LONG position to CUT` };
+      } else {
+        actionBelow = {
+          type: 'ADD_LONG',
+          triggerPrice: currentPrice - gridStep * 2,
+          sizeUSDT: longSize,
+          reason: `Fallback: DCA LONG below (2x ATR) — ${biasNote}`,
+        };
+      }
     }
 
     return {
