@@ -229,6 +229,169 @@ class AiHedgeStrategy extends TradingBase {
     await this.saveState();
   }
 
+  /**
+   * C4 — restart recovery. Called by app.js boot scan when a Firestore
+   * `strategies` doc has `isRunning: true` but the in-memory activeStrategies
+   * map is empty (i.e. the process crashed and PM2 restarted us).
+   *
+   * Mirrors start() but: (a) restores config + state from the snapshot
+   * instead of req.body, (b) discards any in-flight activePlan (it was
+   * mid-trigger when we died — replan from scratch), (c) reconciles
+   * positions against Binance as source of truth (snapshot positions may be
+   * stale; positions may have been liquidated/closed during downtime).
+   */
+  async resume(snapshot) {
+    // Restore identifiers FIRST so addLog can write under the right strategyId.
+    this.strategyId = snapshot.strategyId;
+    this.profileId = snapshot.profileId;
+    this.userId = snapshot.userId;
+    this.gcfProxyUrl = snapshot.gcfProxyUrl;
+    this.sharedVmProxyGcfUrl = snapshot.sharedVmProxyGcfUrl;
+    this.initFirestoreCollections(this.strategyId);
+
+    if (!this.gcfProxyUrl || !this.sharedVmProxyGcfUrl) {
+      const msg = `[RECOVERY] Cannot resume ${this.strategyId}: missing proxy URLs in snapshot (saved before C4 fix)`;
+      console.error(msg);
+      await this.addLog(msg).catch(() => {});
+      this.isRunning = false;
+      this.criticalError = 'recovery_missing_proxy_urls';
+      await this.saveState().catch(() => {});
+      try { this.onStopComplete?.(); } catch (_) { /* ignore */ }
+      return;
+    }
+
+    await this.addLog(`[RECOVERY] Resuming strategy after restart...`);
+
+    // Restore config
+    this.symbol = snapshot.symbol;
+    this.positionSizeUSDT = snapshot.positionSizeUSDT;
+    this.maxPositionSizeUSDT = snapshot.maxPositionSizeUSDT;
+    this.leverage = snapshot.leverage || DEFAULT_LEVERAGE;
+    this.desiredProfitUSDT = snapshot.desiredProfitUSDT || null;
+    this.priceType = snapshot.priceType || 'MARK';
+    this.aiModel = snapshot.aiModel || 'claude-sonnet-4-6';
+    this.initialHedgeMultiplier = snapshot.initialHedgeMultiplier ?? null;
+    this.profitPercent = snapshot.profitPercent ?? null;
+
+    // Restore state
+    this.phase = snapshot.phase || 'INITIAL';
+    this.executionState = 'IDLE';     // Drop in-flight execution state.
+    this.activePlan = null;            // Discard in-flight plan; replan on first tick.
+    this.tradeCount = snapshot.tradeCount || 0;
+    this.firstPositionPrice = snapshot.firstPositionPrice || null;
+    this.initialWalletBalance = snapshot.initialWalletBalance || null;
+    const sst = snapshot.strategyStartTime;
+    this.strategyStartTime = sst?.toDate ? sst.toDate() : (sst ? new Date(sst) : new Date());
+    this.accumulatedRealizedPnL = snapshot.accumulatedRealizedPnL || 0;
+    this.accumulatedTradingFees = snapshot.accumulatedTradingFees || 0;
+    this.longAccumulatedRealizedPnL = snapshot.longAccumulatedRealizedPnL || 0;
+    this.shortAccumulatedRealizedPnL = snapshot.shortAccumulatedRealizedPnL || 0;
+    this.longTradingFees = snapshot.longTradingFees || 0;
+    this.shortTradingFees = snapshot.shortTradingFees || 0;
+
+    const anthropicApiKey = await this._fetchAnthropicApiKey();
+
+    try {
+      await this.setLeverage(this.symbol, this.leverage);
+      await this.setPositionMode(true);
+      await this._getExchangeInfo(this.symbol);
+    } catch (error) {
+      await this.addLog(`[RECOVERY] ERROR setup: ${error.message}`);
+      throw error;
+    }
+
+    const minNotional = this.exchangeInfoCache[this.symbol]?.minNotional || 5;
+
+    this.riskGuard = new AiRiskGuard({
+      maxPositionSizeUSDT: this.maxPositionSizeUSDT,
+      maxImbalanceRatio: 5.0,
+      maxPriceDeviationPercent: 5.0,
+      maxActionsPerHour: 20,
+      minNotional,
+      singleLegStopPercent: 5.0,
+    });
+    this.marketContext = new AiMarketContext(this);
+    this.planner = new AiPlanner(anthropicApiKey, this.aiModel);
+    this.executor = new AiPlanExecutor(this);
+
+    this.isRunning = true;
+
+    await this._retryListenKeyRequest(false);
+    this.connectUserDataStream();
+    this.connectRealtimeWebSocket();
+    this.connectLiquidationWebSocket();
+
+    this.listenKeyRefreshInterval = setInterval(async () => {
+      try {
+        await this._retryListenKeyRequest(true);
+      } catch (error) {
+        console.error(`ListenKey refresh failed: ${error.message}`);
+        await this.addLog(`ERROR: ListenKey refresh failed: ${error.message}`);
+        if (this.listenKeyRefreshInterval) {
+          clearInterval(this.listenKeyRefreshInterval);
+          this.listenKeyRefreshInterval = null;
+        }
+        if (this.userDataWs && this.userDataWs.readyState === 1) {
+          this.userDataWs.close(1000, 'Reconnecting due to listenKey failure');
+        }
+      }
+    }, 30 * 60 * 1000);
+
+    this._startWebSocketHealthMonitoring();
+
+    this._microstructureInterval = setInterval(async () => {
+      if (!this.isRunning || !this.marketContext) return;
+      try {
+        const [oiChange, liquidations, takerRatio, globalLSRatio] = await Promise.all([
+          this.marketContext._getOIChange(),
+          this.marketContext._getLiquidations(),
+          this.marketContext._getTakerRatio(null),
+          this.marketContext._getGlobalLSRatio(),
+        ]);
+        this._lastMicrostructure = { oiChange, liquidations, volumeRatio: this._lastMicrostructure?.volumeRatio || null, takerRatio, globalLSRatio };
+      } catch (err) { /* silent */ }
+    }, 60 * 1000);
+
+    // Reconcile against Binance — source of truth for current positions.
+    await this.detectCurrentPosition(true);
+    await this._refreshHedgePositions();
+
+    const longExists = !!(this.longPosition && this.longPosition.quantity > 0);
+    const shortExists = !!(this.shortPosition && this.shortPosition.quantity > 0);
+
+    if (!longExists && !shortExists) {
+      // Both legs gone — auto-stop fired during downtime, or user closed manually.
+      await this.addLog('[RECOVERY] No positions on Binance — strategy was already closed during downtime. Marking stopped.');
+      this.isRunning = false;
+      this.criticalError = 'positions_closed_during_downtime';
+      this.cleanupWebSockets();
+      if (this._microstructureInterval) { clearInterval(this._microstructureInterval); this._microstructureInterval = null; }
+      this.strategyEndTime = new Date();
+      await this.saveState();
+      try { this.onStopComplete?.(); } catch (_) { /* ignore */ }
+      return;
+    }
+
+    if (longExists !== shortExists) {
+      // Single leg — partial liquidation or partial close. Single-leg guard
+      // would have stopped this normally; do the same here for safety.
+      await this.addLog(`[RECOVERY] Only one leg present (LONG=${longExists}, SHORT=${shortExists}). Stopping for safety — single_leg_after_restart.`);
+      this.criticalError = 'single_leg_after_restart';
+      await this.stop('single_leg_after_restart');
+      return;
+    }
+
+    // Both legs intact — resume in DCA phase.
+    this.phase = 'DCA';
+    if (!this.firstPositionPrice) this.firstPositionPrice = this.longPosition.entryPrice;
+    await this.addLog(
+      `[RECOVERY] Hedge intact. LONG ${this._formatNotional(this.longPosition.notional)} @ ${this._formatPrice(this.longPosition.entryPrice)}, ` +
+      `SHORT ${this._formatNotional(this.shortPosition.notional)} @ ${this._formatPrice(this.shortPosition.entryPrice)}. ` +
+      `Resuming in DCA phase. Will replan on first price tick.`
+    );
+    await this.saveState();
+  }
+
   async stop(reason = 'manual') {
     if (!this.isRunning) return;
 
@@ -684,6 +847,11 @@ class AiHedgeStrategy extends TradingBase {
     await this.detectCurrentPosition(true);
     await this._refreshHedgePositions({ expectNonEmpty: true });
 
+    // C4: persist post-fill state so a crash between fills doesn't lose
+    // tradeCount, phase, or position-derived metrics. saveState is also
+    // called at plan install (line ~603) and start/stop boundaries.
+    await this.saveState();
+
     await this.addLog(
       `Trade #${this.tradeCount}. ` +
       `LONG: ${this.longPosition ? this._formatNotional(this.longPosition.notional) + ' @ ' + this._formatPrice(this.longPosition.entryPrice) : 'none'}, ` +
@@ -875,6 +1043,13 @@ class AiHedgeStrategy extends TradingBase {
         isRunning: this.isRunning,
         phase: this.phase,
         executionState: this.executionState,
+        // C4 recovery fields — required to reconstruct strategy after restart.
+        gcfProxyUrl: this.gcfProxyUrl,
+        sharedVmProxyGcfUrl: this.sharedVmProxyGcfUrl,
+        aiModel: this.aiModel,
+        initialHedgeMultiplier: this.initialHedgeMultiplier,
+        profitPercent: this.profitPercent,
+        criticalError: this.criticalError,
         longPosition: this.longPosition,
         shortPosition: this.shortPosition,
         hedgeGap: this.hedgeGap,

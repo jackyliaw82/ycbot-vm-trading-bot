@@ -6,6 +6,16 @@ module.exports = {
     autorestart: true,
     watch: false,
     max_memory_restart: '768M',
+    // C4: bound restart loops. If the bot crashes within 10s of starting it
+    // doesn't count as a "successful" run, and after 5 such failed attempts
+    // PM2 stops trying — keeps a poison-pill bug from burning CPU forever
+    // and surfaces the failure in `pm2 status` instead of hiding it. Normal
+    // restarts (memory cap, code update, post-10s crash) still auto-recover.
+    max_restarts: 5,
+    min_uptime: '10s',
+    restart_delay: 5000,
+    // Give graceful shutdown 30s to save state to Firestore before SIGKILL.
+    kill_timeout: 30000,
     env: {
       NODE_ENV: 'production',
       PORT: 3000,

@@ -548,16 +548,27 @@ app.get('/strategies/:strategyId', async (req, res) => {
   }
 });
 
-// Graceful shutdown handling
+// Graceful shutdown handling.
+//
+// C4 change: SIGTERM / SIGINT no longer call strategy.stop() (which would
+// close all positions on Binance). PM2 fires SIGTERM on `pm2 restart` (e.g.
+// code update, memory-cap restart) — we want positions to SURVIVE those so
+// the new process can reattach via the boot recovery scan. The latest state
+// is already in Firestore; we just save once more for freshness and exit.
+//
+// User-initiated stop still goes through the /ai-hedge/stop HTTP endpoint,
+// which does close positions. SIGTERM is reserved for restart-recovery.
 const shutdown = async () => {
-  console.log('Received shutdown signal, stopping all active strategies...');
+  console.log('[SHUTDOWN] Received signal — saving state and exiting (positions preserved for restart recovery).');
   for (const [strategyId, strategy] of activeStrategies.entries()) {
-    if (strategy.isRunning) {
-      console.log(`Stopping strategy ${strategyId}...`);
-      await strategy.stop();
+    try {
+      await strategy.saveState();
+      console.log(`[SHUTDOWN] State saved for ${strategyId}`);
+    } catch (err) {
+      console.error(`[SHUTDOWN] Failed to save state for ${strategyId}: ${err.message}`);
     }
   }
-  console.log('All strategies stopped. Exiting.');
+  console.log('[SHUTDOWN] All states saved. Exiting cleanly.');
   process.exit(0);
 };
 
@@ -571,6 +582,94 @@ process.on('SIGINT', () => {
   if (idleUpdateInterval) { clearInterval(idleUpdateInterval); idleUpdateInterval = null; }
   shutdown();
 });
+
+// ─── C4: restart-recovery scan ───────────────────────────────────────────────
+// Runs once after server.listen completes. Queries Firestore for any strategy
+// doc with `isRunning: true` (meaning we crashed mid-run) and resumes them.
+// Each strategy reattaches WS streams, reconciles positions against Binance
+// (source of truth), and resumes monitoring. If positions are gone, the
+// strategy marks itself stopped and removes from activeStrategies.
+async function recoverActiveStrategies() {
+  try {
+    console.log('[RECOVERY] Scanning Firestore for orphaned strategies...');
+    const snapshot = await firestore.collection('strategies')
+      .where('type', '==', 'AI_HEDGE')
+      .where('isRunning', '==', true)
+      .get();
+
+    if (snapshot.empty) {
+      console.log('[RECOVERY] No orphaned strategies found.');
+      return;
+    }
+
+    console.log(`[RECOVERY] Found ${snapshot.size} orphaned strategy(s) — resuming...`);
+
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      const strategyId = doc.id;
+
+      // Skip if already in activeStrategies (defensive — shouldn't happen on boot).
+      if (activeStrategies.has(strategyId)) {
+        console.log(`[RECOVERY] Skipping ${strategyId} — already active`);
+        continue;
+      }
+
+      try {
+        const strategy = new AiHedgeStrategy(
+          data.gcfProxyUrl || null,
+          data.profileId,
+          data.sharedVmProxyGcfUrl || null
+        );
+        strategy.strategyId = strategyId;
+        strategy.profileId = data.profileId;
+        strategy.userId = data.userId;
+        strategy.isRunning = true;
+
+        let walletSnapshotInterval = null;
+        strategy.onStopComplete = () => {
+          if (walletSnapshotInterval) {
+            clearInterval(walletSnapshotInterval);
+            walletSnapshotInterval = null;
+          }
+          _snapshotWallet(strategy).catch(() => { /* logged inside */ });
+          activeStrategies.delete(strategyId);
+        };
+
+        activeStrategies.set(strategyId, strategy);
+
+        // Resume in background — same non-blocking pattern as /ai-hedge/start.
+        strategy.resume(data)
+          .then(() => {
+            // Only continue wallet snapshot loop if resume left strategy running.
+            if (strategy.isRunning) {
+              _snapshotWallet(strategy).catch(() => {});
+              walletSnapshotInterval = setInterval(
+                () => _snapshotWallet(strategy).catch(() => {}),
+                WALLET_SNAPSHOT_INTERVAL_MS
+              );
+              console.log(`[RECOVERY] ✓ ${strategyId} resumed (symbol=${data.symbol}, phase=${strategy.phase})`);
+            } else {
+              console.log(`[RECOVERY] ${strategyId} marked stopped during resume (positions gone or single leg)`);
+            }
+          })
+          .catch((error) => {
+            console.error(`[RECOVERY] ✗ Failed to resume ${strategyId}:`, error);
+            strategy.isRunning = false;
+            activeStrategies.delete(strategyId);
+            firestore.collection('strategies').doc(strategyId).update({
+              isRunning: false,
+              criticalError: `recovery_failed: ${error.message}`,
+              lastUpdated: new Date(),
+            }).catch(() => {});
+          });
+      } catch (err) {
+        console.error(`[RECOVERY] ✗ Failed to instantiate strategy ${strategyId}:`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error('[RECOVERY] Top-level scan failed:', err);
+  }
+}
 
 // ============================
 // Testing Endpoints (Admin Only)
@@ -1396,6 +1495,9 @@ server.listen(PORT, async () => {
   await reportVersionOnStartup();
   setupReleaseListener();
   setupIdleUpdatePolling();
+  // C4: scan for crashed-mid-run strategies and resume them. Runs once at
+  // boot. Non-blocking — server is already accepting requests above.
+  recoverActiveStrategies().catch(err => console.error('[RECOVERY] unhandled:', err));
 });
 
 export default app;
