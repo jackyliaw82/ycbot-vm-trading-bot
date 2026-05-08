@@ -22,7 +22,7 @@ The strategy auto-stops when totalPnL >= effectiveTarget. You do NOT need to pla
 
 ### PHASE 1: INITIAL — Open Hedge at S/R
 No positions exist yet. Your job:
-1. Identify the nearest **resistance** (above current price) and **support** (below current price) from 15m swing highs/lows
+1. Pick the trigger levels from the **SUPPORT & RESISTANCE block** in the user message. That block uses the unified S/R cascade: 15m native → 1h → 4h → 1d → prior-week H/L → currentPrice ± 5×ATR synthetic. Every emitted level is data-layer-guaranteed to be ≥3×ATR from current price. Pick the closest qualifying level on each side regardless of source tag — fallback-tagged levels and atr_5x_fallback synthetic levels are valid OPEN_HEDGE triggers, not reasons to HOLD.
 2. At each level, set up an OPEN_HEDGE action that opens BOTH legs simultaneously with asymmetric sizing:
    - At resistance: SHORT gets the larger share (price likely bounces down)
    - At support: LONG gets the larger share (price likely bounces up)
@@ -31,6 +31,7 @@ No positions exist yet. Your job:
    - At resistance (actionAbove): shortSizeUSDT = positionSizeUSDT × 0.60, longSizeUSDT = positionSizeUSDT × 0.40
    - At support  (actionBelow): longSizeUSDT  = positionSizeUSDT × 0.60, shortSizeUSDT = positionSizeUSDT × 0.40
 5. Both legs open at the SAME price (gap = 0 initially). DCA will widen the gap.
+6. If the SUPPORT & RESISTANCE block reports NO levels at all on a side (extremely rare — only when ATR is also zero or very near it), HOLD that side and document why. Do NOT invent a triggerPrice without a backing level.
 
 ### PHASE 2: DCA — Widen the Gap
 Positions exist from Phase 1. Your job:
@@ -251,14 +252,15 @@ totalPnL >= effectiveTarget; you do NOT plan take-profit.
 
 ## TWO PHASES
 
-### PHASE 1: INITIAL — Open Hedge at S/R (UNCHANGED from v1.x)
+### PHASE 1: INITIAL — Open Hedge at S/R (uses unified S/R cascade — same source as Phase 2)
 No positions exist yet. Your job:
-1. Identify the nearest **resistance** and **support** from 15m swing highs/lows.
+1. Pick the trigger levels from the **SUPPORT & RESISTANCE block** in the user message — the unified cascade (15m native → 1h → 4h → 1d → prior-week H/L → currentPrice ± 5×ATR synthetic). Every level is data-layer-guaranteed to be ≥3×ATR from current price. Pick the closest qualifying level on each side regardless of source tag — fallback-tagged and atr_5x_fallback synthetic levels are valid OPEN_HEDGE triggers, not reasons to HOLD.
 2. At each level, emit OPEN_HEDGE that opens BOTH legs simultaneously.
 3. Sizing ratio: **ALWAYS 60:40** (no conviction-based scaling in Phase 1).
 4. At resistance: shortSizeUSDT = positionSizeUSDT × 0.60, longSizeUSDT × 0.40.
 5. At support: longSizeUSDT = positionSizeUSDT × 0.60, shortSizeUSDT × 0.40.
 6. Both legs open at the SAME price (gap = 0 initially); DCA widens the gap.
+7. Phase 1 keeps the legacy 2-trigger schema (one OPEN_HEDGE per side, atomic). Paired triggers are NOT used in Phase 1 — atomicity matters more than multiple trigger points when opening from zero positions.
 
 ### PHASE 2: DCA — Paired-Trigger Plan (v2.0.0)
 
