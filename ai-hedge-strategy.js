@@ -179,22 +179,15 @@ class AiHedgeStrategy extends TradingBase {
     this.initialWalletBalance = await this.getWalletBalance();
     await this.addLog(`Wallet balance: ${this._formatNotional(this.initialWalletBalance)} USDT`);
 
-    // M7: pre-flight wallet check. The two legs combined consume
-    // 2 × maxPositionSize / leverage in margin. Reject if wallet can't
-    // cover that with at least a 20% safety buffer for slippage,
-    // funding, and minNotional bumps. Catches the common
-    // "small wallet × big leverage × big maxPosition" misconfig that
-    // would only surface as a Binance margin reject mid-DCA.
-    const requiredMargin = (2 * this.maxPositionSizeUSDT) / this.leverage;
-    const requiredWithBuffer = requiredMargin * 1.2;
-    if (this.initialWalletBalance < requiredWithBuffer) {
-      const msg = `Wallet ${this._formatNotional(this.initialWalletBalance)} USDT insufficient for max hedge ` +
-        `${this._formatNotional(this.maxPositionSizeUSDT)} USDT each side @ ${this.leverage}x leverage ` +
-        `(requires ${this._formatNotional(requiredWithBuffer)} USDT incl. 20% buffer; bare margin ${this._formatNotional(requiredMargin)} USDT). ` +
-        `Lower maxPositionSizeUSDT, raise leverage, or top up wallet.`;
-      await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
-      throw new Error(msg);
-    }
+    // M7 was here — pre-flight wallet check against full-DCA margin cap.
+    // Removed: the frontend deliberately sizes maxPositionSize as
+    // wallet × leverage × 0.8 (MAX_POSITION_BUFFER) so Phase 2 can DCA into
+    // the full margin runway. Pre-flighting against (2 × maxPos / leverage)
+    // therefore tripped on every legitimate config from this app:
+    //   wallet ≥ (2 × wallet × leverage × 0.8 / leverage) × 1.2
+    //   wallet ≥ wallet × 1.92  → always false.
+    // Real protection lives in the frontend's MAX_POSITION_BUFFER + the
+    // minNotional check above + Binance's per-fill margin enforcement.
 
     // L5a: marketContext constructed BEFORE riskGuard so we can fetch ATR
     // and scale maxPositionSizeUSDT before the risk guard locks it in.
