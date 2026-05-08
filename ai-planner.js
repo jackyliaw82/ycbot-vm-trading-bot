@@ -34,9 +34,9 @@ Positions exist from Phase 1. Your job:
 2. Create one ADD action for each side. Two independent rules apply per side:
 
    **(a) TRIGGER-PRICE SPACING — by current-notional class:**
-   - **The lighter leg's ADD action** (the ADD targeting whichever side has smaller current notional): use 5m S/R levels, minimum **1x ATR** spacing from current price. If no 5m S/R found, fallback to **1x ATR** from current price as the trigger level.
-   - **The heavier leg's ADD action** (the ADD targeting whichever side has larger current notional): use 15m S/R levels, minimum **2x ATR** spacing from current price. If no 15m S/R found, fallback to **3x ATR** from current price as the trigger level.
-   - Worked example: if LONG notional 280 > SHORT notional 120, then LONG is the heavier leg → ADD_LONG uses 15m/2x ATR, and ADD_SHORT uses 5m/1x ATR. Do not let this round's sizeUSDT allocation change which timeframe you pick.
+   - **The lighter leg's ADD action** (the ADD targeting whichever side has smaller current notional): use the unified S/R block (15m native + cascade fallback to 1h/4h/1d/prior-week H/L), minimum **1x ATR** spacing from current price. If no S/R is available at all, fallback to **1x ATR** from current price as the trigger level.
+   - **The heavier leg's ADD action** (the ADD targeting whichever side has larger current notional): use the same unified S/R block, minimum **2x ATR** spacing from current price. If no S/R is available at all, fallback to **3x ATR** from current price as the trigger level.
+   - Both legs anchor to the same S/R levels; only the minimum ATR spacing differs (1x for lighter, 2x for heavier). Levels are source-tagged in the SUPPORT & RESISTANCE block so you can weight them: '15m' = native swing levels; '*_fallback' = promoted from a higher TF (structurally stronger but typically further from price); 'prior_week_high'/'prior_week_low' = deterministic floor.
 
    **(b) SIZE ALLOCATION — by this-round probability (independent of (a)):**
    - The higher-probability side gets the LARGER sizeUSDT. Use conviction-based ratios: 60:40 (low confidence), 70:30 (medium), 80:20 to 90:10 (high). Cap at 60:40 when signals are mixed or S/R is weak. (Note: Phase 1 OPEN_HEDGE is hard-locked at 60:40 — these conviction-based ratios apply only to Phase 2 DCA.)
@@ -98,8 +98,8 @@ Use these to:
 
 ## VOLATILITY-AWARE SPACING
 Use ATR (Average True Range) from 15m candles. Leg class is determined by CURRENT position notional (see Phase 2 step 1), never by this round's sizeUSDT allocation.
-- Lighter leg DCA (smaller current notional): use 5m S/R levels, minimum 1x ATR from current price. If no 5m S/R available, use **currentPrice ± 1x ATR** as trigger.
-- Heavier leg DCA (larger current notional): use 15m S/R levels, minimum 2x ATR from current price. If no 15m S/R available, use **currentPrice ± 3x ATR** as trigger.
+- Lighter leg DCA (smaller current notional): use the unified S/R block, minimum 1x ATR from current price. If no S/R available, use **currentPrice ± 1x ATR** as trigger.
+- Heavier leg DCA (larger current notional): use the unified S/R block (same levels as lighter), minimum 2x ATR from current price. If no S/R available, use **currentPrice ± 3x ATR** as trigger.
 - In EXTREME volatility: widen further (2x lighter, 4x heavier)
 
 ## ASYMMETRIC SIZING (Phase 2 DCA only — Phase 1 OPEN_HEDGE is hard-locked at 60:40)
@@ -410,34 +410,24 @@ class AiPlanner {
       parts.push(`1h Range: ${t.low} - ${t.high}, Change: ${t.change > 0 ? '+' : ''}${t.change.toFixed(2)}%`);
     }
 
-    // S/R levels (15m — for INITIAL phase and heavier leg DCA)
-    parts.push(`\n## SUPPORT & RESISTANCE (15m swing highs/lows, 5-bar lookback, ~25h data)`);
-    if (context.supportResistance15m) {
-      const sr = context.supportResistance15m;
+    // S/R levels — 15m native swing highs/lows (5-bar lookback, ~3 days),
+    // with per-side cascade fallback to 1h → 4h → 1d → prior-week H/L when
+    // the native side is empty. Both heavier and lighter leg DCA anchor here;
+    // aggression differentiated by ATR/momentum context, not by separate level set.
+    parts.push(`\n## SUPPORT & RESISTANCE (15m native, cascade fallback to 1h/4h/1d/prior-week)`);
+    if (context.supportResistance) {
+      const sr = context.supportResistance;
       const hasR = sr.resistances?.length > 0;
       const hasS = sr.supports?.length > 0;
-      if (hasR) parts.push(`Resistances: ${sr.resistances.map(r => r.price).join(', ')}`);
-      if (hasS) parts.push(`Supports: ${sr.supports.map(s => s.price).join(', ')}`);
+      const fmt = (lvl) => `${lvl.price} [${lvl.source}]`;
+      if (hasR) parts.push(`Resistances: ${sr.resistances.map(fmt).join(', ')}`);
+      if (hasS) parts.push(`Supports: ${sr.supports.map(fmt).join(', ')}`);
       if (!hasR) parts.push(`Resistances: NONE FOUND — use 3x ATR above current price as fallback`);
       if (!hasS) parts.push(`Supports: NONE FOUND — use 3x ATR below current price as fallback`);
+      parts.push(`Source tags: '15m' = native swing levels (~3-day lookback). '*_fallback' = swing levels promoted from a higher TF when 15m side was empty (structurally stronger but typically further from price). 'prior_week_high'/'prior_week_low' = deterministic floor from last 7 daily candles.`);
+      parts.push(`Both heavier and lighter leg DCA anchor to these levels.`);
     } else {
-      parts.push(`No 15m S/R data available — use 3x ATR from current price as fallback for heavier leg`);
-    }
-
-    // S/R levels (5m — for lighter leg DCA only)
-    if (context.phase === 'DCA') {
-      parts.push(`\n## SUPPORT & RESISTANCE (5m swing highs/lows, 3-bar lookback, ~8h data — lighter leg DCA)`);
-      if (context.supportResistance5m) {
-        const sr = context.supportResistance5m;
-        const hasR = sr.resistances?.length > 0;
-        const hasS = sr.supports?.length > 0;
-        if (hasR) parts.push(`Resistances: ${sr.resistances.map(r => r.price).join(', ')}`);
-        if (hasS) parts.push(`Supports: ${sr.supports.map(s => s.price).join(', ')}`);
-        if (!hasR) parts.push(`Resistances: NONE FOUND — use 1x ATR above current price as fallback`);
-        if (!hasS) parts.push(`Supports: NONE FOUND — use 1x ATR below current price as fallback`);
-      } else {
-        parts.push(`No 5m S/R data available — use 1x ATR from current price as fallback for lighter leg`);
-      }
+      parts.push(`No S/R data available — use 3x ATR from current price as fallback for both legs.`);
     }
 
     // Market microstructure (only when abnormal)

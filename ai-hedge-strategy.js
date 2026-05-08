@@ -32,7 +32,7 @@ function formatDuration(ms) {
  * AiHedgeStrategy — AI-driven hedge position management with microstructure data.
  *
  * Phase 1 (INITIAL): Opens both LONG and SHORT at an S/R level with asymmetric sizing.
- * Phase 2 (DCA): Widens the hedge gap through DCA entries at 5m/15m S/R levels.
+ * Phase 2 (DCA): Widens the hedge gap through DCA entries at unified S/R levels (15m native with cascade fallback to 1h/4h/1d/prior-week H/L).
  * Auto-stops when totalPnL >= effectiveTarget.
  */
 class AiHedgeStrategy extends TradingBase {
