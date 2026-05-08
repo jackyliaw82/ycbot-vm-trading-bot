@@ -1,5 +1,12 @@
 import Anthropic from '@anthropic-ai/sdk';
 
+// Feature flag for the v2.0.0 paired-trigger DCA architecture.
+// Values: 'legacy' (default, v1.x dual-action) | 'paired_trigger' (v2.x 4-trigger).
+// Per-profile overrides should set this via the strategy's profileConfig
+// rather than process.env, so canary rollout can flip individual profiles
+// without redeploy.
+const AI_DCA_MODE = (process.env.AI_DCA_MODE || 'legacy').toLowerCase();
+
 const SYSTEM_PROMPT = `You are an AI trading strategist for a cryptocurrency hedge trading bot on Binance Futures.
 
 ## YOUR ROLE
@@ -247,7 +254,10 @@ class AiPlanner {
         if (!text) throw new Error('Empty response from Claude');
 
         const plan = this._parseResponse(text);
-        this._validatePlanStructure(plan, context.phase);
+        const validation = this._validateAndNormalizePlan(plan, context.phase);
+        plan._schema = validation.schema;       // 'legacy' | 'paired'
+        plan._fellBack = validation.fellBack;   // true if paired→legacy fallback fired
+        if (validation.warning) plan._warning = validation.warning;
 
         // Attach token usage for cost tracking
         plan._usage = {
@@ -507,6 +517,95 @@ class AiPlanner {
       const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
       if (jsonMatch) return JSON.parse(jsonMatch[0]);
       throw new Error(`Failed to parse AI response as JSON: ${e.message}`);
+    }
+  }
+
+  /**
+   * Mode-aware validation entrypoint. Phase 1 (INITIAL) is always validated
+   * with the legacy validator since OPEN_HEDGE is not affected by the
+   * paired-trigger redesign. Phase 2 (DCA) uses the paired validator when
+   * AI_DCA_MODE = 'paired_trigger', else legacy.
+   *
+   * On paired-mode validation failure, falls back to legacy validation as a
+   * safety net during rollout. The fallback emits a warning so we can monitor
+   * how often the AI emits malformed paired plans. Once stable in production,
+   * the fallback can be removed (per the rollout plan).
+   */
+  _validateAndNormalizePlan(plan, phase, mode = AI_DCA_MODE) {
+    if (phase === 'INITIAL' || mode !== 'paired_trigger') {
+      this._validatePlanStructure(plan, phase);
+      return { plan, schema: 'legacy', fellBack: false };
+    }
+    // Phase 2 + paired mode
+    try {
+      this._validatePairedPlanStructure(plan);
+      return { plan, schema: 'paired', fellBack: false };
+    } catch (pairedErr) {
+      try {
+        this._validatePlanStructure(plan, phase);
+        console.error(`AI emitted legacy schema while paired_trigger mode active (paired error: ${pairedErr.message}); falling back to legacy for this cycle`);
+        return { plan, schema: 'legacy', fellBack: true, warning: pairedErr.message };
+      } catch (legacyErr) {
+        // Both validators failed — give up.
+        throw new Error(`Plan failed both paired and legacy validation. paired: ${pairedErr.message}; legacy: ${legacyErr.message}`);
+      }
+    }
+  }
+
+  /**
+   * Validate the v2.0.0 paired-trigger Phase 2 plan shape:
+   *
+   *   {
+   *     analysis: string,
+   *     actionAbove: {
+   *       primary: { type: 'ADD_SHORT'|'CUT_SHORT'|'HOLD', triggerPrice, qty, reason },
+   *       shadow:  { type: 'ADD_LONG'|'SKIP',              triggerPrice, qty, reason },
+   *     },
+   *     actionBelow: {
+   *       primary: { type: 'ADD_LONG'|'CUT_LONG'|'HOLD', triggerPrice, qty, reason },
+   *       shadow:  { type: 'ADD_SHORT'|'SKIP',           triggerPrice, qty, reason },
+   *     },
+   *     probabilityAssessment: { higherChance, confidence, reasoning },
+   *   }
+   *
+   * Note: qty (SOL units), not sizeUSDT. Trigger geometry is enforced — shadow
+   * triggerPrice must sit between current price and primary triggerPrice.
+   */
+  _validatePairedPlanStructure(plan) {
+    if (!plan.analysis) throw new Error('Plan missing "analysis"');
+    if (!plan.actionAbove) throw new Error('Plan missing "actionAbove"');
+    if (!plan.actionBelow) throw new Error('Plan missing "actionBelow"');
+
+    const validatePair = (sideKey, expectedPrimaryTypes, expectedShadowTypes) => {
+      const side = plan[sideKey];
+      if (!side.primary) throw new Error(`${sideKey} missing "primary"`);
+      if (!side.shadow)  throw new Error(`${sideKey} missing "shadow"`);
+
+      const p = side.primary;
+      if (!expectedPrimaryTypes.includes(p.type)) {
+        throw new Error(`${sideKey}.primary type "${p.type}" invalid (must be: ${expectedPrimaryTypes.join(', ')})`);
+      }
+      if (p.type !== 'HOLD') {
+        if (typeof p.triggerPrice !== 'number') throw new Error(`${sideKey}.primary missing numeric "triggerPrice"`);
+        if (typeof p.qty !== 'number' || p.qty <= 0) throw new Error(`${sideKey}.primary missing positive "qty"`);
+      }
+
+      const s = side.shadow;
+      if (!expectedShadowTypes.includes(s.type)) {
+        throw new Error(`${sideKey}.shadow type "${s.type}" invalid (must be: ${expectedShadowTypes.join(', ')})`);
+      }
+      if (s.type !== 'SKIP') {
+        if (typeof s.triggerPrice !== 'number') throw new Error(`${sideKey}.shadow missing numeric "triggerPrice"`);
+        if (typeof s.qty !== 'number' || s.qty < 0) throw new Error(`${sideKey}.shadow missing non-negative "qty"`);
+      }
+    };
+
+    validatePair('actionAbove', ['ADD_SHORT', 'CUT_SHORT', 'HOLD'], ['ADD_LONG', 'SKIP']);
+    validatePair('actionBelow', ['ADD_LONG', 'CUT_LONG', 'HOLD'], ['ADD_SHORT', 'SKIP']);
+
+    if (!plan.probabilityAssessment) throw new Error('Missing "probabilityAssessment"');
+    if (!['ABOVE', 'BELOW'].includes(plan.probabilityAssessment.higherChance)) {
+      throw new Error('probabilityAssessment.higherChance must be "ABOVE" or "BELOW"');
     }
   }
 
