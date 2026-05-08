@@ -15,6 +15,11 @@ const MODEL_PRICING = {
   'claude-opus-4-7':   { input: 15.0, output: 75.0, cacheWrite5m: 18.75, cacheRead: 1.50 },
 };
 
+// L5c volatility-aware sizing thresholds
+const ATR_PCT_HIGH_VOL = 2.5;       // start-time scale-down trigger (%)
+const ATR_DYNAMIC_TRIGGER_X = 1.5;  // mid-run scale when current >= 1.5× start
+const VOL_SIZING_FLOOR = 0.4;       // never scale below 40% of original size
+
 function formatDuration(ms) {
   if (!ms || ms < 0) return 'N/A';
   const days = Math.floor(ms / (1000 * 60 * 60 * 24));
@@ -106,6 +111,11 @@ class AiHedgeStrategy extends TradingBase {
     this._targetMinTicks = 3;
     this._targetMinDurationMs = 2500;
 
+    // L5c volatility-aware sizing. Snapshot of atrPercent at strategy start
+    // is the baseline against which mid-run ATR is compared. If current ATR
+    // is significantly higher, ADD orders are scaled down (CUT untouched).
+    this._atrPctAtStart = null;
+
     // C2 funding accounting. Funding settles every 8h on Binance USDS-M
     // (00:00, 08:00, 16:00 UTC). Signed (positive = bot received funding,
     // negative = bot paid). Folded into totalPnL so the auto-stop trigger
@@ -186,6 +196,39 @@ class AiHedgeStrategy extends TradingBase {
       throw new Error(msg);
     }
 
+    // L5a: marketContext constructed BEFORE riskGuard so we can fetch ATR
+    // and scale maxPositionSizeUSDT before the risk guard locks it in.
+    this.marketContext = new AiMarketContext(this);
+
+    // Start-time volatility-aware position-size scaling. If ATR is unusually
+    // high at start, scale down both positionSizeUSDT and maxPositionSizeUSDT
+    // proportionally so the strategy doesn't open overly large positions on
+    // a regime shift the user wasn't expecting. Stores _atrPctAtStart for
+    // L5b dynamic mid-run scaling.
+    try {
+      const startVol = await this.marketContext._getVolatility();
+      const atrPct = startVol?.atrPercent;
+      if (atrPct && atrPct > 0) {
+        this._atrPctAtStart = atrPct;
+        if (atrPct > ATR_PCT_HIGH_VOL) {
+          const rawFactor = ATR_PCT_HIGH_VOL / atrPct;
+          const factor = Math.max(VOL_SIZING_FLOOR, Math.min(1, rawFactor));
+          const oldPos = this.positionSizeUSDT;
+          const oldMax = this.maxPositionSizeUSDT;
+          this.positionSizeUSDT = oldPos * factor;
+          this.maxPositionSizeUSDT = oldMax * factor;
+          await this.addLog(
+            `[L5a] ATR=${atrPct.toFixed(2)}% > ${ATR_PCT_HIGH_VOL}% threshold; scaling positionSize ${oldPos.toFixed(2)} → ${this.positionSizeUSDT.toFixed(2)} USDT, ` +
+            `maxPos ${oldMax.toFixed(2)} → ${this.maxPositionSizeUSDT.toFixed(2)} USDT (×${factor.toFixed(2)}, floor ${VOL_SIZING_FLOOR})`
+          );
+        } else {
+          await this.addLog(`[L5a] ATR=${atrPct.toFixed(2)}% ≤ ${ATR_PCT_HIGH_VOL}% — no start-time scaling.`);
+        }
+      }
+    } catch (err) {
+      console.error(`[L5a] Volatility fetch failed at start, skipping scaling: ${err.message}`);
+    }
+
     this.riskGuard = new AiRiskGuard({
       maxPositionSizeUSDT: this.maxPositionSizeUSDT,
       maxImbalanceRatio: 5.0,
@@ -195,7 +238,6 @@ class AiHedgeStrategy extends TradingBase {
       singleLegStopPercent: 5.0,
     });
 
-    this.marketContext = new AiMarketContext(this);
     this.planner = new AiPlanner(anthropicApiKey, this.aiModel);
     this.executor = new AiPlanExecutor(this);
 
@@ -317,6 +359,11 @@ class AiHedgeStrategy extends TradingBase {
     this.accumulatedFundingFees = snapshot.accumulatedFundingFees || 0;
     this._lastFundingPollTs = snapshot._lastFundingPollTs || this.strategyStartTime.getTime();
 
+    // L5c: restore ATR baseline. If absent (pre-L5 snapshot), best-effort
+    // refetch happens just below — we don't want pre-L5 strategies to
+    // suddenly start scaling on resume against an undefined baseline.
+    this._atrPctAtStart = snapshot._atrPctAtStart || null;
+
     const anthropicApiKey = await this._fetchAnthropicApiKey();
 
     try {
@@ -341,6 +388,21 @@ class AiHedgeStrategy extends TradingBase {
     this.marketContext = new AiMarketContext(this);
     this.planner = new AiPlanner(anthropicApiKey, this.aiModel);
     this.executor = new AiPlanExecutor(this);
+
+    // L5c: best-effort baseline refetch for pre-L5 snapshots. Use current ATR
+    // as the baseline so dynamic mid-run scaling has SOMETHING to compare
+    // against, even if it isn't the literal start-of-strategy value.
+    if (this._atrPctAtStart == null) {
+      try {
+        const vol = await this.marketContext._getVolatility();
+        if (vol?.atrPercent > 0) {
+          this._atrPctAtStart = vol.atrPercent;
+          await this.addLog(`[L5c] Pre-L5 snapshot: backfilled _atrPctAtStart=${vol.atrPercent.toFixed(2)}% from current ATR.`);
+        }
+      } catch (err) {
+        console.error(`[L5c] Baseline refetch failed: ${err.message}`);
+      }
+    }
 
     this.isRunning = true;
 
@@ -526,12 +588,7 @@ class AiHedgeStrategy extends TradingBase {
     // it's ever re-enabled or the API returns nonzero values.
     const u = this.aiTokenUsage;
     if (u.planCount > 0) {
-      const rates = MODEL_PRICING[this.aiModel] || MODEL_PRICING['claude-sonnet-4-6'];
-      const inputCost      = (u.inputTokens   || 0) / 1_000_000 * rates.input;
-      const outputCost     = (u.outputTokens  || 0) / 1_000_000 * rates.output;
-      const cacheWriteCost = (u.cacheCreation || 0) / 1_000_000 * rates.cacheWrite5m;
-      const cacheReadCost  = (u.cacheRead     || 0) / 1_000_000 * rates.cacheRead;
-      const totalCost = inputCost + outputCost + cacheWriteCost + cacheReadCost;
+      const { totalCost } = this._computeAiCost();
       await this.addLog(
         `AI Usage: ${u.planCount} plans, ${u.inputTokens.toLocaleString()} input + ${u.outputTokens.toLocaleString()} output ` +
         `(cache write: ${u.cacheCreation.toLocaleString()}, read: ${u.cacheRead.toLocaleString()}). ` +
@@ -893,6 +950,9 @@ class AiHedgeStrategy extends TradingBase {
     };
 
     this.planHistory.push({ plan: this.activePlan, direction, triggeredAction: action, outcome, timestamp: new Date() });
+    // L2: cap in-memory plan history. AI context only uses the last 5 (line 691)
+    // so dropping older entries is purely RAM hygiene, no behavior change.
+    if (this.planHistory.length > 50) this.planHistory.shift();
     await this._savePlanToFirestore(this.activePlan, outcome);
 
     // Refresh positions. expectNonEmpty: we just placed orders, so if REST
@@ -1084,6 +1144,25 @@ class AiHedgeStrategy extends TradingBase {
     this.totalPnL = this.positionPnL + this.accumulatedRealizedPnL - this.accumulatedTradingFees + this.accumulatedFundingFees;
   }
 
+  // ——— L1 AI cost computation —————————————————————————————————————————
+
+  /**
+   * Compute current AI usage cost in USD from accumulated aiTokenUsage and
+   * MODEL_PRICING. Returns { inputCost, outputCost, cacheWriteCost,
+   * cacheReadCost, totalCost }. Pure function over local state — no
+   * network calls, safe to call from getStatus() on every poll.
+   */
+  _computeAiCost() {
+    const u = this.aiTokenUsage || {};
+    const rates = MODEL_PRICING[this.aiModel] || MODEL_PRICING['claude-sonnet-4-6'];
+    const inputCost      = (u.inputTokens   || 0) / 1_000_000 * rates.input;
+    const outputCost     = (u.outputTokens  || 0) / 1_000_000 * rates.output;
+    const cacheWriteCost = (u.cacheCreation || 0) / 1_000_000 * rates.cacheWrite5m;
+    const cacheReadCost  = (u.cacheRead     || 0) / 1_000_000 * rates.cacheRead;
+    const totalCost = inputCost + outputCost + cacheWriteCost + cacheReadCost;
+    return { inputCost, outputCost, cacheWriteCost, cacheReadCost, totalCost };
+  }
+
   // ——— C2 Funding-fee polling —————————————————————————————————————————
 
   /**
@@ -1208,6 +1287,7 @@ class AiHedgeStrategy extends TradingBase {
         accumulatedTradingFees: this.accumulatedTradingFees,
         accumulatedFundingFees: this.accumulatedFundingFees,
         _lastFundingPollTs: this._lastFundingPollTs,
+        _atrPctAtStart: this._atrPctAtStart,
         longAccumulatedRealizedPnL: this.longAccumulatedRealizedPnL,
         shortAccumulatedRealizedPnL: this.shortAccumulatedRealizedPnL,
         longTradingFees: this.longTradingFees,
@@ -1302,6 +1382,9 @@ class AiHedgeStrategy extends TradingBase {
       } : null,
       tradeCount: this.tradeCount,
       planHistoryCount: this.planHistory.length,
+      // L1: live AI cost so the user can self-judge "stuck or just patient?"
+      aiTokenUsage: { ...this.aiTokenUsage },
+      aiCostUsd: this._computeAiCost().totalCost,
       realtimeWsConnected: this.realtimeWsConnected,
       userDataWsConnected: this.userDataWsConnected,
       streamMode: this.streamMode || 'WS',

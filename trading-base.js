@@ -774,7 +774,7 @@ class TradingBase {
     }
   }
 
-  async _calculateAdjustedQuantity(symbol, positionSizeUSDT, calculationPrice = null) {
+  async _calculateAdjustedQuantity(symbol, positionSizeUSDT, calculationPrice = null, actionType = 'ADD') {
     let priceUsedForCalculation;
 
     if (calculationPrice !== null && calculationPrice > 0) {
@@ -788,6 +788,24 @@ class TradingBase {
     }
 
     const { minQty, maxQty, stepSize, precision, minNotional } = await this._getExchangeInfo(symbol);
+
+    // L5b: dynamic mid-run volatility-aware scaling for ADD actions only.
+    // CUT actions (de-risking) bypass scaling — closing risk should not be
+    // impeded by elevated volatility. Compares current ATR% to the start
+    // baseline; scales DOWN proportionally when current is significantly
+    // higher. Floored at VOL_SIZING_FLOOR so we don't shrink below
+    // executable size.
+    const isAdd = actionType === 'ADD' || actionType === 'ADD_LONG' || actionType === 'ADD_SHORT' || actionType === 'OPEN_HEDGE';
+    const startAtr = this._atrPctAtStart;
+    const curAtr = this._lastVolatility?.atrPercent;
+    if (isAdd && startAtr && curAtr && curAtr > startAtr * 1.5) {
+      const VOL_SIZING_FLOOR = 0.4;
+      const rawFactor = startAtr / curAtr;
+      const factor = Math.max(VOL_SIZING_FLOOR, Math.min(1, rawFactor));
+      const oldSize = positionSizeUSDT;
+      positionSizeUSDT = positionSizeUSDT * factor;
+      this.addLog(`[L5b] ATR ${startAtr.toFixed(2)}% → ${curAtr.toFixed(2)}% (>1.5×); scaling ADD ${oldSize.toFixed(2)} → ${positionSizeUSDT.toFixed(2)} USDT (×${factor.toFixed(2)})`).catch(() => {});
+    }
 
     let rawQuantity = positionSizeUSDT / priceUsedForCalculation;
     // Floor (not ceil) to avoid overshooting the intended sizeUSDT — overshoot

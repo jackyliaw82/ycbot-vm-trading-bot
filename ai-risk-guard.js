@@ -126,6 +126,14 @@ class AiRiskGuard {
 
     for (const key of ['actionAbove', 'actionBelow']) {
       const action = plan[key];
+      // L4: strip triggerPrice from HOLD actions so the executor's crossing
+      // logic doesn't spuriously fire them. AI sometimes emits triggerPrice
+      // on HOLD (cosmetic carryover from when the same level was an ADD)
+      // — that drove wasted replan cycles in the 50h stuck log.
+      if (action && action.type === 'HOLD' && action.triggerPrice != null) {
+        console.warn(`[RISK-GUARD] Stripping triggerPrice from ${key} HOLD action (was ${action.triggerPrice})`);
+        delete action.triggerPrice;
+      }
       if (action.type === 'HOLD') continue;
 
       // Trigger price sanity
@@ -232,6 +240,13 @@ class AiRiskGuard {
     let totalAddNotional = 0;
 
     const validateSub = (sideKey, kind, sub) => {
+      // L4: strip triggerPrice from HOLD/SKIP sub-actions so the executor's
+      // crossing logic doesn't spuriously fire them. Same rationale as the
+      // legacy validator above.
+      if (sub && (sub.type === 'HOLD' || sub.type === 'SKIP') && sub.triggerPrice != null) {
+        console.warn(`[RISK-GUARD] Stripping triggerPrice from ${sideKey}.${kind} ${sub.type} sub-action (was ${sub.triggerPrice})`);
+        delete sub.triggerPrice;
+      }
       // HOLD (primary) and SKIP (shadow) carry no fields to check.
       if (!sub || sub.type === 'HOLD' || sub.type === 'SKIP') return;
 

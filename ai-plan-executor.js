@@ -249,10 +249,11 @@ class AiPlanExecutor {
       return await this._executeOpenHedge(action);
     }
 
-    // Calculate quantity from sizeUSDT
+    // Calculate quantity from sizeUSDT. action.type passed through so
+    // _calculateAdjustedQuantity can apply L5b dynamic scaling on ADD only.
     let quantity = action.quantity;
     if (!quantity && action.sizeUSDT) {
-      quantity = await strategy._calculateAdjustedQuantity(symbol, action.sizeUSDT, action.triggerPrice);
+      quantity = await strategy._calculateAdjustedQuantity(symbol, action.sizeUSDT, action.triggerPrice, action.type);
     }
     if (!quantity || quantity <= 0) {
       throw new Error(`Cannot execute ${action.type}: quantity is ${quantity}`);
@@ -336,8 +337,8 @@ class AiPlanExecutor {
     const strategy = this.strategy;
     const symbol = strategy.symbol;
 
-    const longQty = await strategy._calculateAdjustedQuantity(symbol, action.longSizeUSDT, action.triggerPrice);
-    const shortQty = await strategy._calculateAdjustedQuantity(symbol, action.shortSizeUSDT, action.triggerPrice);
+    const longQty = await strategy._calculateAdjustedQuantity(symbol, action.longSizeUSDT, action.triggerPrice, 'OPEN_HEDGE');
+    const shortQty = await strategy._calculateAdjustedQuantity(symbol, action.shortSizeUSDT, action.triggerPrice, 'OPEN_HEDGE');
 
     if (!longQty || longQty <= 0) throw new Error(`OPEN_HEDGE: invalid LONG quantity from ${action.longSizeUSDT} USDT`);
     if (!shortQty || shortQty <= 0) throw new Error(`OPEN_HEDGE: invalid SHORT quantity from ${action.shortSizeUSDT} USDT`);
