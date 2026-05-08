@@ -169,6 +169,23 @@ class AiHedgeStrategy extends TradingBase {
     this.initialWalletBalance = await this.getWalletBalance();
     await this.addLog(`Wallet balance: ${this._formatNotional(this.initialWalletBalance)} USDT`);
 
+    // M7: pre-flight wallet check. The two legs combined consume
+    // 2 × maxPositionSize / leverage in margin. Reject if wallet can't
+    // cover that with at least a 20% safety buffer for slippage,
+    // funding, and minNotional bumps. Catches the common
+    // "small wallet × big leverage × big maxPosition" misconfig that
+    // would only surface as a Binance margin reject mid-DCA.
+    const requiredMargin = (2 * this.maxPositionSizeUSDT) / this.leverage;
+    const requiredWithBuffer = requiredMargin * 1.2;
+    if (this.initialWalletBalance < requiredWithBuffer) {
+      const msg = `Wallet ${this._formatNotional(this.initialWalletBalance)} USDT insufficient for max hedge ` +
+        `${this._formatNotional(this.maxPositionSizeUSDT)} USDT each side @ ${this.leverage}x leverage ` +
+        `(requires ${this._formatNotional(requiredWithBuffer)} USDT incl. 20% buffer; bare margin ${this._formatNotional(requiredMargin)} USDT). ` +
+        `Lower maxPositionSizeUSDT, raise leverage, or top up wallet.`;
+      await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
+      throw new Error(msg);
+    }
+
     this.riskGuard = new AiRiskGuard({
       maxPositionSizeUSDT: this.maxPositionSizeUSDT,
       maxImbalanceRatio: 5.0,
@@ -191,20 +208,10 @@ class AiHedgeStrategy extends TradingBase {
     this.connectRealtimeWebSocket();
     this.connectLiquidationWebSocket();
 
-    this.listenKeyRefreshInterval = setInterval(async () => {
-      try {
-        await this._retryListenKeyRequest(true);
-      } catch (error) {
-        console.error(`ListenKey refresh failed: ${error.message}`);
-        await this.addLog(`ERROR: ListenKey refresh failed: ${error.message}`);
-        if (this.listenKeyRefreshInterval) {
-          clearInterval(this.listenKeyRefreshInterval);
-          this.listenKeyRefreshInterval = null;
-        }
-        if (this.userDataWs && this.userDataWs.readyState === 1) {
-          this.userDataWs.close(1000, 'Reconnecting due to listenKey failure');
-        }
-      }
+    // M3: scheduledListenKeyRefresh handles retry-with-backoff before
+    // falling back to WS close.
+    this.listenKeyRefreshInterval = setInterval(() => {
+      this._scheduledListenKeyRefresh();
     }, 30 * 60 * 1000);
 
     this._startWebSocketHealthMonitoring();
@@ -342,20 +349,10 @@ class AiHedgeStrategy extends TradingBase {
     this.connectRealtimeWebSocket();
     this.connectLiquidationWebSocket();
 
-    this.listenKeyRefreshInterval = setInterval(async () => {
-      try {
-        await this._retryListenKeyRequest(true);
-      } catch (error) {
-        console.error(`ListenKey refresh failed: ${error.message}`);
-        await this.addLog(`ERROR: ListenKey refresh failed: ${error.message}`);
-        if (this.listenKeyRefreshInterval) {
-          clearInterval(this.listenKeyRefreshInterval);
-          this.listenKeyRefreshInterval = null;
-        }
-        if (this.userDataWs && this.userDataWs.readyState === 1) {
-          this.userDataWs.close(1000, 'Reconnecting due to listenKey failure');
-        }
-      }
+    // M3: scheduledListenKeyRefresh handles retry-with-backoff before
+    // falling back to WS close.
+    this.listenKeyRefreshInterval = setInterval(() => {
+      this._scheduledListenKeyRefresh();
     }, 30 * 60 * 1000);
 
     this._startWebSocketHealthMonitoring();

@@ -101,10 +101,44 @@ async function sendWithRetry(message, maxRetries = 3) {
   throw lastError;
 }
 
+// M8: per-user token-bucket rate limiter. Caps FCM pushes at 10/min per
+// user with a max burst of 10. A misbehaving strategy (rapid state flips
+// during cascade) used to be able to fire hundreds of pushes in minutes.
+// Now extras are dropped — important alerts will queue back into the
+// bucket as it refills. Process-local state; resets on restart, which is
+// fine since the upstream events that drive pushes also reset.
+const FCM_RATE_LIMIT_PER_MIN = 10;
+const FCM_BUCKET_CAP = 10;
+const _fcmRateBuckets = new Map(); // userId -> { tokens, lastRefill }
+
+function _consumeFcmRateLimitToken(userId) {
+  const now = Date.now();
+  const bucket = _fcmRateBuckets.get(userId) || { tokens: FCM_BUCKET_CAP, lastRefill: now };
+  const elapsedMs = now - bucket.lastRefill;
+  const refill = (elapsedMs / 60_000) * FCM_RATE_LIMIT_PER_MIN;
+  bucket.tokens = Math.min(FCM_BUCKET_CAP, bucket.tokens + refill);
+  bucket.lastRefill = now;
+  if (bucket.tokens < 1) {
+    _fcmRateBuckets.set(userId, bucket);
+    return false;
+  }
+  bucket.tokens -= 1;
+  _fcmRateBuckets.set(userId, bucket);
+  return true;
+}
+
 export async function sendPushNotification(userId, notificationData) {
   if (!adminInitialized) {
     console.warn('Firebase Admin SDK not initialized. Skipping push notification.');
     return { success: false, error: 'Firebase Admin SDK not initialized' };
+  }
+
+  // M8: rate-limit before doing any Firestore lookups. Drop quietly with
+  // a single log line — frequent drops would themselves clutter logs, but
+  // the user IS notified that limiting kicked in.
+  if (!_consumeFcmRateLimitToken(userId)) {
+    console.warn(`[FCM-RATE-LIMIT] Dropping push for user ${userId}: bucket empty (>${FCM_RATE_LIMIT_PER_MIN}/min)`);
+    return { success: false, error: 'rate_limited' };
   }
 
   try {

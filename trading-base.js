@@ -2130,6 +2130,56 @@ class TradingBase {
     throw new Error(`Failed to ${isRefresh ? 'refresh' : 'obtain'} listenKey after ${maxAttempts} attempts`);
   }
 
+  /**
+   * M3 fix: smart listenKey refresh handler invoked from the periodic
+   * setInterval. Old behavior force-closed the user-data WS on a single
+   * refresh-cycle failure — leaving the bot blind to fills for up to
+   * 30 min until the next interval. Binance listenKeys live 60 min, so
+   * we have ~30 min runway after a missed refresh before the key actually
+   * expires.
+   *
+   * New behavior: on failure, schedule near-term retries (1min, 5min)
+   * before falling back to WS close. _retryListenKeyRequest already
+   * retries N times internally with backoff on each call, so this gives
+   * us up to 3 separate retry rounds across 6 minutes before declaring
+   * the key dead.
+   */
+  async _scheduledListenKeyRefresh() {
+    if (!this.isRunning) return;
+    try {
+      await this._retryListenKeyRequest(true);
+      this._listenKeyRefreshFailureCount = 0;
+    } catch (error) {
+      this._listenKeyRefreshFailureCount = (this._listenKeyRefreshFailureCount || 0) + 1;
+      console.error(`Failed to refresh listenKey (#${this._listenKeyRefreshFailureCount}/3): ${error.message}`);
+      await this.addLog(`ERROR: [CONNECTION_ERROR] ListenKey refresh failed (#${this._listenKeyRefreshFailureCount}/3): ${error.message}`);
+
+      if (this._listenKeyRefreshFailureCount >= 3) {
+        await this.addLog('ERROR: [CONNECTION_ERROR] 3 consecutive listenKey refresh failures — forcing user-data WS reconnect.');
+        this._listenKeyRefreshFailureCount = 0;
+        if (this.listenKeyRefreshInterval) {
+          clearInterval(this.listenKeyRefreshInterval);
+          this.listenKeyRefreshInterval = null;
+        }
+        if (this.userDataWs && this.userDataWs.readyState === 1) {
+          this.userDataWs.close(1000, 'Reconnecting due to repeated listenKey refresh failures');
+        }
+        return;
+      }
+
+      // Schedule near-term retry: 1min after 1st failure, 5min after 2nd.
+      const retryDelayMs = this._listenKeyRefreshFailureCount === 1 ? 60_000 : 5 * 60_000;
+      await this.addLog(`[REST-API] Scheduling listenKey refresh retry in ${retryDelayMs / 1000}s.`);
+      setTimeout(() => {
+        if (this.isRunning) {
+          this._scheduledListenKeyRefresh().catch(err => {
+            console.error(`[REST-API] Retry scheduler error: ${err.message}`);
+          });
+        }
+      }, retryDelayMs);
+    }
+  }
+
   async attemptUserDataReconnection() {
     if (!this.isRunning) return;
     if (this.userDataReconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
@@ -2155,20 +2205,10 @@ class TradingBase {
       this._needsUserDataReconcileOnOpen = true;
       this.connectUserDataStream();
 
-      this.listenKeyRefreshInterval = setInterval(async () => {
-        try {
-          await this._retryListenKeyRequest(true);
-        } catch (error) {
-          console.error(`Failed to refresh listenKey: ${error.message}`);
-          await this.addLog(`ERROR: [CONNECTION_ERROR] ListenKey refresh failed: ${error.message}`);
-          if (this.listenKeyRefreshInterval) {
-            clearInterval(this.listenKeyRefreshInterval);
-            this.listenKeyRefreshInterval = null;
-          }
-          if (this.userDataWs && this.userDataWs.readyState === 1) {
-            this.userDataWs.close(1000, 'Reconnecting due to listenKey refresh failure');
-          }
-        }
+      // M3: scheduledListenKeyRefresh handles retry-with-backoff before
+      // falling back to WS close.
+      this.listenKeyRefreshInterval = setInterval(() => {
+        this._scheduledListenKeyRefresh();
       }, 30 * 60 * 1000);
 
     } catch (error) {
