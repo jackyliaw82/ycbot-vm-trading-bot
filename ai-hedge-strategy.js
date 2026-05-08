@@ -89,10 +89,11 @@ class AiHedgeStrategy extends TradingBase {
     this._lastReplanTime = 0;
     this._replanCooldownMs = 5000;
 
-    // Paired-mode staleness timer — fires a replan if no fills happen for
-    // STALENESS_TIMEOUT_MS. Cleared on every plan install.
-    this._stalenessTimer = null;
-    this._stalenessTimeoutMs = 4 * 60 * 60 * 1000; // 4 hours
+    // HedgeMetricsChart sampling — 1 write/min to Firestore subcollection
+    // strategies/{strategyId}/metricsSamples for cross-device chart history.
+    // Mirrors the trades subcollection pattern.
+    this._metricsSampleInterval = null;
+
     this.isTradingSequenceInProgress = false;
 
     // Single-leg guard: track price of first ever position
@@ -283,6 +284,9 @@ class AiHedgeStrategy extends TradingBase {
     this._lastFundingPollTs = this.strategyStartTime.getTime();
     this._scheduleNextFundingPoll();
 
+    // HedgeMetricsChart 1/min sampler → strategies/{id}/metricsSamples
+    this._startMetricsSampler();
+
     await this.addLog(`AI Hedge Strategy started in ${this.phase} phase. Waiting for first price tick...`);
     await this.saveState();
   }
@@ -467,6 +471,9 @@ class AiHedgeStrategy extends TradingBase {
     await this._pollFundingIncome();
     this._scheduleNextFundingPoll();
 
+    // HedgeMetricsChart 1/min sampler — same as start()
+    this._startMetricsSampler();
+
     await this.saveState();
   }
 
@@ -476,7 +483,7 @@ class AiHedgeStrategy extends TradingBase {
     this.isStopping = true;
     this.isRunning = false;
     this.executionState = 'IDLE';
-    this._clearStalenessTimer();
+    this._stopMetricsSampler();
 
     await this.addLog(`Stopping AI Hedge Strategy. Reason: ${reason}`);
 
@@ -847,10 +854,11 @@ class AiHedgeStrategy extends TradingBase {
         this._holdReplanAt = null;
       }
 
-      // Paired-mode 4h staleness timer — replan if no fills happen for that long.
-      // Without this, paired plans with no trigger crossings would sit unfilled
-      // indefinitely, even as market state drifts away from where the plan was made.
-      this._resetStalenessTimer();
+      // Note: 4h staleness replan timer was removed — _holdReplanAt above
+      // already handles the both-HOLD case (the only one where a stale plan
+      // is genuinely stuck). Plans with valid ADD/CUT triggers now wait
+      // indefinitely for price to cross the trigger; that's the intended
+      // semantics — no wasted AI calls just because no fill happened.
 
       await this.saveState();
 
@@ -1045,22 +1053,44 @@ class AiHedgeStrategy extends TradingBase {
     }
   }
 
-  _resetStalenessTimer() {
-    if (this._stalenessTimer) clearTimeout(this._stalenessTimer);
-    this._stalenessTimer = setTimeout(() => {
-      this._stalenessTimer = null;
-      if (!this.isStopping && this.isRunning) {
-        this.addLog(`Staleness timer fired (${(this._stalenessTimeoutMs / 60000).toFixed(0)} min). Requesting fresh plan.`)
-          .catch(() => {});
-        this._requestNewPlan('staleness').catch((e) => console.error(`Staleness replan failed: ${e.message}`));
-      }
-    }, this._stalenessTimeoutMs);
+  /**
+   * HedgeMetricsChart 1/min sampler. Writes one
+   * { t, gap, ratio, strategyId } doc to strategies/{id}/metricsSamples on
+   * every tick. Skips when either leg has 0 quantity (matches frontend
+   * gating). Called via setInterval armed in start()/resume(), cleared in
+   * stop(). Mirrors the saveTrade subcollection pattern so cross-device
+   * sync works without bot-side state.
+   */
+  async _writeMetricsSample() {
+    if (!this.strategyId || !this.firestore) return;
+    if (!this.longPosition || !this.shortPosition) return;
+    const longQty = this.longPosition.quantity || 0;
+    const shortQty = this.shortPosition.quantity || 0;
+    if (!(longQty > 0) || !(shortQty > 0)) return;
+    try {
+      await this.firestore.collection('strategies').doc(this.strategyId)
+        .collection('metricsSamples').add({
+          t: Date.now(),
+          gap: this.hedgeGap || 0,
+          ratio: longQty / shortQty,
+          strategyId: this.strategyId,
+        });
+    } catch (err) {
+      console.error(`[METRICS-SAMPLE] write failed: ${err.message}`);
+    }
   }
 
-  _clearStalenessTimer() {
-    if (this._stalenessTimer) {
-      clearTimeout(this._stalenessTimer);
-      this._stalenessTimer = null;
+  _startMetricsSampler() {
+    if (this._metricsSampleInterval) clearInterval(this._metricsSampleInterval);
+    this._metricsSampleInterval = setInterval(() => {
+      if (this.isRunning) this._writeMetricsSample();
+    }, 60_000);
+  }
+
+  _stopMetricsSampler() {
+    if (this._metricsSampleInterval) {
+      clearInterval(this._metricsSampleInterval);
+      this._metricsSampleInterval = null;
     }
   }
 
