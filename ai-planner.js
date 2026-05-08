@@ -122,7 +122,8 @@ When to cap at 60%: microstructure signals are mixed, S/R is weak, or price is i
 ## FEE-AWARE TARGETS
 Closing fee rate: **0.08%** (0.0008) per side.
 effectiveTarget = desiredProfit + estimatedClosingFees
-The strategy auto-stops when totalPnL >= effectiveTarget. You do not need to plan CLOSE_HEDGE or TP.
+totalPnL = positionPnL + accumulatedRealizedPnL − accumulatedTradingFees + accumulatedFundingFees
+The strategy auto-stops when totalPnL >= effectiveTarget. You do not need to plan CLOSE_HEDGE or TP. Funding settles every 8h and is signed (+ received, − paid); it's already folded into totalPnL — don't plan separate funding actions.
 
 ## MARGIN SAFETY
 - If margin usage > 70%: prioritize CUT to free margin.
@@ -397,7 +398,8 @@ to pick the closest qualifying level on each side; spacing is taken care of for 
 ## FEE-AWARE TARGETS
 Closing fee rate: **0.08%** (0.0008) per side.
 effectiveTarget = desiredProfit + estimatedClosingFees
-Strategy auto-stops at totalPnL >= effectiveTarget. Don't plan TP.
+totalPnL = positionPnL + accumulatedRealizedPnL − accumulatedTradingFees + accumulatedFundingFees
+Strategy auto-stops at totalPnL >= effectiveTarget. Don't plan TP. Funding settles every 8h and is signed (+ received, − paid); already folded into totalPnL — don't plan separate funding actions.
 
 ## MARGIN SAFETY
 - Margin usage > 70%: prioritize CUT to free margin.
@@ -577,6 +579,8 @@ class AiPlanner {
       parts.push(`\n## ACCUMULATED P&L`);
       parts.push(`Realized PnL: ${context.accumulatedRealizedPnL} USDT`);
       parts.push(`Trading Fees: ${context.accumulatedTradingFees} USDT`);
+      const funding = context.accumulatedFundingFees || 0;
+      parts.push(`Funding (cumulative, signed): ${funding >= 0 ? '+' : ''}${funding.toFixed(4)} USDT  // already included in Net Total PnL`);
     }
 
     // Funding rate

@@ -106,6 +106,16 @@ class AiHedgeStrategy extends TradingBase {
     this._targetMinTicks = 3;
     this._targetMinDurationMs = 2500;
 
+    // C2 funding accounting. Funding settles every 8h on Binance USDS-M
+    // (00:00, 08:00, 16:00 UTC). Signed (positive = bot received funding,
+    // negative = bot paid). Folded into totalPnL so the auto-stop trigger
+    // and the AI prompt see it without any special handling.
+    // _lastFundingPollTs is the high-water mark on the income ledger — the
+    // next poll uses (it + 1) as startTime so we never double-count.
+    this.accumulatedFundingFees = 0;
+    this._lastFundingPollTs = null;
+    this._fundingPollTimeout = null;
+
     // AI token usage tracking
     this.aiTokenUsage = { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheCreation: 0, planCount: 0 };
 
@@ -225,6 +235,12 @@ class AiHedgeStrategy extends TradingBase {
       await this.addLog('Existing positions detected. Resuming in DCA phase.');
     }
 
+    // C2: funding poll baseline + scheduler. Anchor at strategy start
+    // (no settlements have happened yet) and align future polls to the
+    // next 8h UTC boundary.
+    this._lastFundingPollTs = this.strategyStartTime.getTime();
+    this._scheduleNextFundingPoll();
+
     await this.addLog(`AI Hedge Strategy started in ${this.phase} phase. Waiting for first price tick...`);
     await this.saveState();
   }
@@ -288,6 +304,11 @@ class AiHedgeStrategy extends TradingBase {
     this.shortAccumulatedRealizedPnL = snapshot.shortAccumulatedRealizedPnL || 0;
     this.longTradingFees = snapshot.longTradingFees || 0;
     this.shortTradingFees = snapshot.shortTradingFees || 0;
+
+    // C2: restore funding state. _lastFundingPollTs falls back to
+    // strategyStartTime so a snapshot saved before the C2 fix still works.
+    this.accumulatedFundingFees = snapshot.accumulatedFundingFees || 0;
+    this._lastFundingPollTs = snapshot._lastFundingPollTs || this.strategyStartTime.getTime();
 
     const anthropicApiKey = await this._fetchAnthropicApiKey();
 
@@ -389,6 +410,11 @@ class AiHedgeStrategy extends TradingBase {
       `SHORT ${this._formatNotional(this.shortPosition.notional)} @ ${this._formatPrice(this.shortPosition.entryPrice)}. ` +
       `Resuming in DCA phase. Will replan on first price tick.`
     );
+
+    // C2: catch up on any settlements during downtime, then resume scheduler.
+    await this._pollFundingIncome();
+    this._scheduleNextFundingPoll();
+
     await this.saveState();
   }
 
@@ -468,6 +494,18 @@ class AiHedgeStrategy extends TradingBase {
       clearInterval(this._microstructureInterval);
       this._microstructureInterval = null;
     }
+    // C2: cancel scheduled funding poll, then do one final flush so any
+    // settlement that happened between the last scheduled poll and stop is
+    // captured before platform fee calculation.
+    if (this._fundingPollTimeout) {
+      clearTimeout(this._fundingPollTimeout);
+      this._fundingPollTimeout = null;
+    }
+    try {
+      await this._pollFundingIncome();
+    } catch (err) {
+      console.error(`[FUNDING] final flush failed: ${err.message}`);
+    }
     this.cleanupWebSockets();
     this.strategyEndTime = new Date();
     this.timeTaken = this.strategyStartTime ? formatDuration(Date.now() - new Date(this.strategyStartTime).getTime()) : null;
@@ -475,8 +513,9 @@ class AiHedgeStrategy extends TradingBase {
     await this._refreshHedgePositions();
     this._updateUnrealizedPnL(this.currentPrice);
 
-    // Platform fee
-    const netPnL = this.accumulatedRealizedPnL - this.accumulatedTradingFees;
+    // Platform fee. Funding is included in net so the platform fee scales
+    // with what the bot actually delivered to the user.
+    const netPnL = this.accumulatedRealizedPnL - this.accumulatedTradingFees + this.accumulatedFundingFees;
     if (netPnL > 0) {
       await this.deductPlatformFee(netPnL);
     }
@@ -516,6 +555,7 @@ class AiHedgeStrategy extends TradingBase {
         timeTaken: elapsed,
         realizedPnL: this.accumulatedRealizedPnL,
         tradingFees: this.accumulatedTradingFees,
+        fundingFees: this.accumulatedFundingFees,
       });
     } catch (e) {
       console.error('Notification failed:', e.message);
@@ -632,6 +672,7 @@ class AiHedgeStrategy extends TradingBase {
       const estimatedClosingFees = (longNotional + shortNotional) * FEE_RATE;
       const effectiveTarget = this.desiredProfitUSDT ? this.desiredProfitUSDT + estimatedClosingFees : null;
 
+      // Build snapshot for AI; line numbers below stay aligned with grep:
       const context = await this.marketContext.buildContext({
         phase: this.phase,
         longPosition: this.longPosition,
@@ -646,6 +687,7 @@ class AiHedgeStrategy extends TradingBase {
         minNotional: this.riskGuard.minNotional,
         accumulatedRealizedPnL: this.accumulatedRealizedPnL,
         accumulatedTradingFees: this.accumulatedTradingFees,
+        accumulatedFundingFees: this.accumulatedFundingFees,
         previousPlan: this.activePlan,
         planHistory: this.planHistory.slice(-5),
         firstPositionPrice: this.firstPositionPrice,
@@ -1026,7 +1068,98 @@ class AiHedgeStrategy extends TradingBase {
       this.shortPositionPnL = 0;
     }
     this.positionPnL = this.longPositionPnL + this.shortPositionPnL;
-    this.totalPnL = this.positionPnL + this.accumulatedRealizedPnL - this.accumulatedTradingFees;
+    // C2: include funding so auto-stop and AI prompt see the full picture.
+    this.totalPnL = this.positionPnL + this.accumulatedRealizedPnL - this.accumulatedTradingFees + this.accumulatedFundingFees;
+  }
+
+  // ——— C2 Funding-fee polling —————————————————————————————————————————
+
+  /**
+   * Poll Binance /fapi/v1/income for FUNDING_FEE entries since the last
+   * high-water mark and accumulate them into `accumulatedFundingFees`.
+   * Idempotent: if no new entries, no-op. Failures are logged and
+   * swallowed — funding poll is non-critical to trading.
+   */
+  async _pollFundingIncome() {
+    if (!this.symbol || !this._lastFundingPollTs) return { added: 0, count: 0 };
+    try {
+      // startTime is +1 over the last seen entry's timestamp so we never
+      // re-count the boundary entry. Limit 1000 is well above what could
+      // accumulate between settlements (3/day × 2 legs = 6 entries max
+      // per 8h window for a single symbol).
+      const startTime = this._lastFundingPollTs + 1;
+      const incomes = await this.makeProxyRequest(
+        '/fapi/v1/income',
+        'GET',
+        { symbol: this.symbol, incomeType: 'FUNDING_FEE', startTime, limit: 1000 },
+        true,
+        'futures'
+      ) || [];
+
+      if (!Array.isArray(incomes) || incomes.length === 0) return { added: 0, count: 0 };
+
+      let added = 0;
+      let maxTime = this._lastFundingPollTs;
+      for (const entry of incomes) {
+        const v = parseFloat(entry.income);
+        if (Number.isFinite(v)) {
+          added += v;
+          this.accumulatedFundingFees += v;
+          if (entry.time > maxTime) maxTime = entry.time;
+        }
+      }
+      this._lastFundingPollTs = maxTime;
+
+      await this.addLog(
+        `Funding settled: ${added >= 0 ? '+' : ''}${added.toFixed(4)} USDT ` +
+        `(cumulative ${this.accumulatedFundingFees >= 0 ? '+' : ''}${this.accumulatedFundingFees.toFixed(4)} USDT, ${incomes.length} entries)`
+      );
+      await this.saveState();
+      return { added, count: incomes.length };
+    } catch (err) {
+      console.error(`[FUNDING] poll failed: ${err.message}`);
+      return { added: 0, count: 0, error: err.message };
+    }
+  }
+
+  /**
+   * Schedule the next funding poll aligned to the next 8h UTC settlement
+   * boundary + 60s safety buffer. Self-rescheduling. Cancellable via
+   * clearTimeout(this._fundingPollTimeout).
+   *
+   * If the primary poll at +60s returns zero entries (Binance hasn't
+   * ledger'd the settlement yet), schedules a one-shot retry at +5min,
+   * then resumes the normal 8h cadence regardless of retry outcome.
+   */
+  _scheduleNextFundingPoll() {
+    const EIGHT_HOURS_MS = 8 * 60 * 60 * 1000;
+    const SAFETY_BUFFER_MS = 60 * 1000;          // 60s after settlement
+    const RETRY_BUFFER_MS = 5 * 60 * 1000;       // 5min retry on empty
+
+    if (this._fundingPollTimeout) {
+      clearTimeout(this._fundingPollTimeout);
+      this._fundingPollTimeout = null;
+    }
+
+    const now = Date.now();
+    const nextSettlement = Math.ceil(now / EIGHT_HOURS_MS) * EIGHT_HOURS_MS;
+    const primaryDelay = Math.max(1000, (nextSettlement - now) + SAFETY_BUFFER_MS);
+
+    this._fundingPollTimeout = setTimeout(async () => {
+      if (!this.isRunning) return;
+      const result = await this._pollFundingIncome();
+      // If primary poll found nothing, try once more 5min later in case
+      // Binance was lagging. Don't chain further retries — that's what the
+      // next 8h cycle is for.
+      if (this.isRunning && result.count === 0 && !result.error) {
+        this._fundingPollTimeout = setTimeout(async () => {
+          if (this.isRunning) await this._pollFundingIncome();
+          if (this.isRunning) this._scheduleNextFundingPoll();
+        }, RETRY_BUFFER_MS);
+      } else if (this.isRunning) {
+        this._scheduleNextFundingPoll();
+      }
+    }, primaryDelay);
   }
 
   // ——— State persistence ————————————————————————————————————————————
@@ -1061,6 +1194,8 @@ class AiHedgeStrategy extends TradingBase {
         shortPositionPnL: this.shortPositionPnL,
         accumulatedRealizedPnL: this.accumulatedRealizedPnL,
         accumulatedTradingFees: this.accumulatedTradingFees,
+        accumulatedFundingFees: this.accumulatedFundingFees,
+        _lastFundingPollTs: this._lastFundingPollTs,
         longAccumulatedRealizedPnL: this.longAccumulatedRealizedPnL,
         shortAccumulatedRealizedPnL: this.shortAccumulatedRealizedPnL,
         longTradingFees: this.longTradingFees,
@@ -1133,6 +1268,7 @@ class AiHedgeStrategy extends TradingBase {
       shortPositionPnL: this.shortPositionPnL,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL,
       accumulatedTradingFees: this.accumulatedTradingFees,
+      accumulatedFundingFees: this.accumulatedFundingFees,
       estimatedClosingFees,
       effectiveTarget: this.desiredProfitUSDT ? this.desiredProfitUSDT + estimatedClosingFees : null,
       progressToTarget: this.desiredProfitUSDT ? (this.totalPnL / (this.desiredProfitUSDT + estimatedClosingFees)) * 100 : null,

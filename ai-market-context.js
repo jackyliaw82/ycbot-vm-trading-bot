@@ -95,6 +95,7 @@ class AiMarketContext {
       minNotional,
       accumulatedRealizedPnL,
       accumulatedTradingFees,
+      accumulatedFundingFees,
       previousPlan,
       planHistory,
       firstPositionPrice,
@@ -164,6 +165,7 @@ class AiMarketContext {
 
       accumulatedRealizedPnL: accumulatedRealizedPnL || 0,
       accumulatedTradingFees: accumulatedTradingFees || 0,
+      accumulatedFundingFees: accumulatedFundingFees || 0,
 
       volatility,
       recentCandles,
