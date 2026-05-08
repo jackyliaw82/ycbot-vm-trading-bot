@@ -855,6 +855,21 @@ class AiHedgeStrategy extends TradingBase {
 
     if (action.type === 'HOLD') return { isHold: true };
 
+    // M1: wait for WS to confirm fill(s) before reading positions, closing
+    // the race where REST ACK beats the ACCOUNT_UPDATE event. Bounded
+    // 1500ms — if WS doesn't confirm within that window the existing
+    // _refreshHedgePositions retry will catch up.
+    if (action.type === 'OPEN_HEDGE') {
+      const longId = result?.longResult?.orderId;
+      const shortId = result?.shortResult?.orderId;
+      await Promise.all([
+        this._waitForOrderFillConfirmation(longId, 1500),
+        this._waitForOrderFillConfirmation(shortId, 1500),
+      ]);
+    } else if (result?.orderId) {
+      await this._waitForOrderFillConfirmation(result.orderId, 1500);
+    }
+
     this.tradeCount++;
 
     // Track first position price for single-leg guard

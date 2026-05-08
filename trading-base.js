@@ -2169,6 +2169,33 @@ class TradingBase {
   }
 
   /**
+   * M1 — wait for WS to confirm an orderId fill (via _handleOrderTradeUpdate
+   * setting _wsHandledOrderIds) before reading positions. The race we're
+   * closing: REST ACK can land before the WS ACCOUNT_UPDATE for the same
+   * fill, leaving longPosition/shortPosition reflecting the PRE-fill state.
+   * The existing _refreshHedgePositions retry only triggers when both sides
+   * are empty, so it doesn't catch "one side has the OLD quantity".
+   *
+   * Bounded by timeoutMs (default 1500ms — well past Binance's typical WS
+   * propagation). Returns true if confirmed within the window, false on
+   * timeout. Caller can still proceed on false; positions might be 100-
+   * 500ms stale and the next price tick / replan will reconcile.
+   */
+  async _waitForOrderFillConfirmation(orderId, timeoutMs = 1500) {
+    if (!orderId) return false;
+    if (this._wsHandledOrderIds.has(orderId)) return true;
+    const startedAt = Date.now();
+    return new Promise((resolve) => {
+      const tick = () => {
+        if (this._wsHandledOrderIds.has(orderId)) return resolve(true);
+        if (Date.now() - startedAt >= timeoutMs) return resolve(false);
+        setTimeout(tick, 50);
+      };
+      tick();
+    });
+  }
+
+  /**
    * M3 fix: smart listenKey refresh handler invoked from the periodic
    * setInterval. Old behavior force-closed the user-data WS on a single
    * refresh-cycle failure — leaving the bot blind to fills for up to
