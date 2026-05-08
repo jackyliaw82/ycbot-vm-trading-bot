@@ -1,10 +1,18 @@
-// Abnormality thresholds — metric is included in AI prompt only when exceeded
-const OI_CHANGE_1H_THRESHOLD = 2;          // |oiChange1h| > 2%
-const LIQ_VOLUME_15M_THRESHOLD = 1000000;  // total liqs > $1M in 15m
-const VOLUME_RATIO_HIGH = 3.0;             // current candle vol > 3x average
-const VOLUME_RATIO_LOW = 0.3;              // current candle vol < 0.3x average
-const TAKER_RATIO_HIGH = 1.5;              // buyers dominate
-const TAKER_RATIO_LOW = 0.6;               // sellers dominate
+// Abnormality thresholds — metric is included in AI prompt only when exceeded.
+// FLOORS only — the actual threshold is max(floor, symbol-relative baseline)
+// computed in _computeSymbolBaselines (M4 + M5 fix). The constants below
+// guarantee BTC won't flag every 0.5% OI swing as "abnormal", and ensure
+// extremely quiet symbols still have a meaningful trip threshold.
+const OI_CHANGE_1H_THRESHOLD = 2;          // floor: |oiChange1h| > 2%
+const LIQ_VOLUME_15M_THRESHOLD = 1_000_000; // floor: liqs > $1M in 15m
+const VOLUME_RATIO_HIGH = 3.0;             // already symbol-relative (ratio)
+const VOLUME_RATIO_LOW = 0.3;              // already symbol-relative (ratio)
+const TAKER_RATIO_HIGH = 1.5;              // floor: hard ceiling regardless of baseline
+const TAKER_RATIO_LOW = 0.6;               // floor: hard floor regardless of baseline
+
+// M4 + M5 — symbol-relative scaling. Recomputed every 6h.
+const SYMBOL_BASELINE_TTL_MS = 6 * 60 * 60 * 1000;
+const LIQ_VOLUME_PCT_OF_15M_VOLUME = 0.05;   // flag liqs > 5% of typical 15m volume
 
 // Liquidation-aware DCA sizing (Phase 2 hard ceiling, Phase 1 soft target).
 // Each ADD must keep that leg's projected liq distance >= MIN_LIQ_DISTANCE_PCT.
@@ -75,6 +83,72 @@ class AiMarketContext {
     this._cachedGlobalLSRatio = null;
     this._globalLSRatioCacheTime = 0;
     this._globalLSRatioCacheTTL = 5 * 60 * 1000;
+
+    // M4 + M5 — symbol-relative threshold cache. Refreshed every 6h.
+    this._symbolBaselines = null;
+    this._symbolBaselinesAt = 0;
+  }
+
+  /**
+   * M4 + M5 — compute symbol-relative thresholds from recent baseline data.
+   * Cached for SYMBOL_BASELINE_TTL_MS. Each threshold is `max(floor, baseline)`
+   * so very low-vol symbols still have meaningful trip thresholds and very
+   * high-vol symbols don't flag every routine fluctuation.
+   *
+   * Sources:
+   *   - liquidation threshold ← /fapi/v1/ticker/24hr quoteVolume / 96 (15m windows)
+   *   - taker ratio band      ← /futures/data/takerlongshortRatio period=1h, limit=24
+   *
+   * Caller (buildContext) awaits this before evaluating any abnormality flags.
+   */
+  async _computeSymbolBaselines() {
+    const now = Date.now();
+    if (this._symbolBaselines && (now - this._symbolBaselinesAt) < SYMBOL_BASELINE_TTL_MS) {
+      return this._symbolBaselines;
+    }
+    const symbol = this.strategy.symbol;
+    const baselines = {
+      liqVolumeThreshold: LIQ_VOLUME_15M_THRESHOLD,
+      takerRatioHigh: TAKER_RATIO_HIGH,
+      takerRatioLow: TAKER_RATIO_LOW,
+    };
+    try {
+      const [ticker24h, takerHistory] = await Promise.all([
+        this.strategy.makeProxyRequest('/fapi/v1/ticker/24hr', 'GET', { symbol }, false, 'futures').catch(() => null),
+        this.strategy.makeProxyRequest('/futures/data/takerlongshortRatio', 'GET', { symbol, period: '1h', limit: 24 }, false, 'futures').catch(() => null),
+      ]);
+
+      // M4: liquidation threshold = max($1M floor, 5% of typical 15m quote volume).
+      if (ticker24h && ticker24h.quoteVolume) {
+        const quoteVolume24h = parseFloat(ticker24h.quoteVolume);
+        const typical15m = quoteVolume24h / 96;
+        const scaled = typical15m * LIQ_VOLUME_PCT_OF_15M_VOLUME;
+        baselines.liqVolumeThreshold = Math.max(LIQ_VOLUME_15M_THRESHOLD, scaled);
+      }
+
+      // M5: taker ratio band = max(floor, p90)/min(floor, p10) of 24h history.
+      // Memecoins routinely sit at 1.5+ baseline; this lifts the trip line so
+      // we only flag when CURRENT taker ratio exceeds even the symbol's own
+      // recent extremes. Conservative buffer (+/- 0.1) keeps a ceiling.
+      if (Array.isArray(takerHistory) && takerHistory.length >= 12) {
+        const ratios = takerHistory
+          .map(d => parseFloat(d.buySellRatio))
+          .filter(r => Number.isFinite(r) && r > 0)
+          .sort((a, b) => a - b);
+        if (ratios.length >= 12) {
+          const p10 = ratios[Math.floor(ratios.length * 0.10)];
+          const p90 = ratios[Math.floor(ratios.length * 0.90)];
+          baselines.takerRatioHigh = Math.max(TAKER_RATIO_HIGH, p90 + 0.1);
+          baselines.takerRatioLow = Math.min(TAKER_RATIO_LOW, p10 - 0.1);
+        }
+      }
+
+      this._symbolBaselines = baselines;
+      this._symbolBaselinesAt = now;
+    } catch (err) {
+      console.error(`[BASELINES] failed for ${symbol}: ${err.message}`);
+    }
+    return baselines;
   }
 
   /**
@@ -113,6 +187,15 @@ class AiMarketContext {
       this._getLiquidations(),
       this._getGlobalLSRatio(),
     ]);
+
+    // M5: ATR-relative OI threshold — high-vol symbols tolerate bigger 1h
+    // swings before flagging as abnormal. ATR percentage of price is a clean
+    // proxy for "normal" hourly fluctuation magnitude.
+    if (oiChange && volatility?.atrPercent != null) {
+      const oiThreshold = Math.max(OI_CHANGE_1H_THRESHOLD, volatility.atrPercent);
+      oiChange.threshold = oiThreshold;
+      oiChange.isAbnormal = Math.abs(oiChange.oiChange1h) > oiThreshold;
+    }
 
     // Compute price direction from candles for taker ratio divergence detection
     let priceDirection = null;
@@ -709,9 +792,13 @@ class AiMarketContext {
     const snap = this.strategy.getLiquidationSnapshot();
     if (!snap) return null;
     const totalVol = snap.longLiqVolume15m + snap.shortLiqVolume15m;
+    // M4: symbol-relative threshold (5% of typical 15m volume), floored at $1M.
+    const baselines = await this._computeSymbolBaselines();
+    const threshold = baselines.liqVolumeThreshold;
     return {
       ...snap,
-      isAbnormal: totalVol > LIQ_VOLUME_15M_THRESHOLD || snap.cascadeActive,
+      threshold,
+      isAbnormal: totalVol > threshold || snap.cascadeActive,
     };
   }
 
@@ -740,10 +827,16 @@ class AiMarketContext {
 
   async _getTakerRatio(priceDirection) {
     const now = Date.now();
+    // M5: symbol-relative high/low band, recomputed every 6h.
+    const baselines = await this._computeSymbolBaselines();
+    const hi = baselines.takerRatioHigh;
+    const lo = baselines.takerRatioLow;
     if (this._cachedTakerRatio && (now - this._takerRatioCacheTime) < this._takerRatioCacheTTL) {
       const cached = { ...this._cachedTakerRatio };
       cached.divergence = this._checkTakerDivergence(cached.takerRatio, priceDirection);
-      cached.isAbnormal = cached.takerRatio > TAKER_RATIO_HIGH || cached.takerRatio < TAKER_RATIO_LOW || cached.divergence;
+      cached.thresholdHigh = hi;
+      cached.thresholdLow = lo;
+      cached.isAbnormal = cached.takerRatio > hi || cached.takerRatio < lo || cached.divergence;
       return cached;
     }
     try {
@@ -761,7 +854,7 @@ class AiMarketContext {
       else if (secondAvg < firstAvg * 0.9) takerTrend = 'SELLING_INCREASING';
 
       const divergence = this._checkTakerDivergence(takerRatio, priceDirection);
-      const result = { takerRatio, takerTrend, divergence, isAbnormal: takerRatio > TAKER_RATIO_HIGH || takerRatio < TAKER_RATIO_LOW || divergence };
+      const result = { takerRatio, takerTrend, divergence, thresholdHigh: hi, thresholdLow: lo, isAbnormal: takerRatio > hi || takerRatio < lo || divergence };
       this._cachedTakerRatio = result;
       this._takerRatioCacheTime = now;
       return result;
