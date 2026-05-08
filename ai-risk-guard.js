@@ -116,7 +116,8 @@ class AiRiskGuard {
    */
   _validateDCAPlan(plan, state) {
     const reasons = [];
-    const { currentPrice, longPosition, shortPosition } = state;
+    const { currentPrice, longPosition, shortPosition, volatility } = state;
+    const atr = volatility?.atr || 0;
 
     const longNotional = longPosition?.notional || 0;
     const shortNotional = shortPosition?.notional || 0;
@@ -126,21 +127,33 @@ class AiRiskGuard {
 
     for (const key of ['actionAbove', 'actionBelow']) {
       const action = plan[key];
-      // L4: strip triggerPrice from HOLD actions so the executor's crossing
-      // logic doesn't spuriously fire them. AI sometimes emits triggerPrice
-      // on HOLD (cosmetic carryover from when the same level was an ADD)
-      // — that drove wasted replan cycles in the 50h stuck log.
-      if (action && action.type === 'HOLD' && action.triggerPrice != null) {
-        console.warn(`[RISK-GUARD] Stripping triggerPrice from ${key} HOLD action (was ${action.triggerPrice})`);
-        delete action.triggerPrice;
+      // HOLD now carries a triggerPrice (the price at which the HOLD reasoning
+      // becomes invalid → AI replans on cross). If AI didn't supply one,
+      // synthesize a default at current ± 3×ATR. Direction sanity-checked
+      // below in the same way as ADD/CUT.
+      if (action && action.type === 'HOLD' && currentPrice && atr > 0) {
+        if (action.triggerPrice == null) {
+          const synthesized = key === 'actionAbove'
+            ? currentPrice + 3 * atr
+            : currentPrice - 3 * atr;
+          action.triggerPrice = synthesized;
+          action.synthesizedTrigger = true;
+          console.warn(`[RISK-GUARD] HOLD ${key}: synthesized triggerPrice ${synthesized.toFixed(4)} (current ${currentPrice} ${key === 'actionAbove' ? '+' : '-'} 3×ATR)`);
+        }
       }
-      if (action.type === 'HOLD') continue;
+      // HOLD validates direction below alongside ADD/CUT, then continues
+      // (no size/cap checks since it doesn't place an order).
+      const isHold = action && action.type === 'HOLD';
 
-      // Trigger price sanity
+      // Trigger price sanity. Direction rule applies to ADD/CUT/HOLD alike;
+      // 5%-deviation rule only applies to ADD/CUT (HOLD wake-up triggers can
+      // be 3×ATR away which on high-vol symbols may exceed 5%).
       if (currentPrice && action.triggerPrice) {
-        const deviation = Math.abs(action.triggerPrice - currentPrice) / currentPrice * 100;
-        if (deviation > this.maxPriceDeviationPercent) {
-          reasons.push(`${key}: trigger ${action.triggerPrice} is ${deviation.toFixed(1)}% from current price (max ${this.maxPriceDeviationPercent}%)`);
+        if (!isHold) {
+          const deviation = Math.abs(action.triggerPrice - currentPrice) / currentPrice * 100;
+          if (deviation > this.maxPriceDeviationPercent) {
+            reasons.push(`${key}: trigger ${action.triggerPrice} is ${deviation.toFixed(1)}% from current price (max ${this.maxPriceDeviationPercent}%)`);
+          }
         }
 
         if (key === 'actionAbove' && action.triggerPrice <= currentPrice) {
@@ -150,6 +163,10 @@ class AiRiskGuard {
           reasons.push(`actionBelow: trigger not below current price`);
         }
       }
+
+      // HOLD has no size/quantity to validate; skip the rest of the per-action
+      // checks (size floor, max position, liq caps, imbalance, gap projection).
+      if (isHold) continue;
 
       // Min size floor (minNotional × 2 safety margin)
       const sizeFloor = this.minNotional * 2;
@@ -226,7 +243,8 @@ class AiRiskGuard {
    */
   _validateDCAPlanPaired(plan, state) {
     const reasons = [];
-    const { currentPrice, longPosition, shortPosition } = state;
+    const { currentPrice, longPosition, shortPosition, volatility } = state;
+    const atr = volatility?.atr || 0;
     const sizeFloor = this.minNotional * 2;
     const longNotional = longPosition?.notional || 0;
     const shortNotional = shortPosition?.notional || 0;
@@ -240,28 +258,37 @@ class AiRiskGuard {
     let totalAddNotional = 0;
 
     const validateSub = (sideKey, kind, sub) => {
-      // L4: strip triggerPrice from HOLD/SKIP sub-actions so the executor's
-      // crossing logic doesn't spuriously fire them. Same rationale as the
-      // legacy validator above.
-      if (sub && (sub.type === 'HOLD' || sub.type === 'SKIP') && sub.triggerPrice != null) {
-        console.warn(`[RISK-GUARD] Stripping triggerPrice from ${sideKey}.${kind} ${sub.type} sub-action (was ${sub.triggerPrice})`);
-        delete sub.triggerPrice;
+      // SKIP sub-actions carry nothing — no trigger, no validation.
+      if (!sub || sub.type === 'SKIP') return;
+
+      // HOLD now carries a triggerPrice (price at which the HOLD reasoning
+      // becomes invalid). Synthesize default at current ± 3×ATR if AI didn't
+      // supply one. Only PRIMARY HOLD triggers drive replan (executor side
+      // filters shadow HOLDs); shadow HOLDs are still synthesized + validated
+      // for consistency.
+      if (sub.type === 'HOLD' && currentPrice && atr > 0 && sub.triggerPrice == null) {
+        const synthesized = sideKey === 'actionAbove'
+          ? currentPrice + 3 * atr
+          : currentPrice - 3 * atr;
+        sub.triggerPrice = synthesized;
+        sub.synthesizedTrigger = true;
+        console.warn(`[RISK-GUARD] HOLD ${sideKey}.${kind}: synthesized triggerPrice ${synthesized.toFixed(4)} (current ${currentPrice} ${sideKey === 'actionAbove' ? '+' : '-'} 3×ATR)`);
       }
-      // HOLD (primary) and SKIP (shadow) carry no fields to check.
-      if (!sub || sub.type === 'HOLD' || sub.type === 'SKIP') return;
 
       const tag = `${sideKey}.${kind}`;
+      const isHold = sub.type === 'HOLD';
       const isAdd = sub.type === 'ADD_LONG' || sub.type === 'ADD_SHORT';
       const isCut = sub.type === 'CUT_LONG' || sub.type === 'CUT_SHORT';
 
-      // Trigger price sanity: actionAbove > current, actionBelow < current — applies
-      // to BOTH primary and shadow regardless of action type. Shadow_LONG (under
-      // actionAbove, ADD_LONG) is still above current; shadow_SHORT (under actionBelow,
-      // ADD_SHORT) is still below current.
+      // Trigger price sanity: direction rule applies to ADD/CUT/HOLD;
+      // 5%-deviation rule only applies to ADD/CUT (HOLD wake-up triggers
+      // can be 3×ATR away which on high-vol symbols may exceed 5%).
       if (currentPrice && sub.triggerPrice) {
-        const deviation = Math.abs(sub.triggerPrice - currentPrice) / currentPrice * 100;
-        if (deviation > this.maxPriceDeviationPercent) {
-          reasons.push(`${tag}: trigger ${sub.triggerPrice} is ${deviation.toFixed(1)}% from current price (max ${this.maxPriceDeviationPercent}%)`);
+        if (!isHold) {
+          const deviation = Math.abs(sub.triggerPrice - currentPrice) / currentPrice * 100;
+          if (deviation > this.maxPriceDeviationPercent) {
+            reasons.push(`${tag}: trigger ${sub.triggerPrice} is ${deviation.toFixed(1)}% from current price (max ${this.maxPriceDeviationPercent}%)`);
+          }
         }
         if (sideKey === 'actionAbove' && sub.triggerPrice <= currentPrice) {
           reasons.push(`${tag}: trigger ${sub.triggerPrice} not above current price ${currentPrice}`);
@@ -270,6 +297,9 @@ class AiRiskGuard {
           reasons.push(`${tag}: trigger ${sub.triggerPrice} not below current price ${currentPrice}`);
         }
       }
+
+      // HOLD has no qty/notional — skip remaining checks.
+      if (isHold) return;
 
       // Compute USDT notional from qty × triggerPrice. Shared by floor / cap checks.
       const notional = (typeof sub.qty === 'number' && typeof sub.triggerPrice === 'number')

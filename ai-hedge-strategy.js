@@ -99,8 +99,9 @@ class AiHedgeStrategy extends TradingBase {
     // Single-leg guard: track price of first ever position
     this.firstPositionPrice = null;
 
-    // HOLD replan timer
-    this._holdReplanAt = null;
+    // (HOLD time-based replan timer removed — HOLD now carries a triggerPrice
+    // synthesized at current ± 3×ATR if AI didn't supply one. Replan fires
+    // on price-cross via the executor's normal trigger detection path.)
 
     // Auto-stop hysteresis: require sustained target hit (N consecutive
     // ticks AND min elapsed duration) before closing out. Defends against
@@ -694,12 +695,9 @@ class AiHedgeStrategy extends TradingBase {
         }
       }
 
-      // HOLD replan timer
-      if (this._holdReplanAt && Date.now() >= this._holdReplanAt) {
-        this._holdReplanAt = null;
-        await this.addLog('HOLD timer expired. Requesting fresh plan...');
-        await this._requestNewPlan('hold_replan');
-      }
+      // (HOLD time-based replan removed — replan now fires on HOLD trigger
+      // crossing via the trigger detection above. _runActionAndRecord will
+      // schedule a replan when a HOLD action's triggerPrice is crossed.)
     }
   }
 
@@ -776,6 +774,7 @@ class AiHedgeStrategy extends TradingBase {
         phase: this.phase,
         liquidationCaps: context.liquidationCaps,
         minLiqDistancePct: context.minLiqDistancePct,
+        volatility: context.volatility,
       });
 
       if (!validation.valid) {
@@ -800,6 +799,7 @@ class AiHedgeStrategy extends TradingBase {
           phase: this.phase,
           liquidationCaps: context.liquidationCaps,
           minLiqDistancePct: context.minLiqDistancePct,
+          volatility: context.volatility,
         });
 
         if (!fallbackValidation.valid) {
@@ -842,23 +842,11 @@ class AiHedgeStrategy extends TradingBase {
         await this.addLog(`  Prob: ${plan.probabilityAssessment.higherChance} (${plan.probabilityAssessment.confidence}) — ${plan.probabilityAssessment.reasoning}`);
       }
 
-      // HOLD replan timer (legacy + paired-with-all-HOLD-primaries)
-      const bothHold = plan._schema === 'paired'
-        ? plan.actionAbove?.primary?.type === 'HOLD' && plan.actionBelow?.primary?.type === 'HOLD'
-        : plan.actionAbove?.type === 'HOLD' && plan.actionBelow?.type === 'HOLD';
-      if (bothHold) {
-        const minutes = Math.max(15, Math.min(120, plan.holdReplanMinutes || 30));
-        this._holdReplanAt = Date.now() + minutes * 60 * 1000;
-        await this.addLog(`  Both HOLD. Re-evaluate in ${minutes} min.`);
-      } else {
-        this._holdReplanAt = null;
-      }
-
-      // Note: 4h staleness replan timer was removed — _holdReplanAt above
-      // already handles the both-HOLD case (the only one where a stale plan
-      // is genuinely stuck). Plans with valid ADD/CUT triggers now wait
-      // indefinitely for price to cross the trigger; that's the intended
-      // semantics — no wasted AI calls just because no fill happened.
+      // Time-based replan timers removed (4h staleness + HOLD-replan).
+      // Replan now fires on price-cross of any trigger — including HOLD
+      // primaries which carry a synthesized 3×ATR triggerPrice if AI
+      // didn't supply one. See _runActionAndRecord for the replan
+      // dispatch when a HOLD trigger crosses.
 
       await this.saveState();
 
@@ -911,7 +899,19 @@ class AiHedgeStrategy extends TradingBase {
   async _runActionAndRecord(action, direction) {
     const result = await this.executor.executeAction(action);
 
-    if (action.type === 'HOLD') return { isHold: true };
+    if (action.type === 'HOLD') {
+      // Reaching this branch means the HOLD's triggerPrice was crossed —
+      // the AI's reasoning is now invalid and we need a fresh plan. Fire
+      // and forget; the new plan will replace the active one when it
+      // arrives. Don't await — letting other-side triggers continue
+      // processing on this tick is fine since the replacing plan
+      // supersedes them anyway.
+      const triggerStr = action.triggerPrice ? this._formatPrice(action.triggerPrice) : 'unknown';
+      this.addLog(`HOLD trigger crossed at ${triggerStr} — requesting fresh plan.`).catch(() => {});
+      this._requestNewPlan('hold_trigger_crossed').catch((e) =>
+        console.error(`HOLD-trigger replan failed: ${e.message}`));
+      return { isHold: true };
+    }
 
     // M1: wait for WS to confirm fill(s) before reading positions, closing
     // the race where REST ACK beats the ACCOUNT_UPDATE event. Bounded

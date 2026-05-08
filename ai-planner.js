@@ -248,14 +248,14 @@ Respond with ONLY a valid JSON object. Schema depends on phase:
   "analysis": "Market analysis + gap projection for each action (2-3 sentences)",
   "actionAbove": {
     "type": "ADD_SHORT" | "CUT_SHORT" | "HOLD",
-    "triggerPrice": <number above current price>,
-    "sizeUSDT": <number>,
+    "triggerPrice": <number above current price — for HOLD, the price at which the HOLD reasoning becomes invalid>,
+    "sizeUSDT": <number — omit/null for HOLD>,
     "reason": "Brief explanation + gap projection"
   },
   "actionBelow": {
     "type": "ADD_LONG" | "CUT_LONG" | "HOLD",
-    "triggerPrice": <number below current price>,
-    "sizeUSDT": <number>,
+    "triggerPrice": <number below current price — for HOLD, the price at which the HOLD reasoning becomes invalid>,
+    "sizeUSDT": <number — omit/null for HOLD>,
     "reason": "Brief explanation + gap projection"
   },
   "probabilityAssessment": {
@@ -265,7 +265,7 @@ Respond with ONLY a valid JSON object. Schema depends on phase:
   }
 }
 
-When BOTH actions are HOLD, include "holdReplanMinutes" (15-120).`;
+**HOLD actions MUST include a triggerPrice** — the price at which your HOLD reasoning becomes invalid. When price crosses this level, the strategy will replan. Default to current ± 3×ATR if you have no specific level in mind. Same direction rules as ADD/CUT: actionAbove > current, actionBelow < current. The system will synthesize current ± 3×ATR if you omit it.`;
 
 // ──────────────────────────────────────────────────────────────────────
 // v2.0.0 paired-trigger DCA system prompt. Active only when
@@ -459,17 +459,17 @@ Respond with ONLY a valid JSON object. Schema depends on phase:
 {
   "analysis": "Market analysis + 4 single-action gap projections (primary above, shadow above, primary below, shadow below)",
   "actionAbove": {
-    "primary": { "type": "ADD_SHORT"|"CUT_SHORT"|"HOLD", "triggerPrice": <number ≥ currentPrice + 3×ATR>, "qty": <SOL number>, "reason": "..." },
-    "shadow":  { "type": "ADD_LONG"|"SKIP", "triggerPrice": <primary.triggerPrice − 1×ATR>, "qty": <SOL number, pre-clamped>, "reason": "..." }
+    "primary": { "type": "ADD_SHORT"|"CUT_SHORT"|"HOLD", "triggerPrice": <number ≥ currentPrice + 3×ATR>, "qty": <SOL number, omit/null for HOLD>, "reason": "..." },
+    "shadow":  { "type": "ADD_LONG"|"HOLD"|"SKIP", "triggerPrice": <primary.triggerPrice − 1×ATR for ADD_LONG; for HOLD use any wake-up price above current; SKIP needs no trigger>, "qty": <SOL number, pre-clamped; omit for HOLD/SKIP>, "reason": "..." }
   },
   "actionBelow": {
-    "primary": { "type": "ADD_LONG"|"CUT_LONG"|"HOLD", "triggerPrice": <number ≤ currentPrice − 3×ATR>, "qty": <SOL number>, "reason": "..." },
-    "shadow":  { "type": "ADD_SHORT"|"SKIP", "triggerPrice": <primary.triggerPrice + 1×ATR>, "qty": <SOL number, pre-clamped>, "reason": "..." }
+    "primary": { "type": "ADD_LONG"|"CUT_LONG"|"HOLD", "triggerPrice": <number ≤ currentPrice − 3×ATR>, "qty": <SOL number, omit/null for HOLD>, "reason": "..." },
+    "shadow":  { "type": "ADD_SHORT"|"HOLD"|"SKIP", "triggerPrice": <primary.triggerPrice + 1×ATR for ADD_SHORT; for HOLD use any wake-up price below current; SKIP needs no trigger>, "qty": <SOL number, pre-clamped; omit for HOLD/SKIP>, "reason": "..." }
   },
   "probabilityAssessment": { "higherChance": "ABOVE"|"BELOW", "confidence": "high"|"medium"|"low", "reasoning": "..." }
 }
 
-When all 4 actions are HOLD/SKIP, include "holdReplanMinutes" (15-120).`;
+**Primary HOLD MUST include a triggerPrice** — the price at which your HOLD reasoning becomes invalid. When primary price crosses, the strategy replans. Default to current ± 3×ATR if you have no specific level in mind. Same direction rules: actionAbove > current, actionBelow < current. The system synthesizes current ± 3×ATR if you omit it. **Only PRIMARY HOLD triggers drive replan** — shadow HOLD/SKIP triggers are not wake-up signals.`;
 
 class AiPlanner {
   constructor(apiKey, model = 'claude-sonnet-4-6') {
@@ -871,14 +871,16 @@ class AiPlanner {
       if (!expectedShadowTypes.includes(s.type)) {
         throw new Error(`${sideKey}.shadow type "${s.type}" invalid (must be: ${expectedShadowTypes.join(', ')})`);
       }
-      if (s.type !== 'SKIP') {
+      // ADD shadows need triggerPrice + qty. HOLD shadow has neither (only
+      // primary HOLDs drive replan). SKIP carries nothing.
+      if (s.type !== 'SKIP' && s.type !== 'HOLD') {
         if (typeof s.triggerPrice !== 'number') throw new Error(`${sideKey}.shadow missing numeric "triggerPrice"`);
         if (typeof s.qty !== 'number' || s.qty < 0) throw new Error(`${sideKey}.shadow missing non-negative "qty"`);
       }
     };
 
-    validatePair('actionAbove', ['ADD_SHORT', 'CUT_SHORT', 'HOLD'], ['ADD_LONG', 'SKIP']);
-    validatePair('actionBelow', ['ADD_LONG', 'CUT_LONG', 'HOLD'], ['ADD_SHORT', 'SKIP']);
+    validatePair('actionAbove', ['ADD_SHORT', 'CUT_SHORT', 'HOLD'], ['ADD_LONG', 'HOLD', 'SKIP']);
+    validatePair('actionBelow', ['ADD_LONG', 'CUT_LONG', 'HOLD'], ['ADD_SHORT', 'HOLD', 'SKIP']);
 
     if (!plan.probabilityAssessment) throw new Error('Missing "probabilityAssessment"');
     if (!['ABOVE', 'BELOW'].includes(plan.probabilityAssessment.higherChance)) {

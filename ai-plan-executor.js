@@ -103,8 +103,11 @@ class AiPlanExecutor {
       const side = plan[sideKey];
       if (!side) return;
 
-      // Primary
-      if (side.primary && side.primary.type !== 'HOLD') {
+      // Primary (ADD / CUT / HOLD). HOLD now carries a triggerPrice and
+      // becomes a "wake-up" trigger — when crossed, the strategy fires a
+      // replan instead of placing an order. Shadow HOLDs do NOT drive
+      // wake-up (only primary does, per user directive).
+      if (side.primary && side.primary.type !== 'SKIP') {
         this.pendingActions.push({
           type: side.primary.type,
           triggerPrice: side.primary.triggerPrice,
@@ -116,8 +119,9 @@ class AiPlanExecutor {
         });
       }
 
-      // Shadow — clamp qty as final safety net before placing
-      if (side.shadow && side.shadow.type !== 'SKIP') {
+      // Shadow — only push ADD/CUT shadows (HOLD/SKIP shadows are no-ops
+      // for execution; only primary HOLD drives wake-up).
+      if (side.shadow && side.shadow.type !== 'SKIP' && side.shadow.type !== 'HOLD') {
         const shadowSide = side.shadow.type === 'ADD_LONG' ? 'shadow_long' : 'shadow_short';
         const clamp = AiPlanExecutor.clampShadowQty(
           shadowSide,
