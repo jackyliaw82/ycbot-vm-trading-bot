@@ -28,7 +28,12 @@ class AiRiskGuard {
   }
 
   /**
-   * Validate a dual-action plan (Phase 1 INITIAL or Phase 2 DCA).
+   * Validate a plan against risk constraints.
+   *
+   * Dispatches by phase + schema:
+   *   - Phase 1 INITIAL → legacy 2-trigger OPEN_HEDGE validator (unchanged)
+   *   - Phase 2 DCA, plan._schema === 'paired' → v2.0.0 paired-trigger validator
+   *   - Phase 2 DCA, otherwise → legacy 2-trigger DCA validator (unchanged)
    */
   validatePlan(plan, state) {
     if (!plan || !plan.actionAbove || !plan.actionBelow) {
@@ -37,6 +42,10 @@ class AiRiskGuard {
 
     if (state.phase === 'INITIAL') {
       return this._validateInitialPlan(plan, state);
+    }
+
+    if (plan._schema === 'paired') {
+      return this._validateDCAPlanPaired(plan, state);
     }
 
     return this._validateDCAPlan(plan, state);
@@ -181,6 +190,136 @@ class AiRiskGuard {
     }
 
     // Rate limiting
+    const now = Date.now();
+    this._actionTimestamps = this._actionTimestamps.filter(t => t > now - 3600000);
+    if (this._actionTimestamps.length >= this.maxActionsPerHour) {
+      reasons.push(`Rate limit: ${this._actionTimestamps.length} actions in last hour (max ${this.maxActionsPerHour})`);
+    }
+
+    return { valid: reasons.length === 0, reasons };
+  }
+
+  /**
+   * Validate a v2.0.0 paired-trigger Phase 2 DCA plan.
+   *
+   * Plan shape:
+   *   actionAbove = { primary: { type, triggerPrice, qty }, shadow: { type, triggerPrice, qty } }
+   *   actionBelow = { primary: { type, triggerPrice, qty }, shadow: { type, triggerPrice, qty } }
+   *
+   * Iterates 4 sub-actions and applies the same risk checks as the legacy
+   * validator, with two adaptations:
+   *   - Notional is computed as qty × triggerPrice (paired schema uses qty, not sizeUSDT).
+   *   - Direction sanity is keyed off the parent side (actionAbove must be > currentPrice,
+   *     actionBelow < currentPrice) regardless of whether the sub-action is primary or
+   *     shadow — both live above/below current per the cascade architecture.
+   *
+   * Liquidation cap, max position size, imbalance > 5:1 CUT-only, gap projection, and
+   * rate limiting all apply as in legacy.
+   */
+  _validateDCAPlanPaired(plan, state) {
+    const reasons = [];
+    const { currentPrice, longPosition, shortPosition } = state;
+    const sizeFloor = this.minNotional * 2;
+    const longNotional = longPosition?.notional || 0;
+    const shortNotional = shortPosition?.notional || 0;
+    const imbalanceRatio = (longNotional > 0 && shortNotional > 0)
+      ? Math.max(longNotional / shortNotional, shortNotional / longNotional)
+      : 0;
+    const lighterSide = longNotional < shortNotional ? 'LONG' : 'SHORT';
+    const caps = state.liquidationCaps;
+
+    // Sum of all ADD notionals across 4 sub-actions — for max-total-position check.
+    let totalAddNotional = 0;
+
+    const validateSub = (sideKey, kind, sub) => {
+      // HOLD (primary) and SKIP (shadow) carry no fields to check.
+      if (!sub || sub.type === 'HOLD' || sub.type === 'SKIP') return;
+
+      const tag = `${sideKey}.${kind}`;
+      const isAdd = sub.type === 'ADD_LONG' || sub.type === 'ADD_SHORT';
+      const isCut = sub.type === 'CUT_LONG' || sub.type === 'CUT_SHORT';
+
+      // Trigger price sanity: actionAbove > current, actionBelow < current — applies
+      // to BOTH primary and shadow regardless of action type. Shadow_LONG (under
+      // actionAbove, ADD_LONG) is still above current; shadow_SHORT (under actionBelow,
+      // ADD_SHORT) is still below current.
+      if (currentPrice && sub.triggerPrice) {
+        const deviation = Math.abs(sub.triggerPrice - currentPrice) / currentPrice * 100;
+        if (deviation > this.maxPriceDeviationPercent) {
+          reasons.push(`${tag}: trigger ${sub.triggerPrice} is ${deviation.toFixed(1)}% from current price (max ${this.maxPriceDeviationPercent}%)`);
+        }
+        if (sideKey === 'actionAbove' && sub.triggerPrice <= currentPrice) {
+          reasons.push(`${tag}: trigger ${sub.triggerPrice} not above current price ${currentPrice}`);
+        }
+        if (sideKey === 'actionBelow' && sub.triggerPrice >= currentPrice) {
+          reasons.push(`${tag}: trigger ${sub.triggerPrice} not below current price ${currentPrice}`);
+        }
+      }
+
+      // Compute USDT notional from qty × triggerPrice. Shared by floor / cap checks.
+      const notional = (typeof sub.qty === 'number' && typeof sub.triggerPrice === 'number')
+        ? sub.qty * sub.triggerPrice
+        : 0;
+
+      // Min size floor — applies to ADD and CUT alike (Binance minNotional must be
+      // honoured for any market order).
+      if ((isAdd || isCut) && notional > 0 && notional < sizeFloor) {
+        reasons.push(`${tag}: notional ${notional.toFixed(2)} (qty ${sub.qty} × ${sub.triggerPrice}) below minimum ${sizeFloor} (= minNotional ${this.minNotional} × 2 safety margin)`);
+      }
+
+      if (!isAdd) return; // CUT and other types: no further per-side checks below
+
+      totalAddNotional += notional;
+
+      // Liquidation-aware cap — based on the action.type (ADD_LONG vs ADD_SHORT),
+      // not the parent side. Shadow_LONG @ actionAbove still grows the LONG leg
+      // and must respect maxAddLongUSDT.
+      if (caps) {
+        if (sub.type === 'ADD_LONG' && caps.maxAddLongUSDT != null && notional > caps.maxAddLongUSDT + 0.01) {
+          reasons.push(`${tag}: ADD_LONG notional ${notional.toFixed(2)} exceeds liquidation-safe cap ${caps.maxAddLongUSDT.toFixed(2)} USDT (LONG liq distance would drop below ${state.minLiqDistancePct}%)`);
+        }
+        if (sub.type === 'ADD_SHORT' && caps.maxAddShortUSDT != null && notional > caps.maxAddShortUSDT + 0.01) {
+          reasons.push(`${tag}: ADD_SHORT notional ${notional.toFixed(2)} exceeds liquidation-safe cap ${caps.maxAddShortUSDT.toFixed(2)} USDT (SHORT liq distance would drop below ${state.minLiqDistancePct}%)`);
+        }
+      }
+
+      // Imbalance > 5:1 — CUT-only mode. ADDs to the lighter side are forbidden;
+      // applies to BOTH primary and shadow.
+      if (imbalanceRatio > this.maxImbalanceRatio) {
+        if ((sub.type === 'ADD_LONG' && lighterSide === 'LONG') ||
+            (sub.type === 'ADD_SHORT' && lighterSide === 'SHORT')) {
+          reasons.push(`${tag}: imbalance ${imbalanceRatio.toFixed(1)}:1 — CUT-only mode, cannot ADD to lighter side (${lighterSide})`);
+        }
+      }
+
+      // Gap projection — reject if THIS action alone would flip gap negative.
+      // Each sub-action is projected independently per FORWARD REASONING.
+      if (longPosition && shortPosition && sub.triggerPrice && sub.qty > 0) {
+        const projection = this.projectGap(
+          { type: sub.type, triggerPrice: sub.triggerPrice, sizeUSDT: notional },
+          longPosition,
+          shortPosition,
+        );
+        if (projection.projectedGap < 0) {
+          reasons.push(`${tag}: ${sub.type} at ${sub.triggerPrice} (qty ${sub.qty}) would flip gap to ${projection.projectedGap.toFixed(4)} (current: ${projection.currentGap.toFixed(4)})`);
+        }
+      }
+    };
+
+    validateSub('actionAbove', 'primary', plan.actionAbove?.primary);
+    validateSub('actionAbove', 'shadow',  plan.actionAbove?.shadow);
+    validateSub('actionBelow', 'primary', plan.actionBelow?.primary);
+    validateSub('actionBelow', 'shadow',  plan.actionBelow?.shadow);
+
+    // Max total position size — sum of current legs + all proposed ADDs across
+    // the 4 sub-actions. Even though only some will fire per cycle, validate the
+    // pessimistic case where all four ADDs eventually accumulate.
+    const currentTotal = longNotional + shortNotional;
+    if (currentTotal + totalAddNotional > this.maxPositionSizeUSDT) {
+      reasons.push(`Plan: cumulative ADD notional ${totalAddNotional.toFixed(2)} on top of current ${currentTotal.toFixed(2)} would exceed max ${this.maxPositionSizeUSDT}`);
+    }
+
+    // Rate limiting (shared with legacy DCA path).
     const now = Date.now();
     this._actionTimestamps = this._actionTimestamps.filter(t => t > now - 3600000);
     if (this._actionTimestamps.length >= this.maxActionsPerHour) {
