@@ -119,9 +119,10 @@ class AiMarketContext {
     // Volume ratio computed from already-fetched candles (no API call)
     const volumeRatio = this._getVolumeRatio(recentCandles);
 
-    // S/R levels — 15m native with per-side cascade fallback to 1h → 4h → 1d → prior-week H/L.
-    // Replaces the prior dual-TF (15m + 5m) block; lighter and heavier leg DCA both anchor here.
-    const supportResistance = await this._computeSRWithCascade(candles15m);
+    // S/R levels — 15m native with per-side cascade fallback to 1h → 4h → 1d → prior-week H/L,
+    // then synthetic ±5x ATR if everything else is rejected. Every emitted level is guaranteed
+    // ≥3x ATR from current price (data-layer filter inside the cascade).
+    const supportResistance = await this._computeSRWithCascade(candles15m, volatility?.atr || 0);
 
     return {
       symbol: this.strategy.symbol,
@@ -402,21 +403,24 @@ class AiMarketContext {
 
   // ——— Support & Resistance ————————————————————————————————————————————
 
-  _computeSRLevels(candles, lookback = 5, source = '15m') {
+  _computeSRLevels(candles, lookback = 5, source = '15m', atrFloor = 0) {
     const currentPrice = this.strategy.currentPrice || 0;
     if (!currentPrice || !candles || candles.length < lookback * 2 + 1) return null;
 
     const swings = this._findSwingLevels(candles, lookback);
 
+    // atrFloor enforces a hard minimum distance: every emitted support is
+    // currentPrice - p >= atrFloor; every resistance is p - currentPrice >= atrFloor.
+    // Levels closer than that are rejected here so the cascade can promote.
     const supports = swings.supports
-      .filter(p => p < currentPrice)
+      .filter(p => p < currentPrice && (currentPrice - p) >= atrFloor)
       .sort((a, b) => b - a)
       .filter((s, i, arr) => i === 0 || Math.abs(s - arr[i - 1]) / arr[i - 1] > 0.001)
       .slice(0, 3)
       .map((p, i) => ({ price: p, source, rank: i + 1 }));
 
     const resistances = swings.resistances
-      .filter(p => p > currentPrice)
+      .filter(p => p > currentPrice && (p - currentPrice) >= atrFloor)
       .sort((a, b) => a - b)
       .filter((r, i, arr) => i === 0 || Math.abs(r - arr[i - 1]) / arr[i - 1] > 0.001)
       .slice(0, 3)
@@ -426,23 +430,36 @@ class AiMarketContext {
   }
 
   /**
-   * S/R cascade: 15m native → 1h → 4h → 1d → prior-week H/L floor.
+   * S/R cascade: 15m native → 1h → 4h → 1d → prior-week H/L → synthetic ±5x ATR.
+   *
+   * Distance filter (data-layer guarantee): every emitted level is ≥3x ATR
+   * from current price. Levels closer than 3x ATR are rejected at each
+   * rung so the cascade can promote to the next TF. This makes the rule
+   * "S/R must be ≥3x ATR away from price" deterministic at the data layer
+   * — the AI no longer needs to filter the levels itself.
+   *
    * Per-side: supports and resistances cascade independently. If 15m has
-   * 2 supports + 0 resistances, keep the 2 supports as-is and only run
-   * the cascade for resistances. Within a single side, the cascade
-   * replaces the whole side at the first non-empty rung (no cross-TF
-   * backfill of missing slots).
+   * 2 qualifying supports + 0 qualifying resistances, keep the 2 supports
+   * as-is and only run the cascade for resistances. Within a single side,
+   * the cascade replaces the whole side at the first non-empty rung (no
+   * cross-TF backfill of missing slots).
+   *
+   * Last-resort: if cascade is exhausted (including prior-week H/L) on a
+   * side, emit a synthetic level at currentPrice ± 5x ATR with source
+   * 'atr_5x_fallback' so the AI always has a usable trigger.
    *
    * Returns { supports: [...], resistances: [...] } where each level is
    * { price, source, rank }. `source` is one of:
    *   '15m', '1h_fallback', '4h_fallback', '1d_fallback',
-   *   'prior_week_low', 'prior_week_high'.
+   *   'prior_week_low', 'prior_week_high', 'atr_5x_fallback'.
    */
-  async _computeSRWithCascade(candles15m) {
+  async _computeSRWithCascade(candles15m, atr = 0) {
     const out = { supports: [], resistances: [] };
+    const currentPrice = this.strategy.currentPrice || 0;
+    const atrFloor = atr * 3;  // both legs require S/R ≥3x ATR away from price
 
     // Rung 1: 15m native (300 bars, L=5 → ~3 days lookback)
-    const native = this._computeSRLevels(candles15m, 5, '15m');
+    const native = this._computeSRLevels(candles15m, 5, '15m', atrFloor);
     if (native) {
       if (native.supports.length)    out.supports    = native.supports;
       if (native.resistances.length) out.resistances = native.resistances;
@@ -460,7 +477,7 @@ class AiMarketContext {
         if (out.supports.length > 0 && out.resistances.length > 0) break;
         try {
           const candles = await rung.fetch();
-          const sr = this._computeSRLevels(candles, rung.L, rung.source);
+          const sr = this._computeSRLevels(candles, rung.L, rung.source, atrFloor);
           if (!sr) continue;
           if (out.supports.length === 0    && sr.supports.length)    out.supports    = sr.supports;
           if (out.resistances.length === 0 && sr.resistances.length) out.resistances = sr.resistances;
@@ -471,6 +488,8 @@ class AiMarketContext {
     }
 
     // Rung 5: deterministic floor — prior-week H/L from last 7 daily candles.
+    // Same 3x ATR distance filter applies; if the prior-week H/L is closer than
+    // that to current price, treat as not found.
     if (out.supports.length === 0 || out.resistances.length === 0) {
       try {
         const dailyCandles = await this._get1dCandles();
@@ -478,15 +497,30 @@ class AiMarketContext {
         if (last7.length > 0) {
           const wkHigh = Math.max(...last7.map(c => c.high));
           const wkLow  = Math.min(...last7.map(c => c.low));
-          if (out.supports.length === 0 && wkLow > 0) {
+          if (out.supports.length === 0 && wkLow > 0 && wkLow < currentPrice
+              && (currentPrice - wkLow) >= atrFloor) {
             out.supports = [{ price: wkLow, source: 'prior_week_low', rank: 1 }];
           }
-          if (out.resistances.length === 0 && wkHigh > 0) {
+          if (out.resistances.length === 0 && wkHigh > 0 && wkHigh > currentPrice
+              && (wkHigh - currentPrice) >= atrFloor) {
             out.resistances = [{ price: wkHigh, source: 'prior_week_high', rank: 1 }];
           }
         }
       } catch (e) {
         console.error(`Prior-week H/L derivation failed: ${e.message}`);
+      }
+    }
+
+    // Last resort: synthetic ±5x ATR. Fires only when no qualifying level
+    // (≥3x ATR away) was found anywhere in the cascade — including the
+    // prior-week H/L. Guarantees the AI always sees a usable trigger.
+    if ((out.supports.length === 0 || out.resistances.length === 0)
+        && currentPrice > 0 && atr > 0) {
+      if (out.supports.length === 0) {
+        out.supports = [{ price: currentPrice - 5 * atr, source: 'atr_5x_fallback', rank: 1 }];
+      }
+      if (out.resistances.length === 0) {
+        out.resistances = [{ price: currentPrice + 5 * atr, source: 'atr_5x_fallback', rank: 1 }];
       }
     }
 

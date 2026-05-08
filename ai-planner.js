@@ -33,10 +33,10 @@ Positions exist from Phase 1. Your job:
    - This classification is based ONLY on existing exposure. It is NOT about which side gets the larger allocation in this round's DCA — those are separate concepts (see step 2 below).
 2. Create one ADD action for each side. Two independent rules apply per side:
 
-   **(a) TRIGGER-PRICE SPACING — by current-notional class:**
-   - **The lighter leg's ADD action** (the ADD targeting whichever side has smaller current notional): use the unified S/R block (15m native + cascade fallback to 1h/4h/1d/prior-week H/L), minimum **1x ATR** spacing from current price. If no S/R is available at all, fallback to **1x ATR** from current price as the trigger level.
-   - **The heavier leg's ADD action** (the ADD targeting whichever side has larger current notional): use the same unified S/R block, minimum **2x ATR** spacing from current price. If no S/R is available at all, fallback to **3x ATR** from current price as the trigger level.
-   - Both legs anchor to the same S/R levels; only the minimum ATR spacing differs (1x for lighter, 2x for heavier). Levels are source-tagged in the SUPPORT & RESISTANCE block so you can weight them: '15m' = native swing levels; '*_fallback' = promoted from a higher TF (structurally stronger but typically further from price); 'prior_week_high'/'prior_week_low' = deterministic floor.
+   **(a) TRIGGER-PRICE SPACING — unified S/R for both legs:**
+   - **Both legs' ADD actions** (lighter and heavier alike): use the unified S/R block (15m native + cascade fallback to 1h/4h/1d/prior-week H/L). The block is data-layer-filtered so every returned level is ALREADY ≥3x ATR from current price — pick the closest qualifying level on the relevant side and use it directly as the trigger. No per-leg ATR-multiplier distinction is needed.
+   - If the cascade was exhausted (no qualifying swing-or-structural S/R found anywhere), the block emits a synthetic level tagged 'atr_5x_fallback' at currentPrice ± 5x ATR — use that as the trigger.
+   - Levels are source-tagged in the SUPPORT & RESISTANCE block so you can weight them: '15m' = native swing levels; '*_fallback' = swing levels promoted from a higher TF (structurally stronger but typically further from price); 'prior_week_high'/'prior_week_low' = deterministic structural floor; 'atr_5x_fallback' = last-resort synthetic when no real level was found ≥3x ATR away.
 
    **(b) SIZE ALLOCATION — by this-round probability (independent of (a)):**
    - The higher-probability side gets the LARGER sizeUSDT. Use conviction-based ratios: 60:40 (low confidence), 70:30 (medium), 80:20 to 90:10 (high). Cap at 60:40 when signals are mixed or S/R is weak. (Note: Phase 1 OPEN_HEDGE is hard-locked at 60:40 — these conviction-based ratios apply only to Phase 2 DCA.)
@@ -97,10 +97,10 @@ Use these to:
 3. Detect dangerous conditions (cascades → HOLD both sides)
 
 ## VOLATILITY-AWARE SPACING
-Use ATR (Average True Range) from 15m candles. Leg class is determined by CURRENT position notional (see Phase 2 step 1), never by this round's sizeUSDT allocation.
-- Lighter leg DCA (smaller current notional): use the unified S/R block, minimum 1x ATR from current price. If no S/R available, use **currentPrice ± 1x ATR** as trigger.
-- Heavier leg DCA (larger current notional): use the unified S/R block (same levels as lighter), minimum 2x ATR from current price. If no S/R available, use **currentPrice ± 3x ATR** as trigger.
-- In EXTREME volatility: widen further (2x lighter, 4x heavier)
+Use ATR (Average True Range) from 15m candles. Leg class (from CURRENT position notional, see Phase 2 step 1) determines size allocation only — both legs share the same S/R block for trigger spacing.
+- Both legs DCA: use the unified S/R block. Every level is data-layer-guaranteed to be ≥3x ATR from current price (the cascade rejects closer levels and promotes to the next TF). Pick the closest qualifying level on the relevant side as the trigger.
+- If the cascade returns the synthetic 'atr_5x_fallback' tag, that means no qualifying swing-or-structural S/R was found anywhere even after promoting through 15m → 1h → 4h → 1d → prior-week H/L — use the 5x ATR synthetic level as the trigger.
+- In EXTREME volatility: do NOT manually widen ATR multiples — ATR itself is now larger and the 3x floor scales with it, so the cascade already returns appropriately wider levels.
 
 ## ASYMMETRIC SIZING (Phase 2 DCA only — Phase 1 OPEN_HEDGE is hard-locked at 60:40)
 The higher-probability direction gets a LARGER position size:
@@ -410,11 +410,11 @@ class AiPlanner {
       parts.push(`1h Range: ${t.low} - ${t.high}, Change: ${t.change > 0 ? '+' : ''}${t.change.toFixed(2)}%`);
     }
 
-    // S/R levels — 15m native swing highs/lows (5-bar lookback, ~3 days),
-    // with per-side cascade fallback to 1h → 4h → 1d → prior-week H/L when
-    // the native side is empty. Both heavier and lighter leg DCA anchor here;
-    // aggression differentiated by ATR/momentum context, not by separate level set.
-    parts.push(`\n## SUPPORT & RESISTANCE (15m native, cascade fallback to 1h/4h/1d/prior-week)`);
+    // S/R levels — 15m native swing highs/lows (5-bar lookback, ~3 days)
+    // with per-side cascade fallback to 1h → 4h → 1d → prior-week H/L,
+    // and a synthetic ±5x ATR last-resort. Every emitted level is
+    // data-layer-guaranteed to be ≥3x ATR from current price.
+    parts.push(`\n## SUPPORT & RESISTANCE (15m native + cascade; every level ≥3x ATR from price)`);
     if (context.supportResistance) {
       const sr = context.supportResistance;
       const hasR = sr.resistances?.length > 0;
@@ -422,12 +422,12 @@ class AiPlanner {
       const fmt = (lvl) => `${lvl.price} [${lvl.source}]`;
       if (hasR) parts.push(`Resistances: ${sr.resistances.map(fmt).join(', ')}`);
       if (hasS) parts.push(`Supports: ${sr.supports.map(fmt).join(', ')}`);
-      if (!hasR) parts.push(`Resistances: NONE FOUND — use 3x ATR above current price as fallback`);
-      if (!hasS) parts.push(`Supports: NONE FOUND — use 3x ATR below current price as fallback`);
-      parts.push(`Source tags: '15m' = native swing levels (~3-day lookback). '*_fallback' = swing levels promoted from a higher TF when 15m side was empty (structurally stronger but typically further from price). 'prior_week_high'/'prior_week_low' = deterministic floor from last 7 daily candles.`);
-      parts.push(`Both heavier and lighter leg DCA anchor to these levels.`);
+      if (!hasR) parts.push(`Resistances: NONE FOUND — use currentPrice + 5x ATR as last-resort fallback`);
+      if (!hasS) parts.push(`Supports: NONE FOUND — use currentPrice − 5x ATR as last-resort fallback`);
+      parts.push(`Source tags: '15m' = native swing levels (~3-day lookback). '*_fallback' = swing levels promoted from a higher TF when the 15m side had no qualifying level (structurally stronger but typically further from price). 'prior_week_high'/'prior_week_low' = deterministic structural floor from last 7 daily candles. 'atr_5x_fallback' = synthetic level at currentPrice ± 5x ATR, emitted only when no real S/R was found ≥3x ATR away.`);
+      parts.push(`Both heavier and lighter leg DCA anchor to these levels — pick the closest qualifying level on the relevant side as the trigger.`);
     } else {
-      parts.push(`No S/R data available — use 3x ATR from current price as fallback for both legs.`);
+      parts.push(`No S/R data available — use currentPrice ± 5x ATR as fallback for both legs.`);
     }
 
     // Market microstructure (only when abnormal)
