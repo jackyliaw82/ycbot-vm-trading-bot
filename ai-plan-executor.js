@@ -1,13 +1,60 @@
 /**
  * AiPlanExecutor — monitors trigger prices and executes AI plan actions.
  *
- * Dual-action model: each plan has one action ABOVE and one BELOW current price.
+ * Legacy model (v1.x): each plan has one action ABOVE and one BELOW current price.
  * When one triggers, the other is cancelled and a fresh plan is requested.
+ *
+ * Paired-trigger model (v2.0.0+, AI_DCA_MODE=paired_trigger): each plan has
+ * 4 actions per side — primary + shadow on actionAbove, primary + shadow on
+ * actionBelow. Shadow qty is band-clamped to keep LONG/SHORT ratio in band
+ * even on one-sided fills.
  *
  * Supports OPEN_HEDGE (Phase 1) which opens both LONG and SHORT simultaneously,
  * and ADD/CUT actions (Phase 2) for DCA.
  */
 class AiPlanExecutor {
+  /**
+   * Pure helper: clamp a shadow qty proposal so the post-fill LONG/SHORT
+   * ratio stays inside the band even if the shadow alone fills (price
+   * reverses before reaching the paired primary).
+   *
+   * For Shadow_LONG (ADD_LONG triggered when price rises past the shadow):
+   *   post-fill ratio = (longQty + X) / shortQty
+   *   constraint:      ≤ ratioBand.upper
+   *   max_X = shortQty × ratioBand.upper − longQty
+   *
+   * For Shadow_SHORT (ADD_SHORT triggered when price falls past the shadow):
+   *   post-fill ratio = longQty / (shortQty + Y)
+   *   constraint:      ≥ ratioBand.lower
+   *   max_Y = longQty / ratioBand.lower − shortQty
+   *
+   * Returns { finalQty, wasClamped, reason, maxAllowed }. If maxAllowed ≤ 0
+   * the band is saturated and the caller should SKIP the order.
+   */
+  static clampShadowQty(side, proposedQty, longQty, shortQty, ratioBand) {
+    const { lower, upper } = ratioBand || { lower: 0.85, upper: 1.15 };
+
+    let maxAllowed;
+    if (side === 'shadow_long') {
+      maxAllowed = shortQty * upper - longQty;
+    } else if (side === 'shadow_short') {
+      maxAllowed = longQty / lower - shortQty;
+    } else {
+      throw new Error(`clampShadowQty: unknown side '${side}' (expected shadow_long or shadow_short)`);
+    }
+
+    if (maxAllowed <= 0) {
+      return { finalQty: 0, wasClamped: true, reason: 'band_saturated', maxAllowed };
+    }
+    if (!Number.isFinite(proposedQty) || proposedQty <= 0) {
+      return { finalQty: 0, wasClamped: false, reason: 'proposed_zero_or_invalid', maxAllowed };
+    }
+    if (proposedQty > maxAllowed) {
+      return { finalQty: maxAllowed, wasClamped: true, reason: 'clamped_to_max', maxAllowed };
+    }
+    return { finalQty: proposedQty, wasClamped: false, reason: 'within_band', maxAllowed };
+  }
+
   constructor(strategy) {
     this.strategy = strategy;
     this.activePlan = null;

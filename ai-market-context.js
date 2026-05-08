@@ -11,6 +11,14 @@ const TAKER_RATIO_LOW = 0.6;               // sellers dominate
 // 8% leaves a meaningful safety margin even with sub-second adverse moves.
 const MIN_LIQ_DISTANCE_PCT = 8;
 
+// Paired-trigger DCA (v2.0.0+): hedge-ratio band and shadow trigger distance.
+// Shadow qty is clamped at the executor layer so post-fill ratio stays within
+// the band on a one-sided fill. Shadow distance defines the gap between a
+// primary trigger and its paired shadow on the opposite leg (1×ATR).
+const RATIO_BAND_LOWER = 0.85;
+const RATIO_BAND_UPPER = 1.15;
+const SHADOW_DISTANCE_ATR = 1;
+
 /**
  * AiMarketContext — builds market context for AI plan generation.
  *
@@ -177,6 +185,13 @@ class AiMarketContext {
       // uses the leverage-based projection in the system prompt instead.
       liquidationCaps: this._computeLiquidationCaps(longPosition, shortPosition, marginInfo),
       minLiqDistancePct: MIN_LIQ_DISTANCE_PCT,
+
+      // Paired-trigger DCA constants surfaced for the prompt + executor.
+      // The AI uses these to pre-clamp shadow qty proposals; the executor
+      // re-clamps as a safety net.
+      ratioBand: { lower: RATIO_BAND_LOWER, upper: RATIO_BAND_UPPER },
+      shadowDistanceATR: SHADOW_DISTANCE_ATR,
+      shadowDistance: (volatility?.atr || 0) * SHADOW_DISTANCE_ATR,
     };
   }
 
