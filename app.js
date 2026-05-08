@@ -11,6 +11,7 @@ import { execFile } from 'child_process';
 import { readFileSync } from 'fs';
 import os from 'os';
 import wsBroadcast from './ws-broadcast.js';
+import { httpAuthMiddleware, requireAdmin } from './http-auth.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -44,6 +45,15 @@ app.use(cors({
 }));
 
 app.use(express.json());
+
+// HTTP auth: verifies Firebase ID token from `Authorization: Bearer <token>`
+// header on all routes EXCEPT /health, /startup-status, /update-status (those
+// are public for monitoring + pre-login frontend probes). On success, attaches
+// `req.uid`. Set HTTP_AUTH_REQUIRED=false to bypass for emergency only.
+//
+// Mounted BEFORE express.json()? No — auth comes after json parsing because
+// the userId-vs-token cross-check needs req.body. CORS is already mounted.
+app.use(httpAuthMiddleware);
 
 // Lightweight startup status endpoint - responds immediately without waiting for full initialization
 app.get('/startup-status', (req, res) => {
@@ -567,7 +577,7 @@ process.on('SIGINT', () => {
 // ============================
 
 // Force disconnect Real-time Price WebSocket
-app.post('/test/force-disconnect-realtime-ws', async (req, res) => {
+app.post('/test/force-disconnect-realtime-ws', requireAdmin, async (req, res) => {
   try {
     const { strategyId } = req.body;
 
@@ -603,7 +613,7 @@ app.post('/test/force-disconnect-realtime-ws', async (req, res) => {
 });
 
 // Force disconnect User Data WebSocket
-app.post('/test/force-disconnect-userdata-ws', async (req, res) => {
+app.post('/test/force-disconnect-userdata-ws', requireAdmin, async (req, res) => {
   try {
     const { strategyId } = req.body;
 
@@ -639,7 +649,7 @@ app.post('/test/force-disconnect-userdata-ws', async (req, res) => {
 });
 
 // Force disconnect both WebSockets
-app.post('/test/force-disconnect-websockets', async (req, res) => {
+app.post('/test/force-disconnect-websockets', requireAdmin, async (req, res) => {
   try {
     const { strategyId } = req.body;
 
@@ -687,7 +697,7 @@ app.post('/test/force-disconnect-websockets', async (req, res) => {
 });
 
 // Invalidate listenKey (simulates expired key)
-app.post('/test/invalidate-listenkey', async (req, res) => {
+app.post('/test/invalidate-listenkey', requireAdmin, async (req, res) => {
   try {
     const { strategyId } = req.body;
 
@@ -733,7 +743,7 @@ app.post('/test/invalidate-listenkey', async (req, res) => {
 });
 
 // Clear listenKey completely (tests full re-acquisition)
-app.post('/test/force-clear-listenkey', async (req, res) => {
+app.post('/test/force-clear-listenkey', requireAdmin, async (req, res) => {
   try {
     const { strategyId } = req.body;
 
@@ -781,7 +791,7 @@ app.post('/test/force-clear-listenkey', async (req, res) => {
 });
 
 // Reset reconnection state (clear retry counters and timers)
-app.post('/test/reset-reconnection-state', async (req, res) => {
+app.post('/test/reset-reconnection-state', requireAdmin, async (req, res) => {
   try {
     const { strategyId } = req.body;
 
@@ -848,7 +858,7 @@ app.get('/update-status', (req, res) => {
   });
 });
 
-app.post('/system/update', async (req, res) => {
+app.post('/system/update', requireAdmin, async (req, res) => {
   if (isUpdating) {
     return res.status(409).json({ error: 'Update already in progress.', targetVersion });
   }
@@ -870,7 +880,7 @@ app.post('/system/update', async (req, res) => {
   }
 });
 
-app.post('/system/force-update', async (req, res) => {
+app.post('/system/force-update', requireAdmin, async (req, res) => {
   if (isUpdating) {
     return res.status(409).json({ error: 'Update already in progress.', targetVersion });
   }
