@@ -24,7 +24,12 @@ module.exports = {
       // Phase 2: route all Binance WS through the shared ycbot-ws-relay. VM IP
       // never talks directly to Binance, avoiding the IP-reputation class of
       // bans. Leave unset to fall back to direct Binance.
-      RELAY_WS_URL: 'ws://34.80.183.147:8080/ws'
+      RELAY_WS_URL: 'ws://34.80.183.147:8080/ws',
+      // C5 admin gate: comma-separated list of Firebase UIDs allowed to call
+      // /system/* and /test/* endpoints (requireAdmin middleware). Without
+      // this set, all admin endpoints reject with "Forbidden — uid is not
+      // in the admin list" even when the caller has a valid Firebase token.
+      HTTP_ADMIN_UIDS: 'DKcVtSFFJOVvDzHLMrnPlJhAk3B3'
       // RELAY_AUTH_TOKEN is fetched at runtime by app.js loadRelayAuthToken()
       // from Firestore (relay_auth_tokens/<uid>). No env var needed in PROD.
       // Local dev: export RELAY_AUTH_TOKEN=... to skip the Firestore lookup.
