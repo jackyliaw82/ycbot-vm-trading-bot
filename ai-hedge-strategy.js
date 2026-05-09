@@ -437,8 +437,30 @@ class AiHedgeStrategy extends TradingBase {
     const longExists = !!(this.longPosition && this.longPosition.quantity > 0);
     const shortExists = !!(this.shortPosition && this.shortPosition.quantity > 0);
 
+    // Phase 1 INITIAL with no positions yet is a NORMAL state — the strategy
+    // was waiting for the OPEN_HEDGE trigger price to be crossed when the
+    // restart hit. Resume in INITIAL phase; the strategy will request a fresh
+    // plan on the first price tick and continue waiting for OPEN_HEDGE.
+    // Without this branch, force-update on a Phase-1 strategy would
+    // mistakenly fall through to "positions closed during downtime" and
+    // mark the strategy stopped.
+    if (snapshot.phase === 'INITIAL' && !longExists && !shortExists) {
+      this.phase = 'INITIAL';
+      await this.addLog('[RECOVERY] Phase 1 INITIAL — no positions yet (waiting for OPEN_HEDGE trigger). Resuming in INITIAL phase. Will replan on first price tick.');
+
+      // Funding poll + metrics sampler are safe to start in INITIAL —
+      // sampler skips internally when either leg has 0 qty; funding poll
+      // is symbol-keyed and harmless when there are no positions.
+      this._scheduleNextFundingPoll();
+      this._startMetricsSampler();
+
+      await this.saveState();
+      return;
+    }
+
     if (!longExists && !shortExists) {
-      // Both legs gone — auto-stop fired during downtime, or user closed manually.
+      // DCA phase, both legs gone — auto-stop fired during downtime, or
+      // user closed manually.
       await this.addLog('[RECOVERY] No positions on Binance — strategy was already closed during downtime. Marking stopped.');
       this.isRunning = false;
       this.criticalError = 'positions_closed_during_downtime';
