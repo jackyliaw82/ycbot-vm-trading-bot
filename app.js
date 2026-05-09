@@ -1049,7 +1049,7 @@ function triggerSelfUpdate(retryCount = 0) {
         PATH: process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
         TARGET_VERSION: targetVersion || '',
       }
-    }, (error, stdout, stderr) => {
+    }, async (error, stdout, stderr) => {
       if (error) {
         const exitCode = error.code;
 
@@ -1076,6 +1076,22 @@ function triggerSelfUpdate(retryCount = 0) {
       }
       console.log('[UPDATE] Self-update script completed. PM2 will restart the process.');
       console.log('[UPDATE] stdout:', stdout);
+
+      // Mark 'restarting' before PM2 kills us so the admin UI shows the
+      // correct phase during the PM2 restart gap (port 3000 ECONNREFUSED).
+      // Wait up to 2s for the Firestore write to land — PM2 typically gives
+      // us at least that before SIGTERM.
+      try {
+        await Promise.race([
+          reportUpdateStatus('restarting', {
+            targetVersion,
+            restartingAt: new Date().toISOString(),
+          }),
+          new Promise((res) => setTimeout(res, 2000)),
+        ]);
+      } catch (e) {
+        console.error('[UPDATE] Failed to report restarting status:', e);
+      }
     });
   });
 }
@@ -1097,7 +1113,15 @@ async function reportUpdateStatus(status, details = {}) {
   }
 }
 
+// Owner user-id is fixed for the lifetime of this process — cache once after
+// first successful resolution so subsequent reportUpdateStatus calls don't
+// re-scan the full users collection. Critical during the PM2 restart gap:
+// the 'restarting' write must land in <2s, and the cold-start 'idle' write
+// on the new bot's boot path resolves faster too.
+let _cachedVmOwnerUserId = null;
+
 async function getVmOwnerUserId() {
+  if (_cachedVmOwnerUserId) return _cachedVmOwnerUserId;
   try {
     const usersSnapshot = await firestore.collection('users').get();
     const localIps = getLocalIpAddresses();
@@ -1109,6 +1133,7 @@ async function getVmOwnerUserId() {
         try {
           const urlHost = new URL(userData.vmBotUrl).hostname;
           if (localIps.includes(urlHost)) {
+            _cachedVmOwnerUserId = doc.id;
             return doc.id;
           }
         } catch {
@@ -1122,6 +1147,7 @@ async function getVmOwnerUserId() {
       for (const doc of usersSnapshot.docs) {
         const userData = doc.data();
         if (userData.vmBotUrl && userData.vmBotUrl.includes(hostname)) {
+          _cachedVmOwnerUserId = doc.id;
           return doc.id;
         }
       }
