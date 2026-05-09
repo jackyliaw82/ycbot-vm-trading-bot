@@ -30,8 +30,8 @@ const SHADOW_DISTANCE_ATR = 1;
 /**
  * AiMarketContext — builds market context for AI plan generation.
  *
- * Gathers: price candles (5m/15m/1h, plus 4h/1d on S/R cascade fire),
- * ATR volatility, support/resistance with multi-TF cascade fallback,
+ * Gathers: price candles (5m/15m/1h), ATR volatility,
+ * support/resistance with 15m → 1h cascade fallback,
  * OI change, taker ratio, global L/S ratio, funding rate, liquidations,
  * relative volume, and margin info.
  */
@@ -49,20 +49,10 @@ class AiMarketContext {
     this._candle15mCacheTime = 0;
     this._candle15mCacheTTL = 15 * 60 * 1000;
 
-    // 1h candle cache (for broader trend + S/R cascade rung 2)
+    // 1h candle cache (for broader trend + S/R cascade fallback rung)
     this._cached1hCandles = null;
     this._candle1hCacheTime = 0;
     this._candle1hCacheTTL = 30 * 60 * 1000;
-
-    // 4h candle cache (S/R cascade rung 3)
-    this._cached4hCandles = null;
-    this._candle4hCacheTime = 0;
-    this._candle4hCacheTTL = 60 * 60 * 1000;
-
-    // 1d candle cache (S/R cascade rung 4 + prior-week H/L floor)
-    this._cached1dCandles = null;
-    this._candle1dCacheTime = 0;
-    this._candle1dCacheTTL = 6 * 60 * 60 * 1000;
 
     // Funding rate cache
     this._cachedFundingRate = null;
@@ -211,7 +201,7 @@ class AiMarketContext {
     // Volume ratio computed from already-fetched candles (no API call)
     const volumeRatio = this._getVolumeRatio(recentCandles);
 
-    // S/R levels — 15m native with per-side cascade fallback to 1h → 4h → 1d → prior-week H/L,
+    // S/R levels — 15m native with per-side cascade fallback to 1h,
     // then synthetic ±5x ATR if everything else is rejected. Every emitted level is guaranteed
     // ≥3x ATR from current price (data-layer filter inside the cascade).
     const supportResistance = await this._computeSRWithCascade(candles15m, volatility?.atr || 0);
@@ -457,38 +447,6 @@ class AiMarketContext {
     }
   }
 
-  async _get4hCandles() {
-    const now = Date.now();
-    if (this._cached4hCandles && (now - this._candle4hCacheTime) < this._candle4hCacheTTL) {
-      return this._cached4hCandles;
-    }
-    try {
-      const klines = await this.strategy.makeProxyRequest('/fapi/v1/klines', 'GET', { symbol: this.strategy.symbol, interval: '4h', limit: 120 }, false, 'futures');
-      this._cached4hCandles = this._parseKlines(klines);
-      this._candle4hCacheTime = now;
-      return this._cached4hCandles;
-    } catch (error) {
-      console.error(`Failed to fetch 4h candles: ${error.message}`);
-      return this._cached4hCandles || [];
-    }
-  }
-
-  async _get1dCandles() {
-    const now = Date.now();
-    if (this._cached1dCandles && (now - this._candle1dCacheTime) < this._candle1dCacheTTL) {
-      return this._cached1dCandles;
-    }
-    try {
-      const klines = await this.strategy.makeProxyRequest('/fapi/v1/klines', 'GET', { symbol: this.strategy.symbol, interval: '1d', limit: 60 }, false, 'futures');
-      this._cached1dCandles = this._parseKlines(klines);
-      this._candle1dCacheTime = now;
-      return this._cached1dCandles;
-    } catch (error) {
-      console.error(`Failed to fetch 1d candles: ${error.message}`);
-      return this._cached1dCandles || [];
-    }
-  }
-
   _parseKlines(klines) {
     return klines.map(k => ({
       openTime: k[0],
@@ -530,7 +488,7 @@ class AiMarketContext {
   }
 
   /**
-   * S/R cascade: 15m native → 1h → 4h → 1d → prior-week H/L → synthetic ±5x ATR.
+   * S/R cascade: 15m native → 1h → synthetic ±5x ATR.
    *
    * Distance filter (data-layer guarantee): every emitted level is ≥3x ATR
    * from current price. Levels closer than 3x ATR are rejected at each
@@ -544,14 +502,13 @@ class AiMarketContext {
    * the cascade replaces the whole side at the first non-empty rung (no
    * cross-TF backfill of missing slots).
    *
-   * Last-resort: if cascade is exhausted (including prior-week H/L) on a
-   * side, emit a synthetic level at currentPrice ± 5x ATR with source
+   * Last-resort: if 15m and 1h both fail to produce a qualifying level on
+   * a side, emit a synthetic level at currentPrice ± 5x ATR with source
    * 'atr_5x_fallback' so the AI always has a usable trigger.
    *
    * Returns { supports: [...], resistances: [...] } where each level is
    * { price, source, rank }. `source` is one of:
-   *   '15m', '1h_fallback', '4h_fallback', '1d_fallback',
-   *   'prior_week_low', 'prior_week_high', 'atr_5x_fallback'.
+   *   '15m', '1h_fallback', 'atr_5x_fallback'.
    */
   async _computeSRWithCascade(candles15m, atr = 0) {
     const out = { supports: [], resistances: [] };
@@ -565,55 +522,23 @@ class AiMarketContext {
       if (native.resistances.length) out.resistances = native.resistances;
     }
 
-    // Rung 2-4: cascade per-side. Only fetch a higher TF if at least one
-    // side is still empty.
-    if (out.supports.length === 0 || out.resistances.length === 0) {
-      const ladder = [
-        { tf: '1h', source: '1h_fallback', L: 3, fetch: () => this._get1hCandles() },
-        { tf: '4h', source: '4h_fallback', L: 3, fetch: () => this._get4hCandles() },
-        { tf: '1d', source: '1d_fallback', L: 2, fetch: () => this._get1dCandles() },
-      ];
-      for (const rung of ladder) {
-        if (out.supports.length > 0 && out.resistances.length > 0) break;
-        try {
-          const candles = await rung.fetch();
-          const sr = this._computeSRLevels(candles, rung.L, rung.source, atrFloor);
-          if (!sr) continue;
-          if (out.supports.length === 0    && sr.supports.length)    out.supports    = sr.supports;
-          if (out.resistances.length === 0 && sr.resistances.length) out.resistances = sr.resistances;
-        } catch (e) {
-          console.error(`S/R cascade rung ${rung.tf} failed: ${e.message}`);
-        }
-      }
-    }
-
-    // Rung 5: deterministic floor — prior-week H/L from last 7 daily candles.
-    // Same 3x ATR distance filter applies; if the prior-week H/L is closer than
-    // that to current price, treat as not found.
+    // Rung 2: 1h fallback per-side. Only fetch if at least one side is empty.
     if (out.supports.length === 0 || out.resistances.length === 0) {
       try {
-        const dailyCandles = await this._get1dCandles();
-        const last7 = (dailyCandles || []).slice(-7);
-        if (last7.length > 0) {
-          const wkHigh = Math.max(...last7.map(c => c.high));
-          const wkLow  = Math.min(...last7.map(c => c.low));
-          if (out.supports.length === 0 && wkLow > 0 && wkLow < currentPrice
-              && (currentPrice - wkLow) >= atrFloor) {
-            out.supports = [{ price: wkLow, source: 'prior_week_low', rank: 1 }];
-          }
-          if (out.resistances.length === 0 && wkHigh > 0 && wkHigh > currentPrice
-              && (wkHigh - currentPrice) >= atrFloor) {
-            out.resistances = [{ price: wkHigh, source: 'prior_week_high', rank: 1 }];
-          }
+        const candles1h = await this._get1hCandles();
+        const sr = this._computeSRLevels(candles1h, 3, '1h_fallback', atrFloor);
+        if (sr) {
+          if (out.supports.length === 0    && sr.supports.length)    out.supports    = sr.supports;
+          if (out.resistances.length === 0 && sr.resistances.length) out.resistances = sr.resistances;
         }
       } catch (e) {
-        console.error(`Prior-week H/L derivation failed: ${e.message}`);
+        console.error(`S/R cascade rung 1h failed: ${e.message}`);
       }
     }
 
-    // Last resort: synthetic ±5x ATR. Fires only when no qualifying level
-    // (≥3x ATR away) was found anywhere in the cascade — including the
-    // prior-week H/L. Guarantees the AI always sees a usable trigger.
+    // Last resort: synthetic ±5x ATR. Fires only when neither 15m nor 1h
+    // produced a qualifying level (≥3x ATR away) on a side. Guarantees
+    // the AI always sees a usable trigger.
     if ((out.supports.length === 0 || out.resistances.length === 0)
         && currentPrice > 0 && atr > 0) {
       if (out.supports.length === 0) {
@@ -917,10 +842,6 @@ class AiMarketContext {
     this._candle15mCacheTime = 0;
     this._cached1hCandles = null;
     this._candle1hCacheTime = 0;
-    this._cached4hCandles = null;
-    this._candle4hCacheTime = 0;
-    this._cached1dCandles = null;
-    this._candle1dCacheTime = 0;
     this._cachedFundingRate = null;
     this._fundingRateCacheTime = 0;
     this._cachedOIHistory = null;

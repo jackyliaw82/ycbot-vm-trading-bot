@@ -19,7 +19,7 @@ totalPnL >= effectiveTarget; you do NOT plan take-profit.
 
 ### PHASE 1: INITIAL — Open Hedge at S/R (uses unified S/R cascade — same source as Phase 2)
 No positions exist yet. Your job:
-1. Pick the trigger levels from the **SUPPORT & RESISTANCE block** in the user message — the unified cascade (15m native → 1h → 4h → 1d → prior-week H/L → currentPrice ± 5×ATR synthetic). Every level is data-layer-guaranteed to be ≥3×ATR from current price. Pick the closest qualifying level on each side regardless of source tag — fallback-tagged and atr_5x_fallback synthetic levels are valid OPEN_HEDGE triggers, not reasons to HOLD.
+1. Pick the trigger levels from the **SUPPORT & RESISTANCE block** in the user message — the unified cascade (15m native → 1h → currentPrice ± 5×ATR synthetic). Every level is data-layer-guaranteed to be ≥3×ATR from current price. Pick the closest qualifying level on each side regardless of source tag — 1h_fallback and atr_5x_fallback synthetic levels are valid OPEN_HEDGE triggers, not reasons to HOLD.
 2. At each level, emit OPEN_HEDGE that opens BOTH legs simultaneously.
 3. Sizing ratio: **ALWAYS 60:40** (no conviction-based scaling in Phase 1).
 4. At resistance: shortSizeUSDT = positionSizeUSDT × 0.60, longSizeUSDT × 0.40.
@@ -426,9 +426,9 @@ class AiPlanner {
     }
 
     // S/R levels — 15m native swing highs/lows (5-bar lookback, ~3 days)
-    // with per-side cascade fallback to 1h → 4h → 1d → prior-week H/L,
-    // and a synthetic ±5x ATR last-resort. Every emitted level is
-    // data-layer-guaranteed to be ≥3x ATR from current price.
+    // with per-side cascade fallback to 1h, and a synthetic ±5x ATR
+    // last-resort. Every emitted level is data-layer-guaranteed to be
+    // ≥3x ATR from current price.
     parts.push(`\n## SUPPORT & RESISTANCE (15m native + cascade; every level ≥3x ATR from price)`);
     if (context.supportResistance) {
       const sr = context.supportResistance;
@@ -439,7 +439,7 @@ class AiPlanner {
       if (hasS) parts.push(`Supports: ${sr.supports.map(fmt).join(', ')}`);
       if (!hasR) parts.push(`Resistances: NONE FOUND — use currentPrice + 5x ATR as last-resort fallback`);
       if (!hasS) parts.push(`Supports: NONE FOUND — use currentPrice − 5x ATR as last-resort fallback`);
-      parts.push(`Source tags: '15m' = native swing levels (~3-day lookback). '*_fallback' = swing levels promoted from a higher TF when the 15m side had no qualifying level (structurally stronger but typically further from price). 'prior_week_high'/'prior_week_low' = deterministic structural floor from last 7 daily candles. 'atr_5x_fallback' = synthetic level at currentPrice ± 5x ATR, emitted only when no real S/R was found ≥3x ATR away.`);
+      parts.push(`Source tags: '15m' = native swing levels (~3-day lookback). '1h_fallback' = swing levels promoted from 1h when the 15m side had no qualifying level (structurally stronger but typically further from price). 'atr_5x_fallback' = synthetic level at currentPrice ± 5x ATR, emitted only when neither 15m nor 1h produced a level ≥3x ATR away.`);
       parts.push(`Both heavier and lighter leg DCA anchor to these levels — pick the closest qualifying level on the relevant side as the trigger.`);
     } else {
       parts.push(`No S/R data available — use currentPrice ± 5x ATR as fallback for both legs.`);
