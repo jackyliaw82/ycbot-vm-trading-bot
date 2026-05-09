@@ -362,6 +362,15 @@ class AiHedgeStrategy extends TradingBase {
     // suddenly start scaling on resume against an undefined baseline.
     this._atrPctAtStart = snapshot._atrPctAtStart || null;
 
+    // Restore AI usage counters + plan-rotation history so they survive
+    // force-update / crash / VM reboot. Pre-fix snapshots lack these fields
+    // — fall back to the constructor defaults so older strategies still
+    // resume cleanly (they just lose the pre-restart counters once).
+    this.aiTokenUsage = snapshot.aiTokenUsage || {
+      inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheCreation: 0, planCount: 0,
+    };
+    this.planHistory = snapshot.planHistory || [];
+
     const anthropicApiKey = await this._fetchAnthropicApiKey();
 
     try {
@@ -1340,6 +1349,12 @@ class AiHedgeStrategy extends TradingBase {
         timeTaken: this.timeTaken || null,
         realtimeWsConnected: this.realtimeWsConnected,
         userDataWsConnected: this.userDataWsConnected,
+        // AI cost + plan-rotation continuity across restart. aiTokenUsage drives
+        // the AI Cost cell + plan-count badge in the running view; planHistory
+        // is fed back to the AI as plan-rotation context (sliced to 5 at use).
+        // Both were re-zeroed on every restart before this fix.
+        aiTokenUsage: this.aiTokenUsage,
+        planHistory: this.planHistory.slice(-50),
         lastUpdated: new Date(),
       }, { merge: true });
     } catch (error) {
