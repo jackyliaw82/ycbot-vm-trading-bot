@@ -1,16 +1,18 @@
 /**
  * AiPlanExecutor — monitors trigger prices and executes AI plan actions.
  *
- * Legacy model (v1.x): each plan has one action ABOVE and one BELOW current price.
- * When one triggers, the other is cancelled and a fresh plan is requested.
+ * Phase 1 (INITIAL): one OPEN_HEDGE action ABOVE and one BELOW current price
+ * (flat actionAbove/actionBelow shape). When one triggers, both legs open
+ * atomically.
  *
- * Paired-trigger model (v2.0.0+, AI_DCA_MODE=paired_trigger): each plan has
- * 4 actions per side — primary + shadow on actionAbove, primary + shadow on
- * actionBelow. Shadow qty is band-clamped to keep LONG/SHORT ratio in band
- * even on one-sided fills.
+ * Phase 2 (DCA): paired-trigger plan — primary + shadow on actionAbove,
+ * primary + shadow on actionBelow. Shadow qty is band-clamped to keep
+ * LONG/SHORT ratio in band even on one-sided fills.
  *
- * Supports OPEN_HEDGE (Phase 1) which opens both LONG and SHORT simultaneously,
- * and ADD/CUT actions (Phase 2) for DCA.
+ * HOLD primaries carry a triggerPrice (synthesized at current ± 3×ATR if AI
+ * doesn't supply one); when crossed, the strategy fires a replan instead of
+ * placing an order. Shadow HOLDs are not pushed into pendingActions (only
+ * primary HOLDs drive replan).
  */
 const RATIO_BAND_DEFAULT = { lower: 0.85, upper: 1.15 };
 
@@ -81,11 +83,14 @@ class AiPlanExecutor {
     if (this.isPairedMode) {
       this._installPairedPlan(plan);
     } else {
-      this._installLegacyPlan(plan);
+      this._installPhase1Plan(plan);
     }
   }
 
-  _installLegacyPlan(plan) {
+  // Phase 1 plan: flat actionAbove/actionBelow with type=OPEN_HEDGE on each
+  // side (no _schema flag set). Phase 2 always uses paired schema, so this
+  // path only fires for Phase 1 OPEN_HEDGE plans.
+  _installPhase1Plan(plan) {
     if (plan.actionAbove) {
       this.pendingActions.push({ ...plan.actionAbove, direction: 'ABOVE', kind: 'primary', executed: false });
     }

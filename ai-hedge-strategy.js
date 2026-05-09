@@ -830,13 +830,13 @@ class AiHedgeStrategy extends TradingBase {
       this.executor.setActivePlan(plan);
       this.executionState = 'EXECUTING_PLAN';
 
-      await this.addLog(`AI Plan installed${plan._schema === 'paired' ? ' [paired-trigger]' : ''}${plan._fellBack ? ' [fell back to legacy]' : ''}.`);
+      await this.addLog(`AI Plan installed${plan._schema === 'paired' ? ' [paired]' : ' [phase1]'}.`);
       await this.addLog(`Analysis: ${plan.analysis || 'N/A'}`);
 
       if (plan._schema === 'paired') {
         await this._logPairedPlan(plan);
       } else {
-        await this._logLegacyPlan(plan);
+        await this._logPhase1Plan(plan);
       }
       if (plan.probabilityAssessment) {
         await this.addLog(`  Prob: ${plan.probabilityAssessment.higherChance} (${plan.probabilityAssessment.confidence}) — ${plan.probabilityAssessment.reasoning}`);
@@ -1012,24 +1012,13 @@ class AiHedgeStrategy extends TradingBase {
 
   // ——— Plan logging helpers (schema-aware) ——————————————————————————
 
-  async _logLegacyPlan(plan) {
-    if (plan.actionAbove) {
-      if (plan.actionAbove.type === 'OPEN_HEDGE') {
-        await this.addLog(`  ABOVE: OPEN_HEDGE at ${this._formatPrice(plan.actionAbove.triggerPrice)} — LONG ${plan.actionAbove.longSizeUSDT} / SHORT ${plan.actionAbove.shortSizeUSDT} USDT`);
-      } else if (plan.actionAbove.type === 'HOLD') {
-        await this.addLog(`  ABOVE: HOLD (${plan.actionAbove.reason})`);
-      } else {
-        await this.addLog(`  ABOVE: ${plan.actionAbove.type} at ${this._formatPrice(plan.actionAbove.triggerPrice)} — ${plan.actionAbove.sizeUSDT} USDT (${plan.actionAbove.reason})`);
-      }
+  // Phase 1 plan logging — flat actionAbove/actionBelow with type=OPEN_HEDGE.
+  async _logPhase1Plan(plan) {
+    if (plan.actionAbove?.type === 'OPEN_HEDGE') {
+      await this.addLog(`  ABOVE: OPEN_HEDGE at ${this._formatPrice(plan.actionAbove.triggerPrice)} — LONG ${plan.actionAbove.longSizeUSDT} / SHORT ${plan.actionAbove.shortSizeUSDT} USDT`);
     }
-    if (plan.actionBelow) {
-      if (plan.actionBelow.type === 'OPEN_HEDGE') {
-        await this.addLog(`  BELOW: OPEN_HEDGE at ${this._formatPrice(plan.actionBelow.triggerPrice)} — LONG ${plan.actionBelow.longSizeUSDT} / SHORT ${plan.actionBelow.shortSizeUSDT} USDT`);
-      } else if (plan.actionBelow.type === 'HOLD') {
-        await this.addLog(`  BELOW: HOLD (${plan.actionBelow.reason})`);
-      } else {
-        await this.addLog(`  BELOW: ${plan.actionBelow.type} at ${this._formatPrice(plan.actionBelow.triggerPrice)} — ${plan.actionBelow.sizeUSDT} USDT (${plan.actionBelow.reason})`);
-      }
+    if (plan.actionBelow?.type === 'OPEN_HEDGE') {
+      await this.addLog(`  BELOW: OPEN_HEDGE at ${this._formatPrice(plan.actionBelow.triggerPrice)} — LONG ${plan.actionBelow.longSizeUSDT} / SHORT ${plan.actionBelow.shortSizeUSDT} USDT`);
     }
   }
 

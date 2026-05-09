@@ -40,15 +40,11 @@ class AiRiskGuard {
       return { valid: false, reasons: ['Plan is null or missing actionAbove/actionBelow'] };
     }
 
+    // Phase 1 → flat OPEN_HEDGE schema; Phase 2 → paired primary+shadow.
     if (state.phase === 'INITIAL') {
       return this._validateInitialPlan(plan, state);
     }
-
-    if (plan._schema === 'paired') {
-      return this._validateDCAPlanPaired(plan, state);
-    }
-
-    return this._validateDCAPlan(plan, state);
+    return this._validateDCAPlanPaired(plan, state);
   }
 
   /**
@@ -112,120 +108,7 @@ class AiRiskGuard {
   }
 
   /**
-   * Validate Phase 2 DCA plan.
-   */
-  _validateDCAPlan(plan, state) {
-    const reasons = [];
-    const { currentPrice, longPosition, shortPosition, volatility } = state;
-    const atr = volatility?.atr || 0;
-
-    const longNotional = longPosition?.notional || 0;
-    const shortNotional = shortPosition?.notional || 0;
-    const imbalanceRatio = (longNotional > 0 && shortNotional > 0)
-      ? Math.max(longNotional / shortNotional, shortNotional / longNotional)
-      : 0;
-
-    for (const key of ['actionAbove', 'actionBelow']) {
-      const action = plan[key];
-      // HOLD now carries a triggerPrice (the price at which the HOLD reasoning
-      // becomes invalid → AI replans on cross). If AI didn't supply one,
-      // synthesize a default at current ± 3×ATR. Direction sanity-checked
-      // below in the same way as ADD/CUT.
-      if (action && action.type === 'HOLD' && currentPrice && atr > 0) {
-        if (action.triggerPrice == null) {
-          const synthesized = key === 'actionAbove'
-            ? currentPrice + 3 * atr
-            : currentPrice - 3 * atr;
-          action.triggerPrice = synthesized;
-          action.synthesizedTrigger = true;
-          console.warn(`[RISK-GUARD] HOLD ${key}: synthesized triggerPrice ${synthesized.toFixed(4)} (current ${currentPrice} ${key === 'actionAbove' ? '+' : '-'} 3×ATR)`);
-        }
-      }
-      // HOLD validates direction below alongside ADD/CUT, then continues
-      // (no size/cap checks since it doesn't place an order).
-      const isHold = action && action.type === 'HOLD';
-
-      // Trigger price sanity. Direction rule applies to ADD/CUT/HOLD alike;
-      // 5%-deviation rule only applies to ADD/CUT (HOLD wake-up triggers can
-      // be 3×ATR away which on high-vol symbols may exceed 5%).
-      if (currentPrice && action.triggerPrice) {
-        if (!isHold) {
-          const deviation = Math.abs(action.triggerPrice - currentPrice) / currentPrice * 100;
-          if (deviation > this.maxPriceDeviationPercent) {
-            reasons.push(`${key}: trigger ${action.triggerPrice} is ${deviation.toFixed(1)}% from current price (max ${this.maxPriceDeviationPercent}%)`);
-          }
-        }
-
-        if (key === 'actionAbove' && action.triggerPrice <= currentPrice) {
-          reasons.push(`actionAbove: trigger not above current price`);
-        }
-        if (key === 'actionBelow' && action.triggerPrice >= currentPrice) {
-          reasons.push(`actionBelow: trigger not below current price`);
-        }
-      }
-
-      // HOLD has no size/quantity to validate; skip the rest of the per-action
-      // checks (size floor, max position, liq caps, imbalance, gap projection).
-      if (isHold) continue;
-
-      // Min size floor (minNotional × 2 safety margin)
-      const sizeFloor = this.minNotional * 2;
-      if (action.sizeUSDT && action.sizeUSDT < sizeFloor) {
-        reasons.push(`${key}: size ${action.sizeUSDT} below minimum ${sizeFloor} (= minNotional ${this.minNotional} × 2 safety margin)`);
-      }
-
-      // Max position size
-      if (action.type === 'ADD_LONG' || action.type === 'ADD_SHORT') {
-        const currentTotal = longNotional + shortNotional;
-        if (currentTotal + (action.sizeUSDT || 0) > this.maxPositionSizeUSDT) {
-          reasons.push(`${key}: would exceed max position size`);
-        }
-      }
-
-      // Liquidation-aware cap (server-side enforcement of the prompt rule).
-      // The AI is told the maxAddLongUSDT / maxAddShortUSDT in the user message;
-      // this guard rejects plans where the AI ignored those caps.
-      const caps = state.liquidationCaps;
-      if (caps) {
-        if (action.type === 'ADD_LONG' && caps.maxAddLongUSDT != null && action.sizeUSDT > caps.maxAddLongUSDT + 0.01) {
-          reasons.push(`${key}: ADD_LONG ${action.sizeUSDT.toFixed(2)} exceeds liquidation-safe cap ${caps.maxAddLongUSDT.toFixed(2)} USDT (LONG liq distance would drop below ${state.minLiqDistancePct}%)`);
-        }
-        if (action.type === 'ADD_SHORT' && caps.maxAddShortUSDT != null && action.sizeUSDT > caps.maxAddShortUSDT + 0.01) {
-          reasons.push(`${key}: ADD_SHORT ${action.sizeUSDT.toFixed(2)} exceeds liquidation-safe cap ${caps.maxAddShortUSDT.toFixed(2)} USDT (SHORT liq distance would drop below ${state.minLiqDistancePct}%)`);
-        }
-      }
-
-      // Imbalance > 5:1 — reject ADD to lighter side
-      if (imbalanceRatio > this.maxImbalanceRatio) {
-        const lighterSide = longNotional < shortNotional ? 'LONG' : 'SHORT';
-        if ((action.type === 'ADD_LONG' && lighterSide === 'LONG') ||
-            (action.type === 'ADD_SHORT' && lighterSide === 'SHORT')) {
-          reasons.push(`${key}: imbalance ${imbalanceRatio.toFixed(1)}:1 — CUT-only mode, cannot ADD to lighter side`);
-        }
-      }
-
-      // Gap projection guard
-      if ((action.type === 'ADD_LONG' || action.type === 'ADD_SHORT') &&
-          longPosition && shortPosition && action.triggerPrice && action.sizeUSDT) {
-        const projection = this.projectGap(action, longPosition, shortPosition);
-        if (projection.projectedGap < 0) {
-          reasons.push(`${key}: ${action.type} at ${action.triggerPrice} would flip gap to ${projection.projectedGap.toFixed(4)} (current: ${projection.currentGap.toFixed(4)})`);
-        }
-      }
-    }
-
-    // Rate limiting
-    const now = Date.now();
-    this._actionTimestamps = this._actionTimestamps.filter(t => t > now - 3600000);
-    if (this._actionTimestamps.length >= this.maxActionsPerHour) {
-      reasons.push(`Rate limit: ${this._actionTimestamps.length} actions in last hour (max ${this.maxActionsPerHour})`);
-    }
-
-    return { valid: reasons.length === 0, reasons };
-  }
-
-  /**
-   * Validate a v2.0.0 paired-trigger Phase 2 DCA plan.
+   * Validate the paired-trigger Phase 2 DCA plan.
    *
    * Plan shape:
    *   actionAbove = { primary: { type, triggerPrice, qty }, shadow: { type, triggerPrice, qty } }
@@ -582,10 +465,30 @@ class AiRiskGuard {
       }
     }
 
+    // Convert each side's flat action into paired (primary + shadow=SKIP)
+    // shape so the executor's _installPairedPlan can consume it. qty is in
+    // coin units = sizeUSDT / triggerPrice; HOLD primaries inherit the
+    // 3×ATR-synthesized triggerPrice from the validator.
+    const toPaired = (sideKey, action) => {
+      if (!action) return { primary: { type: 'HOLD', reason: 'fallback: no action' }, shadow: { type: 'SKIP' } };
+      const triggerPrice = action.triggerPrice || currentPrice;
+      const qty = action.sizeUSDT && triggerPrice > 0 ? action.sizeUSDT / triggerPrice : undefined;
+      return {
+        primary: {
+          type: action.type,
+          triggerPrice: action.type === 'HOLD' ? null : triggerPrice,
+          ...(qty != null ? { qty } : {}),
+          reason: action.reason || 'fallback',
+        },
+        shadow: { type: 'SKIP' },
+      };
+    };
+
     return {
+      _schema: 'paired',
       analysis: `Fallback DCA plan — ${reason}.`,
-      actionAbove,
-      actionBelow,
+      actionAbove: toPaired('actionAbove', actionAbove),
+      actionBelow: toPaired('actionBelow', actionBelow),
       probabilityAssessment: { higherChance: 'ABOVE', confidence: 'low', reasoning: 'Fallback' },
     };
   }
