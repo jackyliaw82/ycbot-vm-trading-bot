@@ -146,9 +146,8 @@ class AiRiskGuard {
 
       // HOLD now carries a triggerPrice (price at which the HOLD reasoning
       // becomes invalid). Synthesize default at current ± 3×ATR if AI didn't
-      // supply one. Only PRIMARY HOLD triggers drive replan (executor side
-      // filters shadow HOLDs); shadow HOLDs are still synthesized + validated
-      // for consistency.
+      // supply one. HOLD is primary-only (shadow HOLD is rejected upstream
+      // by the structure validator), so this branch only fires for primaries.
       if (sub.type === 'HOLD' && currentPrice && atr > 0 && sub.triggerPrice == null) {
         const synthesized = sideKey === 'actionAbove'
           ? currentPrice + 3 * atr

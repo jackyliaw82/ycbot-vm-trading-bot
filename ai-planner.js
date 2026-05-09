@@ -105,14 +105,14 @@ single-action gap projections in the analysis field.
 ### Phase 2 paired:
 - ADD_LONG / ADD_SHORT — primaries and shadows.
 - CUT_LONG / CUT_SHORT — primary-only. Triggered by: (a) imbalance > 5:1 CUT-only mode, (b) liq cap below floor / = 0, (c) margin > 85%, (d) both-side gap-flip deadlock. See CUT-DRIVEN ESCALATION.
-- HOLD — primary or shadow; AI judges no good entry on this side this cycle. **MUST include a triggerPrice** = the price at which the HOLD reasoning becomes invalid. When PRIMARY HOLD's triggerPrice crosses, the strategy replans. Shadow HOLD's triggerPrice does NOT drive replan (only primary does). Default to current ± 3×ATR if no specific level — the system synthesizes that if you omit it.
+- HOLD — primary only; AI judges no good entry on this side this cycle. **MUST include a triggerPrice** = the price at which the HOLD reasoning becomes invalid. When the primary HOLD's triggerPrice crosses, the strategy replans. Default to current ± 3×ATR if no specific level — the system synthesizes that if you omit it.
 - SKIP — shadow-only; band saturated, AI judges shadow unsafe, or paired-side primary is CUTting (shadow on a CUT side is always SKIP).
 
 ### Direction constraints (paired):
 - actionAbove.primary type ∈ {ADD_SHORT, CUT_SHORT, HOLD}
-- actionAbove.shadow  type ∈ {ADD_LONG, HOLD, SKIP}
+- actionAbove.shadow  type ∈ {ADD_LONG, SKIP}
 - actionBelow.primary type ∈ {ADD_LONG, CUT_LONG, HOLD}
-- actionBelow.shadow  type ∈ {ADD_SHORT, HOLD, SKIP}
+- actionBelow.shadow  type ∈ {ADD_SHORT, SKIP}
 
 ## MARKET MICROSTRUCTURE SIGNALS
 OI Change, Taker Ratio, Global L/S, Funding Rate, Liquidations, Volume Ratio. Use these
@@ -190,16 +190,16 @@ Respond with ONLY a valid JSON object. Schema depends on phase:
   "analysis": "Market analysis + 4 single-action gap projections (primary above, shadow above, primary below, shadow below)",
   "actionAbove": {
     "primary": { "type": "ADD_SHORT"|"CUT_SHORT"|"HOLD", "triggerPrice": <number ≥ currentPrice + 3×ATR>, "qty": <coin qty, omit/null for HOLD>, "reason": "..." },
-    "shadow":  { "type": "ADD_LONG"|"HOLD"|"SKIP", "triggerPrice": <primary.triggerPrice − 1×ATR for ADD_LONG; for HOLD use any wake-up price above current; SKIP needs no trigger>, "qty": <coin qty, pre-clamped; omit for HOLD/SKIP>, "reason": "..." }
+    "shadow":  { "type": "ADD_LONG"|"SKIP", "triggerPrice": <primary.triggerPrice − 1×ATR for ADD_LONG; SKIP needs no trigger>, "qty": <coin qty, pre-clamped; omit for SKIP>, "reason": "..." }
   },
   "actionBelow": {
     "primary": { "type": "ADD_LONG"|"CUT_LONG"|"HOLD", "triggerPrice": <number ≤ currentPrice − 3×ATR>, "qty": <coin qty, omit/null for HOLD>, "reason": "..." },
-    "shadow":  { "type": "ADD_SHORT"|"HOLD"|"SKIP", "triggerPrice": <primary.triggerPrice + 1×ATR for ADD_SHORT; for HOLD use any wake-up price below current; SKIP needs no trigger>, "qty": <coin qty, pre-clamped; omit for HOLD/SKIP>, "reason": "..." }
+    "shadow":  { "type": "ADD_SHORT"|"SKIP", "triggerPrice": <primary.triggerPrice + 1×ATR for ADD_SHORT; SKIP needs no trigger>, "qty": <coin qty, pre-clamped; omit for SKIP>, "reason": "..." }
   },
   "probabilityAssessment": { "higherChance": "ABOVE"|"BELOW", "confidence": "high"|"medium"|"low", "reasoning": "..." }
 }
 
-**Primary HOLD MUST include a triggerPrice** — the price at which your HOLD reasoning becomes invalid. When primary price crosses, the strategy replans. Default to current ± 3×ATR if you have no specific level in mind. Same direction rules: actionAbove > current, actionBelow < current. The system synthesizes current ± 3×ATR if you omit it. **Only PRIMARY HOLD triggers drive replan** — shadow HOLD/SKIP triggers are not wake-up signals.`;
+**Primary HOLD MUST include a triggerPrice** — the price at which your HOLD reasoning becomes invalid. When primary price crosses, the strategy replans. Default to current ± 3×ATR if you have no specific level in mind. Same direction rules: actionAbove > current, actionBelow < current. The system synthesizes current ± 3×ATR if you omit it. **HOLD is primary-only** — shadow type is restricted to ADD or SKIP.`;
 
 class AiPlanner {
   constructor(apiKey, model = 'claude-sonnet-4-6') {
@@ -556,11 +556,11 @@ class AiPlanner {
    *     analysis: string,
    *     actionAbove: {
    *       primary: { type: 'ADD_SHORT'|'CUT_SHORT'|'HOLD', triggerPrice, qty, reason },
-   *       shadow:  { type: 'ADD_LONG'|'HOLD'|'SKIP',       triggerPrice, qty, reason },
+   *       shadow:  { type: 'ADD_LONG'|'SKIP',              triggerPrice, qty, reason },
    *     },
    *     actionBelow: {
    *       primary: { type: 'ADD_LONG'|'CUT_LONG'|'HOLD', triggerPrice, qty, reason },
-   *       shadow:  { type: 'ADD_SHORT'|'HOLD'|'SKIP',    triggerPrice, qty, reason },
+   *       shadow:  { type: 'ADD_SHORT'|'SKIP',           triggerPrice, qty, reason },
    *     },
    *     probabilityAssessment: { higherChance, confidence, reasoning },
    *   }
@@ -592,16 +592,17 @@ class AiPlanner {
       if (!expectedShadowTypes.includes(s.type)) {
         throw new Error(`${sideKey}.shadow type "${s.type}" invalid (must be: ${expectedShadowTypes.join(', ')})`);
       }
-      // ADD shadows need triggerPrice + qty. HOLD shadow has neither (only
-      // primary HOLDs drive replan). SKIP carries nothing.
-      if (s.type !== 'SKIP' && s.type !== 'HOLD') {
+      // ADD shadows need triggerPrice + qty. SKIP carries nothing. HOLD is
+      // not allowed on shadows — primary-only (it would be a no-op for
+      // execution and indistinguishable from SKIP).
+      if (s.type !== 'SKIP') {
         if (typeof s.triggerPrice !== 'number') throw new Error(`${sideKey}.shadow missing numeric "triggerPrice"`);
         if (typeof s.qty !== 'number' || s.qty < 0) throw new Error(`${sideKey}.shadow missing non-negative "qty"`);
       }
     };
 
-    validatePair('actionAbove', ['ADD_SHORT', 'CUT_SHORT', 'HOLD'], ['ADD_LONG', 'HOLD', 'SKIP']);
-    validatePair('actionBelow', ['ADD_LONG', 'CUT_LONG', 'HOLD'], ['ADD_SHORT', 'HOLD', 'SKIP']);
+    validatePair('actionAbove', ['ADD_SHORT', 'CUT_SHORT', 'HOLD'], ['ADD_LONG', 'SKIP']);
+    validatePair('actionBelow', ['ADD_LONG', 'CUT_LONG', 'HOLD'], ['ADD_SHORT', 'SKIP']);
 
     if (!plan.probabilityAssessment) throw new Error('Missing "probabilityAssessment"');
     if (!['ABOVE', 'BELOW'].includes(plan.probabilityAssessment.higherChance)) {

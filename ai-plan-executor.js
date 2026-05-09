@@ -124,9 +124,10 @@ class AiPlanExecutor {
         });
       }
 
-      // Shadow — only push ADD/CUT shadows (HOLD/SKIP shadows are no-ops
-      // for execution; only primary HOLD drives wake-up).
-      if (side.shadow && side.shadow.type !== 'SKIP' && side.shadow.type !== 'HOLD') {
+      // Shadow — push ADD shadows only. SKIP is a no-op; HOLD is no longer
+      // a valid shadow type (validator rejects it). Only primary HOLD
+      // drives wake-up.
+      if (side.shadow && side.shadow.type !== 'SKIP') {
         const shadowSide = side.shadow.type === 'ADD_LONG' ? 'shadow_long' : 'shadow_short';
         const clamp = AiPlanExecutor.clampShadowQty(
           shadowSide,
