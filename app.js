@@ -987,97 +987,29 @@ app.post('/system/force-update', requireAdmin, async (req, res) => {
     return res.status(400).json({ error: 'No update available.' });
   }
 
+  // Force update no longer closes positions. The C4 restart-recovery design
+  // (saveState on SIGTERM + recoverActiveStrategies on boot) preserves
+  // running strategies across the restart cycle:
+  //   1. PM2 restart sends SIGTERM → shutdown handler (line ~552) saves
+  //      each strategy's state to Firestore with isRunning: true.
+  //   2. New bot process boots → recoverActiveStrategies queries Firestore
+  //      for isRunning + AI_HEDGE strategies and calls strategy.resume()
+  //      on each, which reconciles positions against Binance and reattaches
+  //      WS streams.
+  //   3. User-initiated stop (/ai-hedge/stop) is still the only path that
+  //      closes positions + processes platform fees. Force-update is now
+  //      strictly a fast-restart-with-state-preservation operation.
+  const activeCount = activeStrategies.size;
   res.json({
     success: true,
-    message: `Force update initiated. Stopping ${activeStrategies.size} active strategies before updating to ${targetVersion}.`
+    message: activeCount > 0
+      ? `Force update to ${targetVersion} initiated. ${activeCount} active strategy/strategies will be preserved across the restart and resumed automatically.`
+      : `Force update to ${targetVersion} initiated. No active strategies.`,
   });
 
   setImmediate(async () => {
     try {
-      for (const [strategyId, strategy] of activeStrategies.entries()) {
-        if (strategy.isRunning) {
-          console.log(`[FORCE-UPDATE] Stopping strategy ${strategyId}...`);
-          try {
-            await firestore.collection('strategies').doc(strategyId).update({
-              stoppingStatus: 'in_progress',
-              stoppingStartedAt: Timestamp.now()
-            });
-
-            const stopPromise = strategy.stop();
-            const timeoutPromise = new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('Stop operation timeout')), 45000)
-            );
-            await Promise.race([stopPromise, timeoutPromise]);
-            activeStrategies.delete(strategyId);
-
-            const strategyDoc = await firestore.collection('strategies').doc(strategyId).get();
-            if (strategyDoc.exists) {
-              const strategyData = strategyDoc.data();
-              const finalPnL = strategyData.totalPnL || 0;
-              const userId = strategy.userId || strategyData.userId;
-
-              if (finalPnL > 0 && userId) {
-                const FEE_PERCENTAGE = 0.15;
-                const feeAmount = Math.round(finalPnL * FEE_PERCENTAGE * 100) / 100;
-                const feeId = firestore.collection('temp').doc().id;
-
-                await firestore.collection('strategy_fees').doc(feeId).set({
-                  feeId, strategyId, userId,
-                  profileId: strategy.profileId,
-                  initialPnL: 0, finalPnL, feeAmount,
-                  feePercentage: FEE_PERCENTAGE,
-                  calculatedAt: Timestamp.now(),
-                  status: 'calculated',
-                });
-
-                const walletRef = firestore.collection('users').doc(userId).collection('wallets').doc('default');
-                const walletDoc = await walletRef.get();
-                if (walletDoc.exists) {
-                  const currentBalance = walletDoc.data()?.balance || 0;
-                  const deductAmount = Math.min(feeAmount, currentBalance);
-                  const newBalance = Math.max(0, currentBalance - deductAmount);
-                  const now = Timestamp.now();
-
-                  await walletRef.update({ balance: newBalance, updatedAt: now, lastTransactionAt: now });
-
-                  const transactionId = firestore.collection('temp').doc().id;
-                  await walletRef.collection('transactions').doc(transactionId).set({
-                    transactionId, type: 'debit', amount: deductAmount,
-                    balanceBefore: currentBalance, balanceAfter: newBalance,
-                    reason: 'platform_fee', relatedResourceType: 'strategy',
-                    relatedResourceId: strategyId, createdAt: now,
-                  });
-
-                  await firestore.collection('strategy_fees').doc(feeId).update({
-                    status: currentBalance >= feeAmount ? 'deducted' : 'insufficient_balance',
-                    deductedAt: now, balanceBefore: currentBalance, balanceAfter: newBalance,
-                  });
-
-                  if (deductAmount > 0) {
-                    const earningId = firestore.collection('temp').doc().id;
-                    await firestore.collection('platform_earnings').doc(earningId).set({
-                      earningId, feeId, strategyId, userId, amount: deductAmount,
-                      collectedAt: now, source: 'performance_fee',
-                    });
-                  }
-                }
-              }
-
-              await firestore.collection('strategies').doc(strategyId).update({
-                stoppingStatus: 'completed',
-                stoppingCompletedAt: Timestamp.now()
-              });
-            }
-
-            console.log(`[FORCE-UPDATE] Strategy ${strategyId} stopped and fees processed.`);
-          } catch (err) {
-            console.error(`[FORCE-UPDATE] Error stopping strategy ${strategyId}:`, err);
-            activeStrategies.delete(strategyId);
-          }
-        }
-      }
-
-      console.log(`[FORCE-UPDATE] All strategies stopped. Triggering self-update to ${targetVersion}...`);
+      console.log(`[FORCE-UPDATE] ${activeCount} active strategy/strategies — state will be saved by SIGTERM handler; recoverActiveStrategies will resume them on boot. Triggering self-update to ${targetVersion}...`);
       await triggerSelfUpdate();
     } catch (error) {
       console.error('[FORCE-UPDATE] Error during force update:', error);
