@@ -89,10 +89,11 @@ class AiHedgeStrategy extends TradingBase {
     this._lastReplanTime = 0;
     this._replanCooldownMs = 5000;
 
-    // HedgeMetricsChart sampling — 1 write/min to Firestore subcollection
-    // strategies/{strategyId}/metricsSamples for cross-device chart history.
-    // Mirrors the trades subcollection pattern.
-    this._metricsSampleInterval = null;
+    // HedgeMetricsChart sampling — write one Firestore doc to
+    // strategies/{strategyId}/metricsSamples per TRADE EXECUTION (not on a
+    // fixed cadence). Between trades, gap and ratio are mathematically
+    // constant, so dense periodic samples were redundant. Chart still
+    // renders straight lines between adjacent points — same visual.
 
     this.isTradingSequenceInProgress = false;
 
@@ -293,9 +294,6 @@ class AiHedgeStrategy extends TradingBase {
     this._lastFundingPollTs = this.strategyStartTime.getTime();
     this._scheduleNextFundingPoll();
 
-    // HedgeMetricsChart 1/min sampler → strategies/{id}/metricsSamples
-    this._startMetricsSampler();
-
     await this.addLog(`AI Hedge Strategy started in ${this.phase} phase. Waiting for first price tick...`);
     await this.saveState();
   }
@@ -465,11 +463,10 @@ class AiHedgeStrategy extends TradingBase {
       this.phase = 'INITIAL';
       await this.addLog('[RECOVERY] Phase 1 INITIAL — no positions yet (waiting for OPEN_HEDGE trigger). Resuming in INITIAL phase. Will replan on first price tick.');
 
-      // Funding poll + metrics sampler are safe to start in INITIAL —
-      // sampler skips internally when either leg has 0 qty; funding poll
-      // is symbol-keyed and harmless when there are no positions.
+      // Funding poll is symbol-keyed and harmless when there are no
+      // positions. Metrics samples now write per-trade only, so no sampler
+      // needs starting in the INITIAL recovery path.
       this._scheduleNextFundingPoll();
-      this._startMetricsSampler();
 
       await this.saveState();
       return;
@@ -511,9 +508,6 @@ class AiHedgeStrategy extends TradingBase {
     await this._pollFundingIncome();
     this._scheduleNextFundingPoll();
 
-    // HedgeMetricsChart 1/min sampler — same as start()
-    this._startMetricsSampler();
-
     await this.saveState();
   }
 
@@ -523,7 +517,9 @@ class AiHedgeStrategy extends TradingBase {
     this.isStopping = true;
     this.isRunning = false;
     this.executionState = 'IDLE';
-    this._stopMetricsSampler();
+    // Final metrics sample so the history chart's right edge marks the
+    // actual strategy end state (no-op if either leg has 0 qty).
+    this._writeMetricsSample().catch(() => {});
 
     await this.addLog(`Stopping AI Hedge Strategy. Reason: ${reason}`);
 
@@ -1022,6 +1018,12 @@ class AiHedgeStrategy extends TradingBase {
     // called at plan install (line ~603) and start/stop boundaries.
     await this.saveState();
 
+    // Per-trade metrics sample. gap/ratio only change on fills, so writing
+    // here (rather than on a 60s interval) eliminates ~1,440 redundant
+    // Firestore writes/day per strategy. _writeMetricsSample skips when
+    // either leg has 0 qty, so partial-fill states stay safe.
+    this._writeMetricsSample().catch(() => {});
+
     await this.addLog(
       `Trade #${this.tradeCount}. ` +
       `LONG: ${this.longPosition ? this._formatNotional(this.longPosition.notional) + ' @ ' + this._formatPrice(this.longPosition.entryPrice) : 'none'}, ` +
@@ -1112,12 +1114,14 @@ class AiHedgeStrategy extends TradingBase {
   }
 
   /**
-   * HedgeMetricsChart 1/min sampler. Writes one
-   * { t, gap, ratio, strategyId } doc to strategies/{id}/metricsSamples on
-   * every tick. Skips when either leg has 0 quantity (matches frontend
-   * gating). Called via setInterval armed in start()/resume(), cleared in
-   * stop(). Mirrors the saveTrade subcollection pattern so cross-device
-   * sync works without bot-side state.
+   * HedgeMetricsChart per-trade sampler. Writes one
+   * { t, gap, ratio, strategyId } doc to strategies/{id}/metricsSamples
+   * each time a trade fills (called from _runActionAndRecord) plus one
+   * final sample at strategy stop. Skips when either leg has 0 quantity
+   * — partial-fill / single-leg states stay safe. gap and ratio are
+   * mathematically constant between trades, so writing on cadence was
+   * redundant; per-trade writes are sufficient (~30–300× cost reduction
+   * vs the previous 60s interval).
    */
   async _writeMetricsSample() {
     if (!this.strategyId || !this.firestore) return;
@@ -1135,20 +1139,6 @@ class AiHedgeStrategy extends TradingBase {
         });
     } catch (err) {
       console.error(`[METRICS-SAMPLE] write failed: ${err.message}`);
-    }
-  }
-
-  _startMetricsSampler() {
-    if (this._metricsSampleInterval) clearInterval(this._metricsSampleInterval);
-    this._metricsSampleInterval = setInterval(() => {
-      if (this.isRunning) this._writeMetricsSample();
-    }, 60_000);
-  }
-
-  _stopMetricsSampler() {
-    if (this._metricsSampleInterval) {
-      clearInterval(this._metricsSampleInterval);
-      this._metricsSampleInterval = null;
     }
   }
 
