@@ -1,5 +1,8 @@
 /**
- * AiRiskGuard — validates AI-generated plans against risk constraints.
+ * AiRiskGuard — validates AI-generated plans + light post-processing.
+ *
+ * As of v3.0.0 (Hedge Phase redesign), the risk-guard is a thin
+ * validator + post-processor, NOT a fallback-plan generator.
  *
  * Guardrails:
  * 1. Max total position size
@@ -9,7 +12,15 @@
  * 5. Rate limiting (max actions per hour)
  * 6. Gap projection — reject actions that would make gap negative
  * 7. Single-leg guard — stop if only one leg and price 5% away
- * 8. Fallback plan when AI is unavailable
+ *
+ * Post-processing (applied before validation, on a working copy):
+ * - HOLD/HOLD primaries → force-convert to CUT heavier leg
+ *   (forbidden by prompt rules; we defensively transform if the AI
+ *   slips through).
+ * - HOLD primary missing triggerPrice → synthesize current ± 3×ATR.
+ *
+ * Failure mode: validation rejection now signals to the strategy to
+ * stale-counter retry (no fallback plan generated here).
  */
 
 const FEE_RATE = 0.0008; // 0.08% per side
@@ -30,10 +41,9 @@ class AiRiskGuard {
   /**
    * Validate a plan against risk constraints.
    *
-   * Dispatches by phase + schema:
-   *   - Phase 1 INITIAL → legacy 2-trigger OPEN_HEDGE validator (unchanged)
-   *   - Phase 2 DCA, plan._schema === 'paired' → v2.0.0 paired-trigger validator
-   *   - Phase 2 DCA, otherwise → legacy 2-trigger DCA validator (unchanged)
+   * Dispatches by phase:
+   *   - Phase 1 INITIAL → flat OPEN_HEDGE validator.
+   *   - Phase 2 HEDGE → paired primary+shadow validator (v3.0.0 paired schema).
    */
   validatePlan(plan, state) {
     if (!plan || !plan.actionAbove || !plan.actionBelow) {
@@ -44,7 +54,63 @@ class AiRiskGuard {
     if (state.phase === 'INITIAL') {
       return this._validateInitialPlan(plan, state);
     }
-    return this._validateDCAPlanPaired(plan, state);
+    return this._validateHedgePlanPaired(plan, state);
+  }
+
+  /**
+   * Post-process an AI-generated plan before validation.
+   *
+   * Handles two transforms:
+   *   1. HOLD/HOLD primaries → convert heavier-leg side to CUT_<heavier>
+   *      (the prompt forbids HOLD/HOLD; this is a defensive safety net).
+   *   2. (HOLD triggerPrice synthesis is handled inline in the validator.)
+   *
+   * Returns the plan (possibly mutated). Caller may pass the same object
+   * back into validatePlan() afterward.
+   */
+  postProcessPlan(plan, state) {
+    if (!plan || state.phase !== 'HEDGE') return plan;
+    if (plan._schema !== 'paired') return plan;
+
+    const aboveType = plan.actionAbove?.primary?.type;
+    const belowType = plan.actionBelow?.primary?.type;
+    if (aboveType !== 'HOLD' || belowType !== 'HOLD') return plan;
+
+    // Both primaries are HOLD — forbidden. Convert the heavier-leg side to CUT.
+    const { currentPrice, longPosition, shortPosition } = state;
+    const longNotional = longPosition?.notional || 0;
+    const shortNotional = shortPosition?.notional || 0;
+    const heavierSide = longNotional >= shortNotional ? 'LONG' : 'SHORT';
+    const heavierNotional = Math.max(longNotional, shortNotional);
+
+    // CUT-DRIVEN ESCALATION sizing: 30% of heavier leg, floored at
+    // minNotional × 2 so Binance accepts the order. The 50% upper cap from
+    // the AI-planner prompt is redundant here (30% < 50% always), so we
+    // simplify to max(floor, 0.30 × N).
+    const floor = this.minNotional * 2;
+    const cutSizeUSDT = Math.max(floor, heavierNotional * 0.30);
+    const cutQty = currentPrice > 0 ? cutSizeUSDT / currentPrice : 0;
+    const cutTrigger = currentPrice; // immediate market-level trigger
+
+    if (heavierSide === 'LONG') {
+      plan.actionBelow.primary = {
+        type: 'CUT_LONG',
+        triggerPrice: cutTrigger,
+        qty: cutQty,
+        reason: `Post-hoc: HOLD/HOLD detected; CUT heavier LONG leg (${heavierNotional.toFixed(2)} USDT) to free margin and rebalance.`,
+      };
+      plan.actionBelow.shadow = { type: 'SKIP' };
+    } else {
+      plan.actionAbove.primary = {
+        type: 'CUT_SHORT',
+        triggerPrice: cutTrigger,
+        qty: cutQty,
+        reason: `Post-hoc: HOLD/HOLD detected; CUT heavier SHORT leg (${heavierNotional.toFixed(2)} USDT) to free margin and rebalance.`,
+      };
+      plan.actionAbove.shadow = { type: 'SKIP' };
+    }
+    plan._holdHoldTransformed = true;
+    return plan;
   }
 
   /**
@@ -108,7 +174,7 @@ class AiRiskGuard {
   }
 
   /**
-   * Validate the paired-trigger Phase 2 DCA plan.
+   * Validate the paired-trigger Phase 2 Hedge Phase plan.
    *
    * Plan shape:
    *   actionAbove = { primary: { type, triggerPrice, qty }, shadow: { type, triggerPrice, qty } }
@@ -124,7 +190,7 @@ class AiRiskGuard {
    * Liquidation cap, max position size, imbalance > 5:1 CUT-only, gap projection, and
    * rate limiting all apply as in legacy.
    */
-  _validateDCAPlanPaired(plan, state) {
+  _validateHedgePlanPaired(plan, state) {
     const reasons = [];
     const { currentPrice, longPosition, shortPosition, volatility } = state;
     const atr = volatility?.atr || 0;
@@ -246,7 +312,7 @@ class AiRiskGuard {
       reasons.push(`Plan: cumulative ADD notional ${totalAddNotional.toFixed(2)} on top of current ${currentTotal.toFixed(2)} would exceed max ${this.maxPositionSizeUSDT}`);
     }
 
-    // Rate limiting (shared with legacy DCA path).
+    // Rate limiting.
     const now = Date.now();
     this._actionTimestamps = this._actionTimestamps.filter(t => t > now - 3600000);
     if (this._actionTimestamps.length >= this.maxActionsPerHour) {
@@ -312,185 +378,13 @@ class AiRiskGuard {
     this._actionTimestamps.push(Date.now());
   }
 
-  /**
-   * Generate a fallback dual-action plan when AI is unavailable.
-   */
-  generateFallbackPlan(currentPrice, state, reason = 'AI unavailable', rejectedProbabilityAssessment = null) {
-    const { longPosition, shortPosition, positionSizeUSDT, volatility, phase, liquidationCaps } = state;
-    const atrPercent = (volatility && volatility.atrPercent > 0.3) ? volatility.atrPercent : 0.3;
-    const gridStep = currentPrice * (atrPercent / 100);
+  // ─── REMOVED in v3.0.0 ──────────────────────────────────────────────────
+  // generateFallbackPlan() was removed when Hedge Phase shipped. On AI
+  // failure or validation rejection, the strategy now increments a stale
+  // counter and retries on exponential backoff (30s → 30m) — see
+  // ai-hedge-strategy.js. HOLD/HOLD slip-throughs are handled by the
+  // postProcessPlan() transform above, not by generating a fresh fallback.
 
-    if (phase === 'INITIAL') {
-      // Apply minNotional × 2 floor to each leg in the fallback OPEN_HEDGE.
-      const floor = this.minNotional * 2;
-      return {
-        analysis: `Fallback INITIAL plan — ${reason}. Using ATR-based grid entries.`,
-        actionAbove: {
-          type: 'OPEN_HEDGE',
-          triggerPrice: currentPrice + gridStep,
-          longSizeUSDT: Math.max(positionSizeUSDT * 0.4, floor),
-          shortSizeUSDT: Math.max(positionSizeUSDT * 0.6, floor),
-          reason: 'Fallback: OPEN_HEDGE above with 60:40 SHORT-heavy',
-        },
-        actionBelow: {
-          type: 'OPEN_HEDGE',
-          triggerPrice: currentPrice - gridStep,
-          longSizeUSDT: Math.max(positionSizeUSDT * 0.6, floor),
-          shortSizeUSDT: Math.max(positionSizeUSDT * 0.4, floor),
-          reason: 'Fallback: OPEN_HEDGE below with 60:40 LONG-heavy',
-        },
-        probabilityAssessment: { higherChance: 'ABOVE', confidence: 'low', reasoning: 'Fallback plan' },
-      };
-    }
-
-    // DCA fallback
-    let actionAbove, actionBelow;
-
-    if (!longPosition && !shortPosition) {
-      actionAbove = { type: 'HOLD', reason: 'Fallback: no positions' };
-      actionBelow = { type: 'HOLD', reason: 'Fallback: no positions' };
-    } else {
-      // Split posSize between the two DCA legs. If the rejected AI plan carried a
-      // probabilityAssessment, bias the split using the AI's own ratio ladder
-      // (60:40 / 70:30 / 80:20). If no AI signal, 50:50 neutral.
-      const floor = this.minNotional * 2;
-      let shortRatio = 0.5;
-      let longRatio = 0.5;
-      let biasNote = 'no AI signal — neutral 50:50';
-
-      if (rejectedProbabilityAssessment && rejectedProbabilityAssessment.higherChance) {
-        const conf = rejectedProbabilityAssessment.confidence || 'low';
-        const skew = conf === 'high' ? 0.30 : conf === 'medium' ? 0.20 : 0.10;
-        if (rejectedProbabilityAssessment.higherChance === 'ABOVE') {
-          // Bullish bias → bigger ADD_LONG (catch dip if price retraces),
-          // smaller ADD_SHORT (don't fight up-move).
-          longRatio = 0.5 + skew;
-          shortRatio = 0.5 - skew;
-        } else if (rejectedProbabilityAssessment.higherChance === 'BELOW') {
-          // Bearish bias → bigger ADD_SHORT (fade rally at resistance),
-          // smaller ADD_LONG (don't catch falling knife).
-          shortRatio = 0.5 + skew;
-          longRatio = 0.5 - skew;
-        }
-        biasNote = `AI bias ${rejectedProbabilityAssessment.higherChance}/${conf} → ${(longRatio * 100).toFixed(0)}:${(shortRatio * 100).toFixed(0)} LONG:SHORT`;
-      }
-
-      // Apply minNotional × 2 floor on each leg.
-      let shortSize = Math.max(positionSizeUSDT * shortRatio, floor);
-      let longSize = Math.max(positionSizeUSDT * longRatio, floor);
-
-      // CUT-DRIVEN ESCALATION (mirrors the v2.0.0 prompt rule). When the AI is
-      // unavailable, the fallback now actively de-risks instead of emitting HOLD:
-      //   - margin > 85% → MUST CUT heavier leg (hard rule)
-      //   - liq cap below min floor on a side → CUT that same side
-      // CUT sizing heuristic: 30% of leg notional, clamped to [floor, 50% × leg].
-      const longNotional = longPosition?.notional || 0;
-      const shortNotional = shortPosition?.notional || 0;
-      const heavierSide = longNotional >= shortNotional ? 'LONG' : 'SHORT';
-      const marginUsage = state.marginInfo?.marginUsagePercent || 0;
-      const marginCut = marginUsage > 85;
-
-      const cutSize = (legNotional) => {
-        if (legNotional <= 0) return 0;
-        const target = legNotional * 0.30;
-        return Math.max(floor, Math.min(target, legNotional * 0.5));
-      };
-
-      // Apply liquidation-safe caps for ADD path
-      let shortCapBound = false;
-      let longCapBound = false;
-      if (liquidationCaps) {
-        if (liquidationCaps.maxAddShortUSDT != null) {
-          if (shortSize > liquidationCaps.maxAddShortUSDT) shortSize = liquidationCaps.maxAddShortUSDT;
-          if (shortSize < floor) shortCapBound = true;
-        }
-        if (liquidationCaps.maxAddLongUSDT != null) {
-          if (longSize > liquidationCaps.maxAddLongUSDT) longSize = liquidationCaps.maxAddLongUSDT;
-          if (longSize < floor) longCapBound = true;
-        }
-      }
-
-      // Resolve actionAbove (SHORT side)
-      if (marginCut && heavierSide === 'SHORT' && shortNotional > 0) {
-        actionAbove = {
-          type: 'CUT_SHORT',
-          triggerPrice: currentPrice,
-          sizeUSDT: cutSize(shortNotional),
-          reason: `Fallback: margin ${marginUsage.toFixed(1)}% > 85% — CUT heavier SHORT to free margin (hard rule)`,
-        };
-      } else if (shortCapBound && shortNotional > 0) {
-        actionAbove = {
-          type: 'CUT_SHORT',
-          triggerPrice: currentPrice,
-          sizeUSDT: cutSize(shortNotional),
-          reason: `Fallback: SHORT liq cap below floor (${floor.toFixed(2)} USDT) — CUT to recover liq buffer`,
-        };
-      } else if (shortCapBound) {
-        // Cap-bound but no SHORT to cut (qty 0) → HOLD
-        actionAbove = { type: 'HOLD', reason: `Fallback: ADD_SHORT skipped — liq cap below floor and no SHORT position to CUT` };
-      } else {
-        actionAbove = {
-          type: 'ADD_SHORT',
-          triggerPrice: currentPrice + gridStep * 2,
-          sizeUSDT: shortSize,
-          reason: `Fallback: DCA SHORT above (2x ATR) — ${biasNote}`,
-        };
-      }
-
-      // Resolve actionBelow (LONG side)
-      if (marginCut && heavierSide === 'LONG' && longNotional > 0) {
-        actionBelow = {
-          type: 'CUT_LONG',
-          triggerPrice: currentPrice,
-          sizeUSDT: cutSize(longNotional),
-          reason: `Fallback: margin ${marginUsage.toFixed(1)}% > 85% — CUT heavier LONG to free margin (hard rule)`,
-        };
-      } else if (longCapBound && longNotional > 0) {
-        actionBelow = {
-          type: 'CUT_LONG',
-          triggerPrice: currentPrice,
-          sizeUSDT: cutSize(longNotional),
-          reason: `Fallback: LONG liq cap below floor (${floor.toFixed(2)} USDT) — CUT to recover liq buffer`,
-        };
-      } else if (longCapBound) {
-        actionBelow = { type: 'HOLD', reason: `Fallback: ADD_LONG skipped — liq cap below floor and no LONG position to CUT` };
-      } else {
-        actionBelow = {
-          type: 'ADD_LONG',
-          triggerPrice: currentPrice - gridStep * 2,
-          sizeUSDT: longSize,
-          reason: `Fallback: DCA LONG below (2x ATR) — ${biasNote}`,
-        };
-      }
-    }
-
-    // Convert each side's flat action into paired (primary + shadow=SKIP)
-    // shape so the executor's _installPairedPlan can consume it. qty is in
-    // coin units = sizeUSDT / triggerPrice; HOLD primaries inherit the
-    // 3×ATR-synthesized triggerPrice from the validator.
-    const toPaired = (sideKey, action) => {
-      if (!action) return { primary: { type: 'HOLD', reason: 'fallback: no action' }, shadow: { type: 'SKIP' } };
-      const triggerPrice = action.triggerPrice || currentPrice;
-      const qty = action.sizeUSDT && triggerPrice > 0 ? action.sizeUSDT / triggerPrice : undefined;
-      return {
-        primary: {
-          type: action.type,
-          triggerPrice: action.type === 'HOLD' ? null : triggerPrice,
-          ...(qty != null ? { qty } : {}),
-          reason: action.reason || 'fallback',
-        },
-        shadow: { type: 'SKIP' },
-      };
-    };
-
-    return {
-      _schema: 'paired',
-      analysis: `Fallback DCA plan — ${reason}.`,
-      actionAbove: toPaired('actionAbove', actionAbove),
-      actionBelow: toPaired('actionBelow', actionBelow),
-      probabilityAssessment: { higherChance: 'ABOVE', confidence: 'low', reasoning: 'Fallback' },
-    };
-  }
 
   static get FEE_RATE() {
     return FEE_RATE;

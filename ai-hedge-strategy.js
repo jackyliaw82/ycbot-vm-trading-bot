@@ -37,7 +37,7 @@ function formatDuration(ms) {
  * AiHedgeStrategy — AI-driven hedge position management with microstructure data.
  *
  * Phase 1 (INITIAL): Opens both LONG and SHORT at an S/R level with asymmetric sizing.
- * Phase 2 (DCA): Widens the hedge gap through DCA entries at unified S/R levels (15m native with cascade fallback to 1h).
+ * Phase 2 (HEDGE): Widens the hedge gap through paired-trigger ADD/CUT entries at unified S/R levels (15m native with cascade fallback to 1h).
  * Auto-stops when totalPnL >= effectiveTarget.
  */
 class AiHedgeStrategy extends TradingBase {
@@ -53,7 +53,7 @@ class AiHedgeStrategy extends TradingBase {
     this.lockedProfit = 0;
     this.desiredProfitUSDT = null;
 
-    // Phase: 'INITIAL' or 'DCA'
+    // Phase: 'INITIAL' or 'HEDGE'
     this.phase = 'INITIAL';
     this.executionState = 'IDLE';
     this.activePlan = null;
@@ -131,6 +131,14 @@ class AiHedgeStrategy extends TradingBase {
     // AI token usage tracking
     this.aiTokenUsage = { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheCreation: 0, planCount: 0 };
 
+    // Stale-counter retry mechanism (v3.0.0). On AI plan generation failure
+    // or validation rejection, the strategy keeps the previous plan active
+    // and retries on exponential backoff. No fallback plan generated.
+    this._staleCount = 0;
+    this._aiStale = false;
+    this._nextRetryAt = null;
+    this._aiRetryTimer = null;
+
     // Critical error
     this.criticalError = null;
   }
@@ -181,9 +189,9 @@ class AiHedgeStrategy extends TradingBase {
     this.initialWalletBalance = await this.getWalletBalance();
     await this.addLog(`Wallet balance: ${this._formatNotional(this.initialWalletBalance)} USDT`);
 
-    // M7 was here — pre-flight wallet check against full-DCA margin cap.
+    // M7 was here — pre-flight wallet check against full Hedge Phase margin cap.
     // Removed: the frontend deliberately sizes maxPositionSize as
-    // wallet × leverage × 0.8 (MAX_POSITION_BUFFER) so Phase 2 can DCA into
+    // wallet × leverage × 0.8 (MAX_POSITION_BUFFER) so Phase 2 can ADD into
     // the full margin runway. Pre-flighting against (2 × maxPos / leverage)
     // therefore tripped on every legitimate config from this app:
     //   wallet ≥ (2 × wallet × leverage × 0.8 / leverage) × 1.2
@@ -272,11 +280,11 @@ class AiHedgeStrategy extends TradingBase {
     await this.detectCurrentPosition(true);
     await this._refreshHedgePositions();
 
-    // If positions already exist (strategy restart), go to DCA phase
+    // If positions already exist (strategy restart), go to HEDGE phase
     if (this.longPosition && this.shortPosition) {
-      this.phase = 'DCA';
+      this.phase = 'HEDGE';
       this.firstPositionPrice = this.longPosition.entryPrice; // Best guess
-      await this.addLog('Existing positions detected. Resuming in DCA phase.');
+      await this.addLog('Existing positions detected. Resuming in HEDGE phase.');
     }
 
     // C2: funding poll baseline + scheduler. Anchor at strategy start
@@ -468,7 +476,7 @@ class AiHedgeStrategy extends TradingBase {
     }
 
     if (!longExists && !shortExists) {
-      // DCA phase, both legs gone — auto-stop fired during downtime, or
+      // HEDGE phase, both legs gone — auto-stop fired during downtime, or
       // user closed manually.
       await this.addLog('[RECOVERY] No positions on Binance — strategy was already closed during downtime. Marking stopped.');
       this.isRunning = false;
@@ -490,13 +498,13 @@ class AiHedgeStrategy extends TradingBase {
       return;
     }
 
-    // Both legs intact — resume in DCA phase.
-    this.phase = 'DCA';
+    // Both legs intact — resume in HEDGE phase.
+    this.phase = 'HEDGE';
     if (!this.firstPositionPrice) this.firstPositionPrice = this.longPosition.entryPrice;
     await this.addLog(
       `[RECOVERY] Hedge intact. LONG ${this._formatNotional(this.longPosition.notional)} @ ${this._formatPrice(this.longPosition.entryPrice)}, ` +
       `SHORT ${this._formatNotional(this.shortPosition.notional)} @ ${this._formatPrice(this.shortPosition.entryPrice)}. ` +
-      `Resuming in DCA phase. Will replan on first price tick.`
+      `Resuming in HEDGE phase. Will replan on first price tick.`
     );
 
     // C2: catch up on any settlements during downtime, then resume scheduler.
@@ -592,6 +600,11 @@ class AiHedgeStrategy extends TradingBase {
       clearTimeout(this._fundingPollTimeout);
       this._fundingPollTimeout = null;
     }
+    // v3.0.0: cancel any pending stale-counter retry on stop.
+    if (this._aiRetryTimer) {
+      clearTimeout(this._aiRetryTimer);
+      this._aiRetryTimer = null;
+    }
     try {
       await this._pollFundingIncome();
     } catch (err) {
@@ -665,7 +678,7 @@ class AiHedgeStrategy extends TradingBase {
     // Auto-stop check with hysteresis (C3): totalPnL >= effectiveTarget
     // must hold for N consecutive ticks AND a minimum elapsed duration
     // before stopping. Single-tick wicks reset the watermark.
-    if (this.desiredProfitUSDT && this.phase === 'DCA') {
+    if (this.desiredProfitUSDT && this.phase === 'HEDGE') {
       const longNotional = this.longPosition?.notional || 0;
       const shortNotional = this.shortPosition?.notional || 0;
       const estimatedClosingFees = (longNotional + shortNotional) * FEE_RATE;
@@ -695,7 +708,7 @@ class AiHedgeStrategy extends TradingBase {
     }
 
     // Single-leg guard
-    if (this.phase === 'DCA' && this.riskGuard) {
+    if (this.phase === 'HEDGE' && this.riskGuard) {
       const guard = this.riskGuard.checkSingleLegGuard(this.longPosition, this.shortPosition, price);
       if (guard.shouldStop) {
         await this.addLog(`RISK GUARD: ${guard.reason}`);
@@ -733,6 +746,50 @@ class AiHedgeStrategy extends TradingBase {
   }
 
   // ——— AI plan management ——————————————————————————————————————————————
+
+  // Exponential backoff schedule for stale-counter retries (ms).
+  // 30s → 1m → 2m → 5m → 15m → 30m, repeats at 30m once cap hit.
+  static get _STALE_RETRY_SCHEDULE_MS() {
+    return [30_000, 60_000, 120_000, 300_000, 900_000, 1_800_000];
+  }
+
+  /**
+   * Called when AI plan generation fails (API error / malformed JSON /
+   * validation rejection). Bumps the stale counter and schedules an
+   * exponential-backoff retry. The previous activePlan stays active so
+   * remaining triggers keep firing while AI is recovering.
+   */
+  _onAiPlanFailure(reason) {
+    const schedule = AiHedgeStrategy._STALE_RETRY_SCHEDULE_MS;
+    const delay = schedule[Math.min(this._staleCount, schedule.length - 1)];
+    this._staleCount++;
+    this._aiStale = true;
+    this._nextRetryAt = Date.now() + delay;
+    this.addLog(`AI plan failed (${reason}). Stale counter=${this._staleCount}; retry in ${Math.round(delay / 1000)}s.`).catch(() => {});
+    if (this._aiRetryTimer) clearTimeout(this._aiRetryTimer);
+    this._aiRetryTimer = setTimeout(() => {
+      this._aiRetryTimer = null;
+      this._requestNewPlan('stale_retry').catch((e) =>
+        console.error(`Stale-counter retry failed: ${e.message}`));
+    }, delay);
+  }
+
+  /**
+   * Reset stale counter once a plan is successfully generated, validated,
+   * and installed.
+   */
+  _onAiPlanSuccess() {
+    if (this._staleCount > 0 || this._aiStale) {
+      this.addLog(`AI plan recovered after ${this._staleCount} stale cycle(s).`).catch(() => {});
+    }
+    this._staleCount = 0;
+    this._aiStale = false;
+    this._nextRetryAt = null;
+    if (this._aiRetryTimer) {
+      clearTimeout(this._aiRetryTimer);
+      this._aiRetryTimer = null;
+    }
+  }
 
   async _requestNewPlan(reason = 'execution_complete') {
     // Skip if the strategy is stopping or already stopped — the plan would
@@ -797,6 +854,18 @@ class AiHedgeStrategy extends TradingBase {
         this.aiTokenUsage.planCount++;
       }
 
+      // Post-process: HOLD/HOLD primaries → force-convert to CUT heavier leg.
+      // No-op for any other plan shape. Mutates plan in place.
+      plan = this.riskGuard.postProcessPlan(plan, {
+        phase: this.phase,
+        currentPrice: this.currentPrice,
+        longPosition: this.longPosition,
+        shortPosition: this.shortPosition,
+      });
+      if (plan._holdHoldTransformed) {
+        await this.addLog('HOLD/HOLD detected → post-hoc converted to CUT heavier leg.');
+      }
+
       const validation = this.riskGuard.validatePlan(plan, {
         currentPrice: this.currentPrice,
         longPosition: this.longPosition,
@@ -810,37 +879,11 @@ class AiHedgeStrategy extends TradingBase {
 
       if (!validation.valid) {
         await this.addLog(`AI plan rejected: ${validation.reasons.join(', ')}`);
-        // Preserve the rejected plan's probabilityAssessment so the fallback
-        // DCA path can bias its size split using the AI's own conviction.
-        const rejectedBias = plan?.probabilityAssessment || null;
-        plan = this.riskGuard.generateFallbackPlan(this.currentPrice, {
-          longPosition: this.longPosition,
-          shortPosition: this.shortPosition,
-          positionSizeUSDT: this.positionSizeUSDT,
-          volatility: this._lastVolatility,
-          phase: this.phase,
-          liquidationCaps: context.liquidationCaps,
-        }, 'Risk guard rejection', rejectedBias);
-
-        const fallbackValidation = this.riskGuard.validatePlan(plan, {
-          currentPrice: this.currentPrice,
-          longPosition: this.longPosition,
-          shortPosition: this.shortPosition,
-          positionSizeUSDT: this.positionSizeUSDT,
-          phase: this.phase,
-          liquidationCaps: context.liquidationCaps,
-          minLiqDistancePct: context.minLiqDistancePct,
-          volatility: context.volatility,
-        });
-
-        if (!fallbackValidation.valid) {
-          const msg = `Both AI and fallback plans rejected: ${fallbackValidation.reasons.join(', ')}`;
-          await this.addLog(`ERROR: [CRITICAL] ${msg}`);
-          this.criticalError = msg;
-          await this.stop('critical_error');
-          return;
-        }
-        await this.addLog('Using fallback plan.');
+        // v3.0.0: no fallback plan. Keep the previous activePlan active,
+        // bump the stale counter, schedule an exponential-backoff retry.
+        this.executionState = 'IDLE';
+        this._onAiPlanFailure('validation_rejected');
+        return;
       }
 
       // Freeze the microstructure inputs the AI actually consumed onto the plan,
@@ -860,6 +903,7 @@ class AiHedgeStrategy extends TradingBase {
       this.activePlan = plan;
       this.executor.setActivePlan(plan);
       this.executionState = 'EXECUTING_PLAN';
+      this._onAiPlanSuccess();
 
       await this.addLog(`AI Plan installed${plan._schema === 'paired' ? ' [paired]' : ' [phase1]'}.`);
       await this.addLog(`Analysis: ${plan.analysis || 'N/A'}`);
@@ -897,28 +941,8 @@ class AiHedgeStrategy extends TradingBase {
     } catch (error) {
       await this.addLog(`ERROR: [AI_ERROR] ${error.message}`);
       this.executionState = 'IDLE';
-
-      try {
-        const fallback = this.riskGuard.generateFallbackPlan(this.currentPrice, {
-          longPosition: this.longPosition,
-          shortPosition: this.shortPosition,
-          positionSizeUSDT: this.positionSizeUSDT,
-          volatility: this._lastVolatility,
-          phase: this.phase,
-          liquidationCaps: this._lastLiquidationCaps,
-        }, 'AI error');
-        fallback.microstructureSnapshot = this._lastMicrostructure
-          ? { ...this._lastMicrostructure }
-          : null;
-        fallback.volatilitySnapshot = this._lastVolatility ? { ...this._lastVolatility } : null;
-        fallback.plannedAt = new Date().toISOString();
-        this.activePlan = fallback;
-        this.executor.setActivePlan(fallback);
-        this.executionState = 'EXECUTING_PLAN';
-        await this.addLog('Installed fallback plan due to AI error.');
-      } catch (fbErr) {
-        await this.addLog(`ERROR: Fallback also failed: ${fbErr.message}`);
-      }
+      // v3.0.0: no fallback plan. Stale counter retry with exponential backoff.
+      this._onAiPlanFailure(`ai_error: ${error.message}`);
     }
   }
 
@@ -967,10 +991,10 @@ class AiHedgeStrategy extends TradingBase {
       if (this.riskGuard) this.riskGuard.firstPositionPrice = this.currentPrice;
     }
 
-    // Transition from INITIAL to DCA after OPEN_HEDGE
+    // Transition from INITIAL to HEDGE after OPEN_HEDGE
     if (action.type === 'OPEN_HEDGE') {
-      this.phase = 'DCA';
-      await this.addLog('Phase transition: INITIAL -> DCA');
+      this.phase = 'HEDGE';
+      await this.addLog('Phase transition: INITIAL -> HEDGE');
     }
 
     const outcome = {
@@ -1012,9 +1036,18 @@ class AiHedgeStrategy extends TradingBase {
     const { action, direction } = triggeredAction;
     await this.addLog(`Executing (${direction}): ${action.type}${action.kind ? ' ' + action.kind : ''} — ${action.reason}`);
 
+    // Replan rule (v3.0.0 Hedge Phase): AI replan fires only when a PRIMARY
+    // executes. Shadow fires alone do NOT trigger replan — remaining triggers
+    // in this plan stay active until a primary crosses.
+    // Phase 1 (OPEN_HEDGE flat schema) has no `kind` field — treat any fire
+    // as primary so the INITIAL → HEDGE transition replans as before.
+    const isPaired = this.activePlan?._schema === 'paired';
+    let primaryFiredAny = !isPaired || action.kind === 'primary';
+
     try {
       const { isHold } = await this._runActionAndRecord(action, direction);
       if (isHold) {
+        // HOLD trigger crossed — HOLD is primary-only by schema, so replan.
         await this._requestNewPlan('execution_complete');
         return;
       }
@@ -1025,16 +1058,21 @@ class AiHedgeStrategy extends TradingBase {
       // before the AI replans. Without this, only the closest fires per
       // tick and the rest are canceled by the post-fill replan, costing
       // legitimate fills during fast moves.
-      if (this.activePlan?._schema === 'paired') {
+      if (isPaired) {
         let cascaded;
         while ((cascaded = this.executor.checkImmediateTriggers(this.currentPrice))) {
+          if (cascaded.action.kind === 'primary') primaryFiredAny = true;
           await this.addLog(`Cascade fill (${cascaded.direction}): ${cascaded.action.type}${cascaded.action.kind ? ' ' + cascaded.action.kind : ''} @ ${this._formatPrice(cascaded.action.triggerPrice)}`);
           const r = await this._runActionAndRecord(cascaded.action, cascaded.direction);
           if (r.isHold) break;
         }
       }
 
-      await this._requestNewPlan('execution_complete');
+      if (primaryFiredAny) {
+        await this._requestNewPlan('execution_complete');
+      } else {
+        await this.addLog('Shadow fire — no AI replan (Hedge Phase rule); remaining triggers active until primary fires.');
+      }
     } catch (error) {
       await this.addLog(`ERROR: [TRADING_ERROR] ${action.type}: ${error.message}`);
       await this._requestNewPlan('execution_error');
@@ -1434,6 +1472,12 @@ class AiHedgeStrategy extends TradingBase {
       // L1: live AI cost so the user can self-judge "stuck or just patient?"
       aiTokenUsage: { ...this.aiTokenUsage },
       aiCostUsd: this._computeAiCost().totalCost,
+      // v3.0.0 stale-counter retry state. Frontend renders "AI RETRY" chip
+      // whenever aiStale === true so users know the bot is waiting on a
+      // retryable AI failure (not stuck).
+      aiStale: this._aiStale,
+      staleCount: this._staleCount,
+      nextRetryAt: this._nextRetryAt,
       realtimeWsConnected: this.realtimeWsConnected,
       userDataWsConnected: this.userDataWsConnected,
       streamMode: this.streamMode || 'WS',

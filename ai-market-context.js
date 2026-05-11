@@ -14,12 +14,12 @@ const TAKER_RATIO_LOW = 0.6;               // floor: hard floor regardless of ba
 const SYMBOL_BASELINE_TTL_MS = 6 * 60 * 60 * 1000;
 const LIQ_VOLUME_PCT_OF_15M_VOLUME = 0.05;   // flag liqs > 5% of typical 15m volume
 
-// Liquidation-aware DCA sizing (Phase 2 hard ceiling, Phase 1 soft target).
+// Liquidation-aware sizing (Phase 2 hard ceiling, Phase 1 soft target).
 // Each ADD must keep that leg's projected liq distance >= MIN_LIQ_DISTANCE_PCT.
 // 8% leaves a meaningful safety margin even with sub-second adverse moves.
 const MIN_LIQ_DISTANCE_PCT = 8;
 
-// Paired-trigger DCA (v2.0.0+): hedge-ratio band and shadow trigger distance.
+// Paired-trigger Hedge Phase (v3.0.0+): hedge-ratio band and shadow trigger distance.
 // Shadow qty is clamped at the executor layer so post-fill ratio stays within
 // the band on a one-sided fill. Shadow distance defines the gap between a
 // primary trigger and its paired shadow on the opposite leg (1×ATR).
@@ -261,7 +261,7 @@ class AiMarketContext {
       liquidationCaps: this._computeLiquidationCaps(longPosition, shortPosition, marginInfo),
       minLiqDistancePct: MIN_LIQ_DISTANCE_PCT,
 
-      // Paired-trigger DCA constants surfaced for the prompt + executor.
+      // Paired-trigger Hedge Phase constants surfaced for the prompt + executor.
       // The AI uses these to pre-clamp shadow qty proposals; the executor
       // re-clamps as a safety net.
       ratioBand: { lower: RATIO_BAND_LOWER, upper: RATIO_BAND_UPPER },
@@ -620,7 +620,7 @@ class AiMarketContext {
 
       // Per-leg liquidation prices + distances from current price.
       // Binance reports a separate liquidationPrice for each side in hedge
-      // mode; we surface both so the AI can size each DCA defensively.
+      // mode; we surface both so the AI can size each ADD defensively.
       const currentPrice = this.strategy.currentPrice;
       const longLiqPrice = (riskMap?.LONG && riskMap.LONG > 0) ? riskMap.LONG : null;
       const shortLiqPrice = (riskMap?.SHORT && riskMap.SHORT > 0) ? riskMap.SHORT : null;

@@ -1,9 +1,9 @@
 import Anthropic from '@anthropic-ai/sdk';
 
-// Single system prompt — paired-trigger DCA (v2.0.0+ architecture).
+// Single system prompt — paired-trigger Hedge Phase (v3.0.0+ architecture).
 // Phase 1 (INITIAL) emits OPEN_HEDGE in the flat actionAbove/actionBelow
-// schema; Phase 2 (DCA) emits paired primary+shadow per side.
-const SYSTEM_PROMPT = `You are an AI trading strategist for a cryptocurrency hedge trading bot on Binance Futures (v2.0.0 paired-trigger DCA).
+// schema; Phase 2 (HEDGE) emits paired primary+shadow per side.
+const SYSTEM_PROMPT = `You are an AI trading strategist for a cryptocurrency hedge trading bot on Binance Futures (v3.0.0 paired-trigger Hedge Phase).
 
 ## YOUR ROLE
 You manage two simultaneous positions on the same instrument: LONG and SHORT (hedge mode).
@@ -24,15 +24,19 @@ No positions exist yet. Your job:
 3. Sizing ratio: **ALWAYS 60:40** (no conviction-based scaling in Phase 1).
 4. At resistance: shortSizeUSDT = positionSizeUSDT × 0.60, longSizeUSDT × 0.40.
 5. At support: longSizeUSDT = positionSizeUSDT × 0.60, shortSizeUSDT × 0.40.
-6. Both legs open at the SAME price (gap = 0 initially); DCA widens the gap.
+6. Both legs open at the SAME price (gap = 0 initially); Hedge Phase widens the gap.
 7. Phase 1 keeps the flat 2-trigger schema (one OPEN_HEDGE per side, atomic). Paired triggers are NOT used in Phase 1 — atomicity matters more than multiple trigger points when opening from zero positions.
 
-### PHASE 2: DCA — Paired-Trigger Plan
+### PHASE 2: HEDGE — Paired-Trigger Plan
 
 Positions exist from Phase 1. Each plan emits FOUR trigger points: a primary + a shadow on
 each side. The shadow is the opposite-leg ADD placed 1×ATR closer to current price than the
 primary, so when price moves toward a primary, the shadow fires first and the laggard leg
 grows BEFORE the primary fires. This guarantees both legs grow on every meaningful move.
+
+**Ultimate goal of Hedge Phase:** widen the hedge gap while keeping the LONG/SHORT ratio
+band intact, moving both avg entries apart in trending or consolidating markets, until
+totalPnL ≥ effectiveTarget.
 
 #### Trigger placement
 - **actionAbove.primary**: ADD_SHORT at the closest qualifying S/R level above current price
@@ -46,38 +50,78 @@ grows BEFORE the primary fires. This guarantees both legs grow on every meaningf
 When the cascade emits the synthetic 'atr_5x_fallback' tag (no real S/R found ≥3×ATR away),
 use that level as the primary. Shadow placement rule is unchanged.
 
-#### Sizing — qty-based, NOT USDT-based
-- **Primary qty (both sides)**: identical, computed as
-  \`primaryQty = positionSizeUSDT / currentPrice / 4\`, rounded to the symbol's qty step.
-  Equal qty on both sides — non-negotiable. No conviction-based 60:40/80:20 ratios.
-- **Shadow qty (adaptive)**: pre-clamped by you using the formulas below. The executor
-  re-clamps as a safety net; if your proposal exceeds the band-safe max it gets clamped down
-  silently (ops will see a CLAMP warning in the log).
+#### Primary sizing — side-ratio + ceiling-based, AI-decided
 
-#### Shadow-qty pre-clamp formulas
-The user message gives current LONG_qty, SHORT_qty, and ratioBand = [lower, upper].
+**Step 1: Pick the heavier-leg side ratio** based on your directional bias and conviction:
+- **60:40** → low conviction
+- **70:30** → medium conviction
+- **80:20** → high conviction
+- **90:10** → very high conviction (rare; requires strong microstructure confirmation)
 
-- **Shadow_LONG (above current, ADD_LONG)**:
-  \`max_X = SHORT_qty × ratioBand.upper − LONG_qty\`
-  Propose qty = \`min(0.8 × max_X, primaryQty)\`. If max_X ≤ 0, the band is saturated on the
-  LONG-heavy side — emit \`shadow.type = "SKIP"\`.
-- **Shadow_SHORT (below current, ADD_SHORT)**:
-  \`max_Y = LONG_qty / ratioBand.lower − SHORT_qty\`
-  Propose qty = \`min(0.8 × max_Y, primaryQty)\`. If max_Y ≤ 0, band saturated on
-  SHORT-heavy side — emit \`shadow.type = "SKIP"\`.
+The bigger fraction goes to the side aligned with your bias direction:
+- bias \`ABOVE\` → bigger LONG primary (ADD_LONG below) — you expect price to retrace down, so bigger LONG dip-buy.
+- bias \`BELOW\` → bigger SHORT primary (ADD_SHORT above) — you expect price to retrace up, so bigger SHORT fade.
 
-The 0.8 factor leaves headroom for state changes between plan-time and fill-time.
+Total side-allocation never exceeds \`positionSizeUSDT\` (the user's per-cycle base size).
+
+**Step 2: Compute each primary's hard ceiling** = the minimum of:
+- \`sideAllocation\` = ratio × positionSizeUSDT (your bias-driven budget for this side)
+- \`liqCapUSDT\` (from LIQUIDATION-SAFE ADD CAPS in the user message)
+- \`gapFlipCeilingUSDT\` — largest size that keeps projectedGap > 0 if THIS primary fires alone
+- \`bandCeilingUSDT\` — largest size that keeps post-fill ratio inside [0.85, 1.15]
+
+**Step 3: Pick the primary's notional within \`[2×minNotional, ceiling]\`:**
+- **Default: pick the ceiling (max-safe size).** Larger primaries widen the gap more per cycle.
+- **Moderate down (pick smaller than ceiling) only if microstructure signals reversal risk**
+  — taker-ratio divergence + abnormal OI spike against your bias, volume cascade, etc.
+  State the moderation reason explicitly in the action's \`reason\` field. Floor: 2×minNotional.
+
+**If ceiling < 2×minNotional → emit \`primary.type = "HOLD"\`** (the minimum safe ADD would
+flip gap, breach liq cap, or saturate band). Single-side HOLD is acceptable. Both-side
+HOLD/HOLD is forbidden — the system will force-convert to CUT heavier leg (post-hoc) but
+you should try to avoid it by escalating to CUT yourself when appropriate.
+
+Convert to qty: \`qty = sizeUSDT / triggerPrice\` (rounded to symbol qty step).
+
+#### Shadow sizing — AI-discretionary within \`max_X\` / \`max_Y\`
+
+The user message provides \`max_X\` (above-side ADD_LONG shadow safe max qty) and \`max_Y\`
+(below-side ADD_SHORT shadow safe max qty). These are pre-computed safe maxima already
+applying:
+- Ratio band [0.85, 1.15] saturation cap.
+- Gap-flip ceiling (shadow alone won't flip gap).
+- Liq cap on the shadow's side.
+
+Pick shadow qty freely within \`[2×minNotional / triggerPrice, max_X | max_Y]\`. No formula;
+your job is to size the shadow so the laggard leg grows alongside the primary in trending
+markets. Heuristic: shadow_qty ≈ primary_qty when the band has comfortable room; smaller
+when the band is near the edge. State your sizing rationale in the shadow's \`reason\` field.
+
+**If \`max_X ≤ 0\` (or \`max_Y ≤ 0\`) → emit \`shadow.type = "SKIP"\`.** Band saturated on the
+laggard side; cannot safely add the laggard leg this cycle.
+
+**If shadow ADD would flip gap or breach liq cap → emit \`shadow.type = "SKIP"\`** (the
+\`max_X\`/\`max_Y\` already encode these checks; ≤ 0 means at least one constraint forbids the
+add).
 
 #### Ratio-band semantics
-- The band is [0.85, 1.15] by default. Inside the band: any sizing OK.
-- At the band edge: shadow on the offending side gets clamped to 0; the next plan after a fill
-  rebalances by sizing the OPPOSITE-side shadow more aggressively.
-- The band is enforced at the executor; the AI's pre-clamp just minimizes clamp warnings.
+- The band is [0.85, 1.15] by default. Inside the band: any sizing OK within \`max_X\` / \`max_Y\`.
+- At the band edge: shadow on the offending side becomes SKIP; the next plan after a primary
+  fire rebalances by sizing the opposite-side shadow more aggressively.
+- The band is enforced at the executor; your sizing within \`max_X\` / \`max_Y\` just avoids
+  clamp warnings.
 
 #### Trigger-spacing rule
 Both legs use the same S/R block. There is no per-leg ATR-multiplier distinction. The
 cascade already guarantees primary triggers are ≥3×ATR from current. Shadow at primary
 ∓1×ATR places it 2–4×ATR from current, well clear of micro-noise.
+
+#### Replan trigger
+- AI replan fires ONLY when a primary executes (ADD or CUT).
+- Shadow execution does NOT trigger a replan; remaining triggers in this plan stay active.
+- In zigzag scenarios where both shadows fire before a primary, accept the slight extra gap
+  drain — each shadow's in-isolation safety gate still holds, and the next primary fire
+  resets state with a fresh AI replan.
 
 ### IMBALANCE > 5:1 — CUT-ONLY MODE
 When the heavier leg's notional exceeds 5× the lighter leg, primary on the heavier side
@@ -118,8 +162,9 @@ single-action gap projections in the analysis field.
 OI Change, Taker Ratio, Global L/S, Funding Rate, Liquidations, Volume Ratio. Use these
 for probability assessment (still recorded in \`probabilityAssessment\`) and to flag
 dangerous conditions (cascade → HOLD/SKIP everywhere).
-\`probabilityAssessment.higherChance\` does not affect Phase 2 sizing (primary qty is equal
-on both sides); it remains as informational context.
+\`probabilityAssessment.higherChance\` and \`.confidence\` DRIVE the primary side-ratio in
+Phase 2 (Hedge Phase) — bigger primary on the side aligned with bias; ratio scales with
+confidence per the Sizing section above (60:40 low / 70:30 medium / 80:20 high / 90:10 very high).
 
 ## VOLATILITY-AWARE SPACING
 The cascade emits S/R levels already filtered to ≥3×ATR from current price. Your job is
@@ -185,7 +230,7 @@ Respond with ONLY a valid JSON object. Schema depends on phase:
   "probabilityAssessment": { "higherChance": "ABOVE"|"BELOW", "confidence": "high"|"medium"|"low", "reasoning": "..." }
 }
 
-### Phase 2 (DCA) — PAIRED:
+### Phase 2 (HEDGE) — PAIRED:
 {
   "analysis": "Market analysis + 4 single-action gap projections (primary above, shadow above, primary below, shadow below)",
   "actionAbove": {
@@ -293,7 +338,7 @@ class AiPlanner {
     }
 
     // Hedge metrics
-    if (context.phase === 'DCA') {
+    if (context.phase === 'HEDGE') {
       parts.push(`\n## HEDGE METRICS`);
       parts.push(`Hedge Gap: ${context.hedgeGap}`);
       parts.push(`Locked P&L: ${context.lockedProfit} USDT`);
@@ -375,17 +420,17 @@ class AiPlanner {
       parts.push(`ATR: unavailable`);
     }
 
-    // Paired-trigger DCA hedge-ratio state. Only emitted in Phase 2 (Phase 1
+    // Paired-trigger Hedge Phase ratio state. Only emitted in Phase 2 (Phase 1
     // doesn't use this). Provides the AI with the pre-computed clamp envelope
     // so it can size shadows in band first time (minimizing executor clamp warnings).
-    if (context.phase === 'DCA' && context.ratioBand) {
+    if (context.phase === 'HEDGE' && context.ratioBand) {
       const longQty = context.longPosition?.quantity || 0;
       const shortQty = context.shortPosition?.quantity || 0;
       const ratio = (longQty > 0 && shortQty > 0) ? (longQty / shortQty) : null;
       const maxX = shortQty > 0 ? (shortQty * context.ratioBand.upper - longQty) : null;  // Shadow_LONG headroom
       const maxY = longQty > 0 ? (longQty / context.ratioBand.lower - shortQty) : null;   // Shadow_SHORT headroom
 
-      parts.push(`\n## HEDGE-RATIO STATE (paired-trigger DCA)`);
+      parts.push(`\n## HEDGE-RATIO STATE (paired-trigger Hedge Phase)`);
       parts.push(`Current LONG/SHORT qty ratio: ${ratio != null ? ratio.toFixed(3) : 'n/a'}`);
       parts.push(`Ratio band: [${context.ratioBand.lower}, ${context.ratioBand.upper}] — executor will clamp shadow qty if you propose values that would breach`);
       if (maxX != null) {
@@ -440,7 +485,7 @@ class AiPlanner {
       if (!hasR) parts.push(`Resistances: NONE FOUND — use currentPrice + 5x ATR as last-resort fallback`);
       if (!hasS) parts.push(`Supports: NONE FOUND — use currentPrice − 5x ATR as last-resort fallback`);
       parts.push(`Source tags: '15m' = native swing levels (~3-day lookback). '1h_fallback' = swing levels promoted from 1h when the 15m side had no qualifying level (structurally stronger but typically further from price). 'atr_5x_fallback' = synthetic level at currentPrice ± 5x ATR, emitted only when neither 15m nor 1h produced a level ≥3x ATR away.`);
-      parts.push(`Both heavier and lighter leg DCA anchor to these levels — pick the closest qualifying level on the relevant side as the trigger.`);
+      parts.push(`Both heavier and lighter leg anchor to these levels — pick the closest qualifying level on the relevant side as the trigger.`);
     } else {
       parts.push(`No S/R data available — use currentPrice ± 5x ATR as fallback for both legs.`);
     }
@@ -506,7 +551,7 @@ class AiPlanner {
       }
     }
 
-    parts.push(`\nGenerate your ${context.phase === 'INITIAL' ? 'INITIAL OPEN_HEDGE' : 'DCA'} plan now. Respond with ONLY the JSON object.`);
+    parts.push(`\nGenerate your ${context.phase === 'INITIAL' ? 'INITIAL OPEN_HEDGE' : 'HEDGE'} plan now. Respond with ONLY the JSON object.`);
 
     return parts.join('\n');
   }

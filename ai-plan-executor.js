@@ -5,7 +5,7 @@
  * (flat actionAbove/actionBelow shape). When one triggers, both legs open
  * atomically.
  *
- * Phase 2 (DCA): paired-trigger plan — primary + shadow on actionAbove,
+ * Phase 2 (HEDGE): paired-trigger plan — primary + shadow on actionAbove,
  * primary + shadow on actionBelow. Shadow qty is band-clamped to keep
  * LONG/SHORT ratio in band even on one-sided fills.
  *
