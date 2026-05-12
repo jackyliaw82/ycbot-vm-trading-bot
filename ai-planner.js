@@ -66,55 +66,95 @@ Total side-allocation never exceeds \`positionSizeUSDT\` (the user's per-cycle b
 
 **Step 2: Compute each primary's hard ceiling** = the minimum of:
 - \`sideAllocation\` = ratio × positionSizeUSDT (your bias-driven budget for this side)
-- \`liqCapUSDT\` (from LIQUIDATION-SAFE ADD CAPS in the user message)
+- \`liqCapUSDT\` (from LIQUIDATION-SAFE ADD CAPS in the user message) — HARD safety
 - \`gapFlipCeilingUSDT\` — largest size that keeps projectedGap > 0 ASSUMING the same-side
   shadow has fired first (use POST-SHADOW LO_after / SH_after per FORWARD REASONING
   below). If the same-side shadow is SKIP, fall back to current-state projection.
-- \`bandCeilingUSDT\` — largest size that keeps post-fill ratio inside [0.85, 1.15],
-  computed against POST-SHADOW qty totals: (qtyLO + shadowAbove.qty, qtySH) for the
-  above-side primary; (qtyLO, qtySH + shadowBelow.qty) for the below-side primary.
-  If the same-side shadow is SKIP, use current qtys.
+  HARD safety.
 
-**Step 3: Pick the primary's notional within \`[2×minNotional, ceiling]\`:**
-- **Default: pick the ceiling (max-safe size).** Larger primaries widen the gap more per cycle.
-- **Moderate down (pick smaller than ceiling) only if microstructure signals reversal risk**
-  — taker-ratio divergence + abnormal OI spike against your bias, volume cascade, etc.
-  State the moderation reason explicitly in the action's \`reason\` field. Floor: 2×minNotional.
+**Band saturation is NOT a primary sizing constraint.** Ratio may drift further
+outside the band on a primary fire when adding to the heavier side. The same-side
+shadow on the next plan (which has opposite direction to its primary by construction)
+will pull ratio back toward band via the \`max_X\`/\`max_Y\` headroom that opens up when
+the heavier leg grows. Cyclic push (primary) and pull (next-plan same-side shadow) is
+by design — only the hedge-gap-positive invariant is sacred.
 
-**If ceiling < 2×minNotional → emit \`primary.type = "HOLD"\`** (the minimum safe ADD would
-flip gap, breach liq cap, or saturate band). Single-side HOLD is acceptable. Both-side
-HOLD/HOLD is forbidden — the system will force-convert to CUT heavier leg (post-hoc) but
-you should try to avoid it by escalating to CUT yourself when appropriate.
+When the current ratio is already outside the band and you are ADDing to the heavier
+side, explicitly state in \`analysis\`: the current ratio, the post-fill ratio, and the
+rebalance mechanism on the next plan. Keep the reasoning auditable.
+
+**Step 3: Pick the primary's notional within \`[2×minNotional, hardCeiling]\`:**
+
+If the primary is on the LIGHTER side (would pull ratio toward band — e.g. current
+ratio 1.50 LONG-heavy and you are ADD_SHORT, or ratio 0.70 SHORT-heavy and you are
+ADD_LONG): aim for the largest qty that brings ratio closest to band. Typically the
+hardCeiling. If \`gapFlipCeilingUSDT\` would force the qty below what's needed to
+land inside the band, ADD at the gap-flip-bounded qty anyway — ratio moves toward
+band but may not fully re-enter. This is a partial rebalance and is acceptable.
+
+If the primary is on the HEAVIER side (would push ratio further from band — e.g.
+current ratio 1.50 LONG-heavy and you are ADD_LONG): size freely within
+\`[2×minNotional, hardCeiling]\`. **Default: pick the hardCeiling (max-safe size).**
+Ratio drift is acceptable here; the rebalance happens on the next plan's same-side
+shadow.
+
+If the primary is on the BALANCED side (current ratio inside band): pick within
+\`[2×minNotional, hardCeiling]\` per microstructure judgment. Default: pick the
+hardCeiling. Moderate down only on reversal-risk signals (taker divergence,
+abnormal OI spike, volume cascade, etc.). State moderation reason in \`reason\`.
+
+**If hardCeiling < 2×minNotional → emit \`primary.type = "HOLD"\`** — the minimum
+safe ADD would flip gap or breach liq cap. Band saturation is NOT a HOLD reason
+anymore. Single-side HOLD is acceptable; both-side HOLD/HOLD is forbidden — the
+system will force-convert to CUT heavier leg (post-hoc) but you should try to
+avoid it by escalating to CUT yourself when appropriate.
 
 Convert to qty: \`qty = sizeUSDT / triggerPrice\` (rounded to symbol qty step).
 
-#### Shadow sizing — AI-discretionary within \`max_X\` / \`max_Y\`
+#### Shadow sizing — band-bounded, gap-flip-aware
 
-The user message provides \`max_X\` (above-side ADD_LONG shadow safe max qty) and \`max_Y\`
-(below-side ADD_SHORT shadow safe max qty). These are pre-computed safe maxima already
-applying:
-- Ratio band [0.85, 1.15] saturation cap.
-- Gap-flip ceiling (shadow alone won't flip gap).
-- Liq cap on the shadow's side.
+The user message provides \`max_X\` (above-side ADD_LONG shadow band headroom) and \`max_Y\`
+(below-side ADD_SHORT shadow band headroom). These encode the band saturation cap:
+\`max_X = qtySH × 1.15 − qtyLO\` and \`max_Y = qtyLO / 0.85 − qtySH\`.
 
-Pick shadow qty freely within \`[2×minNotional / triggerPrice, max_X | max_Y]\`. No formula;
-your job is to size the shadow so the laggard leg grows alongside the primary in trending
-markets. Heuristic: shadow_qty ≈ primary_qty when the band has comfortable room; smaller
-when the band is near the edge. State your sizing rationale in the shadow's \`reason\` field.
+Shadows fall into two cases:
 
-**If \`max_X ≤ 0\` (or \`max_Y ≤ 0\`) → emit \`shadow.type = "SKIP"\`.** Band saturated on the
-laggard side; cannot safely add the laggard leg this cycle.
+**Case 1 — Drift-away shadow (band-saturated side):** \`max_X ≤ 0\` (or \`max_Y ≤ 0\`).
+The shadow would push ratio FURTHER from the band on the already-heavy side. Emit
+\`shadow.type = "SKIP"\`. Shadows are never allowed to drift ratio away from the band.
 
-**If shadow ADD would flip gap or breach liq cap → emit \`shadow.type = "SKIP"\`** (the
-\`max_X\`/\`max_Y\` already encode these checks; ≤ 0 means at least one constraint forbids the
-add).
+**Case 2 — Rebalance shadow (lighter side has headroom):** \`max_X > 0\` (or \`max_Y > 0\`).
+The shadow pulls ratio TOWARD the band. Compute the gap-flip ceiling for the shadow —
+the largest qty Q such that the leg projection still leaves post-shadow gap > 0:
+- ADD_LONG shadow above @ shadowPrice (pulls LO):
+  \`LO_after = (LO×qtyLO + shadowPrice×Q) / (qtyLO + Q)\` must satisfy \`SH − LO_after > 0\`.
+  When shadowPrice > LO, Q is unbounded by gap; when shadowPrice < LO, Q is bounded.
+- ADD_SHORT shadow below @ shadowPrice (pulls SH):
+  \`SH_after = (SH×qtySH + shadowPrice×Q) / (qtySH + Q)\` must satisfy \`SH_after − LO > 0\`.
+  When shadowPrice < SH, Q is unbounded by gap; when shadowPrice closer to LO or below, Q bounded.
+
+Pick shadow qty = \`min(max_X or max_Y, gap_flip_ceiling)\` × 0.70 safety margin.
+Floor: \`2×minNotional / triggerPrice\`.
+
+**If even the floor would flip gap or breach liq cap → emit \`shadow.type = "SKIP"\`.**
+Only this corner case (no positive Q fits gap-positive) maps to SKIP under the new rule.
+
+State your sizing rationale in the shadow's \`reason\` field: which case applies,
+the gap-flip ceiling value, and the chosen qty.
 
 #### Ratio-band semantics
-- The band is [0.85, 1.15] by default. Inside the band: any sizing OK within \`max_X\` / \`max_Y\`.
-- At the band edge: shadow on the offending side becomes SKIP; the next plan after a primary
-  fire rebalances by sizing the opposite-side shadow more aggressively.
-- The band is enforced at the executor; your sizing within \`max_X\` / \`max_Y\` just avoids
-  clamp warnings.
+- The band [0.85, 1.15] constrains SHADOW sizing only. Primaries ADD freely within hard
+  ceilings (sideAllocation, liqCap, gapFlipCeiling). Ratio may drift outside band on
+  primary fires when ADDing to the heavier side.
+- Drift-away shadow (\`max_X ≤ 0\` or \`max_Y ≤ 0\` on the heavier side): SKIP.
+- Rebalance shadow (\`max_X > 0\` or \`max_Y > 0\` on the lighter side): pull ratio toward
+  band. If full \`max_X\`/\`max_Y\` would flip gap, scale down to the gap-flip ceiling (with
+  ~70% safety margin). Only SKIP if even the floor would flip gap.
+- Across cycles, primary pushes ratio outside band, the next plan's same-side shadow
+  (opposite direction to its primary by construction) pulls it partially back. Steady-state
+  oscillation around the band edge is acceptable.
+- Imbalance > 5:1 still escalates to CUT-only mode (hard stop on runaway drift).
+- Only the gap-positive invariant is sacred.
 
 #### Trigger-spacing rule
 Both legs use the same S/R block. There is no per-leg ATR-multiplier distinction. The
