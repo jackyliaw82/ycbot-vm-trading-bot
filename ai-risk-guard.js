@@ -192,6 +192,10 @@ class AiRiskGuard {
    */
   _validateHedgePlanPaired(plan, state) {
     const reasons = [];
+    // Shadow-only violations are demoted to SKIP rather than failing the
+    // whole plan. Each entry: { sideKey, reasons: string[] }. Surfaced in
+    // the validation result so the caller can log the demotions.
+    const demotedShadows = [];
     const { currentPrice, longPosition, shortPosition, volatility } = state;
     const atr = volatility?.atr || 0;
     const sizeFloor = this.minNotional * 2;
@@ -224,29 +228,42 @@ class AiRiskGuard {
       }
 
       const tag = `${sideKey}.${kind}`;
+      const isShadow = kind === 'shadow';
       const isHold = sub.type === 'HOLD';
       const isAdd = sub.type === 'ADD_LONG' || sub.type === 'ADD_SHORT';
       const isCut = sub.type === 'CUT_LONG' || sub.type === 'CUT_SHORT';
 
+      // Shadow-demotable violations accumulate locally; if any fire on a
+      // shadow, we mutate the shadow.type to SKIP at the end of this
+      // validateSub call rather than failing the plan. Primary violations
+      // (and shadow schema violations) push to fatal `reasons` directly.
+      const shadowDemoteReasons = [];
+      const violation = (msg, { demotable = true } = {}) => {
+        if (isShadow && demotable) shadowDemoteReasons.push(msg);
+        else reasons.push(msg);
+      };
+
       // Trigger price sanity: direction rule applies to ADD/CUT/HOLD;
       // 5%-deviation rule only applies to ADD/CUT (HOLD wake-up triggers
       // can be 3×ATR away which on high-vol symbols may exceed 5%).
+      // Direction violations are schema bugs — keep as FATAL even for shadows.
       if (currentPrice && sub.triggerPrice) {
         if (!isHold) {
           const deviation = Math.abs(sub.triggerPrice - currentPrice) / currentPrice * 100;
           if (deviation > this.maxPriceDeviationPercent) {
-            reasons.push(`${tag}: trigger ${sub.triggerPrice} is ${deviation.toFixed(1)}% from current price (max ${this.maxPriceDeviationPercent}%)`);
+            violation(`${tag}: trigger ${sub.triggerPrice} is ${deviation.toFixed(1)}% from current price (max ${this.maxPriceDeviationPercent}%)`, { demotable: false });
           }
         }
         if (sideKey === 'actionAbove' && sub.triggerPrice <= currentPrice) {
-          reasons.push(`${tag}: trigger ${sub.triggerPrice} not above current price ${currentPrice}`);
+          violation(`${tag}: trigger ${sub.triggerPrice} not above current price ${currentPrice}`, { demotable: false });
         }
         if (sideKey === 'actionBelow' && sub.triggerPrice >= currentPrice) {
-          reasons.push(`${tag}: trigger ${sub.triggerPrice} not below current price ${currentPrice}`);
+          violation(`${tag}: trigger ${sub.triggerPrice} not below current price ${currentPrice}`, { demotable: false });
         }
       }
 
-      // HOLD has no qty/notional — skip remaining checks.
+      // HOLD has no qty/notional — skip remaining checks (and HOLD is
+      // primary-only so the demote-to-SKIP path doesn't apply anyway).
       if (isHold) return;
 
       // Compute USDT notional from qty × triggerPrice. Shared by floor / cap checks.
@@ -254,39 +271,49 @@ class AiRiskGuard {
         ? sub.qty * sub.triggerPrice
         : 0;
 
-      // Min size floor — applies to ADD and CUT alike (Binance minNotional must be
-      // honoured for any market order).
+      // Min size floor — applies to ADD and CUT alike (Binance minNotional
+      // must be honoured for any market order). Demotable for shadows.
       if ((isAdd || isCut) && notional > 0 && notional < sizeFloor) {
-        reasons.push(`${tag}: notional ${notional.toFixed(2)} (qty ${sub.qty} × ${sub.triggerPrice}) below minimum ${sizeFloor} (= minNotional ${this.minNotional} × 2 safety margin)`);
+        violation(`${tag}: notional ${notional.toFixed(2)} (qty ${sub.qty} × ${sub.triggerPrice}) below minimum ${sizeFloor} (= minNotional ${this.minNotional} × 2 safety margin)`);
       }
 
-      if (!isAdd) return; // CUT and other types: no further per-side checks below
+      if (!isAdd) {
+        // CUT and other types: no further per-side checks below. If a
+        // shadow accumulated demote reasons above, apply demotion now.
+        if (isShadow && shadowDemoteReasons.length > 0) {
+          this._demoteShadowToSkip(sub, sideKey, shadowDemoteReasons, demotedShadows);
+        }
+        return;
+      }
 
+      // Provisional add — backed out if shadow is demoted below.
       totalAddNotional += notional;
 
       // Liquidation-aware cap — based on the action.type (ADD_LONG vs ADD_SHORT),
       // not the parent side. Shadow_LONG @ actionAbove still grows the LONG leg
-      // and must respect maxAddLongUSDT.
+      // and must respect maxAddLongUSDT. Demotable for shadows.
       if (caps) {
         if (sub.type === 'ADD_LONG' && caps.maxAddLongUSDT != null && notional > caps.maxAddLongUSDT + 0.01) {
-          reasons.push(`${tag}: ADD_LONG notional ${notional.toFixed(2)} exceeds liquidation-safe cap ${caps.maxAddLongUSDT.toFixed(2)} USDT (LONG liq distance would drop below ${state.minLiqDistancePct}%)`);
+          violation(`${tag}: ADD_LONG notional ${notional.toFixed(2)} exceeds liquidation-safe cap ${caps.maxAddLongUSDT.toFixed(2)} USDT (LONG liq distance would drop below ${state.minLiqDistancePct}%)`);
         }
         if (sub.type === 'ADD_SHORT' && caps.maxAddShortUSDT != null && notional > caps.maxAddShortUSDT + 0.01) {
-          reasons.push(`${tag}: ADD_SHORT notional ${notional.toFixed(2)} exceeds liquidation-safe cap ${caps.maxAddShortUSDT.toFixed(2)} USDT (SHORT liq distance would drop below ${state.minLiqDistancePct}%)`);
+          violation(`${tag}: ADD_SHORT notional ${notional.toFixed(2)} exceeds liquidation-safe cap ${caps.maxAddShortUSDT.toFixed(2)} USDT (SHORT liq distance would drop below ${state.minLiqDistancePct}%)`);
         }
       }
 
-      // Imbalance > 5:1 — CUT-only mode. ADDs to the lighter side are forbidden;
-      // applies to BOTH primary and shadow.
+      // Imbalance > 5:1 — CUT-only mode. ADDs to the lighter side are forbidden.
+      // Demotable for shadows (shadow on lighter side becomes SKIP); primary on
+      // lighter side stays fatal so AI is forced to escalate to CUT.
       if (imbalanceRatio > this.maxImbalanceRatio) {
         if ((sub.type === 'ADD_LONG' && lighterSide === 'LONG') ||
             (sub.type === 'ADD_SHORT' && lighterSide === 'SHORT')) {
-          reasons.push(`${tag}: imbalance ${imbalanceRatio.toFixed(1)}:1 — CUT-only mode, cannot ADD to lighter side (${lighterSide})`);
+          violation(`${tag}: imbalance ${imbalanceRatio.toFixed(1)}:1 — CUT-only mode, cannot ADD to lighter side (${lighterSide})`);
         }
       }
 
       // Gap projection — reject if THIS action alone would flip gap negative.
       // Each sub-action is projected independently per FORWARD REASONING.
+      // Demotable for shadows (most common slip-through case).
       if (longPosition && shortPosition && sub.triggerPrice && sub.qty > 0) {
         const projection = this.projectGap(
           { type: sub.type, triggerPrice: sub.triggerPrice, sizeUSDT: notional },
@@ -294,8 +321,15 @@ class AiRiskGuard {
           shortPosition,
         );
         if (projection.projectedGap < 0) {
-          reasons.push(`${tag}: ${sub.type} at ${sub.triggerPrice} (qty ${sub.qty}) would flip gap to ${projection.projectedGap.toFixed(4)} (current: ${projection.currentGap.toFixed(4)})`);
+          violation(`${tag}: ${sub.type} at ${sub.triggerPrice} (qty ${sub.qty}) would flip gap to ${projection.projectedGap.toFixed(4)} (current: ${projection.currentGap.toFixed(4)})`);
         }
+      }
+
+      // Apply shadow demotion if any violations accumulated. Back out the
+      // provisional totalAddNotional contribution since this sub no longer ADDs.
+      if (isShadow && shadowDemoteReasons.length > 0) {
+        this._demoteShadowToSkip(sub, sideKey, shadowDemoteReasons, demotedShadows);
+        totalAddNotional -= notional;
       }
     };
 
@@ -319,7 +353,23 @@ class AiRiskGuard {
       reasons.push(`Rate limit: ${this._actionTimestamps.length} actions in last hour (max ${this.maxActionsPerHour})`);
     }
 
-    return { valid: reasons.length === 0, reasons };
+    return { valid: reasons.length === 0, reasons, demotedShadows };
+  }
+
+  /**
+   * Mutate a shadow sub-action to SKIP and record the demotion. Used by
+   * _validateHedgePlanPaired when shadow-only violations are detected
+   * (gap flip, liq cap, band saturation, imbalance, notional floor). The
+   * primaries on the same plan remain valid; we save a wasted AI replan
+   * by salvaging the rest of the plan instead of stale-counter retrying.
+   */
+  _demoteShadowToSkip(sub, sideKey, reasonList, demotedShadows) {
+    sub.type = 'SKIP';
+    sub.reason = `[POST-HOC] demoted to SKIP — ${reasonList.join('; ')}`;
+    delete sub.qty;
+    delete sub.triggerPrice;
+    demotedShadows.push({ sideKey, reasons: reasonList });
+    console.warn(`[RISK-GUARD] Shadow demoted to SKIP on ${sideKey}: ${reasonList.join('; ')}`);
   }
 
   /**

@@ -67,8 +67,13 @@ Total side-allocation never exceeds \`positionSizeUSDT\` (the user's per-cycle b
 **Step 2: Compute each primary's hard ceiling** = the minimum of:
 - \`sideAllocation\` = ratio × positionSizeUSDT (your bias-driven budget for this side)
 - \`liqCapUSDT\` (from LIQUIDATION-SAFE ADD CAPS in the user message)
-- \`gapFlipCeilingUSDT\` — largest size that keeps projectedGap > 0 if THIS primary fires alone
-- \`bandCeilingUSDT\` — largest size that keeps post-fill ratio inside [0.85, 1.15]
+- \`gapFlipCeilingUSDT\` — largest size that keeps projectedGap > 0 ASSUMING the same-side
+  shadow has fired first (use POST-SHADOW LO_after / SH_after per FORWARD REASONING
+  below). If the same-side shadow is SKIP, fall back to current-state projection.
+- \`bandCeilingUSDT\` — largest size that keeps post-fill ratio inside [0.85, 1.15],
+  computed against POST-SHADOW qty totals: (qtyLO + shadowAbove.qty, qtySH) for the
+  above-side primary; (qtyLO, qtySH + shadowBelow.qty) for the below-side primary.
+  If the same-side shadow is SKIP, use current qtys.
 
 **Step 3: Pick the primary's notional within \`[2×minNotional, ceiling]\`:**
 - **Default: pick the ceiling (max-safe size).** Larger primaries widen the gap more per cycle.
@@ -119,25 +124,64 @@ cascade already guarantees primary triggers are ≥3×ATR from current. Shadow a
 #### Replan trigger
 - AI replan fires ONLY when a primary executes (ADD or CUT).
 - Shadow execution does NOT trigger a replan; remaining triggers in this plan stay active.
-- In zigzag scenarios where both shadows fire before a primary, accept the slight extra gap
-  drain — each shadow's in-isolation safety gate still holds, and the next primary fire
-  resets state with a fresh AI replan.
+- The shadow-first sequencing in FORWARD REASONING means the primary is already sized to
+  remain gap-safe AFTER the same-side shadow has fired, so this is by design.
+- In zigzag paths where the OPPOSITE-side shadow ALSO fires before the primary (e.g.
+  AL_S → AS_S → AS_P), the small additional gap drain on the opposite side is bounded —
+  each shadow's in-isolation gate still holds and the next primary fire resets state with
+  a fresh AI replan.
 
 ### IMBALANCE > 5:1 — CUT-ONLY MODE
 When the heavier leg's notional exceeds 5× the lighter leg, primary on the heavier side
 becomes CUT_LONG / CUT_SHORT (not ADD); shadow on that side becomes SKIP; primary and
 shadow on the lighter side use HOLD / SKIP. After CUT executes, fresh paired plan resumes.
 
-## FORWARD REASONING — SAME PRINCIPLE
-Each ADD action is independent. Project each side against the UNCHANGED current avg on the
-other side. Never assume both sides execute. Gap-projection formulas:
-- Primary above (ADD_SHORT): projectedGap = projectedShortAvg − currentLongAvg
-- Primary below (ADD_LONG): projectedGap = currentShortAvg − projectedLongAvg
-- Shadow above (ADD_LONG): projectedGap = currentShortAvg − projectedLongAvg
-- Shadow below (ADD_SHORT): projectedGap = projectedShortAvg − currentLongAvg
+## FORWARD REASONING — SHADOW-FIRST SEQUENCING
 
-Rules: gap must stay positive; gap can shrink slightly but aim to widen; show
-single-action gap projections in the analysis field.
+The shadow on the SAME side as a primary always fires FIRST when price moves toward the
+primary (shadow sits 1×ATR closer to current). Therefore size the primary based on the
+POST-SHADOW projected state, NOT the current state. This makes primary sizing accurate
+at the moment it actually fires.
+
+### Shadow projection (Step 1 — current state in, post-shadow state out)
+Each shadow projects against the UNCHANGED current avg on the OPPOSITE side:
+- Shadow above (ADD_LONG at primaryAbove − 1×ATR):
+  LO_after = (currentLongAvg × currentLongQty + shadowAbove.triggerPrice × shadowAbove.qty)
+             / (currentLongQty + shadowAbove.qty)
+  projectedGap_shadowAbove = currentShortAvg − LO_after  (MUST stay > 0)
+- Shadow below (ADD_SHORT at primaryBelow + 1×ATR):
+  SH_after = (currentShortAvg × currentShortQty + shadowBelow.triggerPrice × shadowBelow.qty)
+             / (currentShortQty + shadowBelow.qty)
+  projectedGap_shadowBelow = SH_after − currentLongAvg  (MUST stay > 0)
+
+### Primary projection (Step 2 — uses POST-SHADOW state on same side)
+Each primary projects against the POST-SHADOW projected avg on the SAME side (because the
+same-side shadow fires first), and the UNCHANGED current avg on the opposite side:
+- Primary above (ADD_SHORT at primaryAbove.triggerPrice):
+  SH_after_primary = (currentShortAvg × currentShortQty + primaryAbove.triggerPrice × primaryAbove.qty)
+                     / (currentShortQty + primaryAbove.qty)
+  projectedGap_primaryAbove = SH_after_primary − LO_after  (where LO_after is from Step 1)
+- Primary below (ADD_LONG at primaryBelow.triggerPrice):
+  LO_after_primary = (currentLongAvg × currentLongQty + primaryBelow.triggerPrice × primaryBelow.qty)
+                     / (currentLongQty + primaryBelow.qty)
+  projectedGap_primaryBelow = SH_after − LO_after_primary  (where SH_after is from Step 1)
+
+### Fallback when shadow.type = SKIP
+If the same-side shadow is SKIP (band saturated, or shadow gap-flip), the primary reverts
+to current-state projection:
+- Primary above (shadow above = SKIP): projectedGap = projectedShortAvg − currentLongAvg
+- Primary below (shadow below = SKIP): projectedGap = currentShortAvg − projectedLongAvg
+
+### Edge case
+If price gaps directly through the primary level without touching the shadow level first
+(rare — single tick covering >1×ATR), the primary will be mildly under-sized vs what
+current-state would have allowed. This is acceptable — leaves a bit of notional on the
+table but is never a safety issue.
+
+Rules: gap must stay positive after BOTH steps; gap can shrink slightly but aim to widen;
+show BOTH the shadow projection AND the post-shadow primary projection numerically in the
+\`analysis\` field (e.g. "LO_after AL_shadow = 100.83, then SH_after AS_primary = 112.5,
+projectedGap = 11.67").
 
 **Both-side gap-flip → CUT escalation:** If EVERY reachable trigger on actionAbove projects negative gap AND EVERY reachable trigger on actionBelow also projects negative gap (i.e. the only options would be HOLD/HOLD on primaries), DO NOT emit HOLD/HOLD. Instead, emit CUT on the heavier leg per **CUT-DRIVEN ESCALATION** below. If only ONE side is gap-flip-blocked and the other has a viable ADD, the unblocked side ADDs as normal and the blocked side stays HOLD (single-side HOLD is acceptable).
 
@@ -260,7 +304,13 @@ class AiPlanner {
       try {
         const response = await this.client.messages.create({
           model: this.model,
-          max_tokens: 2048,
+          // 8192 cap — was 2048, but Hedge Phase analyses can run long
+          // (multi-paragraph math + gap projections + band reasoning),
+          // and truncated responses produce "Unexpected end of JSON input"
+          // parse failures that send the strategy into the stale-counter
+          // retry loop. Output is billed per emitted token, not per cap,
+          // so the higher ceiling has no cost impact in normal operation.
+          max_tokens: 8192,
           system: SYSTEM_PROMPT,
           messages: [{ role: 'user', content: userMessage }],
         });

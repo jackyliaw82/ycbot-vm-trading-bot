@@ -140,6 +140,22 @@ class AiHedgeStrategy extends TradingBase {
     this._nextRetryAt = null;
     this._aiRetryTimer = null;
 
+    // In-flight guard: prevents duplicate concurrent AI plan requests when
+    // multiple paths fire `_requestNewPlan` simultaneously (e.g., resume()
+    // schedules one and the "replan on first price tick" logic schedules
+    // another). The 5s cooldown only protects against rapid re-entry, not
+    // against parallel paths racing — the in-flight flag does that.
+    this._planRequestInFlight = false;
+
+    // Fired action keys since the current activePlan was installed. Used by
+    // resume() to decide whether to restore the previous plan vs replan from
+    // scratch. If any shadow already fired, the remaining triggers (other
+    // shadow + both primaries) were laid out consistent with that fill —
+    // replanning would discard that context. If no shadow fired, the market
+    // may have shifted during the restart gap; replan for fresh context.
+    // Format: ['actionAbove.shadow', 'actionBelow.primary', ...].
+    this._firedActionKeys = [];
+
     // Critical error
     this.criticalError = null;
   }
@@ -345,7 +361,24 @@ class AiHedgeStrategy extends TradingBase {
     // Restore state
     this.phase = snapshot.phase || 'INITIAL';
     this.executionState = 'IDLE';     // Drop in-flight execution state.
-    this.activePlan = null;            // Discard in-flight plan; replan on first tick.
+    // Restore activePlan only when a shadow has already fired since the
+    // plan was installed. The remaining triggers (other shadow + both
+    // primaries) were laid out consistent with that fill; replanning would
+    // discard that context. If no shadow fired, the market may have
+    // shifted during the restart gap — replan for fresh context (current
+    // behavior). `firedActionKeys` is persisted by saveState.
+    const firedKeys = Array.isArray(snapshot.firedActionKeys) ? snapshot.firedActionKeys : [];
+    const shadowFired = firedKeys.some(k => k.endsWith('.shadow'));
+    if (shadowFired && snapshot.activePlan) {
+      this.activePlan = snapshot.activePlan;
+      this._firedActionKeys = firedKeys;
+      // Executor's pendingActions are repopulated by setActivePlan below
+      // (called after _refreshHedgePositions). For now just hold the plan
+      // object; setActivePlan will mark fired actions as executed:true.
+    } else {
+      this.activePlan = null; // Discard in-flight plan; replan on first tick.
+      this._firedActionKeys = [];
+    }
     this.tradeCount = snapshot.tradeCount || 0;
     this.firstPositionPrice = snapshot.firstPositionPrice || null;
     this.initialWalletBalance = snapshot.initialWalletBalance || null;
@@ -498,15 +531,45 @@ class AiHedgeStrategy extends TradingBase {
     // Both legs intact — resume in HEDGE phase.
     this.phase = 'HEDGE';
     if (!this.firstPositionPrice) this.firstPositionPrice = this.longPosition.entryPrice;
+
+    // #2 plan restore: if we held onto a previous activePlan because a
+    // shadow had fired (set earlier in this resume()), install it now on
+    // the executor and mark already-fired sub-actions as executed:true so
+    // they don't re-fire on price retracement.
+    const willRestorePlan = !!this.activePlan;
+    if (willRestorePlan) {
+      this.executor.setActivePlan(this.activePlan);
+      if (Array.isArray(this._firedActionKeys)) {
+        const firedSet = new Set(this._firedActionKeys);
+        for (const pa of this.executor.pendingActions || []) {
+          const key = `${pa.direction === 'ABOVE' ? 'actionAbove' : 'actionBelow'}.${pa.kind}`;
+          if (firedSet.has(key)) pa.executed = true;
+        }
+      }
+      this.executionState = 'EXECUTING_PLAN';
+    }
+
+    // #3: log qty + entry price instead of notional. Notional is qty × current
+    // mark price and drifts between save and recovery; qty proves continuity.
+    const symbolShort = this.symbol?.replace('USDT', '') || '';
     await this.addLog(
-      `[RECOVERY] Hedge intact. LONG ${this._formatNotional(this.longPosition.notional)} @ ${this._formatPrice(this.longPosition.entryPrice)}, ` +
-      `SHORT ${this._formatNotional(this.shortPosition.notional)} @ ${this._formatPrice(this.shortPosition.entryPrice)}. ` +
-      `Resuming in HEDGE phase. Will replan on first price tick.`
+      `[RECOVERY] Hedge intact. LONG ${this.longPosition.quantity} ${symbolShort} @ ${this._formatPrice(this.longPosition.entryPrice)}, ` +
+      `SHORT ${this.shortPosition.quantity} ${symbolShort} @ ${this._formatPrice(this.shortPosition.entryPrice)}. ` +
+      (willRestorePlan
+        ? `Resuming in HEDGE phase. Previous plan restored (shadow already fired: ${this._firedActionKeys.join(', ')}).`
+        : `Resuming in HEDGE phase. Will replan on first price tick.`)
     );
 
     // C2: catch up on any settlements during downtime, then resume scheduler.
     await this._pollFundingIncome();
     this._scheduleNextFundingPoll();
+
+    // #5: immediate L3 reconcile pass to catch per-fill trade records that
+    // L1 (WS user-data stream) or L2 (deferred REST fallback) missed if the
+    // bot died mid-stream. Without this, missed fills wait ~30 min for the
+    // next periodic reconcile cycle. Fire-and-forget — failures are logged.
+    this._reconcileRecentTrades().catch(err =>
+      console.error(`[RECONCILE-ON-RESUME] failed: ${err.message}`));
 
     await this.saveState();
   }
@@ -795,10 +858,19 @@ class AiHedgeStrategy extends TradingBase {
     if (this.isStopping || !this.isRunning) {
       return;
     }
+    // In-flight guard: drop duplicate concurrent requests. Multiple paths
+    // can race (resume() + first-price-tick replan, stale-counter timer +
+    // event-driven trigger, etc.). The 5s cooldown below only protects
+    // against rapid re-entry, not against parallel paths overlapping.
+    if (this._planRequestInFlight) {
+      await this.addLog(`Skipping replan (${reason}) — another AI plan request already in flight`);
+      return;
+    }
     const now = Date.now();
     if (now - this._lastReplanTime < this._replanCooldownMs) return;
     this._lastReplanTime = now;
 
+    this._planRequestInFlight = true;
     this.executionState = 'WAITING_FOR_PLAN';
     await this.addLog(`Requesting AI plan... Phase: ${this.phase}, Reason: ${reason}`);
 
@@ -882,6 +954,16 @@ class AiHedgeStrategy extends TradingBase {
         return;
       }
 
+      // v3.x.x: shadow-only violations (gap-flip, liq cap, band saturation
+      // on the laggard side, etc.) are demoted to SKIP rather than failing
+      // the plan. Primaries stay valid; we salvage the plan and save a
+      // wasted AI replan. Log every demotion so ops can spot patterns.
+      if (validation.demotedShadows?.length) {
+        for (const d of validation.demotedShadows) {
+          await this.addLog(`[POST-HOC] ${d.sideKey}.shadow demoted to SKIP — ${d.reasons.join('; ')}`);
+        }
+      }
+
       // Freeze the microstructure inputs the AI actually consumed onto the plan,
       // so the frontend can show users exactly what the model saw (live data
       // keeps ticking after the plan is made).
@@ -898,6 +980,8 @@ class AiHedgeStrategy extends TradingBase {
       // Install plan
       this.activePlan = plan;
       this.executor.setActivePlan(plan);
+      // Reset fire tracking — new plan, no triggers fired yet.
+      this._firedActionKeys = [];
       this.executionState = 'EXECUTING_PLAN';
       this._onAiPlanSuccess();
 
@@ -939,6 +1023,8 @@ class AiHedgeStrategy extends TradingBase {
       this.executionState = 'IDLE';
       // v3.0.0: no fallback plan. Stale counter retry with exponential backoff.
       this._onAiPlanFailure(`ai_error: ${error.message}`);
+    } finally {
+      this._planRequestInFlight = false;
     }
   }
 
@@ -949,6 +1035,15 @@ class AiHedgeStrategy extends TradingBase {
    */
   async _runActionAndRecord(action, direction) {
     const result = await this.executor.executeAction(action);
+
+    // Record fire coordinates for resume() to detect mid-cycle restarts.
+    // direction = 'ABOVE' | 'BELOW' → sideKey 'actionAbove' | 'actionBelow'.
+    // action.kind = 'primary' | 'shadow'. HOLD/SKIP don't reach this path.
+    if (action.kind && (direction === 'ABOVE' || direction === 'BELOW')) {
+      const sideKey = direction === 'ABOVE' ? 'actionAbove' : 'actionBelow';
+      const key = `${sideKey}.${action.kind}`;
+      if (!this._firedActionKeys.includes(key)) this._firedActionKeys.push(key);
+    }
 
     if (action.type === 'HOLD') {
       // Reaching this branch means the HOLD's triggerPrice was crossed —
@@ -1024,10 +1119,14 @@ class AiHedgeStrategy extends TradingBase {
     // either leg has 0 qty, so partial-fill states stay safe.
     this._writeMetricsSample().catch(() => {});
 
+    // #3: log qty + entry instead of notional. Notional = qty × mark price
+    // drifts between trades; qty + entry is the deterministic state that
+    // proves continuity across restarts.
+    const symShort = this.symbol?.replace('USDT', '') || '';
     await this.addLog(
       `Trade #${this.tradeCount}. ` +
-      `LONG: ${this.longPosition ? this._formatNotional(this.longPosition.notional) + ' @ ' + this._formatPrice(this.longPosition.entryPrice) : 'none'}, ` +
-      `SHORT: ${this.shortPosition ? this._formatNotional(this.shortPosition.notional) + ' @ ' + this._formatPrice(this.shortPosition.entryPrice) : 'none'}, ` +
+      `LONG: ${this.longPosition ? this.longPosition.quantity + ' ' + symShort + ' @ ' + this._formatPrice(this.longPosition.entryPrice) : 'none'}, ` +
+      `SHORT: ${this.shortPosition ? this.shortPosition.quantity + ' ' + symShort + ' @ ' + this._formatPrice(this.shortPosition.entryPrice) : 'none'}, ` +
       `Gap: ${this._formatPrice(this.hedgeGap)}, P&L: ${this._formatNotional(this.lockedProfit)} USDT`
     );
 
@@ -1383,6 +1482,9 @@ class AiHedgeStrategy extends TradingBase {
         // Both were re-zeroed on every restart before this fix.
         aiTokenUsage: this.aiTokenUsage,
         planHistory: this.planHistory.slice(-50),
+        // Fired action keys since current activePlan was installed. Used by
+        // resume() to decide whether to restore the previous plan or replan.
+        firedActionKeys: this._firedActionKeys,
         lastUpdated: new Date(),
       }, { merge: true });
     } catch (error) {
