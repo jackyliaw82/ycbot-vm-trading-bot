@@ -104,88 +104,110 @@ class AiReversalStrategy extends TradingBase {
    * Start the strategy. Forces one-way position mode, instantiates AI
    * modules, subscribes to WS streams, requests first PLAN.
    */
-  async start(config) {
-    const {
-      symbol,
-      leverage = DEFAULT_LEVERAGE,
-      initialSize,
-      recoveryFactor = DEFAULT_RECOVERY_FACTOR,
-      recoveryDistance = DEFAULT_RECOVERY_DISTANCE,
-      harvestLossThreshold = HARVEST_LOSS_THRESHOLD_PCT,
-      desiredProfitUSDT = 0,
-      maxPositionSizeUSDT = 0,
-      priceType = 'MARK',
-      aiModel = 'claude-sonnet-4-6',
-      anthropicApiKey,
-      apiKey,
-      apiSecret,
-      userId,
-    } = config;
-
-    if (!symbol) throw new Error('AiReversalStrategy.start: missing symbol');
-    if (!initialSize || initialSize <= 0) throw new Error('AiReversalStrategy.start: invalid initialSize');
-    if (!anthropicApiKey) throw new Error('AiReversalStrategy.start: missing anthropicApiKey');
-
-    this.symbol = symbol;
-    this.leverage = leverage;
-    this.maxPositionSizeUSDT = maxPositionSizeUSDT || initialSize * 10;
-    this.priceType = priceType;
-    this.aiModel = aiModel;
-    this.userId = userId;
-    this.recoveryFactor = recoveryFactor;
-    this.recoveryDistance = recoveryDistance;
-    this.harvestLossThreshold = harvestLossThreshold;
-    this.desiredProfitUSDT = desiredProfitUSDT;
-    this.currentInitialSize = initialSize;
-
-    await this.addLog(`[REVERSAL] start: symbol=${symbol} initialSize=${initialSize} leverage=${leverage}x model=${aiModel}`);
-
-    // Configure Binance credentials + symbol metadata first (TradingBase machinery).
-    await this._configureBinance(apiKey, apiSecret);
-    await this._getExchangeInfo(symbol);
-
-    // ONE-WAY position mode — reversal is single-sided. Mutually exclusive with hedge mode at account level.
-    try {
-      await this.setPositionMode(false);
-      await this.addLog('[REVERSAL] Binance position mode set to ONE-WAY');
-    } catch (err) {
-      // If already in one-way, Binance returns an error — non-fatal.
-      await this.addLog(`[REVERSAL] setPositionMode(false) note: ${err.message}`);
+  async start(config = {}) {
+    // strategyId is set by app.js before calling start() (non-blocking pattern).
+    if (!this.strategyId) {
+      this.strategyId = `ai_reversal_${this.profileId}_${Date.now()}`;
     }
-    await this.setLeverage(symbol, leverage);
+    this.initFirestoreCollections(this.strategyId);
 
-    // Initial capital snapshot (used by harvest gate + sizing self-regulation).
-    const wallet = await this.getWalletBalance();
-    this.initialCapital = wallet || initialSize;
-    await this.addLog(`[REVERSAL] initialCapital snapshot: ${this.initialCapital} USDT`);
+    this.symbol = config.symbol || 'BTCUSDT';
+    this.leverage = config.leverage || DEFAULT_LEVERAGE;
+    this.priceType = config.priceType || 'MARK';
+    this.aiModel = config.aiModel || 'claude-sonnet-4-6';
+    this.recoveryFactor = config.recoveryFactor ?? DEFAULT_RECOVERY_FACTOR;
+    this.recoveryDistance = config.recoveryDistance ?? DEFAULT_RECOVERY_DISTANCE;
+    this.harvestLossThreshold = config.harvestLossThreshold ?? HARVEST_LOSS_THRESHOLD_PCT;
+    this.desiredProfitUSDT = config.desiredProfitUSDT || 0;
+    this.currentInitialSize = config.initialSize || 0;
+    this.maxPositionSizeUSDT = config.maxPositionSizeUSDT || (this.currentInitialSize * 10);
 
-    // Instantiate AI modules.
-    this.planner = new AiPlanner(anthropicApiKey, aiModel);
-    this.executor = new AiPlanExecutor(this);
+    if (!this.symbol) throw new Error('AiReversalStrategy.start: missing symbol');
+    if (!this.currentInitialSize || this.currentInitialSize <= 0) {
+      throw new Error('AiReversalStrategy.start: invalid initialSize');
+    }
+
+    // Anthropic key comes from GCP Secret Manager via _fetchAnthropicApiKey,
+    // not from the config form — same pattern as ai-hedge-strategy.
+    const anthropicApiKey = await this._fetchAnthropicApiKey();
+
+    await this.addLog(`Starting AI Reversal Strategy for ${this.symbol}...`);
+    await this.addLog(`Config: initialSize=${this.currentInitialSize} USDT, leverage=${this.leverage}x, maxPos=${this.maxPositionSizeUSDT} USDT, model=${this.aiModel}`);
+
+    try {
+      await this.setLeverage(this.symbol, this.leverage);
+      // ONE-WAY position mode — reversal is single-sided. Mutually exclusive
+      // with AI Hedge (which uses hedge mode) at the Binance account level.
+      try {
+        await this.setPositionMode(false);
+        await this.addLog('Binance position mode set to ONE-WAY (single-sided).');
+      } catch (err) {
+        // If already in the target mode OR open positions block the switch,
+        // Binance returns an error. Non-fatal — log and continue.
+        await this.addLog(`setPositionMode(false) note: ${err.message}`);
+      }
+      await this._getExchangeInfo(this.symbol);
+    } catch (error) {
+      await this.addLog(`ERROR: [SETUP_ERROR] ${error.message}`);
+      throw error;
+    }
+
+    const minNotional = this.exchangeInfoCache[this.symbol]?.minNotional || 5;
+    this.minNotional = minNotional;
+    if (this.currentInitialSize < minNotional) {
+      const msg = `Initial size (${this.currentInitialSize} USDT) below minimum notional (${minNotional} USDT)`;
+      await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
+      throw new Error(msg);
+    }
+
+    // Initial capital snapshot — drives the harvest gate and the sizing self-regulation loop.
+    this.initialWalletBalance = await this.getWalletBalance();
+    this.initialCapital = this.initialWalletBalance || this.currentInitialSize;
+    await this.addLog(`Wallet balance: ${this._formatNotional(this.initialWalletBalance)} USDT — using as initialCapital.`);
+
+    // AI modules — same instantiation order as ai-hedge-strategy.
+    this.marketContext = new AiMarketContext(this);
     this.riskGuard = new AiRiskGuard({
       maxPositionSizeUSDT: this.maxPositionSizeUSDT,
-      minNotional: this.minNotional || 5,
+      maxImbalanceRatio: 5.0,
+      maxPriceDeviationPercent: 5.0,
+      maxActionsPerHour: 20,
+      minNotional,
+      singleLegStopPercent: 5.0,
     });
-    this.marketContext = new AiMarketContext(this);
+    this.planner = new AiPlanner(anthropicApiKey, this.aiModel);
+    this.executor = new AiPlanExecutor(this);
 
-    // Connect WS streams.
-    await this.connectRealtimeWebSocket();
-    await this.connectUserDataStream();
-    await this.connectLiquidationWebSocket();
+    this.isRunning = true;
+    this.cycleStartTime = Date.now();
+    this.strategyStartTime = new Date();
+    this.subState = 'INITIAL';
+    this.executionState = 'PLANNING';
 
-    // Detect any pre-existing position on this symbol (e.g., after VM restart).
+    // WebSocket setup — same pattern as hedge (listen key first, then streams).
+    await this._retryListenKeyRequest(false);
+    this.connectUserDataStream();
+    this.connectRealtimeWebSocket();
+    this.connectLiquidationWebSocket();
+
+    // Periodic listen key refresh — keeps user data stream alive.
+    this.listenKeyRefreshInterval = setInterval(() => {
+      this._scheduledListenKeyRefresh();
+    }, 30 * 60 * 1000);
+
+    this._startWebSocketHealthMonitoring();
+
+    // Reconcile against Binance — pick up any pre-existing position (e.g., manual trade or VM restart).
+    await this.detectCurrentPosition(true);
     await this._refreshCurrentPosition();
 
-    this.cycleStartTime = Date.now();
-    this.executionState = 'PLANNING';
-    this.subState = 'INITIAL';
-    this.isRunning = true;
+    await this.addLog(`AI Reversal Strategy started. Waiting for AI to set bull/bear levels...`);
     await this._saveState();
 
-    // First PLAN request — sets bullLevel + bearLevel.
-    await this._requestPlan('cycle_start');
-
-    // Start heartbeat scheduler.
+    // Kick off first PLAN consult and start heartbeat scheduler.
+    this._requestPlan('cycle_start').catch(err => {
+      this.addLog(`[REVERSAL] initial plan request error: ${err.message}`).catch(() => {});
+    });
     this._startHeartbeat();
   }
 
