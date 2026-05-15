@@ -816,6 +816,33 @@ class AiReversalStrategy extends TradingBase {
     );
   }
 
+  /**
+   * Fetches the Anthropic API key for this profile. Mirrors
+   * AiHedgeStrategy._fetchAnthropicApiKey (env var override, then GCF proxy
+   * to the user's Secret Manager binding). Duplicated here rather than
+   * inherited because AiReversalStrategy extends TradingBase, not
+   * AiHedgeStrategy — follow-up: refactor to TradingBase.
+   */
+  async _fetchAnthropicApiKey() {
+    const envKey = process.env.ANTHROPIC_API_KEY;
+    if (envKey) return envKey;
+
+    const response = await fetch(this.sharedVmProxyGcfUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-User-Id': this.profileId },
+      body: JSON.stringify({ apiType: 'secret', endpoint: '/secret/anthropic', profileBinanceApiGcfUrl: this.gcfProxyUrl }),
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(`Failed to fetch Anthropic key: ${response.status} - ${err.error || response.statusText}`);
+    }
+
+    const { apiKey } = await response.json();
+    if (!apiKey) throw new Error('No Anthropic API key configured.');
+    return apiKey;
+  }
+
   // ——— Status snapshot (consumed by /ai-reversal/status) ——————————————
 
   getStatus() {
