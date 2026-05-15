@@ -41,13 +41,23 @@ class AiRiskGuard {
   /**
    * Validate a plan against risk constraints.
    *
-   * Dispatches by phase:
-   *   - Phase 1 INITIAL → flat OPEN_HEDGE validator.
-   *   - Phase 2 HEDGE → paired primary+shadow validator (v3.0.0 paired schema).
+   * Dispatches by strategy type and phase:
+   *   - Reversal (any consult context) → _validateReversalPlan.
+   *   - Hedge Phase 1 INITIAL → flat OPEN_HEDGE validator.
+   *   - Hedge Phase 2 HEDGE → paired primary+shadow validator (v3.0.0 paired schema).
    */
   validatePlan(plan, state) {
-    if (!plan || !plan.actionAbove || !plan.actionBelow) {
-      return { valid: false, reasons: ['Plan is null or missing actionAbove/actionBelow'] };
+    if (!plan) {
+      return { valid: false, reasons: ['Plan is null'] };
+    }
+
+    // Reversal strategy — dispatched by _schema flag set in ai-planner.js.
+    if (plan._schema === 'reversal' || state.strategyType === 'reversal') {
+      return this._validateReversalPlan(plan, state);
+    }
+
+    if (!plan.actionAbove || !plan.actionBelow) {
+      return { valid: false, reasons: ['Plan is missing actionAbove/actionBelow'] };
     }
 
     // Phase 1 → flat OPEN_HEDGE schema; Phase 2 → paired primary+shadow.
@@ -55,6 +65,105 @@ class AiRiskGuard {
       return this._validateInitialPlan(plan, state);
     }
     return this._validateHedgePlanPaired(plan, state);
+  }
+
+  /**
+   * Validate an AI Reversal Strategy plan.
+   *
+   * Per-context validation:
+   *   - 'plan'      → decision=PLAN, level math, sizing within bounds.
+   *   - 'heartbeat' → decision in {CONTINUE, ADJUST, HARVEST}, level math if ADJUST,
+   *                   HARVEST gating (accumulated_loss ≥ 30% × initial_capital AND profitable).
+   *   - 'veto'      → decision in {CONTINUE, REDUCE}, REDUCE size within bounds.
+   *
+   * Disallowed verbs (REPLAN / PAUSE / EXIT) are rejected here as defense
+   * in depth; the prompt also forbids them.
+   */
+  _validateReversalPlan(plan, state) {
+    const reasons = [];
+    const consultContext = plan._consultContext || state.consultContext || 'plan';
+    const { currentPrice, volatility, harvestEligible } = state;
+    const atr = volatility?.atr || 0;
+    const minSpacing = atr * (state.minLevelSpacingATR || 1.5);
+
+    // Reject forbidden verbs outright (defense in depth).
+    if (['REPLAN', 'PAUSE', 'EXIT'].includes(plan.decision)) {
+      reasons.push(`Verb ${plan.decision} is not allowed in the reversal strategy verb space`);
+      return { valid: false, reasons };
+    }
+
+    if (consultContext === 'plan') {
+      if (plan.decision !== 'PLAN') {
+        reasons.push(`plan context: expected decision=PLAN, got ${plan.decision}`);
+      }
+      this._validateReversalLevels(plan, currentPrice, minSpacing, reasons);
+      // Optional newInitialSize override — must be within bounds if present.
+      if (plan.newInitialSize != null) {
+        const floor = this.minNotional * 2;
+        if (plan.newInitialSize < floor) {
+          reasons.push(`newInitialSize ${plan.newInitialSize} below minNotional×2 (${floor})`);
+        }
+        if (this.maxPositionSizeUSDT && plan.newInitialSize > this.maxPositionSizeUSDT) {
+          reasons.push(`newInitialSize ${plan.newInitialSize} above maxPositionSizeUSDT (${this.maxPositionSizeUSDT})`);
+        }
+      }
+    } else if (consultContext === 'heartbeat') {
+      if (!['CONTINUE', 'ADJUST', 'HARVEST'].includes(plan.decision)) {
+        reasons.push(`heartbeat: decision must be CONTINUE | ADJUST | HARVEST, got ${plan.decision}`);
+      }
+      if (plan.decision === 'ADJUST') {
+        this._validateReversalLevels(plan, currentPrice, minSpacing, reasons);
+      }
+      if (plan.decision === 'HARVEST' && !harvestEligible) {
+        reasons.push('HARVEST not eligible (bot gate: accumulated_loss must be ≥ 30% of initial_capital AND position must be profitable)');
+      }
+    } else if (consultContext === 'veto') {
+      if (!['CONTINUE', 'REDUCE'].includes(plan.decision)) {
+        reasons.push(`veto: decision must be CONTINUE | REDUCE, got ${plan.decision}`);
+      }
+      if (plan.decision === 'REDUCE') {
+        if (typeof plan.newSize !== 'number' || plan.newSize <= 0) {
+          reasons.push('REDUCE requires positive newSize');
+        } else {
+          const floor = this.minNotional * 2;
+          if (plan.newSize < floor) {
+            reasons.push(`REDUCE newSize ${plan.newSize} below minNotional×2 (${floor})`);
+          }
+          if (state.proposedNewSize != null && plan.newSize > state.proposedNewSize) {
+            reasons.push(`REDUCE newSize ${plan.newSize} exceeds proposedNewSize ${state.proposedNewSize}`);
+          }
+        }
+      }
+    } else {
+      reasons.push(`Unknown consult context: ${consultContext}`);
+    }
+
+    return { valid: reasons.length === 0, reasons };
+  }
+
+  /**
+   * Shared level validation for PLAN and ADJUST decisions.
+   * Mutates reasons in place.
+   */
+  _validateReversalLevels(plan, currentPrice, minSpacing, reasons) {
+    if (typeof plan.bullLevel !== 'number' || !Number.isFinite(plan.bullLevel)) {
+      reasons.push('bullLevel must be a finite number');
+    }
+    if (typeof plan.bearLevel !== 'number' || !Number.isFinite(plan.bearLevel)) {
+      reasons.push('bearLevel must be a finite number');
+    }
+    if (typeof plan.bullLevel === 'number' && typeof plan.bearLevel === 'number') {
+      if (currentPrice != null && plan.bullLevel <= currentPrice) {
+        reasons.push(`bullLevel ${plan.bullLevel} must be > current price ${currentPrice}`);
+      }
+      if (currentPrice != null && plan.bearLevel >= currentPrice) {
+        reasons.push(`bearLevel ${plan.bearLevel} must be < current price ${currentPrice}`);
+      }
+      const spacing = plan.bullLevel - plan.bearLevel;
+      if (minSpacing > 0 && spacing < minSpacing) {
+        reasons.push(`level spacing ${spacing.toFixed(6)} below required 1.5×ATR (${minSpacing.toFixed(6)})`);
+      }
+    }
   }
 
   /**

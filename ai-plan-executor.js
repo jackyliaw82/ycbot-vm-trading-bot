@@ -259,6 +259,20 @@ class AiPlanExecutor {
       return await this._executeOpenHedge(action);
     }
 
+    // AI Reversal Strategy verbs — operate in one-way position mode
+    // (positionSide='BOTH'). The orchestrator (ai-reversal-strategy.js) is
+    // responsible for tracking the current side/qty/entry; this executor
+    // only routes verbs to placeMarketOrder.
+    if (action.type === 'OPEN_LONG_AT_LEVEL' || action.type === 'OPEN_SHORT_AT_LEVEL') {
+      return await this._executeOpenAtLevel(action);
+    }
+    if (action.type === 'REVERSE_TO_LONG' || action.type === 'REVERSE_TO_SHORT') {
+      return await this._executeReverse(action);
+    }
+    if (action.type === 'HARVEST_CLOSE') {
+      return await this._executeHarvestClose(action);
+    }
+
     // Calculate quantity from sizeUSDT. action.type passed through so
     // _calculateAdjustedQuantity can apply L5b dynamic scaling on ADD only.
     let quantity = action.quantity;
@@ -369,6 +383,115 @@ class AiPlanExecutor {
     if (strategy.riskGuard) strategy.riskGuard.recordAction();
 
     return { status: 'HEDGE_OPENED', longResult, shortResult };
+  }
+
+  // ——— AI Reversal Strategy execution helpers ——————————————————————————
+  //
+  // One-way position mode: positionSide is always 'BOTH'. Reversal verbs
+  // bypass the LONG/SHORT clamping logic used by hedge CUT actions; clamps
+  // happen here using strategy.currentPosition.quantity.
+
+  /**
+   * OPEN_LONG_AT_LEVEL / OPEN_SHORT_AT_LEVEL — initial entry or post-harvest
+   * fresh entry. qty comes from the orchestrator (initial size or AI-vetoed
+   * value). triggerPrice is the level that was touched.
+   */
+  async _executeOpenAtLevel(action) {
+    const strategy = this.strategy;
+    const symbol = strategy.symbol;
+    const isLong = action.type === 'OPEN_LONG_AT_LEVEL';
+    const side = isLong ? 'BUY' : 'SELL';
+    const positionSide = 'BOTH';
+
+    let quantity = action.quantity;
+    if (!quantity && action.sizeUSDT && action.triggerPrice) {
+      quantity = await strategy._calculateAdjustedQuantity(symbol, action.sizeUSDT, action.triggerPrice, action.type);
+    }
+    if (!quantity || quantity <= 0) {
+      throw new Error(`Cannot execute ${action.type}: quantity is ${quantity}`);
+    }
+    quantity = strategy.roundQuantity(quantity);
+
+    await strategy.addLog(`[AI] ${action.type}: ${side} ${quantity} @ market (level: ${strategy._formatPrice(action.triggerPrice)})`);
+    const result = await strategy.placeMarketOrder(symbol, side, quantity, positionSide);
+
+    if (result && result.orderId) {
+      strategy._scheduleRestFallback(result.orderId, symbol, side, positionSide);
+    }
+    if (strategy.riskGuard) strategy.riskGuard.recordAction();
+    return { status: 'OPENED', side: isLong ? 'LONG' : 'SHORT', quantity, result };
+  }
+
+  /**
+   * REVERSE_TO_LONG / REVERSE_TO_SHORT — close current opposite-side position
+   * + open new same-direction position with new size. Two sequential market
+   * orders so per-fill PnL is cleanly attributable.
+   *
+   * action.newQuantity = size from the dynamic-sizing formula (post AI veto).
+   */
+  async _executeReverse(action) {
+    const strategy = this.strategy;
+    const symbol = strategy.symbol;
+    const isToLong = action.type === 'REVERSE_TO_LONG';
+    const fromSide = isToLong ? 'SHORT' : 'LONG';
+    const currentPos = strategy.currentPosition;
+
+    if (!currentPos || !currentPos.quantity || currentPos.quantity <= 0) {
+      throw new Error(`Cannot ${action.type}: no current ${fromSide} position to reverse`);
+    }
+
+    const closeQty = strategy.roundQuantity(currentPos.quantity);
+    // Closing a SHORT = BUY; closing a LONG = SELL.
+    // For one-way mode, this is also the direction we'd open the new opposite side,
+    // but we split into two market orders so per-fill PnL is cleanly attributable.
+    const closeSide = isToLong ? 'BUY' : 'SELL';
+    await strategy.addLog(`[AI] ${action.type} step 1/2: closing ${fromSide} ${closeQty} @ market`);
+    const closeResult = await strategy.placeMarketOrder(symbol, closeSide, closeQty, 'BOTH');
+    if (closeResult && closeResult.orderId) {
+      strategy._scheduleRestFallback(closeResult.orderId, symbol, closeSide, 'BOTH');
+    }
+
+    // Open the new opposite side. After the close, the account is flat; the
+    // same-direction market order now opens the new position.
+    const openQty = strategy.roundQuantity(action.newQuantity || action.quantity);
+    if (!openQty || openQty <= 0) {
+      throw new Error(`Cannot ${action.type}: invalid new quantity ${openQty}`);
+    }
+    const openSide = closeSide;
+    await strategy.addLog(`[AI] ${action.type} step 2/2: opening ${isToLong ? 'LONG' : 'SHORT'} ${openQty} @ market`);
+    const openResult = await strategy.placeMarketOrder(symbol, openSide, openQty, 'BOTH');
+    if (openResult && openResult.orderId) {
+      strategy._scheduleRestFallback(openResult.orderId, symbol, openSide, 'BOTH');
+    }
+
+    if (strategy.riskGuard) strategy.riskGuard.recordAction();
+    return { status: 'REVERSED', closeResult, openResult, newSide: isToLong ? 'LONG' : 'SHORT', closeQty, openQty };
+  }
+
+  /**
+   * HARVEST_CLOSE — fully close the current position to flat. Realized PnL
+   * reduces accumulated_loss. Orchestrator follows up with a Context 1
+   * PLAN consult to set fresh bullLevel/bearLevel.
+   */
+  async _executeHarvestClose(action) {
+    const strategy = this.strategy;
+    const symbol = strategy.symbol;
+    const currentPos = strategy.currentPosition;
+    const currentSide = strategy.currentSide;
+
+    if (!currentPos || !currentPos.quantity || currentPos.quantity <= 0) {
+      throw new Error('HARVEST_CLOSE: no current position to harvest');
+    }
+    const closeQty = strategy.roundQuantity(currentPos.quantity);
+    const closeSide = currentSide === 'LONG' ? 'SELL' : 'BUY';
+
+    await strategy.addLog(`[AI] HARVEST_CLOSE: closing ${currentSide} ${closeQty} @ market — ${action.reason || 'AI harvest'}`);
+    const result = await strategy.placeMarketOrder(symbol, closeSide, closeQty, 'BOTH');
+    if (result && result.orderId) {
+      strategy._scheduleRestFallback(result.orderId, symbol, closeSide, 'BOTH');
+    }
+    if (strategy.riskGuard) strategy.riskGuard.recordAction();
+    return { status: 'HARVESTED', closeQty, side: currentSide, result };
   }
 
   getPendingActions() {

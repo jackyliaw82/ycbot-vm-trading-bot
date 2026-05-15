@@ -1,8 +1,10 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { REVERSAL_SYSTEM_PROMPT } from './ai-reversal-prompt.js';
 
-// Single system prompt — paired-trigger Hedge Phase (v3.0.0+ architecture).
+// Hedge system prompt — paired-trigger Hedge Phase (v3.0.0+ architecture).
 // Phase 1 (INITIAL) emits OPEN_HEDGE in the flat actionAbove/actionBelow
 // schema; Phase 2 (HEDGE) emits paired primary+shadow per side.
+// Reversal system prompt is imported above; selection happens in generatePlan.
 const SYSTEM_PROMPT = `You are an AI trading strategist for a cryptocurrency hedge trading bot on Binance Futures (v3.0.0 paired-trigger Hedge Phase).
 
 ## YOUR ROLE
@@ -337,8 +339,10 @@ class AiPlanner {
     this.maxRetries = 3;
   }
 
-  async generatePlan(context) {
-    const userMessage = this._buildUserMessage(context);
+  async generatePlan(context, strategyType = 'hedge') {
+    const isReversal = strategyType === 'reversal' || context.strategyType === 'reversal';
+    const systemPrompt = isReversal ? REVERSAL_SYSTEM_PROMPT : SYSTEM_PROMPT;
+    const userMessage = isReversal ? this._buildReversalUserMessage(context) : this._buildUserMessage(context);
 
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       try {
@@ -351,7 +355,7 @@ class AiPlanner {
           // retry loop. Output is billed per emitted token, not per cap,
           // so the higher ceiling has no cost impact in normal operation.
           max_tokens: 8192,
-          system: SYSTEM_PROMPT,
+          system: systemPrompt,
           messages: [{ role: 'user', content: userMessage }],
         });
 
@@ -359,11 +363,16 @@ class AiPlanner {
         if (!text) throw new Error('Empty response from Claude');
 
         const plan = this._parseResponse(text);
-        // Phase 1 → flat OPEN_HEDGE schema (no _schema flag).
-        // Phase 2 → paired primary+shadow schema (_schema = 'paired').
-        if (context.phase === 'INITIAL') {
+
+        if (isReversal) {
+          this._validateReversalPlanShape(plan, context.consultContext || 'plan');
+          plan._schema = 'reversal';
+          plan._consultContext = context.consultContext || 'plan';
+        } else if (context.phase === 'INITIAL') {
+          // Phase 1 → flat OPEN_HEDGE schema (no _schema flag).
           this._validatePhase1Plan(plan);
         } else {
+          // Phase 2 → paired primary+shadow schema (_schema = 'paired').
           this._validatePairedPlanStructure(plan);
           plan._schema = 'paired';
         }
@@ -385,6 +394,224 @@ class AiPlanner {
         await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
       }
     }
+  }
+
+  /**
+   * Validate reversal plan shape per consult context.
+   * Risk-guard layer does the structural/business validation; this is a
+   * cheap front-line shape check so malformed JSON fails fast.
+   */
+  _validateReversalPlanShape(plan, consultContext) {
+    if (!plan || typeof plan !== 'object') throw new Error('Reversal plan: not an object');
+    if (typeof plan.decision !== 'string') throw new Error('Reversal plan: missing decision');
+    const decision = plan.decision;
+    if (consultContext === 'plan') {
+      if (decision !== 'PLAN') {
+        throw new Error(`Reversal plan (plan context): expected decision=PLAN, got ${decision}`);
+      }
+      if (typeof plan.bullLevel !== 'number' || typeof plan.bearLevel !== 'number') {
+        throw new Error('Reversal plan (plan context): bullLevel/bearLevel must be numbers');
+      }
+    } else if (consultContext === 'heartbeat') {
+      if (!['CONTINUE', 'ADJUST', 'HARVEST'].includes(decision)) {
+        throw new Error(`Reversal plan (heartbeat): expected CONTINUE|ADJUST|HARVEST, got ${decision}`);
+      }
+      if (decision === 'ADJUST') {
+        if (typeof plan.bullLevel !== 'number' || typeof plan.bearLevel !== 'number') {
+          throw new Error('Reversal plan (ADJUST): bullLevel/bearLevel required');
+        }
+      }
+    } else if (consultContext === 'veto') {
+      if (!['CONTINUE', 'REDUCE'].includes(decision)) {
+        throw new Error(`Reversal plan (veto): expected CONTINUE|REDUCE, got ${decision}`);
+      }
+      if (decision === 'REDUCE' && typeof plan.newSize !== 'number') {
+        throw new Error('Reversal plan (REDUCE): newSize required');
+      }
+    } else {
+      throw new Error(`Reversal plan: unknown consult context ${consultContext}`);
+    }
+  }
+
+  /**
+   * Build the user message for reversal AI consults.
+   * Three consult contexts are supported: plan, heartbeat, veto.
+   * The context object is built by AiMarketContext.buildReversalContext.
+   */
+  _buildReversalUserMessage(context) {
+    const parts = [];
+    const ctx = context.consultContext || 'plan';
+
+    parts.push(`CONTEXT: ${ctx.toUpperCase()}`);
+    parts.push('');
+    parts.push(`## SYMBOL & PRICING`);
+    parts.push(`Symbol: ${context.symbol}`);
+    parts.push(`Current Price: ${context.currentPrice}`);
+    parts.push(`Wallet Balance: ${context.walletBalance} USDT`);
+    parts.push(`Initial Capital (cycle start): ${context.initialCapital} USDT`);
+    parts.push(`Configured Initial Position Size: ${context.currentInitialSize} USDT`);
+    parts.push(`Max Position Size: ${context.maxPositionSizeUSDT} USDT`);
+    parts.push(`Min Notional Floor: ${context.minNotional} USDT`);
+
+    parts.push('');
+    parts.push(`## CYCLE STATE`);
+    parts.push(`Active Side: ${context.currentSide || 'NONE (flat / awaiting touch)'}`);
+    if (context.currentPosition) {
+      parts.push(`Position Entry: ${context.currentPosition.avgEntry}`);
+      parts.push(`Position Quantity: ${context.currentPosition.quantity}`);
+      parts.push(`Position Notional: ${context.currentPosition.notional} USDT`);
+      parts.push(`Unrealized PnL: ${context.currentPosition.unrealizedPnl} USDT`);
+    }
+    parts.push(`Current bullLevel: ${context.bullLevel != null ? context.bullLevel : 'unset'}`);
+    parts.push(`Current bearLevel: ${context.bearLevel != null ? context.bearLevel : 'unset'}`);
+    parts.push(`Current Final TP price: ${context.finalTpPrice != null ? context.finalTpPrice : 'unset'}`);
+    parts.push(`Reversal Count: ${context.reversalCount}`);
+    parts.push(`Harvest Count: ${context.harvestCount}`);
+    parts.push(`Cycle Accumulated Loss: ${context.cycleAccumulatedLoss} USDT`);
+    parts.push(`  (= -Σ realized PnL + Σ trading fees + Σ funding fees)`);
+    parts.push(`Σ Realized PnL: ${context.accumulatedRealizedPnL} USDT`);
+    parts.push(`Σ Trading Fees: ${context.accumulatedTradingFees} USDT`);
+    parts.push(`Σ Funding Fees: ${context.accumulatedFundingFees} USDT`);
+
+    // Volatility — used for level spacing constraint.
+    if (context.volatility) {
+      parts.push('');
+      parts.push(`## VOLATILITY`);
+      parts.push(`ATR(14, 15m): ${context.volatility.atr} (${context.volatility.atrPercent}%) — ${context.volatility.interpretation}`);
+      const atr = context.volatility.atr || 0;
+      const minSpacing = atr * (context.minLevelSpacingATR || 1.5);
+      parts.push(`Required level spacing: bullLevel − bearLevel ≥ ${minSpacing.toFixed(6)} (= 1.5 × ATR)`);
+    }
+
+    // Volume Profile — primary signal for level placement.
+    parts.push('');
+    parts.push(`## VOLUME PROFILE (24h, 5m candles × 288 bars)`);
+    if (context.volumeProfile24h) {
+      const vp = context.volumeProfile24h;
+      parts.push(`POC: ${vp.poc.price.toFixed(6)} (volume ${vp.poc.volume.toFixed(2)})`);
+      parts.push(`Value Area: VAL=${vp.val.toFixed(6)} → VAH=${vp.vah.toFixed(6)} (70% of volume)`);
+      parts.push(`Price Range: ${vp.priceMin.toFixed(6)} → ${vp.priceMax.toFixed(6)}`);
+      parts.push(`HVN ranges (magnetic / reversal-prone, top 20% by volume):`);
+      for (const h of vp.hvns.slice(0, 5)) {
+        parts.push(`  ${h.priceLow.toFixed(6)} → ${h.priceHigh.toFixed(6)} (vol ${h.volume.toFixed(2)})`);
+      }
+      parts.push(`LVN ranges (voids / breakout-friendly, bottom 20% by volume):`);
+      for (const l of vp.lvns.slice(0, 5)) {
+        parts.push(`  ${l.priceLow.toFixed(6)} → ${l.priceHigh.toFixed(6)} (vol ${l.volume.toFixed(2)})`);
+      }
+    } else {
+      parts.push(`(unavailable)`);
+    }
+
+    parts.push('');
+    parts.push(`## VOLUME PROFILE (7d, 1h candles × 168 bars)`);
+    if (context.volumeProfile7d) {
+      const vp = context.volumeProfile7d;
+      parts.push(`POC: ${vp.poc.price.toFixed(6)}`);
+      parts.push(`Value Area: VAL=${vp.val.toFixed(6)} → VAH=${vp.vah.toFixed(6)}`);
+      parts.push(`HVN ranges (top 5):`);
+      for (const h of vp.hvns.slice(0, 5)) {
+        parts.push(`  ${h.priceLow.toFixed(6)} → ${h.priceHigh.toFixed(6)}`);
+      }
+      parts.push(`LVN ranges (top 5):`);
+      for (const l of vp.lvns.slice(0, 5)) {
+        parts.push(`  ${l.priceLow.toFixed(6)} → ${l.priceHigh.toFixed(6)}`);
+      }
+    } else {
+      parts.push(`(unavailable)`);
+    }
+
+    // CVD — momentum confirmation.
+    parts.push('');
+    parts.push(`## CVD (Cumulative Volume Delta)`);
+    if (context.cvd) {
+      parts.push(`CVD over last ${context.cvd.lookbackMinutes}min: ${context.cvd.cvd.toFixed(2)}`);
+      parts.push(`Trend: ${context.cvd.cvdTrend} (1st-half Δ ${context.cvd.firstHalfDelta.toFixed(2)} → 2nd-half Δ ${context.cvd.secondHalfDelta.toFixed(2)})`);
+    } else {
+      parts.push(`(unavailable)`);
+    }
+
+    // Orderbook depth — instantaneous flow.
+    parts.push('');
+    parts.push(`## ORDERBOOK DEPTH (top-${context.orderbookDepth?.levels || 100} each side)`);
+    if (context.orderbookDepth) {
+      const d = context.orderbookDepth;
+      parts.push(`Bid vs Ask volume: ${d.bidVolume.toFixed(2)} vs ${d.askVolume.toFixed(2)} (imbalance ${(d.imbalance * 100).toFixed(2)}%)`);
+      parts.push(`Top-10 levels: bid ${d.top10Bids.toFixed(2)} vs ask ${d.top10Asks.toFixed(2)} (imbalance ${(d.top10Imbalance * 100).toFixed(2)}%)`);
+    } else {
+      parts.push(`(unavailable)`);
+    }
+
+    // S/R cascade — backup signals.
+    if (context.supportResistance) {
+      parts.push('');
+      parts.push(`## SUPPORT & RESISTANCE (cascade)`);
+      const sr = context.supportResistance;
+      if (sr.supports?.length) {
+        parts.push(`Supports:`);
+        for (const s of sr.supports) parts.push(`  ${s.price.toFixed(6)} (${s.source}, rank ${s.rank})`);
+      }
+      if (sr.resistances?.length) {
+        parts.push(`Resistances:`);
+        for (const r of sr.resistances) parts.push(`  ${r.price.toFixed(6)} (${r.source}, rank ${r.rank})`);
+      }
+    }
+
+    // Funding / OI / liquidations — regime indicators.
+    if (context.fundingRate) {
+      parts.push('');
+      parts.push(`## FUNDING`);
+      parts.push(`Rate: ${context.fundingRate.rate} (next ${context.fundingRate.nextFundingTime})`);
+      if (context.fundingRate.estimatedHourlyCost != null) {
+        parts.push(`Est hourly cost (current position): ${context.fundingRate.estimatedHourlyCost.toFixed(4)} USDT`);
+      }
+    }
+
+    if (context.oiChange?.isAbnormal) {
+      parts.push('');
+      parts.push(`## OI CHANGE (abnormal)`);
+      parts.push(`oiChange5m=${context.oiChange.oiChange5m?.toFixed(2)}% oiChange1h=${context.oiChange.oiChange1h?.toFixed(2)}% trend=${context.oiChange.oiTrend}`);
+    }
+
+    if (context.liquidations?.isAbnormal) {
+      parts.push('');
+      parts.push(`## LIQUIDATIONS (abnormal)`);
+      const l = context.liquidations;
+      parts.push(`Long liq vol 15m: ${l.longLiqVolume15m?.toFixed(2)}  Short liq vol 15m: ${l.shortLiqVolume15m?.toFixed(2)}  Cascade: ${l.cascadeActive}`);
+    }
+
+    // Margin info — important for size discussions.
+    if (context.marginInfo) {
+      parts.push('');
+      parts.push(`## MARGIN`);
+      parts.push(`Available: ${context.marginInfo.availableBalance?.toFixed(2)} USDT (margin used ${context.marginInfo.marginUsagePercent?.toFixed(2)}%)`);
+      if (context.marginInfo.liquidationDistance != null) {
+        parts.push(`Account liquidation distance: ${context.marginInfo.liquidationDistance.toFixed(2)}%`);
+      }
+    }
+
+    // Context-specific footer.
+    parts.push('');
+    parts.push(`## CONSULT REQUEST`);
+    if (ctx === 'plan') {
+      parts.push(`Emit a fresh PLAN with bullLevel + bearLevel. Hard constraints:`);
+      parts.push(`  - bullLevel > current_price (${context.currentPrice})`);
+      parts.push(`  - bearLevel < current_price (${context.currentPrice})`);
+      parts.push(`  - bullLevel − bearLevel ≥ 1.5 × ATR`);
+      parts.push(`  - Levels must straddle the POC and prefer LVN-facing edges of the HVN.`);
+    } else if (ctx === 'heartbeat') {
+      parts.push(`Decide: CONTINUE / ADJUST / HARVEST.`);
+      parts.push(`HARVEST eligible: ${context.harvestEligible ? 'YES (loss ≥ 30% of initial capital AND profitable position)' : 'NO (gate not met — do not return HARVEST)'}`);
+      parts.push(`Use ADJUST only for small slides (≤ 1×ATR) driven by: POC drift > 0.5%, level invalidation pattern, CVD divergence at level, or regime shift (ATR > 2× recent norm).`);
+    } else if (ctx === 'veto') {
+      parts.push(`Bot proposes New size: ${context.proposedNewSize} USDT (already passed deterministic margin-headroom projection).`);
+      parts.push(`Decide: CONTINUE (approve) or REDUCE (provide smaller newSize ≥ ${(context.minNotional * 2).toFixed(2)} USDT).`);
+    }
+
+    parts.push('');
+    parts.push(`Return JSON only. No markdown fences, no commentary outside the JSON object.`);
+
+    return parts.join('\n');
   }
 
   _buildUserMessage(context) {

@@ -1,6 +1,17 @@
 import express from 'express';
 import cors from 'cors';
 import { AiHedgeStrategy } from './ai-hedge-strategy.js';
+import { AiReversalStrategy } from './ai-reversal-strategy.js';
+
+// TradFi-Perps symbols are gated by Binance behind a separate trading agreement
+// (error -4411 fires for unsigned accounts). The reversal strategy's symbol
+// dropdown filters these out and /prepare-symbol rejects them server-side.
+const TRADFI_PERPS_PREFIXES = ['CL', 'NG', 'GC', 'SI', 'HG', 'ZB', 'ZN', 'ZT', 'MSTR', 'COIN', 'TSLA', 'NVDA', 'AAPL', 'AMZN', 'GOOG', 'META', 'MSFT'];
+function isTradFiPerps(symbol) {
+  if (!symbol || typeof symbol !== 'string') return false;
+  const upper = symbol.toUpperCase();
+  return TRADFI_PERPS_PREFIXES.some(p => upper.startsWith(p) && (upper.endsWith('USDT') || upper.endsWith('USDC')));
+}
 import http from 'http';
 import { WebSocketServer, WebSocket as WsClient } from 'ws';
 import { Firestore, Timestamp, FieldValue } from '@google-cloud/firestore';
@@ -1442,6 +1453,170 @@ app.get('/ai-hedge/plan-history', async (req, res) => {
     snapshot.forEach(doc => plans.push({ id: doc.id, ...doc.data() }));
 
     res.json({ plans, count: plans.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ——— AI Reversal Strategy endpoints ——————————————————————————————————
+
+app.post('/ai-reversal/prepare-symbol', (req, res) => {
+  const { symbol } = req.body || {};
+  if (!symbol || typeof symbol !== 'string') {
+    return res.status(400).json({ error: 'symbol is required' });
+  }
+  const normalized = symbol.toUpperCase();
+  if (isTradFiPerps(normalized)) {
+    return res.status(400).json({
+      error: `${normalized} is a TradFi-Perps contract; sign the Binance TradFi-Perps agreement in the UI before trading. AI Reversal does not support these symbols.`,
+      code: 'TRADFI_PERPS_BLOCKED',
+    });
+  }
+  if (warmSymbol === normalized && warmWs && warmWs.readyState === WsClient.OPEN) {
+    return res.json({ ok: true, alreadyWarm: true, symbol: normalized });
+  }
+  _closeWarmWs('switching symbol');
+  _openWarmWs(normalized);
+  return res.json({ ok: true, symbol: normalized });
+});
+
+app.post('/ai-reversal/start', async (req, res) => {
+  if (isUpdating) {
+    return res.status(503).json({ error: 'VM is currently updating.', code: 'VM_UPDATING' });
+  }
+
+  try {
+    const { profileId, gcpProxyUrl, sharedVmProxyGcfUrl, config, userId } = req.body;
+
+    if (!profileId || !gcpProxyUrl || !sharedVmProxyGcfUrl || !config) {
+      return res.status(400).json({ error: 'profileId, gcpProxyUrl, sharedVmProxyGcfUrl, and config are required.' });
+    }
+
+    if (isTradFiPerps(config.symbol)) {
+      return res.status(400).json({
+        error: `${config.symbol} is a TradFi-Perps contract; not supported by AI Reversal.`,
+        code: 'TRADFI_PERPS_BLOCKED',
+      });
+    }
+
+    // One strategy per profile (matches existing model). User must stop AI Hedge first.
+    for (const [sId, strategy] of activeStrategies.entries()) {
+      if (strategy.profileId === profileId) {
+        return res.status(400).json({
+          error: `A strategy for profile ${profileId} is already running. Stop it before starting AI Reversal.`,
+          strategyId: sId,
+        });
+      }
+    }
+
+    const strategy = new AiReversalStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
+    strategy.userId = userId;
+
+    const strategyId = `ai_reversal_${profileId}_${Date.now()}`;
+    strategy.strategyId = strategyId;
+    strategy.isRunning = true;
+    activeStrategies.set(strategyId, strategy);
+
+    let walletSnapshotInterval = null;
+    strategy.onStopComplete = () => {
+      if (walletSnapshotInterval) {
+        clearInterval(walletSnapshotInterval);
+        walletSnapshotInterval = null;
+      }
+      _snapshotWallet(strategy).catch(() => { /* logged inside */ });
+      activeStrategies.delete(strategyId);
+    };
+
+    console.log(`✓ AI Reversal Strategy ${strategyId} starting (non-blocking)...`);
+    res.json({
+      success: true,
+      strategyId,
+      message: 'AI Reversal Strategy starting',
+    });
+
+    strategy.start(config)
+      .then(() => {
+        _snapshotWallet(strategy).catch(() => { /* logged inside */ });
+        walletSnapshotInterval = setInterval(
+          () => _snapshotWallet(strategy).catch(() => { /* logged inside */ }),
+          WALLET_SNAPSHOT_INTERVAL_MS
+        );
+      })
+      .catch((error) => {
+        console.error(`Failed to start AI Reversal Strategy ${strategyId}:`, error);
+        strategy.isRunning = false;
+        activeStrategies.delete(strategyId);
+      });
+  } catch (error) {
+    console.error('Failed to start AI Reversal Strategy:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/ai-reversal/stop', async (req, res) => {
+  try {
+    const { strategyId, flatten } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AiReversalStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No AI Reversal strategy running with ID ${strategyId}` });
+    }
+
+    res.json({ success: true, stopping: true, message: 'AI Reversal Strategy stop initiated', strategyId });
+
+    setImmediate(async () => {
+      try {
+        await strategy.stop({ flatten: !!flatten });
+        activeStrategies.delete(strategyId);
+      } catch (error) {
+        console.error(`Error stopping AI Reversal Strategy ${strategyId}:`, error);
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/ai-reversal/status', (req, res) => {
+  const { strategyId } = req.query;
+
+  if (strategyId) {
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AiReversalStrategy)) {
+      return res.status(404).json({ error: `AI Reversal strategy ${strategyId} not found.` });
+    }
+    return res.json(strategy.getStatus());
+  }
+
+  const reversalStrategies = {};
+  activeStrategies.forEach((strategy, sId) => {
+    if (strategy instanceof AiReversalStrategy) {
+      reversalStrategies[sId] = strategy.getStatus();
+    }
+  });
+
+  res.json({ strategies: reversalStrategies, count: Object.keys(reversalStrategies).length });
+});
+
+app.post('/ai-reversal/replan', async (req, res) => {
+  try {
+    const { strategyId } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AiReversalStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running AI Reversal strategy with ID ${strategyId}` });
+    }
+
+    // For reversal, "replan" forces a heartbeat consult (Context 2). PLAN
+    // (Context 1) is only entered at cycle start or post-HARVEST.
+    if (strategy.currentPosition && strategy.currentPosition.quantity > 0) {
+      strategy._requestHeartbeat().catch(() => {});
+    } else {
+      strategy._requestPlan('manual_replan').catch(() => {});
+    }
+    res.json({ success: true, message: 'Replan triggered', strategyId });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
