@@ -1,5 +1,3 @@
-'use strict';
-
 const REVERSAL_SYSTEM_PROMPT = `
 You are the trading planner for the AI Reversal Strategy on Binance USDⓈ-M Perpetual Futures (one-way position mode).
 
@@ -131,4 +129,4 @@ Verb rules:
 Return JSON only. No markdown fences, no commentary outside the JSON object.
 `;
 
-module.exports = { REVERSAL_SYSTEM_PROMPT };
+export { REVERSAL_SYSTEM_PROMPT };
