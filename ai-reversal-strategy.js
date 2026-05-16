@@ -440,12 +440,35 @@ class AiReversalStrategy extends TradingBase {
       this.listenKeyRefreshInterval = null;
     }
 
-    if (flatten && this.activePosition && this.activePosition.quantity > 0) {
+    if (flatten) {
+      // Source-of-truth refresh BEFORE the flatten check. activePosition can be
+      // null in-memory while Binance still holds an open position (state lost
+      // across a partial restart, missed WS update, etc.) — without this
+      // refresh the close silently no-ops and the user is left with an open
+      // position. Mirrors hedge's stop() pattern which always closes.
       try {
-        await this.addLog('[REVERSAL] stop: flattening current position');
-        await this.executor.executeAction({ type: 'HARVEST_CLOSE', reason: 'user-stop' });
+        await this._refreshCurrentPosition();
       } catch (err) {
-        await this.addLog(`[REVERSAL] stop: flatten failed: ${err.message}`);
+        await this.addLog(`[REVERSAL] stop: pre-flatten position refresh failed: ${err.message}`);
+      }
+
+      if (this.activePosition && this.activePosition.quantity > 0) {
+        try {
+          await this.addLog(`[REVERSAL] stop: flattening ${this.currentSide} ${this.activePosition.quantity}`);
+          await this.executor.executeAction({ type: 'HARVEST_CLOSE', reason: 'user-stop' });
+          // Verify the close actually flattened — if Binance still reports a
+          // residual position, log a warning so it's surfaced in the log feed.
+          await this._refreshCurrentPosition();
+          if (this.activePosition && this.activePosition.quantity > 0) {
+            await this.addLog(`[REVERSAL] WARNING: stop+flatten left residual ${this.currentSide} ${this.activePosition.quantity} on Binance — close it manually`);
+          } else {
+            await this.addLog('[REVERSAL] stop: position confirmed flat');
+          }
+        } catch (err) {
+          await this.addLog(`[REVERSAL] stop: flatten failed: ${err.message}`);
+        }
+      } else {
+        await this.addLog('[REVERSAL] stop: no open position on Binance — nothing to flatten');
       }
     }
 
@@ -722,30 +745,72 @@ class AiReversalStrategy extends TradingBase {
     if (this.executionState === 'EXECUTING') return;
     this.executionState = 'EXECUTING';
     try {
-      await this.addLog(`[REVERSAL] Final TP hit at ${this.currentPrice} — closing cycle`);
+      const exitPrice = this.currentPrice;
+      const exitSide = this.currentSide;
+      await this.addLog(`[REVERSAL] Final TP hit at ${exitPrice} — closing cycle`);
       await this.executor.executeAction({ type: 'HARVEST_CLOSE', reason: 'final_tp' });
+
+      // Verify Binance actually flattened the position. HARVEST_CLOSE sends
+      // a market order, but if it errors or only partially fills the user is
+      // left exposed. Refresh from REST + warn if residual remains; don't
+      // null activePosition until we've confirmed it's actually flat.
       await this._refreshCurrentPosition();
+      if (this.activePosition && this.activePosition.quantity > 0) {
+        await this.addLog(`[REVERSAL] WARNING: Final TP close left residual ${this.currentSide} ${this.activePosition.quantity} on Binance — close it manually`);
+      }
+
       this.activePosition = null;
       this.currentSide = null;
       this.subState = 'EXITED';
       this.executionState = 'TERMINATED';
       this.isRunning = false;
+      this.strategyEndTime = new Date();
       this._stopHeartbeat();
       // Clear all background timers since the cycle is over (mirrors stop()).
       if (this._fundingPollTimeout) { clearTimeout(this._fundingPollTimeout); this._fundingPollTimeout = null; }
       if (this.listenKeyRefreshInterval) { clearInterval(this.listenKeyRefreshInterval); this.listenKeyRefreshInterval = null; }
-      await this._postExecuteBookkeeping('FINAL_TP_HIT', { exitPrice: this.currentPrice });
+      await this._postExecuteBookkeeping('FINAL_TP_HIT', { exitPrice });
+
+      // Drop both WS streams (cycle is over, no more level-touch dispatch).
       try {
-        await sendStrategyCompletionNotification({
-          userId: this.userId,
+        if (typeof this.cleanupWebSockets === 'function') this.cleanupWebSockets();
+      } catch (cleanupErr) {
+        console.error(`[REVERSAL] Final TP cleanupWebSockets failed: ${cleanupErr.message}`);
+      }
+
+      // Push notification. Helper signature is (userId, strategyData) — the
+      // previous single-object call meant strategyData was undefined and
+      // sendPushNotification got the object as userId, so the FCM token
+      // lookup silently failed. Fields mirror hedge's payload.
+      try {
+        const elapsed = this.cycleStartTime
+          ? formatDuration(Date.now() - this.cycleStartTime)
+          : 'N/A';
+        const netPnL = (this.accumulatedRealizedPnL || 0)
+          - (this.accumulatedTradingFees || 0)
+          + (this.accumulatedFundingFees || 0);
+        await sendStrategyCompletionNotification(this.userId, {
           strategyId: this.strategyId,
-          strategyType: 'AI Reversal',
           symbol: this.symbol,
-          totalPnL: -this.cycleAccumulatedLoss + this.desiredProfitUSDT,
-          duration: formatDuration(Date.now() - (this.cycleStartTime || Date.now())),
+          netPnL,
+          profitPercentage: this.initialCapital ? (netPnL / this.initialCapital) * 100 : 0,
+          tradeCount: this.tradeCount || (this.reversalCount + this.harvestCount + 1),
+          timeTaken: elapsed,
+          realizedPnL: this.accumulatedRealizedPnL || 0,
+          tradingFees: this.accumulatedTradingFees || 0,
+          fundingFees: this.accumulatedFundingFees || 0,
         });
       } catch (notifyErr) {
         await this.addLog(`[REVERSAL] notify error: ${notifyErr.message}`);
+      }
+
+      // Persist the terminal state — required for the frontend's
+      // useStrategyCompletionListener to see isRunning=false on a doc
+      // tagged type='AI_REVERSAL' and surface the in-app notification.
+      try {
+        await this.saveState();
+      } catch (saveErr) {
+        console.error(`[REVERSAL] Final TP saveState failed: ${saveErr.message}`);
       }
     } catch (err) {
       await this.addLog(`[REVERSAL] _handleFinalTpHit error: ${err.message}`);
@@ -1333,6 +1398,11 @@ class AiReversalStrategy extends TradingBase {
         lastDecision: this.lastDecision,
         planHistory: this.planHistory.slice(-50),
         cycleStartTime: this.cycleStartTime,
+        // strategyStartTime + strategyEndTime are read by the frontend
+        // useStrategyCompletionListener to compute timeTaken on the in-app
+        // Final-TP notification banner. Without them duration shows 'N/A'.
+        strategyStartTime: this.strategyStartTime || null,
+        strategyEndTime: this.strategyEndTime || null,
         leverage: this.leverage,
         maxPositionSizeUSDT: this.maxPositionSizeUSDT,
         aiModel: this.aiModel,
@@ -1382,6 +1452,9 @@ class AiReversalStrategy extends TradingBase {
           cycleAccumulatedLoss: this.cycleAccumulatedLoss,
           bullLevel: this.bullLevel,
           bearLevel: this.bearLevel,
+          // Persisted per consult so the chart can rebuild Final TP history
+          // segments on reload. Side-aware coloring uses currentSide above.
+          finalTpPrice: this.finalTpPrice ?? null,
         },
         timestamp: new Date(),
       });
