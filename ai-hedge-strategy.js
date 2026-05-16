@@ -11,8 +11,18 @@ import fetch from 'node-fetch';
 // Used to compute end-of-strategy AI usage cost — kept here so a model change
 // only requires updating this table.
 const MODEL_PRICING = {
-  'claude-sonnet-4-6': { input: 3.0,  output: 15.0, cacheWrite5m: 3.75,  cacheRead: 0.30 },
-  'claude-opus-4-7':   { input: 15.0, output: 75.0, cacheWrite5m: 18.75, cacheRead: 1.50 },
+  // Anthropic — Claude (rates from anthropic.com pricing).
+  'claude-sonnet-4-6': { input: 3.0,   output: 15.0, cacheWrite5m: 3.75,   cacheRead: 0.30 },
+  'claude-opus-4-7':   { input: 15.0,  output: 75.0, cacheWrite5m: 18.75,  cacheRead: 1.50 },
+  // DeepSeek V4 — via Anthropic-compatible endpoint at api.deepseek.com/anthropic.
+  // Per-1M-token USD rates from api-docs.deepseek.com (as of 2026-05-16).
+  // v4-pro is currently on a 75% discount that expires 2026-05-31 15:59 UTC;
+  // after expiry, multiply v4-pro rates by 4 to get post-discount values.
+  // cache_control isn't honored by DeepSeek's Anthropic endpoint, so
+  // cacheWrite5m mirrors `input` (cache miss = full price); cacheRead is
+  // DeepSeek's automatic cache-hit rate when prefix-cached server-side.
+  'deepseek-v4-flash': { input: 0.14,  output: 0.28, cacheWrite5m: 0.14,   cacheRead: 0.0028 },
+  'deepseek-v4-pro':   { input: 0.435, output: 0.87, cacheWrite5m: 0.435,  cacheRead: 0.003625 },
 };
 
 // L5c volatility-aware sizing thresholds
@@ -181,8 +191,14 @@ class AiHedgeStrategy extends TradingBase {
     this.initialHedgeMultiplier = config.initialHedgeMultiplier ?? null;
     this.profitPercent = config.profitPercent ?? null;
 
-    const anthropicApiKey = await this._fetchAnthropicApiKey();
+    // Branch the AI provider on the model-ID prefix. `deepseek-*` models
+    // use the same Anthropic SDK against DeepSeek's Anthropic-compatible
+    // endpoint; the key fetcher just hits a different /secret/* endpoint.
     this.aiModel = config.aiModel || 'claude-sonnet-4-6';
+    const isDeepseek = this.aiModel.startsWith('deepseek-');
+    const aiApiKey = isDeepseek
+      ? await this._fetchDeepseekApiKey()
+      : await this._fetchAnthropicApiKey();
 
     await this.addLog(`Starting AI Hedge Strategy for ${this.symbol}...`);
     await this.addLog(`Config: posSize=${this.positionSizeUSDT} USDT, leverage=${this.leverage}x, maxPos=${this.maxPositionSizeUSDT} USDT, model=${this.aiModel}`);
@@ -258,7 +274,7 @@ class AiHedgeStrategy extends TradingBase {
       singleLegStopPercent: 5.0,
     });
 
-    this.planner = new AiPlanner(anthropicApiKey, this.aiModel);
+    this.planner = new AiPlanner(aiApiKey, this.aiModel);
     this.executor = new AiPlanExecutor(this);
 
     this.isRunning = true;
@@ -410,7 +426,13 @@ class AiHedgeStrategy extends TradingBase {
     };
     this.planHistory = snapshot.planHistory || [];
 
-    const anthropicApiKey = await this._fetchAnthropicApiKey();
+    // Branch the AI provider on the model-ID prefix — same as start().
+    // `this.aiModel` was already restored from the snapshot above so the
+    // resumed strategy keeps the same provider.
+    const isDeepseek = (this.aiModel || '').startsWith('deepseek-');
+    const aiApiKey = isDeepseek
+      ? await this._fetchDeepseekApiKey()
+      : await this._fetchAnthropicApiKey();
 
     try {
       await this.setLeverage(this.symbol, this.leverage);
@@ -432,7 +454,7 @@ class AiHedgeStrategy extends TradingBase {
       singleLegStopPercent: 5.0,
     });
     this.marketContext = new AiMarketContext(this);
-    this.planner = new AiPlanner(anthropicApiKey, this.aiModel);
+    this.planner = new AiPlanner(aiApiKey, this.aiModel);
     this.executor = new AiPlanExecutor(this);
 
     // L5c: best-effort baseline refetch for pre-L5 snapshots. Use current ATR
@@ -1260,6 +1282,30 @@ class AiHedgeStrategy extends TradingBase {
 
     const { apiKey } = await response.json();
     if (!apiKey) throw new Error('No Anthropic API key configured.');
+    return apiKey;
+  }
+
+  // DeepSeek key fetcher — same pattern as _fetchAnthropicApiKey, just hits
+  // a different /secret/* endpoint on the per-profile binance-proxy GCF.
+  // ai-planner detects the model prefix and routes the SDK to
+  // api.deepseek.com/anthropic so the key works against DeepSeek V4.
+  async _fetchDeepseekApiKey() {
+    const envKey = process.env.DEEPSEEK_API_KEY;
+    if (envKey) return envKey;
+
+    const response = await fetch(this.sharedVmProxyGcfUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-User-Id': this.profileId },
+      body: JSON.stringify({ apiType: 'secret', endpoint: '/secret/deepseek', profileBinanceApiGcfUrl: this.gcfProxyUrl }),
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(`Failed to fetch DeepSeek key: ${response.status} - ${err.error || response.statusText}`);
+    }
+
+    const { apiKey } = await response.json();
+    if (!apiKey) throw new Error('No DeepSeek API key configured.');
     return apiKey;
   }
 

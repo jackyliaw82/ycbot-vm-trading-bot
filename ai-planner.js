@@ -332,10 +332,22 @@ Respond with ONLY a valid JSON object. Schema depends on phase:
 
 **Primary HOLD MUST include a triggerPrice** — the price at which your HOLD reasoning becomes invalid. When primary price crosses, the strategy replans. Default to current ± 3×ATR if you have no specific level in mind. Same direction rules: actionAbove > current, actionBelow < current. The system synthesizes current ± 3×ATR if you omit it. **HOLD is primary-only** — shadow type is restricted to ADD or SKIP.`;
 
+// DeepSeek exposes an Anthropic-compatible endpoint at /anthropic. Pointing
+// the @anthropic-ai/sdk at this baseURL lets us reuse the same
+// `messages.create(...)` signature for DeepSeek V4 models with no other code
+// changes. Auth is via the same `x-api-key` header the SDK already sends.
+// Source: https://api-docs.deepseek.com/guides/anthropic_api
+const DEEPSEEK_BASE_URL = 'https://api.deepseek.com/anthropic';
+
 class AiPlanner {
   constructor(apiKey, model = 'claude-sonnet-4-6') {
-    this.client = new Anthropic({ apiKey });
+    const isDeepseek = typeof model === 'string' && model.startsWith('deepseek-');
+    this.client = new Anthropic({
+      apiKey,
+      ...(isDeepseek ? { baseURL: DEEPSEEK_BASE_URL } : {}),
+    });
     this.model = model;
+    this.provider = isDeepseek ? 'deepseek' : 'anthropic';
     this.maxRetries = 3;
   }
 
