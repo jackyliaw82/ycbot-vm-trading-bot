@@ -103,6 +103,14 @@ class AiReversalStrategy extends TradingBase {
     // Stale retry on AI failure
     this._staleRetryAttempt = 0;
     this._staleRetryTimer = null;
+
+    // Lifecycle infrastructure (mirrors AiHedgeStrategy fields). Tracked
+    // here so stop() can clear every interval/timeout deterministically
+    // and start()/resume() can restart them. Leaving any unset means a
+    // restart will leak the prior session's timer.
+    this.listenKeyRefreshInterval = null;
+    this._fundingPollTimeout = null;
+    this._lastFundingPollTs = null;
   }
 
   // ——— Lifecycle ——————————————————————————————————————————————————————
@@ -208,8 +216,14 @@ class AiReversalStrategy extends TradingBase {
     await this.detectCurrentPosition(true);
     await this._refreshCurrentPosition();
 
+    // Funding poll baseline + scheduler. Anchor at strategy start so the
+    // first poll only catches entries from THIS cycle. Mirrors hedge's
+    // pattern at ai-hedge-strategy.js:310-311.
+    this._lastFundingPollTs = this.strategyStartTime.getTime();
+    this._scheduleNextFundingPoll();
+
     await this.addLog(`AI Reversal Strategy started. Waiting for AI to set bull/bear levels...`);
-    await this._saveState();
+    await this.saveState();
 
     // Kick off first PLAN consult and start heartbeat scheduler.
     this._requestPlan('cycle_start').catch(err => {
@@ -219,24 +233,60 @@ class AiReversalStrategy extends TradingBase {
   }
 
   /**
-   * Resume a strategy from a Firestore snapshot. Used on VM restart.
+   * Resume a strategy from a Firestore snapshot. Called by app.js boot-scan
+   * (recoverActiveStrategies) when a `type: 'AI_REVERSAL'` doc has
+   * `isRunning: true` but no in-memory instance exists (i.e. PM2 restart
+   * / VM force-update). Mirrors AiHedgeStrategy.resume (line 328+).
+   *
+   * Critical contract (see audit C3+C4+C5):
+   *   - Restore identifiers FIRST so addLog can write under the right strategyId
+   *   - Validate C4 proxy URLs before doing anything else
+   *   - Fetch a FRESH Anthropic key (snapshot.anthropicApiKey is never stored)
+   *   - Restore _lastFundingPollTs so the next funding poll uses correct baseline
+   *   - Reissue listen-key request + refresh interval + WS health monitor
+   *   - Schedule next funding poll
+   *   - Reconcile current position from Binance (source of truth)
    */
   async resume(snapshot) {
     if (!snapshot) throw new Error('AiReversalStrategy.resume: missing snapshot');
 
+    // Restore identifiers FIRST so addLog writes under the correct strategyId.
+    this.strategyId = snapshot.strategyId;
+    this.profileId = snapshot.profileId;
+    this.userId = snapshot.userId;
+    this.gcfProxyUrl = snapshot.gcfProxyUrl;
+    this.sharedVmProxyGcfUrl = snapshot.sharedVmProxyGcfUrl;
+    this.initFirestoreCollections(this.strategyId);
+
+    // C4 proxy URL validation. Without these the strategy cannot reach
+    // Binance OR the Anthropic key fetcher; abort cleanly and mark the
+    // doc with a recoverable error.
+    if (!this.gcfProxyUrl || !this.sharedVmProxyGcfUrl) {
+      const msg = `[RECOVERY] Cannot resume ${this.strategyId}: missing proxy URLs in snapshot (saved before C4 fix)`;
+      console.error(msg);
+      await this.addLog(msg).catch(() => {});
+      this.isRunning = false;
+      this.criticalError = 'recovery_missing_proxy_urls';
+      await this.saveState().catch(() => {});
+      try { this.onStopComplete?.(); } catch (_) { /* ignore */ }
+      return;
+    }
+
+    await this.addLog(`[RECOVERY] Resuming AI Reversal Strategy after restart...`);
+
+    // Restore config
     this.symbol = snapshot.symbol;
     this.leverage = snapshot.leverage || DEFAULT_LEVERAGE;
     this.maxPositionSizeUSDT = snapshot.maxPositionSizeUSDT || 0;
     this.priceType = snapshot.priceType || 'MARK';
     this.aiModel = snapshot.aiModel || 'claude-sonnet-4-6';
-    this.userId = snapshot.userId;
-    this.recoveryFactor = snapshot.config?.recoveryFactor || DEFAULT_RECOVERY_FACTOR;
-    this.recoveryDistance = snapshot.config?.recoveryDistance || DEFAULT_RECOVERY_DISTANCE;
-    this.harvestLossThreshold = snapshot.config?.harvestLossThreshold || HARVEST_LOSS_THRESHOLD_PCT;
+    this.recoveryFactor = snapshot.config?.recoveryFactor ?? DEFAULT_RECOVERY_FACTOR;
+    this.recoveryDistance = snapshot.config?.recoveryDistance ?? DEFAULT_RECOVERY_DISTANCE;
+    this.harvestLossThreshold = snapshot.config?.harvestLossThreshold ?? HARVEST_LOSS_THRESHOLD_PCT;
     this.desiredProfitUSDT = snapshot.config?.desiredProfitUSDT || 0;
     this.currentInitialSize = snapshot.currentInitialSize || snapshot.config?.initialSize || 0;
-    this.initialCapital = snapshot.initialCapital || 0;
 
+    // Restore cycle state
     this.currentSide = snapshot.currentSide || null;
     this.currentPosition = snapshot.currentPosition || null;
     this.bullLevel = snapshot.bullLevel || null;
@@ -245,50 +295,142 @@ class AiReversalStrategy extends TradingBase {
     this.cycleAccumulatedLoss = snapshot.cycleAccumulatedLoss || 0;
     this.reversalCount = snapshot.reversalCount || 0;
     this.harvestCount = snapshot.harvestCount || 0;
-    this.cycleStartTime = snapshot.cycleStartTime || Date.now();
+    this.initialCapital = snapshot.initialCapital || 0;
+    this.initialWalletBalance = snapshot.initialWalletBalance || null;
+    const sst = snapshot.cycleStartTime;
+    this.cycleStartTime = typeof sst === 'number' ? sst : Date.now();
+    this.strategyStartTime = new Date(this.cycleStartTime);
     this.subState = snapshot.subState || 'WAITING';
     this.executionState = 'IDLE';
     this.accumulatedRealizedPnL = snapshot.accumulatedRealizedPnL || 0;
     this.accumulatedTradingFees = snapshot.accumulatedTradingFees || 0;
     this.accumulatedFundingFees = snapshot.accumulatedFundingFees || 0;
-    this.planHistory = snapshot.planHistory || [];
-    this.activePlan = snapshot.activePlan || null;
+
+    // Funding poll high-water mark. Fall back to strategyStartTime for
+    // pre-v3.4.0 snapshots that didn't persist this field.
+    this._lastFundingPollTs = snapshot._lastFundingPollTs || this.cycleStartTime;
+
+    // AI continuity. planHistory restored as-is; activePlan restored only
+    // if a position is currently held (otherwise we're in WAITING and a
+    // fresh plan will arrive on the next heartbeat anyway).
     this.aiTokenUsage = snapshot.aiTokenUsage || { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheCreation: 0, requests: 0 };
+    this.planHistory = Array.isArray(snapshot.planHistory) ? snapshot.planHistory : [];
+    this.activePlan = snapshot.activePlan || null;
+    this.lastDecision = snapshot.lastDecision || null;
 
-    await this.addLog(`[REVERSAL] resume: subState=${this.subState} side=${this.currentSide || 'NONE'} reversals=${this.reversalCount} harvests=${this.harvestCount} accLoss=${this.cycleAccumulatedLoss}`);
+    // FRESH Anthropic key — never trust a snapshot value (the snapshot
+    // shape doesn't actually store this, but defensive anyway).
+    const anthropicApiKey = await this._fetchAnthropicApiKey();
 
-    await this._configureBinance(snapshot.apiKey, snapshot.apiSecret);
-    await this._getExchangeInfo(this.symbol);
+    try {
+      await this.setLeverage(this.symbol, this.leverage);
+      // One-way mode — reversal is single-sided. Wrap in try/catch
+      // because Binance refuses the call if positions are open.
+      try {
+        await this.setPositionMode(false);
+      } catch (err) {
+        await this.addLog(`[RECOVERY] setPositionMode(false) note: ${err.message}`);
+      }
+      await this._getExchangeInfo(this.symbol);
+    } catch (error) {
+      await this.addLog(`[RECOVERY] ERROR setup: ${error.message}`);
+      throw error;
+    }
 
-    this.planner = new AiPlanner(snapshot.anthropicApiKey, this.aiModel);
-    this.executor = new AiPlanExecutor(this);
+    const minNotional = this.exchangeInfoCache[this.symbol]?.minNotional || 5;
+    this.minNotional = minNotional;
+
+    this.marketContext = new AiMarketContext(this);
     this.riskGuard = new AiRiskGuard({
       maxPositionSizeUSDT: this.maxPositionSizeUSDT,
-      minNotional: this.minNotional || 5,
+      maxImbalanceRatio: 5.0,
+      maxPriceDeviationPercent: 5.0,
+      maxActionsPerHour: 20,
+      minNotional,
+      singleLegStopPercent: 5.0,
     });
-    this.marketContext = new AiMarketContext(this);
-
-    await this.connectRealtimeWebSocket();
-    await this.connectUserDataStream();
-    await this.connectLiquidationWebSocket();
-
-    await this._refreshCurrentPosition();
+    this.planner = new AiPlanner(anthropicApiKey, this.aiModel);
+    this.executor = new AiPlanExecutor(this);
 
     this.isRunning = true;
+
+    // WS lifecycle — listen-key request FIRST (avoids stale-key races),
+    // then user-data stream, then realtime + liquidation feeds, then
+    // refresh interval + health monitor.
+    await this._retryListenKeyRequest(false);
+    this.connectUserDataStream();
+    this.connectRealtimeWebSocket();
+    this.connectLiquidationWebSocket();
+
+    this.listenKeyRefreshInterval = setInterval(() => {
+      this._scheduledListenKeyRefresh();
+    }, 30 * 60 * 1000);
+
+    this._startWebSocketHealthMonitoring();
+
+    // Reconcile position from Binance (source of truth).
+    await this.detectCurrentPosition(true);
+    await this._refreshCurrentPosition();
+
+    // Catch up on any funding settlements during downtime, then schedule
+    // the next 8h-aligned poll. _pollFundingIncome calls saveState itself
+    // so accumulators are persisted before we proceed.
+    try {
+      await this._pollFundingIncome();
+    } catch (err) {
+      console.error(`[RECOVERY] funding catch-up failed: ${err.message}`);
+    }
+    this._scheduleNextFundingPoll();
+
+    // Recompute Final TP from restored accumulated_loss + current position
+    // (Final TP is a derived value; never persisted).
+    this._recomputeFinalTpPrice();
+
+    await this.addLog(`[RECOVERY] subState=${this.subState} side=${this.currentSide || 'NONE'} reversals=${this.reversalCount} harvests=${this.harvestCount} accLoss=${this.cycleAccumulatedLoss.toFixed(4)} USDT`);
+
+    await this.saveState();
+
+    // Start heartbeat (5min cadence) so AI keeps consulting on the
+    // resumed position. If we're in WAITING with no position, the
+    // first price tick (or manual replan) will trigger a fresh PLAN.
     this._startHeartbeat();
   }
 
   /**
-   * Stop the strategy. Optionally flat the current position before stopping.
+   * Stop the strategy. Optionally flat the current position before
+   * stopping. Mirrors AiHedgeStrategy.stop's cleanup discipline: every
+   * interval/timeout started in start() or resume() MUST be cleared
+   * here, otherwise a stop→start cycle leaks the prior session's timers.
+   *
+   * Order matters:
+   *   1. Set isRunning=false to short-circuit any in-flight pollers
+   *   2. Optional flatten (only if user asked)
+   *   3. Clear ALL timers (heartbeat, stale retry, funding poll, listen-key refresh)
+   *   4. Final funding poll so any settlement during stop is captured
+   *   5. cleanupWebSockets to release the listen-key + drop streams
+   *   6. saveState with isRunning=false marker
+   *   7. Notification + onStopComplete hook
    */
   async stop(options = {}) {
     const { flatten = false } = options;
     this.isRunning = false;
+
+    // Cancel ALL background timers. Each was started in start()/resume()
+    // and would leak across a restart if missed here.
     this._stopHeartbeat();
     if (this._staleRetryTimer) {
       clearTimeout(this._staleRetryTimer);
       this._staleRetryTimer = null;
     }
+    if (this._fundingPollTimeout) {
+      clearTimeout(this._fundingPollTimeout);
+      this._fundingPollTimeout = null;
+    }
+    if (this.listenKeyRefreshInterval) {
+      clearInterval(this.listenKeyRefreshInterval);
+      this.listenKeyRefreshInterval = null;
+    }
+
     if (flatten && this.currentPosition && this.currentPosition.quantity > 0) {
       try {
         await this.addLog('[REVERSAL] stop: flattening current position');
@@ -297,9 +439,26 @@ class AiReversalStrategy extends TradingBase {
         await this.addLog(`[REVERSAL] stop: flatten failed: ${err.message}`);
       }
     }
+
+    // Final funding flush — capture any settlement that happened between
+    // the last scheduled poll and stop. Non-critical: swallow errors.
+    try {
+      await this._pollFundingIncome();
+    } catch (err) {
+      console.error(`[REVERSAL] final funding poll failed: ${err.message}`);
+    }
+
+    // Release the user-data listen key + drop both WS streams.
+    try {
+      if (typeof this.cleanupWebSockets === 'function') this.cleanupWebSockets();
+    } catch (err) {
+      console.error(`[REVERSAL] cleanupWebSockets failed: ${err.message}`);
+    }
+
     this.executionState = 'TERMINATED';
     this.subState = 'EXITED';
-    await this._saveState();
+    this.strategyEndTime = new Date();
+    await this.saveState();
     await this.addLog('[REVERSAL] stop: terminated');
   }
 
@@ -401,6 +560,8 @@ class AiReversalStrategy extends TradingBase {
         await this.addLog(`[REVERSAL] VETO validation failed: ${validation.reasons.join('; ')} — falling back to proposed size`);
         return proposedNewSize;
       }
+      // Persist the veto plan for audit trail (consumed by plan-history).
+      this._savePlanToFirestore(plan, 'veto').catch(() => {});
       if (plan.decision === 'REDUCE' && typeof plan.newSize === 'number' && plan.newSize > 0) {
         await this.addLog(`[REVERSAL] AI veto REDUCE: ${proposedNewSize} → ${plan.newSize} (${plan.rationale || 'no rationale'})`);
         return plan.newSize;
@@ -435,11 +596,18 @@ class AiReversalStrategy extends TradingBase {
     this.executionState = 'IDLE';
     await this.addLog(`[REVERSAL] PLAN accepted: bull=${plan.bullLevel} bear=${plan.bearLevel} size=${this.currentInitialSize} (${plan.rationale || 'no rationale'})`);
     this._recomputeFinalTpPrice();
-    await this._saveState();
+    await this.saveState();
+    // Persist the plan to the aiPlans subcollection for audit trail
+    // (consumed by /ai-reversal/plan-history).
+    this._savePlanToFirestore(plan, 'plan').catch(() => {});
   }
 
   async _handleHeartbeatResponse(plan) {
     this.lastDecision = { decision: plan.decision, rationale: plan.rationale, timestamp: Date.now() };
+    // Every heartbeat response gets persisted to aiPlans regardless of
+    // the verb so the audit trail captures CONTINUE decisions too.
+    this._savePlanToFirestore(plan, 'heartbeat').catch(() => {});
+
     if (plan.decision === 'CONTINUE') {
       await this.addLog(`[REVERSAL] heartbeat: CONTINUE — ${plan.rationale || 'levels intact'}`);
       return;
@@ -450,7 +618,7 @@ class AiReversalStrategy extends TradingBase {
       this.bullLevel = plan.bullLevel;
       this.bearLevel = plan.bearLevel;
       await this.addLog(`[REVERSAL] heartbeat: ADJUST — bull ${oldBull} → ${plan.bullLevel}, bear ${oldBear} → ${plan.bearLevel} (${plan.rationale || 'no rationale'})`);
-      await this._saveState();
+      await this.saveState();
       return;
     }
     if (plan.decision === 'HARVEST') {
@@ -464,9 +632,9 @@ class AiReversalStrategy extends TradingBase {
   async _openInitialPosition(side, levelPrice) {
     if (this.executionState === 'EXECUTING') return;
     this.executionState = 'EXECUTING';
+    const verb = side === 'LONG' ? 'OPEN_LONG_AT_LEVEL' : 'OPEN_SHORT_AT_LEVEL';
     try {
       const sizeUSDT = this.currentInitialSize;
-      const verb = side === 'LONG' ? 'OPEN_LONG_AT_LEVEL' : 'OPEN_SHORT_AT_LEVEL';
       const quantity = await this._calculateAdjustedQuantity(this.symbol, sizeUSDT, levelPrice, verb);
       await this.executor.executeAction({
         type: verb,
@@ -480,19 +648,20 @@ class AiReversalStrategy extends TradingBase {
       await this.addLog(`[REVERSAL] _openInitialPosition error: ${err.message}`);
     } finally {
       this.executionState = 'IDLE';
-      await this._saveState();
+      await this._postExecuteBookkeeping(verb, { triggerPrice: levelPrice });
     }
   }
 
   async _performReversal(newSide) {
     if (this.executionState === 'EXECUTING') return;
     this.executionState = 'EXECUTING';
+    const verb = newSide === 'LONG' ? 'REVERSE_TO_LONG' : 'REVERSE_TO_SHORT';
+    let finalSize = 0;
     try {
       // Compute new size (formula + margin projection + AI veto).
       const proposed = this._computeFormulaSize();
       const projected = this._applyMarginHeadroomCap(proposed);
-      const finalSize = await this._requestVeto(projected);
-      const verb = newSide === 'LONG' ? 'REVERSE_TO_LONG' : 'REVERSE_TO_SHORT';
+      finalSize = await this._requestVeto(projected);
       const targetLevel = newSide === 'LONG' ? this.bullLevel : this.bearLevel;
       const newQty = await this._calculateAdjustedQuantity(this.symbol, finalSize, targetLevel || this.currentPrice, verb);
 
@@ -509,8 +678,7 @@ class AiReversalStrategy extends TradingBase {
       await this.addLog(`[REVERSAL] _performReversal error: ${err.message}`);
     } finally {
       this.executionState = 'IDLE';
-      this._recomputeFinalTpPrice();
-      await this._saveState();
+      await this._postExecuteBookkeeping(verb, { sizeUSDT: finalSize });
     }
   }
 
@@ -526,7 +694,7 @@ class AiReversalStrategy extends TradingBase {
       this.currentPosition = null;
       this.currentSide = null;
       this.subState = 'WAITING';
-      await this._saveState();
+      await this._postExecuteBookkeeping('HARVEST_CLOSE', { reason: reason || null });
       // Immediately request fresh PLAN.
       await this._requestPlan('post_harvest');
     } catch (err) {
@@ -549,7 +717,10 @@ class AiReversalStrategy extends TradingBase {
       this.executionState = 'TERMINATED';
       this.isRunning = false;
       this._stopHeartbeat();
-      await this._saveState();
+      // Clear all background timers since the cycle is over (mirrors stop()).
+      if (this._fundingPollTimeout) { clearTimeout(this._fundingPollTimeout); this._fundingPollTimeout = null; }
+      if (this.listenKeyRefreshInterval) { clearInterval(this.listenKeyRefreshInterval); this.listenKeyRefreshInterval = null; }
+      await this._postExecuteBookkeeping('FINAL_TP_HIT', { exitPrice: this.currentPrice });
       try {
         await sendStrategyCompletionNotification({
           userId: this.userId,
@@ -659,25 +830,67 @@ class AiReversalStrategy extends TradingBase {
   // ——— Trade fill reconciliation ——————————————————————————————————————
 
   /**
-   * Hook called by TradingBase machinery when a trade fill is recorded.
-   * Updates accumulated_loss based on realized PnL + fees, refreshes
-   * currentPosition, recomputes Final TP.
+   * Post-execute bookkeeping hook. Called by each strategy action helper
+   * (_openInitialPosition / _performReversal / _executeHarvest /
+   * _handleFinalTpHit) AFTER `executor.executeAction()` resolves.
+   *
+   * IMPORTANT: TradingBase already updates `accumulatedTradingFees` and
+   * `accumulatedRealizedPnL` automatically when ORDER_TRADE_UPDATE events
+   * arrive on the user-data WS (and via the REST fallback when WS misses).
+   * This hook just recomputes the DERIVED state that depends on those
+   * accumulators — cycleAccumulatedLoss, currentPosition, finalTpPrice —
+   * plus persists a metricsSample + strategyFlow audit-trail record.
+   *
+   * Brief settle delay (~250ms) allows the WS path to deliver before we
+   * read the accumulators. Not strictly necessary — the saveState() at
+   * the end captures whatever state is current — but produces a cleaner
+   * first-trade audit record.
    */
-  async _onTradeRecorded(trade) {
-    const realized = parseFloat(trade.realizedPnl || 0);
-    const commission = parseFloat(trade.commission || 0);
-    this.accumulatedRealizedPnL = (this.accumulatedRealizedPnL || 0) + realized;
-    this.accumulatedTradingFees = (this.accumulatedTradingFees || 0) + commission;
-    // accumulated_loss is a POSITIVE number when in net loss.
-    this.cycleAccumulatedLoss = Math.max(0, -this.accumulatedRealizedPnL + this.accumulatedTradingFees + (this.accumulatedFundingFees || 0));
-    await this._refreshCurrentPosition();
-    this._recomputeFinalTpPrice();
-    await this._saveState();
-    // Per-trade metrics sample (mirrors hedge pattern).
+  async _postExecuteBookkeeping(actionType, extra = {}) {
     try {
-      await this._writeMetricsSample();
+      await new Promise((r) => setTimeout(r, 250));
+      await this._refreshCurrentPosition();
+      this.cycleAccumulatedLoss = Math.max(0,
+        -(this.accumulatedRealizedPnL || 0)
+        + (this.accumulatedTradingFees || 0)
+        + (this.accumulatedFundingFees || 0)
+      );
+      this._recomputeFinalTpPrice();
+      await this.saveState();
+      this._writeMetricsSample().catch(() => {});
+      this._writeStrategyFlow(actionType, extra).catch(() => {});
     } catch (err) {
-      await this.addLog(`[REVERSAL] _writeMetricsSample error: ${err.message}`);
+      console.error(`[REVERSAL] _postExecuteBookkeeping error: ${err.message}`);
+    }
+  }
+
+  /**
+   * Audit-trail record per strategy action. Enables the frontend chart
+   * to correlate fills with the originating verb (OPEN_LONG_AT_LEVEL vs
+   * REVERSE_TO_SHORT vs HARVEST_CLOSE) by timestamp proximity. Mirrors
+   * hedge's strategyFlow subcollection.
+   */
+  async _writeStrategyFlow(actionType, extra = {}) {
+    if (!this.firestore || !this.strategyId) return;
+    try {
+      await this.firestore.collection('strategies').doc(this.strategyId).collection('strategyFlow').add({
+        actionType,
+        side: this.currentSide || null,
+        price: this.currentPrice || null,
+        position: this.currentPosition ? {
+          quantity: this.currentPosition.quantity,
+          entryPrice: this.currentPosition.entryPrice,
+          notional: this.currentPosition.notional,
+        } : null,
+        cycleAccumulatedLoss: this.cycleAccumulatedLoss,
+        reversalCount: this.reversalCount,
+        harvestCount: this.harvestCount,
+        finalTpPrice: this.finalTpPrice,
+        ...extra,
+        timestamp: new Date(),
+      });
+    } catch (err) {
+      console.error(`[REVERSAL] _writeStrategyFlow failed: ${err.message}`);
     }
   }
 
@@ -697,26 +910,100 @@ class AiReversalStrategy extends TradingBase {
 
   // ——— Funding fee polling ————————————————————————————————————————————
 
+  /**
+   * Poll Binance income endpoint for FUNDING_FEE entries since the last
+   * recorded high-water mark. Idempotent: re-running with the same
+   * `_lastFundingPollTs` is a no-op if no new entries. Mirrors
+   * AiHedgeStrategy._pollFundingIncome (ai-hedge-strategy.js:1344-1384).
+   *
+   * On success, advances `_lastFundingPollTs` to the maximum entry time
+   * (NOT Date.now() — that would skip any future entries with
+   * timestamps just before now).
+   */
   async _pollFundingIncome() {
+    if (!this.symbol || !this._lastFundingPollTs) return { added: 0, count: 0 };
     try {
-      const since = this._lastFundingPollTs || (Date.now() - 8 * 60 * 60 * 1000);
-      const items = await this.makeProxyRequest('/fapi/v1/income', 'GET', {
-        symbol: this.symbol,
-        incomeType: 'FUNDING_FEE',
-        startTime: since,
-        limit: 100,
-      }, true, 'futures').catch(() => []);
-      if (Array.isArray(items)) {
-        for (const it of items) {
-          this.accumulatedFundingFees = (this.accumulatedFundingFees || 0) + parseFloat(it.income || 0);
+      const startTime = this._lastFundingPollTs + 1;
+      const incomes = await this.makeProxyRequest(
+        '/fapi/v1/income',
+        'GET',
+        { symbol: this.symbol, incomeType: 'FUNDING_FEE', startTime, limit: 1000 },
+        true,
+        'futures',
+      ) || [];
+
+      if (!Array.isArray(incomes) || incomes.length === 0) return { added: 0, count: 0 };
+
+      let added = 0;
+      let maxTime = this._lastFundingPollTs;
+      for (const entry of incomes) {
+        const v = parseFloat(entry.income);
+        if (Number.isFinite(v)) {
+          added += v;
+          this.accumulatedFundingFees = (this.accumulatedFundingFees || 0) + v;
+          if (entry.time > maxTime) maxTime = entry.time;
         }
       }
-      this._lastFundingPollTs = Date.now();
-      this.cycleAccumulatedLoss = Math.max(0, -this.accumulatedRealizedPnL + this.accumulatedTradingFees + this.accumulatedFundingFees);
+      this._lastFundingPollTs = maxTime;
+
+      // Funding flows into accumulated_loss with the same sign convention
+      // as fees (positive = cost, increases the loss the strategy needs
+      // to recover). negative funding (rebate) reduces loss.
+      this.cycleAccumulatedLoss = Math.max(0,
+        -(this.accumulatedRealizedPnL || 0)
+        + (this.accumulatedTradingFees || 0)
+        + (this.accumulatedFundingFees || 0)
+      );
       this._recomputeFinalTpPrice();
+
+      await this.addLog(
+        `Funding settled: ${added >= 0 ? '+' : ''}${added.toFixed(4)} USDT ` +
+        `(cumulative ${this.accumulatedFundingFees >= 0 ? '+' : ''}${this.accumulatedFundingFees.toFixed(4)} USDT, ${incomes.length} entries)`
+      );
+      await this.saveState();
+      return { added, count: incomes.length };
     } catch (err) {
-      await this.addLog(`[REVERSAL] funding poll error: ${err.message}`);
+      console.error(`[REVERSAL] funding poll error: ${err.message}`);
+      return { added: 0, count: 0, error: err.message };
     }
+  }
+
+  /**
+   * Schedule the next funding-fee poll aligned to the next 8h UTC
+   * settlement boundary + 60s safety buffer. Self-rescheduling.
+   * Cancellable via clearTimeout(this._fundingPollTimeout). Mirrors
+   * AiHedgeStrategy._scheduleNextFundingPoll (ai-hedge-strategy.js:1395-1424).
+   *
+   * If the primary poll at +60s returns zero entries (Binance lagged on
+   * ledgering the settlement), retries once at +5min then resumes the
+   * normal 8h cadence regardless of the retry outcome.
+   */
+  _scheduleNextFundingPoll() {
+    const EIGHT_HOURS_MS = 8 * 60 * 60 * 1000;
+    const SAFETY_BUFFER_MS = 60 * 1000;
+    const RETRY_BUFFER_MS = 5 * 60 * 1000;
+
+    if (this._fundingPollTimeout) {
+      clearTimeout(this._fundingPollTimeout);
+      this._fundingPollTimeout = null;
+    }
+
+    const now = Date.now();
+    const nextSettlement = Math.ceil(now / EIGHT_HOURS_MS) * EIGHT_HOURS_MS;
+    const primaryDelay = Math.max(1000, (nextSettlement - now) + SAFETY_BUFFER_MS);
+
+    this._fundingPollTimeout = setTimeout(async () => {
+      if (!this.isRunning) return;
+      const result = await this._pollFundingIncome();
+      if (this.isRunning && result.count === 0 && !result.error) {
+        this._fundingPollTimeout = setTimeout(async () => {
+          if (this.isRunning) await this._pollFundingIncome();
+          if (this.isRunning) this._scheduleNextFundingPoll();
+        }, RETRY_BUFFER_MS);
+      } else if (this.isRunning) {
+        this._scheduleNextFundingPoll();
+      }
+    }, primaryDelay);
   }
 
   // ——— Heartbeat scheduling ——————————————————————————————————————————
@@ -909,11 +1196,32 @@ class AiReversalStrategy extends TradingBase {
 
   // ——— Firestore persistence ——————————————————————————————————————————
 
-  async _saveState() {
+  /**
+   * Persist the full strategy snapshot to Firestore. Public so resume()
+   * (via app.js recoverActiveStrategies) can find the doc by `type` and
+   * so all lifecycle sites have a single source-of-truth save method.
+   *
+   * Required fields for the bot's boot-time recovery scan:
+   *   - type: 'AI_REVERSAL' (queried by recoverActiveStrategies)
+   *   - isRunning: true while the strategy is alive
+   *   - gcfProxyUrl + sharedVmProxyGcfUrl (C4 — without these resume()
+   *     can't reconstruct the Binance proxy or Anthropic key fetcher)
+   *   - _lastFundingPollTs (so the next poll uses the correct high-water
+   *     mark instead of re-scanning the last 8h)
+   */
+  async saveState() {
     if (!this.firestore || !this.strategyId) return;
     try {
       const doc = {
-        strategyType: 'reversal',
+        // Type tag for the boot-recovery scan.
+        type: 'AI_REVERSAL',
+        strategyType: 'reversal',  // legacy alias; kept for back-compat
+        strategyId: this.strategyId,
+        userId: this.userId,
+        profileId: this.profileId,
+        // C4 — proxy URLs required to reconstruct the strategy after restart.
+        gcfProxyUrl: this.gcfProxyUrl,
+        sharedVmProxyGcfUrl: this.sharedVmProxyGcfUrl,
         symbol: this.symbol,
         isRunning: this.isRunning,
         executionState: this.executionState,
@@ -927,11 +1235,16 @@ class AiReversalStrategy extends TradingBase {
         reversalCount: this.reversalCount,
         harvestCount: this.harvestCount,
         initialCapital: this.initialCapital,
+        initialWalletBalance: this.initialWalletBalance,
         currentInitialSize: this.currentInitialSize,
         accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
         accumulatedTradingFees: this.accumulatedTradingFees || 0,
         accumulatedFundingFees: this.accumulatedFundingFees || 0,
+        // Funding poll baseline — without this, resume() would re-scan
+        // the entire last-8h window and double-count past entries.
+        _lastFundingPollTs: this._lastFundingPollTs,
         activePlan: this.activePlan,
+        lastDecision: this.lastDecision,
         planHistory: this.planHistory.slice(-50),
         cycleStartTime: this.cycleStartTime,
         leverage: this.leverage,
@@ -945,14 +1258,49 @@ class AiReversalStrategy extends TradingBase {
           desiredProfitUSDT: this.desiredProfitUSDT,
           initialSize: this.currentInitialSize,
         },
-        userId: this.userId,
-        profileId: this.profileId,
-        gcfProxyUrl: this.gcfProxyUrl,
+        criticalError: this.criticalError || null,
+        lastUpdated: new Date(),
         updatedAt: Date.now(),
       };
       await this.firestore.collection('strategies').doc(this.strategyId).set(doc, { merge: true });
     } catch (err) {
-      await this.addLog(`[REVERSAL] _saveState error: ${err.message}`);
+      await this.addLog(`[REVERSAL] saveState error: ${err.message}`);
+    }
+  }
+
+  /**
+   * Persist a single AI plan response to the strategies/{id}/aiPlans
+   * subcollection. Mirrors AiHedgeStrategy._savePlanToFirestore so the
+   * /ai-reversal/plan-history endpoint can return a real audit trail.
+   * Stores the consult context (plan / heartbeat / veto) for filtering.
+   */
+  async _savePlanToFirestore(plan, consultContext) {
+    if (!this.firestore || !this.strategyId) return;
+    try {
+      await this.firestore.collection('strategies').doc(this.strategyId).collection('aiPlans').add({
+        consultContext: consultContext || 'plan',
+        plan: {
+          decision: plan.decision || null,
+          bullLevel: plan.bullLevel ?? null,
+          bearLevel: plan.bearLevel ?? null,
+          newInitialSize: plan.newInitialSize ?? null,
+          newSize: plan.newSize ?? null,
+          rationale: plan.rationale || null,
+          confidence: typeof plan.confidence === 'number' ? plan.confidence : null,
+        },
+        usage: plan._usage || null,
+        cycleSnapshot: {
+          currentSide: this.currentSide,
+          reversalCount: this.reversalCount,
+          harvestCount: this.harvestCount,
+          cycleAccumulatedLoss: this.cycleAccumulatedLoss,
+          bullLevel: this.bullLevel,
+          bearLevel: this.bearLevel,
+        },
+        timestamp: new Date(),
+      });
+    } catch (err) {
+      console.error(`Failed to save reversal plan: ${err.message}`);
     }
   }
 }

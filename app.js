@@ -603,8 +603,11 @@ process.on('SIGINT', () => {
 async function recoverActiveStrategies() {
   try {
     console.log('[RECOVERY] Scanning Firestore for orphaned strategies...');
+    // Single query for ALL running strategies; dispatch by strategy type
+    // in code (Firestore doesn't support OR across fields cheaply, and
+    // type-by-id-prefix is a robust forward-compat path that handles
+    // pre-v3.4.0 reversal docs missing the `type` field).
     const snapshot = await firestore.collection('strategies')
-      .where('type', '==', 'AI_HEDGE')
       .where('isRunning', '==', true)
       .get();
 
@@ -625,8 +628,23 @@ async function recoverActiveStrategies() {
         continue;
       }
 
+      // Dispatch by type. Prefer the explicit `type` field; fall back to
+      // strategyId prefix (handles pre-v3.4.0 reversal docs that only had
+      // strategyType: 'reversal' without the canonical type tag).
+      const isReversal = data.type === 'AI_REVERSAL'
+        || data.strategyType === 'reversal'
+        || strategyId.startsWith('ai_reversal_');
+      const isHedge = data.type === 'AI_HEDGE'
+        || strategyId.startsWith('ai_hedge_');
+
+      if (!isReversal && !isHedge) {
+        console.log(`[RECOVERY] Skipping ${strategyId} — unknown strategy type (data.type=${data.type})`);
+        continue;
+      }
+
       try {
-        const strategy = new AiHedgeStrategy(
+        const StrategyClass = isReversal ? AiReversalStrategy : AiHedgeStrategy;
+        const strategy = new StrategyClass(
           data.gcfProxyUrl || null,
           data.profileId,
           data.sharedVmProxyGcfUrl || null
@@ -658,7 +676,8 @@ async function recoverActiveStrategies() {
                 () => _snapshotWallet(strategy).catch(() => {}),
                 WALLET_SNAPSHOT_INTERVAL_MS
               );
-              console.log(`[RECOVERY] ✓ ${strategyId} resumed (symbol=${data.symbol}, phase=${strategy.phase})`);
+              const phaseInfo = strategy.phase || strategy.subState || 'running';
+              console.log(`[RECOVERY] ✓ ${strategyId} resumed (symbol=${data.symbol}, phase=${phaseInfo})`);
             } else {
               console.log(`[RECOVERY] ${strategyId} marked stopped during resume (positions gone or single leg)`);
             }
@@ -1617,6 +1636,27 @@ app.post('/ai-reversal/replan', async (req, res) => {
       strategy._requestPlan('manual_replan').catch(() => {});
     }
     res.json({ success: true, message: 'Replan triggered', strategyId });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Plan-history audit trail for AI Reversal. Reads from
+// strategies/{strategyId}/aiPlans subcollection populated by
+// AiReversalStrategy._savePlanToFirestore on every consult.
+app.get('/ai-reversal/plan-history', async (req, res) => {
+  try {
+    const { strategyId, limit: queryLimit } = req.query;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+
+    const planLimit = parseInt(queryLimit) || 50;
+    const plansRef = firestore.collection('strategies').doc(strategyId).collection('aiPlans');
+    const snapshot = await plansRef.orderBy('timestamp', 'desc').limit(planLimit).get();
+
+    const plans = [];
+    snapshot.forEach(doc => plans.push({ id: doc.id, ...doc.data() }));
+
+    res.json({ plans, count: plans.length });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
