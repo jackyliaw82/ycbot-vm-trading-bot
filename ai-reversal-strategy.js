@@ -87,6 +87,13 @@ class AiReversalStrategy extends TradingBase {
     this.lastDecision = null;               // last heartbeat decision
     this.planHistory = [];
 
+    // Cached volume primitives — refreshed at every AI consult and surfaced
+    // via getStatus() so the frontend chart can overlay POC/VAH/VAL/HVN edges.
+    this._lastVolumeProfile24h = null;
+    this._lastVolumeProfile7d = null;
+    this._lastCvd = null;
+    this._lastOrderbookDepth = null;
+
     // Token usage accumulators
     this.aiTokenUsage = { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheCreation: 0, requests: 0 };
 
@@ -338,6 +345,7 @@ class AiReversalStrategy extends TradingBase {
     await this.addLog(`[REVERSAL] _requestPlan(${reason})`);
     try {
       const ctx = await this.marketContext.buildReversalContext(this._buildStrategyState({ consultContext: 'plan' }));
+      this._cacheVolumeContext(ctx);
       const plan = await this.planner.generatePlan(ctx, 'reversal');
       this._accumulateAiUsage(plan);
       const validation = this.riskGuard.validatePlan(plan, ctx);
@@ -364,6 +372,7 @@ class AiReversalStrategy extends TradingBase {
         consultContext: 'heartbeat',
         harvestEligible,
       }));
+      this._cacheVolumeContext(ctx);
       const plan = await this.planner.generatePlan(ctx, 'reversal');
       this._accumulateAiUsage(plan);
       const validation = this.riskGuard.validatePlan(plan, ctx);
@@ -384,6 +393,7 @@ class AiReversalStrategy extends TradingBase {
         vetoMode: true,
         proposedNewSize,
       }));
+      this._cacheVolumeContext(ctx);
       const plan = await this.planner.generatePlan(ctx, 'reversal');
       this._accumulateAiUsage(plan);
       const validation = this.riskGuard.validatePlan(plan, ctx);
@@ -792,6 +802,19 @@ class AiReversalStrategy extends TradingBase {
     }
   }
 
+  /**
+   * Cache the volume primitives from a freshly-built reversal context so
+   * getStatus() can surface them to the frontend chart. Refreshed at every
+   * AI consult (Context 1 plan, Context 2 heartbeat, Context 3 veto).
+   */
+  _cacheVolumeContext(ctx) {
+    if (!ctx) return;
+    if (ctx.volumeProfile24h !== undefined) this._lastVolumeProfile24h = ctx.volumeProfile24h;
+    if (ctx.volumeProfile7d !== undefined) this._lastVolumeProfile7d = ctx.volumeProfile7d;
+    if (ctx.cvd !== undefined) this._lastCvd = ctx.cvd;
+    if (ctx.orderbookDepth !== undefined) this._lastOrderbookDepth = ctx.orderbookDepth;
+  }
+
   _accumulateAiUsage(plan) {
     if (!plan?._usage) return;
     this.aiTokenUsage.inputTokens += plan._usage.inputTokens || 0;
@@ -874,6 +897,13 @@ class AiReversalStrategy extends TradingBase {
       cycleStartTime: this.cycleStartTime,
       cycleDuration: this.cycleStartTime ? formatDuration(Date.now() - this.cycleStartTime) : null,
       currentPrice: this.currentPrice,
+
+      // Volume primitives — cached at every AI consult by _cacheVolumeContext.
+      // Frontend chart overlays POC / VAH / VAL / HVN edges from these.
+      volumeProfile24h: this._lastVolumeProfile24h,
+      volumeProfile7d: this._lastVolumeProfile7d,
+      cvd: this._lastCvd,
+      orderbookDepth: this._lastOrderbookDepth,
     };
   }
 
