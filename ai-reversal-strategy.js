@@ -57,7 +57,7 @@ class AiReversalStrategy extends TradingBase {
     // Reversal-specific state
     this.strategyType = 'reversal';
     this.currentSide = null;                // 'LONG' | 'SHORT' | null
-    this.currentPosition = null;            // { quantity, entryPrice, notional, unrealizedPnl }
+    this.activePosition = null;            // { quantity, entryPrice, notional, unrealizedPnl }
     this.bullLevel = null;
     this.bearLevel = null;
     this.finalTpPrice = null;
@@ -288,7 +288,7 @@ class AiReversalStrategy extends TradingBase {
 
     // Restore cycle state
     this.currentSide = snapshot.currentSide || null;
-    this.currentPosition = snapshot.currentPosition || null;
+    this.activePosition = snapshot.currentPosition || null;
     this.bullLevel = snapshot.bullLevel || null;
     this.bearLevel = snapshot.bearLevel || null;
     this.finalTpPrice = snapshot.finalTpPrice || null;
@@ -431,7 +431,7 @@ class AiReversalStrategy extends TradingBase {
       this.listenKeyRefreshInterval = null;
     }
 
-    if (flatten && this.currentPosition && this.currentPosition.quantity > 0) {
+    if (flatten && this.activePosition && this.activePosition.quantity > 0) {
       try {
         await this.addLog('[REVERSAL] stop: flattening current position');
         await this.executor.executeAction({ type: 'HARVEST_CLOSE', reason: 'user-stop' });
@@ -476,8 +476,13 @@ class AiReversalStrategy extends TradingBase {
     if (!Number.isFinite(price) || price <= 0) return;
     this.currentPrice = price;
 
+    // Keep the in-memory position's unrealized PnL fresh on every tick.
+    // Cheap (multiplication + sign branch); needed so getStatus() and
+    // Final TP gating see the latest unrealized value.
+    if (this.activePosition) this._updateUnrealizedPnL(price);
+
     // Final TP check — highest priority. If hit, close to flat and terminate cycle.
-    if (this.currentPosition && this.finalTpPrice && this._checkFinalTpHit(price)) {
+    if (this.activePosition && this.finalTpPrice && this._checkFinalTpHit(price)) {
       await this._handleFinalTpHit();
       return;
     }
@@ -523,7 +528,7 @@ class AiReversalStrategy extends TradingBase {
 
   async _requestHeartbeat() {
     if (!this.isRunning || this.executionState === 'TERMINATED') return;
-    if (!this.currentPosition || !this.currentPosition.quantity) return;  // only consult while holding
+    if (!this.activePosition || !this.activePosition.quantity) return;  // only consult while holding
     await this.addLog('[REVERSAL] _requestHeartbeat');
     try {
       const harvestEligible = this._isHarvestEligible();
@@ -691,7 +696,7 @@ class AiReversalStrategy extends TradingBase {
       this.harvestCount += 1;
       // Position fully closed; refresh from Binance to confirm.
       await this._refreshCurrentPosition();
-      this.currentPosition = null;
+      this.activePosition = null;
       this.currentSide = null;
       this.subState = 'WAITING';
       await this._postExecuteBookkeeping('HARVEST_CLOSE', { reason: reason || null });
@@ -711,7 +716,7 @@ class AiReversalStrategy extends TradingBase {
       await this.addLog(`[REVERSAL] Final TP hit at ${this.currentPrice} — closing cycle`);
       await this.executor.executeAction({ type: 'HARVEST_CLOSE', reason: 'final_tp' });
       await this._refreshCurrentPosition();
-      this.currentPosition = null;
+      this.activePosition = null;
       this.currentSide = null;
       this.subState = 'EXITED';
       this.executionState = 'TERMINATED';
@@ -765,7 +770,7 @@ class AiReversalStrategy extends TradingBase {
     const wallet = this.lastWalletSnapshot?.totalMarginBalance || this.initialCapital || 0;
     if (wallet <= 0) return proposedSize;
     const proposedNotional = proposedSize;
-    const usedMargin = (this.currentPosition?.notional || 0) / Math.max(1, this.leverage);
+    const usedMargin = (this.activePosition?.notional || 0) / Math.max(1, this.leverage);
     const proposedMarginUse = proposedNotional / Math.max(1, this.leverage);
     // Pessimistic: assume two more reversals at same proposed size.
     const projectedUsed = usedMargin + proposedMarginUse * 2;
@@ -790,12 +795,12 @@ class AiReversalStrategy extends TradingBase {
    *          price ≤ entryAvg - (accLoss + desiredProfit) / qty
    */
   _recomputeFinalTpPrice() {
-    if (!this.currentPosition || !this.currentPosition.quantity || this.currentPosition.quantity <= 0) {
+    if (!this.activePosition || !this.activePosition.quantity || this.activePosition.quantity <= 0) {
       this.finalTpPrice = null;
       return;
     }
-    const qty = this.currentPosition.quantity;
-    const entry = this.currentPosition.entryPrice || this.currentPosition.avgEntry;
+    const qty = this.activePosition.quantity;
+    const entry = this.activePosition.entryPrice || this.activePosition.avgEntry;
     const needed = (this.cycleAccumulatedLoss || 0) + (this.desiredProfitUSDT || 0);
     if (!entry || qty <= 0) {
       this.finalTpPrice = null;
@@ -820,8 +825,8 @@ class AiReversalStrategy extends TradingBase {
   // ——— Harvest eligibility gate ——————————————————————————————————————
 
   _isHarvestEligible() {
-    if (!this.currentPosition || !this.currentPosition.quantity) return false;
-    const unrealized = this.currentPosition.unrealizedPnl || 0;
+    if (!this.activePosition || !this.activePosition.quantity) return false;
+    const unrealized = this.activePosition.unrealizedPnl || 0;
     if (unrealized <= 0) return false;
     if (this.initialCapital <= 0) return false;
     return this.cycleAccumulatedLoss >= this.harvestLossThreshold * this.initialCapital;
@@ -849,7 +854,16 @@ class AiReversalStrategy extends TradingBase {
   async _postExecuteBookkeeping(actionType, extra = {}) {
     try {
       await new Promise((r) => setTimeout(r, 250));
-      await this._refreshCurrentPosition();
+      // OPEN/REVERSE actions leave a fresh position on Binance; pass
+      // expectNonEmpty so _refreshCurrentPosition retries against REST
+      // lag (Binance's /fapi/v2/account routinely takes 100-500ms to
+      // reflect a market-order fill). HARVEST/FINAL_TP close the
+      // position — expect empty; no retry.
+      const expectNonEmpty = actionType === 'OPEN_LONG_AT_LEVEL'
+        || actionType === 'OPEN_SHORT_AT_LEVEL'
+        || actionType === 'REVERSE_TO_LONG'
+        || actionType === 'REVERSE_TO_SHORT';
+      await this._refreshCurrentPosition(expectNonEmpty);
       this.cycleAccumulatedLoss = Math.max(0,
         -(this.accumulatedRealizedPnL || 0)
         + (this.accumulatedTradingFees || 0)
@@ -877,10 +891,10 @@ class AiReversalStrategy extends TradingBase {
         actionType,
         side: this.currentSide || null,
         price: this.currentPrice || null,
-        position: this.currentPosition ? {
-          quantity: this.currentPosition.quantity,
-          entryPrice: this.currentPosition.entryPrice,
-          notional: this.currentPosition.notional,
+        position: this.activePosition ? {
+          quantity: this.activePosition.quantity,
+          entryPrice: this.activePosition.entryPrice,
+          notional: this.activePosition.notional,
         } : null,
         cycleAccumulatedLoss: this.cycleAccumulatedLoss,
         reversalCount: this.reversalCount,
@@ -899,7 +913,7 @@ class AiReversalStrategy extends TradingBase {
     const sample = {
       t: Date.now(),
       accumulatedLoss: this.cycleAccumulatedLoss,
-      currentSize: this.currentPosition?.notional || 0,
+      currentSize: this.activePosition?.notional || 0,
       reversalCount: this.reversalCount,
       harvestCount: this.harvestCount,
       side: this.currentSide || null,
@@ -1041,7 +1055,7 @@ class AiReversalStrategy extends TradingBase {
     return {
       strategyType: 'reversal',
       currentSide: this.currentSide,
-      currentPosition: this.currentPosition,
+      currentPosition: this.activePosition,
       bullLevel: this.bullLevel,
       bearLevel: this.bearLevel,
       finalTpPrice: this.finalTpPrice,
@@ -1062,31 +1076,94 @@ class AiReversalStrategy extends TradingBase {
     };
   }
 
-  async _refreshCurrentPosition() {
+  /**
+   * Reconcile the in-memory position snapshot against Binance via
+   * TradingBase. CRITICAL: `detectCurrentPosition()` does NOT return
+   * positions — it updates instance fields on the base class:
+   *   this.currentPosition       — STRING 'LONG' | 'SHORT' | 'NONE'
+   *   this.positionEntryPrice    — number
+   *   this.currentPositionQuantity — number (abs value)
+   *   this.positionSize          — number (abs notional)
+   * We read those AFTER awaiting detectCurrentPosition and project them
+   * into our local OBJECT `this.activePosition` (different field name to
+   * avoid the collision with TradingBase's string write on every WS
+   * ACCOUNT_UPDATE event).
+   */
+  /**
+   * Reconcile in-memory position against Binance via TradingBase.
+   *
+   * `expectNonEmpty`: when true (caller knows a position should exist —
+   * post-OPEN, post-REVERSE), retry the REST call up to 5× with 300ms
+   * gaps if the first call returns empty. Binance's /fapi/v2/account
+   * routinely lags a fresh market fill by 100-500ms, so without the
+   * retry we'd persist activePosition=null right after the order
+   * acknowledges, leaving the Firestore doc + frontend in a stale
+   * "no position" state until the next tick or external trigger.
+   * Mirrors AiHedgeStrategy._refreshHedgePositions (ai-hedge-strategy.js:1268).
+   */
+  async _refreshCurrentPosition(expectNonEmpty = false) {
     try {
-      const positions = await this.detectCurrentPosition(true);
-      // In one-way mode there's a single net position; find the one for our symbol.
-      const pos = Array.isArray(positions)
-        ? positions.find(p => p.symbol === this.symbol)
-        : positions;
-      if (pos && Math.abs(parseFloat(pos.positionAmt)) > 0) {
-        const qty = Math.abs(parseFloat(pos.positionAmt));
-        const side = parseFloat(pos.positionAmt) > 0 ? 'LONG' : 'SHORT';
-        this.currentPosition = {
+      await this.detectCurrentPosition(true);
+      let side = this.currentPosition;
+      let qty = this.currentPositionQuantity;
+      let entryPrice = this.positionEntryPrice;
+
+      const hasPosition = (side === 'LONG' || side === 'SHORT')
+        && qty && qty > 0
+        && Number.isFinite(entryPrice) && entryPrice > 0;
+
+      if (expectNonEmpty && !hasPosition) {
+        for (let attempt = 1; attempt <= 5; attempt++) {
+          console.log(`[REVERSAL] _refreshCurrentPosition: REST returned empty post-trade; retry ${attempt}/5 after 300ms`);
+          await new Promise((r) => setTimeout(r, 300));
+          await this.detectCurrentPosition(true);
+          side = this.currentPosition;
+          qty = this.currentPositionQuantity;
+          entryPrice = this.positionEntryPrice;
+          if ((side === 'LONG' || side === 'SHORT') && qty && qty > 0 && Number.isFinite(entryPrice) && entryPrice > 0) {
+            console.log(`[REVERSAL] _refreshCurrentPosition: REST resolved non-empty on attempt ${attempt}/5`);
+            break;
+          }
+        }
+      }
+
+      if ((side === 'LONG' || side === 'SHORT') && qty && qty > 0 && Number.isFinite(entryPrice) && entryPrice > 0) {
+        const notional = qty * entryPrice;
+        this.activePosition = {
           quantity: qty,
-          entryPrice: parseFloat(pos.entryPrice),
-          avgEntry: parseFloat(pos.entryPrice),
-          notional: qty * parseFloat(pos.entryPrice),
-          unrealizedPnl: parseFloat(pos.unRealizedProfit || 0),
+          entryPrice,
+          avgEntry: entryPrice,
+          notional,
+          unrealizedPnl: 0,
         };
         this.currentSide = side;
-      } else {
-        this.currentPosition = null;
-        this.currentSide = null;
+        if (Number.isFinite(this.currentPrice) && this.currentPrice > 0) {
+          this._updateUnrealizedPnL(this.currentPrice);
+        }
+        return;
       }
+
+      // No position (or REST kept returning empty after retries).
+      this.activePosition = null;
+      this.currentSide = null;
     } catch (err) {
       await this.addLog(`[REVERSAL] _refreshCurrentPosition error: ${err.message}`);
     }
+  }
+
+  /**
+   * Recompute unrealized PnL on the active position from the latest
+   * mark price. LONG: (price - entry) × qty; SHORT: (entry - price) × qty.
+   * Cheap — called from handleRealtimePrice on every tick and at the end
+   * of _postExecuteBookkeeping. Result is written to activePosition.unrealizedPnl.
+   */
+  _updateUnrealizedPnL(currentPrice) {
+    if (!this.activePosition || !Number.isFinite(currentPrice) || currentPrice <= 0) return;
+    const { quantity, entryPrice } = this.activePosition;
+    if (!Number.isFinite(quantity) || !Number.isFinite(entryPrice) || quantity <= 0 || entryPrice <= 0) return;
+    const direction = this.currentSide === 'LONG' ? 1 : this.currentSide === 'SHORT' ? -1 : 0;
+    if (direction === 0) return;
+    this.activePosition.unrealizedPnl = (currentPrice - entryPrice) * quantity * direction;
   }
 
   /**
@@ -1164,7 +1241,7 @@ class AiReversalStrategy extends TradingBase {
       executionState: this.executionState,
       subState: this.subState,
       currentSide: this.currentSide,
-      currentPosition: this.currentPosition,
+      currentPosition: this.activePosition,
       bullLevel: this.bullLevel,
       bearLevel: this.bearLevel,
       finalTpPrice: this.finalTpPrice,
@@ -1227,7 +1304,7 @@ class AiReversalStrategy extends TradingBase {
         executionState: this.executionState,
         subState: this.subState,
         currentSide: this.currentSide,
-        currentPosition: this.currentPosition,
+        currentPosition: this.activePosition,
         bullLevel: this.bullLevel,
         bearLevel: this.bearLevel,
         finalTpPrice: this.finalTpPrice,

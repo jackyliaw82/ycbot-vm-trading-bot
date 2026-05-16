@@ -389,7 +389,9 @@ class AiPlanExecutor {
   //
   // One-way position mode: positionSide is always 'BOTH'. Reversal verbs
   // bypass the LONG/SHORT clamping logic used by hedge CUT actions; clamps
-  // happen here using strategy.currentPosition.quantity.
+  // happen here using strategy.activePosition.quantity (the OBJECT
+  // representation; strategy.currentPosition is the STRING side from
+  // TradingBase's `detectCurrentPosition`).
 
   /**
    * OPEN_LONG_AT_LEVEL / OPEN_SHORT_AT_LEVEL — initial entry or post-harvest
@@ -434,7 +436,11 @@ class AiPlanExecutor {
     const symbol = strategy.symbol;
     const isToLong = action.type === 'REVERSE_TO_LONG';
     const fromSide = isToLong ? 'SHORT' : 'LONG';
-    const currentPos = strategy.currentPosition;
+    // Reversal stores its position OBJECT on `activePosition` to avoid
+    // colliding with TradingBase's `currentPosition` (which is the
+    // STRING 'LONG'|'SHORT'|'NONE' that gets overwritten on every WS
+    // ACCOUNT_UPDATE event).
+    const currentPos = strategy.activePosition;
 
     if (!currentPos || !currentPos.quantity || currentPos.quantity <= 0) {
       throw new Error(`Cannot ${action.type}: no current ${fromSide} position to reverse`);
@@ -476,7 +482,9 @@ class AiPlanExecutor {
   async _executeHarvestClose(action) {
     const strategy = this.strategy;
     const symbol = strategy.symbol;
-    const currentPos = strategy.currentPosition;
+    // See _executeReverse — reversal's position OBJECT lives on
+    // activePosition; currentPosition on the base class is a STRING.
+    const currentPos = strategy.activePosition;
     const currentSide = strategy.currentSide;
 
     if (!currentPos || !currentPos.quantity || currentPos.quantity <= 0) {
