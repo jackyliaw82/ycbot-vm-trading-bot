@@ -368,6 +368,15 @@ class AiReversalStrategy extends TradingBase {
 
     this._startWebSocketHealthMonitoring();
 
+    // L3 catch-up: sweep any fills Binance executed during VM downtime
+    // BEFORE the next scheduled listenKey refresh (30 min) does it
+    // automatically. Mirrors hedge's resume() pattern at
+    // ai-hedge-strategy.js:571. Best-effort; swallow errors — the
+    // automatic 30-min L3 will catch anything we miss here.
+    this._reconcileRecentTrades().catch((err) => {
+      console.error(`[REVERSAL] L3 reconcile on resume failed: ${err.message}`);
+    });
+
     // Reconcile position from Binance (source of truth).
     await this.detectCurrentPosition(true);
     await this._refreshCurrentPosition();
