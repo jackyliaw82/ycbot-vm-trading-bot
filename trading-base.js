@@ -364,6 +364,7 @@ class TradingBase {
         let totalCommission = 0;
         let totalRealizedPnl = 0;
         let lastCommissionAsset = 'USDT';
+        let maxFillTime = 0;
 
         for (const fill of fills) {
           // Re-check dedup per-fill in case WS arrived mid-loop.
@@ -373,6 +374,7 @@ class TradingBase {
           totalCommission += commission;
           totalRealizedPnl += realizedPnl;
           lastCommissionAsset = fill.commissionAsset || 'USDT';
+          if (fill.time && fill.time > maxFillTime) maxFillTime = fill.time;
           await this.saveTrade({
             tradeId: fill.id,
             orderId: fill.orderId,
@@ -405,6 +407,11 @@ class TradingBase {
             if (positionSide === 'LONG') this.longAccumulatedRealizedPnL += totalRealizedPnl;
             else if (positionSide === 'SHORT') this.shortAccumulatedRealizedPnL += totalRealizedPnl;
           }
+          // Advance the persisted watermark so post-restart L3 reconcile
+          // does not re-pull these fills against the snapshot.
+          if (maxFillTime > 0) {
+            this._lastReconciliationAt = Math.max(this._lastReconciliationAt || 0, maxFillTime);
+          }
           // Mark so a slow WS event can't re-double-count later.
           this._wsHandledOrderIds.set(orderId, Date.now());
           this._restFallbackCount++;
@@ -432,8 +439,12 @@ class TradingBase {
   async _reconcileRecentTrades() {
     if (!this.isRunning) return;
     if (!this.symbol) return;
+    // +1ms makes startTime strictly greater than the last accumulated fill —
+    // Binance's userTrades startTime is inclusive, so without the +1 we'd
+    // re-pull the very fill whose effects are already in the accumulators.
     const startTime = this._lastReconciliationAt
-      || (this.strategyStartTime ? new Date(this.strategyStartTime).getTime() : Date.now() - 30 * 60 * 1000);
+      ? this._lastReconciliationAt + 1
+      : (this.strategyStartTime ? new Date(this.strategyStartTime).getTime() : Date.now() - 30 * 60 * 1000);
     const endTime = Date.now();
 
     try {
@@ -488,6 +499,9 @@ class TradingBase {
           this.accumulatedRealizedPnL += realizedPnl;
           if (positionSide === 'LONG') this.longAccumulatedRealizedPnL += realizedPnl;
           else if (positionSide === 'SHORT') this.shortAccumulatedRealizedPnL += realizedPnl;
+        }
+        if (fill.time) {
+          this._lastReconciliationAt = Math.max(this._lastReconciliationAt || 0, fill.time);
         }
         this._wsHandledOrderIds.set(fill.orderId, Date.now());
         recoveredCount++;
@@ -1804,6 +1818,12 @@ class TradingBase {
           if (orderPositionSide === 'LONG') this.longTradingFees += commission;
           else if (orderPositionSide === 'SHORT') this.shortTradingFees += commission;
         }
+
+        // Watermark: latest fill time whose effects are now in the accumulators.
+        // Persisted via saveState so post-restart L3 reconcile skips fills
+        // already counted in the restored snapshot (prevents fee double-count).
+        const fillTime = order.T || Date.now();
+        this._lastReconciliationAt = Math.max(this._lastReconciliationAt || 0, fillTime);
 
         await this.saveTrade({
           tradeId: order.t,                      // Binance trade ID — unique per fill (differs across partial fills of one order)

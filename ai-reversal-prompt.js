@@ -19,7 +19,7 @@ This is a volume-driven, single-sided reversal strategy:
     Additional size    = Recovery size / recovery_distance     (default 0.5%)
     New size           = Initial size + Additional size
 - accumulated_loss = -(Σ realized PnL) + Σ trading fees + Σ funding fees
-- Final TP price is the price at which (realized + unrealized PnL) ≥ accumulated_loss + desired_profit. Recalculated after every event. When Final TP price is touched, the cycle ends successfully.
+- Final TP price is the price at which (realized + unrealized PnL) ≥ accumulated_loss + desired_profit + ai_consult_cost. AI consult cost is the running DeepSeek/Anthropic USD spend across all consults in this cycle — the cycle's true breakeven includes it. Recalculated after every event AND after every AI consult. When Final TP price is touched, the cycle ends successfully.
 
 CORE INTUITION: pick bullLevel/bearLevel that have LOW reversal probability — i.e., levels which, once breached, price is likely to continue through rather than whipsaw. The "low reversal probability" zone is the edge of a High Volume Node (HVN) facing a Low Volume Node (LVN void). Volume profile is the primary tool.
 

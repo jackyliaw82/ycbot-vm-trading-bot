@@ -412,6 +412,12 @@ class AiHedgeStrategy extends TradingBase {
     this.accumulatedFundingFees = snapshot.accumulatedFundingFees || 0;
     this._lastFundingPollTs = snapshot._lastFundingPollTs || this.strategyStartTime.getTime();
 
+    // L3-reconcile watermark — restore so the post-resume L3 sweep starts
+    // from the latest fill already in the accumulators (not from cycle
+    // start, which would double-count every historical commission/realizedPnL
+    // on top of the just-restored snapshot accumulators).
+    this._lastReconciliationAt = snapshot._lastReconciliationAt || null;
+
     // L5c: restore ATR baseline. If absent (pre-L5 snapshot), best-effort
     // refetch happens just below — we don't want pre-L5 strategies to
     // suddenly start scaling on resume against an undefined baseline.
@@ -1503,6 +1509,10 @@ class AiHedgeStrategy extends TradingBase {
         accumulatedTradingFees: this.accumulatedTradingFees,
         accumulatedFundingFees: this.accumulatedFundingFees,
         _lastFundingPollTs: this._lastFundingPollTs,
+        // L3-reconcile watermark — latest fill time already accumulated.
+        // Without persistence, every VM restart re-pulls all historical
+        // fills and doubles accumulatedTradingFees / accumulatedRealizedPnL.
+        _lastReconciliationAt: this._lastReconciliationAt || null,
         _atrPctAtStart: this._atrPctAtStart,
         longAccumulatedRealizedPnL: this.longAccumulatedRealizedPnL,
         shortAccumulatedRealizedPnL: this.shortAccumulatedRealizedPnL,

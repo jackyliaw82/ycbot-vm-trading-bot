@@ -103,6 +103,10 @@ class AiReversalStrategy extends TradingBase {
     this._lastVolumeProfile7d = null;
     this._lastCvd = null;
     this._lastOrderbookDepth = null;
+    // ATR / volatility snapshot — feeds the Volume Analytics panel's ATR
+    // cell. Populated by _cacheVolumeContext on every AI consult; mirrors
+    // hedge's _lastVolatility pattern.
+    this._lastVolatility = null;
 
     // Token usage accumulators
     this.aiTokenUsage = { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheCreation: 0, requests: 0 };
@@ -346,6 +350,13 @@ class AiReversalStrategy extends TradingBase {
     // pre-v3.4.0 snapshots that didn't persist this field.
     this._lastFundingPollTs = snapshot._lastFundingPollTs || this.cycleStartTime;
 
+    // L3-reconcile watermark — restore so the post-resume L3 sweep starts
+    // FROM the latest fill already in the accumulators, not from cycle
+    // start. Pre-v3.7.0 snapshots leave this null; the strategyStartTime
+    // fallback inside _reconcileRecentTrades absorbs that one final
+    // double-count, after which saveState persists the field going forward.
+    this._lastReconciliationAt = snapshot._lastReconciliationAt || null;
+
     // AI continuity. planHistory restored as-is; activePlan restored only
     // if a position is currently held (otherwise we're in WAITING and a
     // fresh plan will arrive on the next heartbeat anyway).
@@ -443,6 +454,24 @@ class AiReversalStrategy extends TradingBase {
     // resumed position. If we're in WAITING with no position, the
     // first price tick (or manual replan) will trigger a fresh PLAN.
     this._startHeartbeat();
+
+    // Volume analytics live on _lastVolumeProfile24h/7d/_lastCvd/
+    // _lastOrderbookDepth, populated only by _cacheVolumeContext() inside
+    // an AI consult. Those fields are intentionally not persisted (stale
+    // on resume anyway), so the running view's Volume Analytics panel
+    // sits empty until the next consult — up to 5 min for in-position,
+    // potentially hours for WAITING. Mirror start()'s immediate-consult
+    // pattern so the panel populates within seconds. DeepSeek's prefix
+    // cache absorbs most of the input-token cost.
+    if (this.activePosition) {
+      this._requestHeartbeat().catch((err) => {
+        this.addLog(`[RECOVERY] immediate heartbeat failed: ${err.message}`).catch(() => {});
+      });
+    } else {
+      this._requestPlan('resume_recovery').catch((err) => {
+        this.addLog(`[RECOVERY] immediate plan failed: ${err.message}`).catch(() => {});
+      });
+    }
   }
 
   /**
@@ -901,12 +930,18 @@ class AiReversalStrategy extends TradingBase {
 
   /**
    * Final TP price — solves for price where unrealized PnL on the current
-   * position covers accumulated_loss + desired_profit.
+   * position covers accumulated_loss + desired_profit + ai_consult_cost.
    *
-   *   LONG:  qty × (price - entryAvg) ≥ accLoss + desiredProfit
-   *          price ≥ entryAvg + (accLoss + desiredProfit) / qty
-   *   SHORT: qty × (entryAvg - price) ≥ accLoss + desiredProfit
-   *          price ≤ entryAvg - (accLoss + desiredProfit) / qty
+   *   needed = accLoss + desiredProfit + aiCost
+   *   LONG:  qty × (price - entryAvg) ≥ needed
+   *          price ≥ entryAvg + needed / qty
+   *   SHORT: qty × (entryAvg - price) ≥ needed
+   *          price ≤ entryAvg - needed / qty
+   *
+   * AI cost is folded in so the cycle exits at TRUE breakeven-plus-profit
+   * including the running DeepSeek/Anthropic consult cost. Recomputed after
+   * every event AND after every AI consult (via _accumulateAiUsage) so the
+   * target rises in lock-step with cost growth.
    */
   _recomputeFinalTpPrice() {
     if (!this.activePosition || !this.activePosition.quantity || this.activePosition.quantity <= 0) {
@@ -915,7 +950,8 @@ class AiReversalStrategy extends TradingBase {
     }
     const qty = this.activePosition.quantity;
     const entry = this.activePosition.entryPrice || this.activePosition.avgEntry;
-    const needed = (this.cycleAccumulatedLoss || 0) + (this.desiredProfitUSDT || 0);
+    const aiCost = typeof this.getAiUsageCost === 'function' ? (this.getAiUsageCost() || 0) : 0;
+    const needed = (this.cycleAccumulatedLoss || 0) + (this.desiredProfitUSDT || 0) + aiCost;
     if (!entry || qty <= 0) {
       this.finalTpPrice = null;
       return;
@@ -1291,6 +1327,7 @@ class AiReversalStrategy extends TradingBase {
     if (ctx.volumeProfile7d !== undefined) this._lastVolumeProfile7d = ctx.volumeProfile7d;
     if (ctx.cvd !== undefined) this._lastCvd = ctx.cvd;
     if (ctx.orderbookDepth !== undefined) this._lastOrderbookDepth = ctx.orderbookDepth;
+    if (ctx.volatility !== undefined) this._lastVolatility = ctx.volatility;
   }
 
   _accumulateAiUsage(plan) {
@@ -1300,6 +1337,9 @@ class AiReversalStrategy extends TradingBase {
     this.aiTokenUsage.cacheRead += plan._usage.cacheRead || 0;
     this.aiTokenUsage.cacheCreation += plan._usage.cacheCreation || 0;
     this.aiTokenUsage.requests += 1;
+    // Final TP target includes AI consult cost — recompute so the price
+    // creeps up in lock-step with token spend, not just on trades/funding.
+    this._recomputeFinalTpPrice();
   }
 
   /**
@@ -1424,6 +1464,8 @@ class AiReversalStrategy extends TradingBase {
       volumeProfile7d: this._lastVolumeProfile7d,
       cvd: this._lastCvd,
       orderbookDepth: this._lastOrderbookDepth,
+      // ATR / volatility — feeds the Volume Analytics panel's ATR cell.
+      volatility: this._lastVolatility,
     };
   }
 
@@ -1476,6 +1518,12 @@ class AiReversalStrategy extends TradingBase {
         // Funding poll baseline — without this, resume() would re-scan
         // the entire last-8h window and double-count past entries.
         _lastFundingPollTs: this._lastFundingPollTs,
+        // L3-reconcile watermark — latest fill time whose effects are
+        // already in accumulatedTradingFees / accumulatedRealizedPnL.
+        // Without persistence, resume() would default to strategyStartTime
+        // and L3 would re-add every historical fill on top of the restored
+        // accumulators (fee/realized-PnL doubling on every VM restart).
+        _lastReconciliationAt: this._lastReconciliationAt || null,
         activePlan: this.activePlan,
         lastDecision: this.lastDecision,
         planHistory: this.planHistory.slice(-50),
