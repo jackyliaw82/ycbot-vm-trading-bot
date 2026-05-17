@@ -349,6 +349,13 @@ class AiPlanner {
     this.model = model;
     this.provider = isDeepseek ? 'deepseek' : 'anthropic';
     this.maxRetries = 3;
+    // One-shot diagnostic flag — first successful consult logs the raw
+    // response.usage shape so we can verify which cache-hit fields the
+    // provider populates (esp. DeepSeek's Anthropic-compatible endpoint:
+    // Anthropic-style `cache_read_input_tokens` vs DeepSeek-native
+    // `prompt_cache_hit_tokens`). Stays false after first log to keep
+    // production logs clean.
+    this._loggedUsageShape = false;
   }
 
   async generatePlan(context, strategyType = 'hedge') {
@@ -414,12 +421,36 @@ class AiPlanner {
           plan._schema = 'paired';
         }
 
-        // Attach token usage for cost tracking
+        // One-shot diagnostic — log the raw usage shape on the first
+        // successful consult per AiPlanner instance. Tells us exactly
+        // which cache-hit field name the provider populates (esp. on
+        // DeepSeek's Anthropic-compatible endpoint where it's
+        // undocumented whether they map to Anthropic naming or keep
+        // DeepSeek-native naming). Fires once per cycle.
+        if (!this._loggedUsageShape) {
+          this._loggedUsageShape = true;
+          console.log(
+            `[ai-planner] usage shape (${this.provider}/${this.model}): ` +
+            JSON.stringify(response.usage ?? null)
+          );
+        }
+
+        // Attach token usage for cost tracking. Defensive read: tries
+        // Anthropic-style `cache_read_input_tokens` first (works for
+        // both Anthropic Claude and likely DeepSeek's Anthropic
+        // endpoint), then falls back to DeepSeek-native
+        // `prompt_cache_hit_tokens`. Cost calc credits whichever
+        // wins, so the discount flows through regardless of which
+        // naming convention is used.
+        const usage = response.usage || {};
         plan._usage = {
-          inputTokens: response.usage?.input_tokens || 0,
-          outputTokens: response.usage?.output_tokens || 0,
-          cacheRead: response.usage?.cache_read_input_tokens || 0,
-          cacheCreation: response.usage?.cache_creation_input_tokens || 0,
+          inputTokens: usage.input_tokens ?? 0,
+          outputTokens: usage.output_tokens ?? 0,
+          cacheRead:
+            usage.cache_read_input_tokens
+            ?? usage.prompt_cache_hit_tokens
+            ?? 0,
+          cacheCreation: usage.cache_creation_input_tokens ?? 0,
         };
         return plan;
 

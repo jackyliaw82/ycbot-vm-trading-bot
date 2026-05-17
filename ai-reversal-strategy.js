@@ -1389,6 +1389,20 @@ class AiReversalStrategy extends TradingBase {
       initialCapital: this.initialCapital,
       currentInitialSize: this.currentInitialSize,
       desiredProfitUSDT: this.desiredProfitUSDT,
+      // Running config — surfaced so the frontend's Active Config panel
+      // can show the values the bot is ACTUALLY using rather than the
+      // form's DEFAULT_CONFIG (which is what reversal's frontend used
+      // to read, producing a wrong picture when a strategy was started
+      // with non-default settings and the user later refreshed the page).
+      leverage: this.leverage,
+      priceType: this.priceType,
+      aiModel: this.aiModel,
+      recoveryFactor: this.recoveryFactor,
+      recoveryDistance: this.recoveryDistance,
+      harvestLossThreshold: this.harvestLossThreshold,
+      maxPositionSizeUSDT: this.maxPositionSizeUSDT,
+      recoveryFactorDecay: this.recoveryFactorDecay,
+      recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
