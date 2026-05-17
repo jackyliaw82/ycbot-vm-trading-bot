@@ -446,6 +446,7 @@ class TradingBase {
       ? this._lastReconciliationAt + 1
       : (this.strategyStartTime ? new Date(this.strategyStartTime).getTime() : Date.now() - 30 * 60 * 1000);
     const endTime = Date.now();
+    console.log(`[RECONCILE] sweep ${this.strategyId || ''}: startTime=${startTime} (_lastReconciliationAt=${this._lastReconciliationAt}) endTime=${endTime} dedup.size=${this._wsHandledOrderIds.size}`);
 
     try {
       const fills = await this.makeProxyRequest(
@@ -463,9 +464,10 @@ class TradingBase {
       let recoveredCount = 0;
       let recoveredCommission = 0;
       let recoveredRealizedPnl = 0;
+      let skippedCount = 0;
 
       for (const fill of fills) {
-        if (this._wsHandledOrderIds.has(fill.orderId)) continue;
+        if (this._wsHandledOrderIds.has(fill.orderId)) { skippedCount++; continue; }
 
         const commission = parseFloat(fill.commission) || 0;
         const realizedPnl = parseFloat(fill.realizedPnl) || 0;
@@ -510,11 +512,54 @@ class TradingBase {
       }
 
       this._lastReconciliationAt = endTime;
+      console.log(`[RECONCILE] sweep ${this.strategyId || ''}: fills.length=${fills.length} skipped(dedup)=${skippedCount} recovered=${recoveredCount} (fees=${recoveredCommission.toFixed(6)}, realizedPnl=${recoveredRealizedPnl.toFixed(6)})`);
       if (recoveredCount > 0) {
         await this.addLog(`[RECONCILE] Recovered ${recoveredCount} fill(s) missed by L1+L2. fees=${recoveredCommission.toFixed(4)}, realizedPnl=${recoveredRealizedPnl.toFixed(4)}`);
       }
     } catch (err) {
       await this.addLog(`ERROR: [RECONCILE] failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * Resume-time preload: seed _wsHandledOrderIds from the strategy's
+   * Firestore trades subcollection so the post-resume L3 sweep correctly
+   * skips fills that are already in the persisted accumulators.
+   *
+   * Why this exists on top of the _lastReconciliationAt watermark:
+   * The watermark relies on WS `order.T` matching userTrades `time` to
+   * the millisecond. In practice we've observed cases where the same
+   * fill returns from /userTrades with a `time` strictly greater than
+   * the WS-captured `T` for that fill — so startTime = watermark+1
+   * still pulls it back and L3 double-counts. Order-ID dedup is
+   * authoritative: every fill we've already accumulated has an
+   * idempotent doc in trades/{tradeId} with its orderId field, so
+   * preloading those IDs makes L3 dedup correct regardless of clock
+   * drift in Binance's two endpoints. Coarse per-orderId (multiple
+   * fills of the same order share an ID) is a known limitation —
+   * single-fill orders are the overwhelming majority.
+   */
+  async _preloadWsHandledOrderIdsFromFirestore() {
+    if (!this.tradesCollectionRef) return;
+    try {
+      const snap = await this.tradesCollectionRef
+        .orderBy('time', 'desc')
+        .limit(1000)
+        .get();
+      let count = 0;
+      snap.forEach(doc => {
+        const data = doc.data();
+        if (data?.orderId != null) {
+          this._wsHandledOrderIds.set(data.orderId, Date.now());
+          count++;
+        }
+      });
+      console.log(`[RECOVERY] Preloaded ${count} orderId(s) from trades/ subcollection into WS dedup map (strategyId=${this.strategyId || ''})`);
+      if (count > 0) {
+        await this.addLog(`[RECOVERY] Preloaded ${count} orderId(s) for L3 dedup`);
+      }
+    } catch (err) {
+      console.error(`[RECOVERY] _preloadWsHandledOrderIdsFromFirestore failed: ${err.message}`);
     }
   }
 

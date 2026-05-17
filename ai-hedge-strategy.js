@@ -592,6 +592,11 @@ class AiHedgeStrategy extends TradingBase {
     await this._pollFundingIncome();
     this._scheduleNextFundingPoll();
 
+    // Preload orderId dedup map from Firestore trades/ subcollection BEFORE
+    // L3 reconcile fires. Without this, the empty in-memory map causes L3 to
+    // re-add every historical fill on top of the restored accumulators.
+    await this._preloadWsHandledOrderIdsFromFirestore();
+
     // #5: immediate L3 reconcile pass to catch per-fill trade records that
     // L1 (WS user-data stream) or L2 (deferred REST fallback) missed if the
     // bot died mid-stream. Without this, missed fills wait ~30 min for the

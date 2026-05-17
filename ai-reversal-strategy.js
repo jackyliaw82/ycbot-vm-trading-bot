@@ -419,6 +419,15 @@ class AiReversalStrategy extends TradingBase {
 
     this._startWebSocketHealthMonitoring();
 
+    // Preload _wsHandledOrderIds from Firestore trades subcollection BEFORE
+    // L3 reconcile fires. The in-memory dedup map is empty on every restart;
+    // without this preload, L3 sees every historical fill as "unhandled"
+    // and re-adds commission/realizedPnL on top of the restored accumulators
+    // (fee/realizedPnL doubling — observed regression of the v3.7.0 watermark
+    // fix when WS T and userTrades.time drift apart). Awaited (not fire-and-
+    // forget) so the map is populated before reconcile reads it.
+    await this._preloadWsHandledOrderIdsFromFirestore();
+
     // L3 catch-up: sweep any fills Binance executed during VM downtime
     // BEFORE the next scheduled listenKey refresh (30 min) does it
     // automatically. Mirrors hedge's resume() pattern at
