@@ -146,6 +146,10 @@ class AiReversalStrategy extends TradingBase {
     this.desiredProfitUSDT = config.desiredProfitUSDT || 0;
     this.currentInitialSize = config.initialSize || 0;
     this.maxPositionSizeUSDT = config.maxPositionSizeUSDT || (this.currentInitialSize * 10);
+    // Advanced toggles — currently advisory (sizing math doesn't act on them
+    // yet) but stored so the startup log reflects what the form sent.
+    this.recoveryFactorDecay = !!config.recoveryFactorDecay;
+    this.recoveryDistanceAutoWiden = !!config.recoveryDistanceAutoWiden;
 
     if (!this.symbol) throw new Error('AiReversalStrategy.start: missing symbol');
     if (!this.currentInitialSize || this.currentInitialSize <= 0) {
@@ -162,7 +166,20 @@ class AiReversalStrategy extends TradingBase {
       : await this._fetchAnthropicApiKey();
 
     await this.addLog(`Starting AI Reversal Strategy for ${this.symbol}...`);
-    await this.addLog(`Config: initialSize=${this.currentInitialSize} USDT, leverage=${this.leverage}x, maxPos=${this.maxPositionSizeUSDT} USDT, model=${this.aiModel}`);
+    // Surface EVERY config field — used to verify the form values made it
+    // through to the VM untouched. Three groups separated by `|` for
+    // readability: identity/sizing | recovery knobs | advanced toggles.
+    await this.addLog(
+      `Config: symbol=${this.symbol}, initialSize=${this.currentInitialSize} USDT, ` +
+      `leverage=${this.leverage}x, maxPos=${this.maxPositionSizeUSDT} USDT, ` +
+      `priceType=${this.priceType}, model=${this.aiModel} ` +
+      `| recoveryFactor=${(this.recoveryFactor * 100).toFixed(0)}%, ` +
+      `recoveryDistance=${(this.recoveryDistance * 100).toFixed(2)}%, ` +
+      `harvestLossThreshold=${(this.harvestLossThreshold * 100).toFixed(0)}%, ` +
+      `desiredProfitUSDT=${this.desiredProfitUSDT} ` +
+      `| recoveryFactorDecay=${this.recoveryFactorDecay ? 'on' : 'off'}, ` +
+      `recoveryDistanceAutoWiden=${this.recoveryDistanceAutoWiden ? 'on' : 'off'}`
+    );
 
     try {
       await this.setLeverage(this.symbol, this.leverage);
@@ -214,11 +231,12 @@ class AiReversalStrategy extends TradingBase {
     this.subState = 'INITIAL';
     this.executionState = 'PLANNING';
 
-    // WebSocket setup — same pattern as hedge (listen key first, then streams).
+    // WebSocket setup — listen key first, then user-data + realtime price.
+    // No liquidation WS: reversal's AI consult / sizing math never reads
+    // liquidation data (unlike hedge). One less stream to keep alive.
     await this._retryListenKeyRequest(false);
     this.connectUserDataStream();
     this.connectRealtimeWebSocket();
-    this.connectLiquidationWebSocket();
 
     // Periodic listen key refresh — keeps user data stream alive.
     this.listenKeyRefreshInterval = setInterval(() => {
@@ -300,6 +318,9 @@ class AiReversalStrategy extends TradingBase {
     this.harvestLossThreshold = snapshot.config?.harvestLossThreshold ?? HARVEST_LOSS_THRESHOLD_PCT;
     this.desiredProfitUSDT = snapshot.config?.desiredProfitUSDT || 0;
     this.currentInitialSize = snapshot.currentInitialSize || snapshot.config?.initialSize || 0;
+    // Restore advanced toggles too (advisory, but tracked for log parity).
+    this.recoveryFactorDecay = !!snapshot.config?.recoveryFactorDecay;
+    this.recoveryDistanceAutoWiden = !!snapshot.config?.recoveryDistanceAutoWiden;
 
     // Restore cycle state
     this.currentSide = snapshot.currentSide || null;
@@ -374,12 +395,12 @@ class AiReversalStrategy extends TradingBase {
     this.isRunning = true;
 
     // WS lifecycle — listen-key request FIRST (avoids stale-key races),
-    // then user-data stream, then realtime + liquidation feeds, then
-    // refresh interval + health monitor.
+    // then user-data stream, then realtime price feed, then refresh
+    // interval + health monitor. No liquidation WS: reversal's AI consult
+    // and sizing math never read liquidation data (unlike hedge).
     await this._retryListenKeyRequest(false);
     this.connectUserDataStream();
     this.connectRealtimeWebSocket();
-    this.connectLiquidationWebSocket();
 
     this.listenKeyRefreshInterval = setInterval(() => {
       this._scheduledListenKeyRefresh();
@@ -1377,6 +1398,10 @@ class AiReversalStrategy extends TradingBase {
       aiUsageCostUSD: this.getAiUsageCost(),
       cycleStartTime: this.cycleStartTime,
       cycleDuration: this.cycleStartTime ? formatDuration(Date.now() - this.cycleStartTime) : null,
+      // Emitted as an ISO string for the frontend chart's SS marker
+      // (`updateSessionStartX` does `Date.parse(status.strategyStartTime)`).
+      // Without this, the SS vertical dotted line never draws on reversal.
+      strategyStartTime: this.strategyStartTime ? this.strategyStartTime.toISOString() : null,
       currentPrice: this.currentPrice,
 
       // Volume primitives — cached at every AI consult by _cacheVolumeContext.
@@ -1456,6 +1481,8 @@ class AiReversalStrategy extends TradingBase {
           harvestLossThreshold: this.harvestLossThreshold,
           desiredProfitUSDT: this.desiredProfitUSDT,
           initialSize: this.currentInitialSize,
+          recoveryFactorDecay: this.recoveryFactorDecay,
+          recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
         },
         criticalError: this.criticalError || null,
         lastUpdated: new Date(),

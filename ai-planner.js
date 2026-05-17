@@ -371,8 +371,33 @@ class AiPlanner {
           messages: [{ role: 'user', content: userMessage }],
         });
 
-        const text = response.content[0]?.text;
-        if (!text) throw new Error('Empty response from Claude');
+        // Concatenate every text block; skip non-text content (thinking /
+        // tool_use blocks). Future-proofs against reasoning-mode responses
+        // and DeepSeek's Anthropic-compatible endpoint which may lead with
+        // a non-text block.
+        const textBlocks = (response.content || [])
+          .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+          .map((b) => b.text);
+        const text = textBlocks.join('\n').trim();
+
+        if (!text) {
+          // Surface the actual response shape so the next "empty response"
+          // isn't a black box. Logs once per attempt; the catch block below
+          // handles the retry loop.
+          const diag = {
+            provider: this.provider,
+            model: this.model,
+            stopReason: response.stop_reason ?? null,
+            contentTypes: (response.content || []).map((b) => b?.type ?? typeof b),
+            inputTokens: response.usage?.input_tokens ?? null,
+            outputTokens: response.usage?.output_tokens ?? null,
+          };
+          console.error(`[ai-planner] empty response: ${JSON.stringify(diag)}`);
+          throw new Error(
+            `Empty response from ${this.provider} (${this.model}); ` +
+            `stop_reason=${diag.stopReason}, output_tokens=${diag.outputTokens}`
+          );
+        }
 
         const plan = this._parseResponse(text);
 
