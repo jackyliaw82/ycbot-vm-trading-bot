@@ -1628,13 +1628,17 @@ app.post('/ai-reversal/replan', async (req, res) => {
       return res.status(400).json({ error: `No running AI Reversal strategy with ID ${strategyId}` });
     }
 
-    // For reversal, "replan" forces a heartbeat consult (Context 2). PLAN
-    // (Context 1) is only entered at cycle start or post-HARVEST.
+    // Manual replan is allowed ONLY when flat. Bull/bear levels are now
+    // permanent for an open cycle — the heartbeat-driven mid-cycle rethink
+    // was removed. Calling _requestPlan mid-position would also corrupt
+    // subState (it resets to WAITING via _handlePlanResponse). If the user
+    // really needs new levels, they must stop and restart the strategy.
     if (strategy.currentPosition && strategy.currentPosition.quantity > 0) {
-      strategy._requestHeartbeat().catch(() => {});
-    } else {
-      strategy._requestPlan('manual_replan').catch(() => {});
+      return res.status(400).json({
+        error: 'Cannot replan while a position is open. Bull/bear levels are fixed for the cycle. Stop the strategy to set new levels.',
+      });
     }
+    strategy._requestPlan('manual_replan').catch(() => {});
     res.json({ success: true, message: 'Replan triggered', strategyId });
   } catch (error) {
     res.status(500).json({ error: error.message });

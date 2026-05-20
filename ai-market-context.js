@@ -750,10 +750,9 @@ class AiMarketContext {
       accumulatedFundingFees,
       previousPlan,
       planHistory,
-      harvestEligible,           // bot-side gate; AI may only return HARVEST when true
-      vetoMode,                  // Context 3 flag — bot is asking for size approval
-      proposedNewSize,           // for Context 3
-      consultContext,            // 'plan' | 'heartbeat' | 'veto'
+      vetoMode,                  // Context 2 flag — bot is asking for size approval
+      proposedNewSize,           // for Context 2
+      consultContext,            // 'plan' | 'veto'
     } = strategyState;
 
     // Fetch parallel.
@@ -824,7 +823,6 @@ class AiMarketContext {
       supportResistance,
 
       // Consult-context-specific fields.
-      harvestEligible: !!harvestEligible,
       vetoMode: !!vetoMode,
       proposedNewSize: proposedNewSize || null,
 
@@ -834,7 +832,6 @@ class AiMarketContext {
 
       // Reversal-strategy constants surfaced for the prompt.
       minLevelSpacingATR: 1.5,
-      harvestLossThresholdPct: 0.30,
       minLiqDistancePct: MIN_LIQ_DISTANCE_PCT,
     };
   }

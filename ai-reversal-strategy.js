@@ -21,7 +21,6 @@ const MODEL_PRICING = {
   'deepseek-v4-pro':   { input: 0.435, output: 0.87, cacheWrite5m: 0.435,  cacheRead: 0.003625 },
 };
 
-const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;       // AI Context 2 cadence
 const MARGIN_HEADROOM_FLOOR_PCT = 30;              // free margin floor for sizing safety
 const HARVEST_LOSS_THRESHOLD_PCT = 0.30;           // 30% of initial capital — gate for HARVEST eligibility
 const DEFAULT_RECOVERY_FACTOR = 0.20;
@@ -53,12 +52,16 @@ function formatDuration(ms) {
  * Stop, or unrecoverable system error.
  *
  * AI consult contexts:
- *   - 'plan'      → emit fresh bullLevel/bearLevel (cycle start + post-HARVEST)
- *   - 'heartbeat' → every 5min while position open: CONTINUE / ADJUST / HARVEST
+ *   - 'plan'      → emit fresh bullLevel/bearLevel (cycle start only; bull/bear
+ *                    stay fixed for the rest of the cycle. No periodic AI
+ *                    rethink — the 5-min heartbeat was removed deliberately.)
  *   - 'veto'      → out-of-band before each reversal: CONTINUE / REDUCE size
  *
  * State machine:
  *   INITIAL → WAITING → (LONG_HELD | SHORT_HELD) → (reverse or HARVESTING → WAITING) → EXITED
+ *
+ * The HARVESTING branch is preserved for a future non-AI-driven harvest
+ * implementation; the periodic AI heartbeat that previously drove it is gone.
  */
 class AiReversalStrategy extends TradingBase {
   constructor(gcfProxyUrl, profileId, sharedVmProxyGcfUrl) {
@@ -74,6 +77,15 @@ class AiReversalStrategy extends TradingBase {
     this.cycleAccumulatedLoss = 0;
     this.reversalCount = 0;
     this.harvestCount = 0;
+    // AI-set harvest target. When accLoss ≥ 30% × initialCapital and a
+    // position is open, an AI consult sets this to a side-favorable price
+    // (LONG: > entry; SHORT: < entry). On every price tick, if price
+    // reaches this value, _executeHarvest fires. Cleared on every position
+    // event (reversal, harvest, final TP). null = no active target.
+    this.harvestPrice = null;
+    // Guards against firing >1 in-flight harvest_price AI consult per tick.
+    // Set true at consult start, cleared on success/failure/stale-retry.
+    this._harvestConsultPending = false;
     this.initialCapital = 0;
     this.currentInitialSize = 0;
     this.cycleStartTime = null;
@@ -94,7 +106,11 @@ class AiReversalStrategy extends TradingBase {
 
     // Plan + history
     this.activePlan = null;                 // last PLAN response from AI
-    this.lastDecision = null;               // last heartbeat decision
+    // lastDecision: previously set by the 5-min heartbeat (CONTINUE/ADJUST/
+    // HARVEST). The heartbeat was removed — bull/bear are now picked once at
+    // cycle start and stay fixed. Field is preserved (serialized + surfaced
+    // in getStatus) for a future non-AI-driven harvest mechanism to populate.
+    this.lastDecision = null;
     this.planHistory = [];
 
     // Cached volume primitives — refreshed at every AI consult and surfaced
@@ -110,9 +126,6 @@ class AiReversalStrategy extends TradingBase {
 
     // Token usage accumulators
     this.aiTokenUsage = { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheCreation: 0, requests: 0 };
-
-    // Heartbeat scheduler
-    this._heartbeatTimer = null;
 
     // Stale retry on AI failure
     this._staleRetryAttempt = 0;
@@ -262,11 +275,12 @@ class AiReversalStrategy extends TradingBase {
     await this.addLog(`AI Reversal Strategy started. Waiting for AI to set bull/bear levels...`);
     await this.saveState();
 
-    // Kick off first PLAN consult and start heartbeat scheduler.
+    // Single AI consult at cycle start. Bull/bear levels are set once here
+    // and stay fixed for the entire cycle — there is no periodic 5-min
+    // rethink. Cycle ends only at Final TP, user Stop, or system error.
     this._requestPlan('cycle_start').catch(err => {
       this.addLog(`[REVERSAL] initial plan request error: ${err.message}`).catch(() => {});
     });
-    this._startHeartbeat();
   }
 
   /**
@@ -335,6 +349,13 @@ class AiReversalStrategy extends TradingBase {
     this.cycleAccumulatedLoss = snapshot.cycleAccumulatedLoss || 0;
     this.reversalCount = snapshot.reversalCount || 0;
     this.harvestCount = snapshot.harvestCount || 0;
+    // Restore the in-flight harvest target if the VM died mid-cycle while
+    // an AI-set harvestPrice was being watched. Only honored if a position
+    // is also restored — otherwise it'll be cleared on the next position
+    // event anyway.
+    this.harvestPrice = typeof snapshot.harvestPrice === 'number' && Number.isFinite(snapshot.harvestPrice)
+      ? snapshot.harvestPrice
+      : null;
     this.initialCapital = snapshot.initialCapital || 0;
     this.initialWalletBalance = snapshot.initialWalletBalance || null;
     const sst = snapshot.cycleStartTime;
@@ -357,9 +378,9 @@ class AiReversalStrategy extends TradingBase {
     // double-count, after which saveState persists the field going forward.
     this._lastReconciliationAt = snapshot._lastReconciliationAt || null;
 
-    // AI continuity. planHistory restored as-is; activePlan restored only
-    // if a position is currently held (otherwise we're in WAITING and a
-    // fresh plan will arrive on the next heartbeat anyway).
+    // AI continuity. planHistory + activePlan restored as-is. lastDecision
+    // preserved on the off chance a future harvest mechanism has written to
+    // it; the now-removed heartbeat was the only writer historically.
     this.aiTokenUsage = snapshot.aiTokenUsage || { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheCreation: 0, requests: 0 };
     this.planHistory = Array.isArray(snapshot.planHistory) ? snapshot.planHistory : [];
     this.activePlan = snapshot.activePlan || null;
@@ -459,24 +480,15 @@ class AiReversalStrategy extends TradingBase {
 
     await this.saveState();
 
-    // Start heartbeat (5min cadence) so AI keeps consulting on the
-    // resumed position. If we're in WAITING with no position, the
-    // first price tick (or manual replan) will trigger a fresh PLAN.
-    this._startHeartbeat();
-
-    // Volume analytics live on _lastVolumeProfile24h/7d/_lastCvd/
-    // _lastOrderbookDepth, populated only by _cacheVolumeContext() inside
-    // an AI consult. Those fields are intentionally not persisted (stale
-    // on resume anyway), so the running view's Volume Analytics panel
-    // sits empty until the next consult — up to 5 min for in-position,
-    // potentially hours for WAITING. Mirror start()'s immediate-consult
-    // pattern so the panel populates within seconds. DeepSeek's prefix
-    // cache absorbs most of the input-token cost.
-    if (this.activePosition) {
-      this._requestHeartbeat().catch((err) => {
-        this.addLog(`[RECOVERY] immediate heartbeat failed: ${err.message}`).catch(() => {});
-      });
-    } else {
+    // Resume policy after heartbeat removal:
+    //   - In-position: do nothing. Bull/bear are restored from snapshot
+    //     and stay fixed — no AI re-consult needed (the periodic rethink
+    //     was removed deliberately).
+    //   - No position (WAITING / fresh restart pre-touch): fire one PLAN
+    //     to re-derive bull/bear levels. Without this the strategy would
+    //     idle forever if the saved snapshot didn't have levels (e.g.
+    //     crash before the first plan landed).
+    if (!this.activePosition) {
       this._requestPlan('resume_recovery').catch((err) => {
         this.addLog(`[RECOVERY] immediate plan failed: ${err.message}`).catch(() => {});
       });
@@ -492,7 +504,7 @@ class AiReversalStrategy extends TradingBase {
    * Order matters:
    *   1. Set isRunning=false to short-circuit any in-flight pollers
    *   2. Optional flatten (only if user asked)
-   *   3. Clear ALL timers (heartbeat, stale retry, funding poll, listen-key refresh)
+   *   3. Clear ALL timers (stale retry, funding poll, listen-key refresh)
    *   4. Final funding poll so any settlement during stop is captured
    *   5. cleanupWebSockets to release the listen-key + drop streams
    *   6. saveState with isRunning=false marker
@@ -504,7 +516,6 @@ class AiReversalStrategy extends TradingBase {
 
     // Cancel ALL background timers. Each was started in start()/resume()
     // and would leak across a restart if missed here.
-    this._stopHeartbeat();
     if (this._staleRetryTimer) {
       clearTimeout(this._staleRetryTimer);
       this._staleRetryTimer = null;
@@ -597,6 +608,28 @@ class AiReversalStrategy extends TradingBase {
       return;
     }
 
+    // Harvest-price hit — second priority. If hit, close to flat and re-PLAN.
+    // Direction-aware: LONG → price ≥ harvestPrice; SHORT → price ≤ harvestPrice.
+    // Validation at consult time guarantees harvestPrice is on the profitable
+    // side of entry, so any tick that hits it represents a profitable close.
+    if (this.activePosition && this.harvestPrice != null && this._checkHarvestPriceHit(price)) {
+      await this._executeHarvest('ai_harvest_price_hit');
+      return;
+    }
+
+    // Harvest gate — fire an AI consult to SET a harvestPrice if all of:
+    //   1. We're in a position (LONG_HELD or SHORT_HELD).
+    //   2. Cycle accumulated loss ≥ 30% × initial capital.
+    //   3. No harvestPrice currently set (idempotency — cleared on every
+    //      position event so re-arm naturally happens after reversals).
+    //   4. No consult currently in flight (prevents tick-rate AI spam).
+    //   5. executionState is IDLE (don't fire during EXECUTING or PLANNING).
+    if (this._isHarvestGateOpen()) {
+      this._requestHarvestPrice().catch((err) => {
+        this.addLog(`[REVERSAL] harvest_price consult error: ${err.message}`).catch(() => {});
+      });
+    }
+
     // Level-touch dispatch.
     if (this.subState === 'WAITING' && this.bullLevel != null && this.bearLevel != null) {
       if (price >= this.bullLevel) {
@@ -611,7 +644,35 @@ class AiReversalStrategy extends TradingBase {
     }
   }
 
-  // ——— Plan / Heartbeat / Veto consults ——————————————————————————————
+  // Direction-aware check: hit if price has reached the AI-set harvestPrice
+  // in the favorable direction. harvestPrice is validated at consult time
+  // to be > entry for LONG (or < entry for SHORT), so a hit guarantees a
+  // profitable close.
+  _checkHarvestPriceHit(price) {
+    if (!this.harvestPrice || !this.currentSide) return false;
+    if (this.currentSide === 'LONG') return price >= this.harvestPrice;
+    if (this.currentSide === 'SHORT') return price <= this.harvestPrice;
+    return false;
+  }
+
+  // Gate for firing an AI consult to derive a fresh harvestPrice.
+  // All conditions must hold:
+  //   - Position is open (otherwise there's nothing to plan an exit from)
+  //   - accLoss meets the threshold (default 30% × initialCapital)
+  //   - No harvestPrice already in effect
+  //   - No consult currently in flight
+  //   - executionState is IDLE (not EXECUTING a trade / not PLANNING bull/bear)
+  _isHarvestGateOpen() {
+    if (this.executionState !== 'IDLE') return false;
+    if (!this.activePosition || !this.activePosition.quantity) return false;
+    if (this.harvestPrice != null) return false;
+    if (this._harvestConsultPending) return false;
+    if (this.initialCapital <= 0) return false;
+    const threshold = this.harvestLossThreshold * this.initialCapital;
+    return this.cycleAccumulatedLoss >= threshold;
+  }
+
+  // ——— Plan / Harvest-Price / Veto consults ——————————————————————————
 
   async _requestPlan(reason) {
     if (this.executionState === 'TERMINATED') return;
@@ -636,28 +697,64 @@ class AiReversalStrategy extends TradingBase {
     }
   }
 
-  async _requestHeartbeat() {
-    if (!this.isRunning || this.executionState === 'TERMINATED') return;
-    if (!this.activePosition || !this.activePosition.quantity) return;  // only consult while holding
-    await this.addLog('[REVERSAL] _requestHeartbeat');
+  /**
+   * Consult AI for a fresh harvestPrice. Gate ALREADY checked by
+   * _isHarvestGateOpen — caller (handleRealtimePrice) only invokes this
+   * when position is open, accLoss ≥ threshold, no harvestPrice set, no
+   * consult in flight, and executionState is IDLE.
+   *
+   * In-flight guard (`_harvestConsultPending`) prevents tick-rate spam:
+   * set true at entry, cleared in finally (success OR failure).
+   *
+   * On validation failure, schedules a stale retry with exponential backoff
+   * (same pattern as _requestPlan). During the retry window the pending
+   * flag stays cleared so subsequent ticks don't fire — the retry timer
+   * is the sole driver. We DO NOT keep the pending flag set, because if
+   * the bot crashes mid-retry the flag would never clear; the stale retry
+   * timer is the right place for backoff state.
+   */
+  async _requestHarvestPrice() {
+    if (this._harvestConsultPending) return;
+    this._harvestConsultPending = true;
+    await this.addLog('[REVERSAL] _requestHarvestPrice');
     try {
-      const harvestEligible = this._isHarvestEligible();
       const ctx = await this.marketContext.buildReversalContext(this._buildStrategyState({
-        consultContext: 'heartbeat',
-        harvestEligible,
+        consultContext: 'harvest_price',
       }));
       this._cacheVolumeContext(ctx);
       const plan = await this.planner.generatePlan(ctx, 'reversal');
       this._accumulateAiUsage(plan);
       const validation = this.riskGuard.validatePlan(plan, ctx);
       if (!validation.valid) {
-        await this.addLog(`[REVERSAL] HEARTBEAT validation failed: ${validation.reasons.join('; ')}`);
+        await this.addLog(`[REVERSAL] HARVEST_PRICE validation failed: ${validation.reasons.join('; ')}`);
+        this._scheduleStaleRetry('harvest_price', 'gate_open');
         return;
       }
-      await this._handleHeartbeatResponse(plan);
+      await this._handleHarvestPriceResponse(plan);
+      this._staleRetryAttempt = 0;
     } catch (err) {
-      await this.addLog(`[REVERSAL] _requestHeartbeat error: ${err.message}`);
+      await this.addLog(`[REVERSAL] _requestHarvestPrice error: ${err.message}`);
+      this._scheduleStaleRetry('harvest_price', 'gate_open');
+    } finally {
+      this._harvestConsultPending = false;
     }
+  }
+
+  async _handleHarvestPriceResponse(plan) {
+    this.harvestPrice = plan.harvestPrice;
+    this.lastDecision = {
+      decision: 'HARVEST_PRICE',
+      rationale: plan.rationale,
+      timestamp: Date.now(),
+    };
+    await this.addLog(
+      `[REVERSAL] HARVEST_PRICE set: ${this.currentSide} entry=${this.activePosition?.entryPrice} ` +
+      `harvestPrice=${plan.harvestPrice} accLoss=${this.cycleAccumulatedLoss.toFixed(4)} ` +
+      `(${plan.rationale || 'no rationale'})`
+    );
+    await this.saveState();
+    // Persist for audit trail — surfaced in /ai-reversal/plan-history.
+    this._savePlanToFirestore(plan, 'harvest_price').catch(() => {});
   }
 
   async _requestVeto(proposedNewSize) {
@@ -717,31 +814,6 @@ class AiReversalStrategy extends TradingBase {
     this._savePlanToFirestore(plan, 'plan').catch(() => {});
   }
 
-  async _handleHeartbeatResponse(plan) {
-    this.lastDecision = { decision: plan.decision, rationale: plan.rationale, timestamp: Date.now() };
-    // Every heartbeat response gets persisted to aiPlans regardless of
-    // the verb so the audit trail captures CONTINUE decisions too.
-    this._savePlanToFirestore(plan, 'heartbeat').catch(() => {});
-
-    if (plan.decision === 'CONTINUE') {
-      await this.addLog(`[REVERSAL] heartbeat: CONTINUE — ${plan.rationale || 'levels intact'}`);
-      return;
-    }
-    if (plan.decision === 'ADJUST') {
-      const oldBull = this.bullLevel;
-      const oldBear = this.bearLevel;
-      this.bullLevel = plan.bullLevel;
-      this.bearLevel = plan.bearLevel;
-      await this.addLog(`[REVERSAL] heartbeat: ADJUST — bull ${oldBull} → ${plan.bullLevel}, bear ${oldBear} → ${plan.bearLevel} (${plan.rationale || 'no rationale'})`);
-      await this.saveState();
-      return;
-    }
-    if (plan.decision === 'HARVEST') {
-      await this.addLog(`[REVERSAL] heartbeat: HARVEST — ${plan.rationale || 'AI harvest'}`);
-      await this._executeHarvest(plan.rationale);
-    }
-  }
-
   // ——— Position actions ——————————————————————————————————————————————
 
   async _openInitialPosition(side, levelPrice) {
@@ -788,6 +860,11 @@ class AiReversalStrategy extends TradingBase {
 
       this.reversalCount += 1;
       this.subState = newSide === 'LONG' ? 'LONG_HELD' : 'SHORT_HELD';
+      // Clear the previous harvestPrice — it was direction- and entry-bound
+      // to the OLD position. The new position will re-trigger the gate on
+      // the next tick if accLoss is still ≥ threshold, and a fresh
+      // harvestPrice will be consulted for the new side/entry.
+      this.harvestPrice = null;
       await this.addLog(`[REVERSAL] reversal #${this.reversalCount} → ${newSide} (size ${finalSize} USDT, accLoss ${this.cycleAccumulatedLoss})`);
     } catch (err) {
       await this.addLog(`[REVERSAL] _performReversal error: ${err.message}`);
@@ -800,6 +877,11 @@ class AiReversalStrategy extends TradingBase {
   async _executeHarvest(reason) {
     if (this.executionState === 'EXECUTING') return;
     this.executionState = 'EXECUTING';
+    // Clear the harvest target up-front — the close is about to fire and
+    // we don't want a tick mid-close to re-trigger the gate based on a
+    // stale price. Once subState transitions to WAITING (post-close), the
+    // gate naturally stays closed because activePosition will be null.
+    this.harvestPrice = null;
     try {
       this.subState = 'HARVESTING';
       await this.executor.executeAction({ type: 'HARVEST_CLOSE', reason });
@@ -839,11 +921,11 @@ class AiReversalStrategy extends TradingBase {
 
       this.activePosition = null;
       this.currentSide = null;
+      this.harvestPrice = null;
       this.subState = 'EXITED';
       this.executionState = 'TERMINATED';
       this.isRunning = false;
       this.strategyEndTime = new Date();
-      this._stopHeartbeat();
       // Clear all background timers since the cycle is over (mirrors stop()).
       if (this._fundingPollTimeout) { clearTimeout(this._fundingPollTimeout); this._fundingPollTimeout = null; }
       if (this.listenKeyRefreshInterval) { clearInterval(this.listenKeyRefreshInterval); this.listenKeyRefreshInterval = null; }
@@ -1179,22 +1261,6 @@ class AiReversalStrategy extends TradingBase {
     }, primaryDelay);
   }
 
-  // ——— Heartbeat scheduling ——————————————————————————————————————————
-
-  _startHeartbeat() {
-    this._stopHeartbeat();
-    this._heartbeatTimer = setInterval(() => {
-      this._requestHeartbeat().catch(() => {});
-    }, HEARTBEAT_INTERVAL_MS);
-  }
-
-  _stopHeartbeat() {
-    if (this._heartbeatTimer) {
-      clearInterval(this._heartbeatTimer);
-      this._heartbeatTimer = null;
-    }
-  }
-
   // ——— Stale retry on AI failure ——————————————————————————————————————
 
   _scheduleStaleRetry(consultContext, reason) {
@@ -1204,7 +1270,17 @@ class AiReversalStrategy extends TradingBase {
     if (this._staleRetryTimer) clearTimeout(this._staleRetryTimer);
     this._staleRetryTimer = setTimeout(() => {
       if (consultContext === 'plan') this._requestPlan(reason).catch(() => {});
-      else if (consultContext === 'heartbeat') this._requestHeartbeat().catch(() => {});
+      else if (consultContext === 'harvest_price') {
+        // Re-check the gate at retry time — between the original failure
+        // and now, a reversal may have flipped the position (clearing
+        // harvestPrice) or accLoss may have moved. The gate function
+        // collapses all those checks into one call.
+        if (this._isHarvestGateOpen()) {
+          this._requestHarvestPrice().catch(() => {});
+        }
+      }
+      // veto failures fall back to the proposed size inline (see _requestVeto)
+      // and never reach this retry scheduler.
     }, delay);
   }
 
@@ -1328,7 +1404,7 @@ class AiReversalStrategy extends TradingBase {
   /**
    * Cache the volume primitives from a freshly-built reversal context so
    * getStatus() can surface them to the frontend chart. Refreshed at every
-   * AI consult (Context 1 plan, Context 2 heartbeat, Context 3 veto).
+   * AI consult (Context 1 plan, Context 2 veto).
    */
   _cacheVolumeContext(ctx) {
     if (!ctx) return;
@@ -1435,6 +1511,7 @@ class AiReversalStrategy extends TradingBase {
       cycleAccumulatedLoss: this.cycleAccumulatedLoss,
       reversalCount: this.reversalCount,
       harvestCount: this.harvestCount,
+      harvestPrice: this.harvestPrice,
       initialCapital: this.initialCapital,
       currentInitialSize: this.currentInitialSize,
       desiredProfitUSDT: this.desiredProfitUSDT,
@@ -1518,6 +1595,7 @@ class AiReversalStrategy extends TradingBase {
         cycleAccumulatedLoss: this.cycleAccumulatedLoss,
         reversalCount: this.reversalCount,
         harvestCount: this.harvestCount,
+        harvestPrice: this.harvestPrice,
         initialCapital: this.initialCapital,
         initialWalletBalance: this.initialWalletBalance,
         currentInitialSize: this.currentInitialSize,
@@ -1569,7 +1647,7 @@ class AiReversalStrategy extends TradingBase {
    * Persist a single AI plan response to the strategies/{id}/aiPlans
    * subcollection. Mirrors AiHedgeStrategy._savePlanToFirestore so the
    * /ai-reversal/plan-history endpoint can return a real audit trail.
-   * Stores the consult context (plan / heartbeat / veto) for filtering.
+   * Stores the consult context (plan / veto) for filtering.
    */
   async _savePlanToFirestore(plan, consultContext) {
     if (!this.firestore || !this.strategyId) return;

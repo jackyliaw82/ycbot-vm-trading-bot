@@ -480,14 +480,12 @@ class AiPlanner {
       if (typeof plan.bullLevel !== 'number' || typeof plan.bearLevel !== 'number') {
         throw new Error('Reversal plan (plan context): bullLevel/bearLevel must be numbers');
       }
-    } else if (consultContext === 'heartbeat') {
-      if (!['CONTINUE', 'ADJUST', 'HARVEST'].includes(decision)) {
-        throw new Error(`Reversal plan (heartbeat): expected CONTINUE|ADJUST|HARVEST, got ${decision}`);
+    } else if (consultContext === 'harvest_price') {
+      if (decision !== 'HARVEST_PRICE') {
+        throw new Error(`Reversal plan (harvest_price): expected decision=HARVEST_PRICE, got ${decision}`);
       }
-      if (decision === 'ADJUST') {
-        if (typeof plan.bullLevel !== 'number' || typeof plan.bearLevel !== 'number') {
-          throw new Error('Reversal plan (ADJUST): bullLevel/bearLevel required');
-        }
+      if (typeof plan.harvestPrice !== 'number' || !Number.isFinite(plan.harvestPrice)) {
+        throw new Error('Reversal plan (harvest_price): harvestPrice must be a finite number');
       }
     } else if (consultContext === 'veto') {
       if (!['CONTINUE', 'REDUCE'].includes(decision)) {
@@ -503,7 +501,7 @@ class AiPlanner {
 
   /**
    * Build the user message for reversal AI consults.
-   * Three consult contexts are supported: plan, heartbeat, veto.
+   * Three consult contexts are supported: plan, harvest_price, veto.
    * The context object is built by AiMarketContext.buildReversalContext.
    */
   _buildReversalUserMessage(context) {
@@ -667,10 +665,22 @@ class AiPlanner {
       parts.push(`  - bearLevel < current_price (${context.currentPrice})`);
       parts.push(`  - bullLevel − bearLevel ≥ 1.5 × ATR`);
       parts.push(`  - Levels must straddle the POC and prefer LVN-facing edges of the HVN.`);
-    } else if (ctx === 'heartbeat') {
-      parts.push(`Decide: CONTINUE / ADJUST / HARVEST.`);
-      parts.push(`HARVEST eligible: ${context.harvestEligible ? 'YES (loss ≥ 30% of initial capital AND profitable position)' : 'NO (gate not met — do not return HARVEST)'}`);
-      parts.push(`Use ADJUST only for small slides (≤ 1×ATR) driven by: POC drift > 0.5%, level invalidation pattern, CVD divergence at level, or regime shift (ATR > 2× recent norm).`);
+      parts.push(`  - These levels are PERMANENT for the cycle — there is no periodic AI rethink. Pick robust levels that survive multi-hour holds, not opportunistic short-term ones.`);
+    } else if (ctx === 'harvest_price') {
+      const pos = context.currentPosition;
+      const entry = pos?.avgEntry;
+      const side = context.currentSide;
+      parts.push(`Emit a HARVEST_PRICE — a single price the bot will watch on every tick. When current price reaches this value, the bot closes the position to flat (locking in a profit on the current leg) and re-PLANs fresh bullLevel/bearLevel for a new cycle phase.`);
+      parts.push(`Active position: ${side} entry=${entry} qty=${pos?.quantity} notional=${pos?.notional} unrealizedPnl=${pos?.unrealizedPnl}`);
+      parts.push(`Hard constraints:`);
+      if (side === 'LONG') {
+        parts.push(`  - harvestPrice > entry (${entry}) — must be strictly above entry for a profitable close.`);
+      } else if (side === 'SHORT') {
+        parts.push(`  - harvestPrice < entry (${entry}) — must be strictly below entry for a profitable close.`);
+      }
+      parts.push(`  - Pick the price most likely to be touched next while still ensuring profitable close. Use volume profile + CVD + orderbook depth — look for high-probability targets near liquid HVNs or value-area edges.`);
+      parts.push(`  - If you believe the most likely target is BEYOND finalTpPrice (above for LONG, below for SHORT), set harvestPrice to that anyway — the bot will hit Final TP first and the cycle will complete naturally. This is acceptable.`);
+      parts.push(`  - This is a ONE-SHOT consult per position phase. If the position is reversed (price hits bullLevel/bearLevel) before harvestPrice is touched, harvestPrice is discarded and you will be re-consulted for the new side/entry.`);
     } else if (ctx === 'veto') {
       parts.push(`Bot proposes New size: ${context.proposedNewSize} USDT (already passed deterministic margin-headroom projection).`);
       parts.push(`Decide: CONTINUE (approve) or REDUCE (provide smaller newSize ≥ ${(context.minNotional * 2).toFixed(2)} USDT).`);

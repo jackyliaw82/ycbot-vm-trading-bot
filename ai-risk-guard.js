@@ -71,23 +71,30 @@ class AiRiskGuard {
    * Validate an AI Reversal Strategy plan.
    *
    * Per-context validation:
-   *   - 'plan'      → decision=PLAN, level math, sizing within bounds.
-   *   - 'heartbeat' → decision in {CONTINUE, ADJUST, HARVEST}, level math if ADJUST,
-   *                   HARVEST gating (accumulated_loss ≥ 30% × initial_capital AND profitable).
-   *   - 'veto'      → decision in {CONTINUE, REDUCE}, REDUCE size within bounds.
+   *   - 'plan'          → decision=PLAN, level math, sizing within bounds.
+   *                       Fires once at cycle start; bull/bear stay fixed for
+   *                       the rest of the cycle.
+   *   - 'harvest_price' → decision=HARVEST_PRICE, harvestPrice on the
+   *                       profitable side of the current position's entry
+   *                       (LONG: > entry; SHORT: < entry).
+   *   - 'veto'          → decision in {CONTINUE, REDUCE}, REDUCE size within bounds.
    *
-   * Disallowed verbs (REPLAN / PAUSE / EXIT) are rejected here as defense
+   * Disallowed verbs (REPLAN / PAUSE / EXIT / ADJUST / HARVEST without
+   * _PRICE / CONTINUE in a non-veto context) are rejected here as defense
    * in depth; the prompt also forbids them.
    */
   _validateReversalPlan(plan, state) {
     const reasons = [];
     const consultContext = plan._consultContext || state.consultContext || 'plan';
-    const { currentPrice, volatility, harvestEligible } = state;
+    const { currentPrice, volatility } = state;
     const atr = volatility?.atr || 0;
     const minSpacing = atr * (state.minLevelSpacingATR || 1.5);
 
-    // Reject forbidden verbs outright (defense in depth).
-    if (['REPLAN', 'PAUSE', 'EXIT'].includes(plan.decision)) {
+    // Reject forbidden verbs outright (defense in depth). ADJUST and bare
+    // HARVEST were heartbeat-only verbs; the heartbeat is gone but a stale
+    // prompt or mis-trained model could still emit them, so we explicitly
+    // block. HARVEST_PRICE (the new verb) is intentionally NOT in this list.
+    if (['REPLAN', 'PAUSE', 'EXIT', 'ADJUST', 'HARVEST'].includes(plan.decision)) {
       reasons.push(`Verb ${plan.decision} is not allowed in the reversal strategy verb space`);
       return { valid: false, reasons };
     }
@@ -107,15 +114,28 @@ class AiRiskGuard {
           reasons.push(`newInitialSize ${plan.newInitialSize} above maxPositionSizeUSDT (${this.maxPositionSizeUSDT})`);
         }
       }
-    } else if (consultContext === 'heartbeat') {
-      if (!['CONTINUE', 'ADJUST', 'HARVEST'].includes(plan.decision)) {
-        reasons.push(`heartbeat: decision must be CONTINUE | ADJUST | HARVEST, got ${plan.decision}`);
+    } else if (consultContext === 'harvest_price') {
+      if (plan.decision !== 'HARVEST_PRICE') {
+        reasons.push(`harvest_price context: expected decision=HARVEST_PRICE, got ${plan.decision}`);
       }
-      if (plan.decision === 'ADJUST') {
-        this._validateReversalLevels(plan, currentPrice, minSpacing, reasons);
-      }
-      if (plan.decision === 'HARVEST' && !harvestEligible) {
-        reasons.push('HARVEST not eligible (bot gate: accumulated_loss must be ≥ 30% of initial_capital AND position must be profitable)');
+      if (typeof plan.harvestPrice !== 'number' || !Number.isFinite(plan.harvestPrice) || plan.harvestPrice <= 0) {
+        reasons.push('harvest_price: harvestPrice must be a positive finite number');
+      } else {
+        // Direction check: harvestPrice must be on the profitable side of
+        // the current position's entry. Without a position there's nothing
+        // to validate against — but the strategy only fires this consult
+        // when a position is open, so missing position is a programming
+        // error (still tolerated as a soft warning rather than a reject).
+        const pos = state.currentPosition;
+        const side = state.currentSide;
+        const entry = pos?.avgEntry ?? pos?.entryPrice;
+        if (!pos || !Number.isFinite(entry) || entry <= 0) {
+          reasons.push('harvest_price: no active position to validate harvestPrice against');
+        } else if (side === 'LONG' && plan.harvestPrice <= entry) {
+          reasons.push(`harvest_price: LONG requires harvestPrice (${plan.harvestPrice}) > entry (${entry}) for a profitable close`);
+        } else if (side === 'SHORT' && plan.harvestPrice >= entry) {
+          reasons.push(`harvest_price: SHORT requires harvestPrice (${plan.harvestPrice}) < entry (${entry}) for a profitable close`);
+        }
       }
     } else if (consultContext === 'veto') {
       if (!['CONTINUE', 'REDUCE'].includes(plan.decision)) {
