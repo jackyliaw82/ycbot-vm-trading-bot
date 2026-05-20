@@ -496,22 +496,39 @@ class AiReversalStrategy extends TradingBase {
   }
 
   /**
-   * Stop the strategy. Optionally flat the current position before
-   * stopping. Mirrors AiHedgeStrategy.stop's cleanup discipline: every
-   * interval/timeout started in start() or resume() MUST be cleared
-   * here, otherwise a stop→start cycle leaks the prior session's timers.
+   * Single termination path — used for BOTH manual stop and Final TP
+   * auto-stop (v4.0.1 consolidation). Mirrors AiHedgeStrategy.stop's
+   * "one method to rule them all" pattern: position close (when
+   * requested), final funding flush, WS cleanup, platform fee
+   * deduction, AI usage log, completion notification, saveState, and
+   * the onStopComplete hook that unregisters from app.js's
+   * `activeStrategies` map.
    *
-   * Order matters:
-   *   1. Set isRunning=false to short-circuit any in-flight pollers
-   *   2. Optional flatten (only if user asked)
-   *   3. Clear ALL timers (stale retry, funding poll, listen-key refresh)
-   *   4. Final funding poll so any settlement during stop is captured
-   *   5. cleanupWebSockets to release the listen-key + drop streams
-   *   6. saveState with isRunning=false marker
-   *   7. Notification + onStopComplete hook
+   * options.flatten — close any open position via HARVEST_CLOSE first.
+   *                   Manual stops pass this when the user opts in;
+   *                   Final TP passes true unconditionally.
+   * options.reason  — 'manual' (default) | 'final_tp'. Threads through
+   *                   to the executor's close-order log and (for
+   *                   final_tp only) triggers the strategyFlow audit
+   *                   record + metricsSample bookkeeping so the
+   *                   frontend chart can mark the TP exit.
+   *
+   * Idempotent — calling twice (e.g. user clicks Stop just as Final TP
+   * fires) early-exits on the second call.
    */
   async stop(options = {}) {
-    const { flatten = false } = options;
+    const { flatten = false, reason = 'manual' } = options;
+
+    // Concurrency + idempotency guard. stop() is reachable from
+    // /ai-reversal/stop AND from _handleFinalTpHit; both could fire in
+    // quick succession. The `!isRunning` check catches the concurrent
+    // race (first call sets isRunning=false synchronously before any
+    // await, so the second microtask-queued call bails). The
+    // TERMINATED check catches a stop attempt AFTER a previous stop
+    // already completed. Mirrors hedge's `if (!this.isRunning) return;`
+    // guard at ai-hedge-strategy.js:611.
+    if (!this.isRunning || this.executionState === 'TERMINATED') return;
+
     this.isRunning = false;
 
     // Cancel ALL background timers. Each was started in start()/resume()
@@ -529,6 +546,8 @@ class AiReversalStrategy extends TradingBase {
       this.listenKeyRefreshInterval = null;
     }
 
+    const exitPrice = this.currentPrice;
+
     if (flatten) {
       // Source-of-truth refresh BEFORE the flatten check. activePosition can be
       // null in-memory while Binance still holds an open position (state lost
@@ -542,9 +561,10 @@ class AiReversalStrategy extends TradingBase {
       }
 
       if (this.activePosition && this.activePosition.quantity > 0) {
+        const closeReason = reason === 'final_tp' ? 'final_tp' : 'user-stop';
         try {
-          await this.addLog(`[REVERSAL] stop: flattening ${this.currentSide} ${this.activePosition.quantity}`);
-          await this.executor.executeAction({ type: 'HARVEST_CLOSE', reason: 'user-stop' });
+          await this.addLog(`[REVERSAL] stop: flattening ${this.currentSide} ${this.activePosition.quantity} (${closeReason})`);
+          await this.executor.executeAction({ type: 'HARVEST_CLOSE', reason: closeReason });
           // Verify the close actually flattened — if Binance still reports a
           // residual position, log a warning so it's surfaced in the log feed.
           await this._refreshCurrentPosition();
@@ -559,7 +579,24 @@ class AiReversalStrategy extends TradingBase {
       } else {
         await this.addLog('[REVERSAL] stop: no open position on Binance — nothing to flatten');
       }
+
+      // Final TP: write the strategyFlow audit record + metricsSample so
+      // the frontend chart can mark the exit. Manual stops skip this to
+      // avoid changing existing audit-log cadence.
+      if (reason === 'final_tp') {
+        try {
+          await this._postExecuteBookkeeping('FINAL_TP_HIT', { exitPrice });
+        } catch (bkErr) {
+          console.error(`[REVERSAL] FINAL_TP_HIT bookkeeping failed: ${bkErr.message}`);
+        }
+      }
     }
+
+    // Clear position-derived state. Done after the optional flatten so
+    // `_refreshCurrentPosition` had real fields to work against.
+    this.activePosition = null;
+    this.currentSide = null;
+    this.harvestPrice = null;
 
     // Final funding flush — capture any settlement that happened between
     // the last scheduled poll and stop. Non-critical: swallow errors.
@@ -579,12 +616,70 @@ class AiReversalStrategy extends TradingBase {
     this.executionState = 'TERMINATED';
     this.subState = 'EXITED';
     this.strategyEndTime = new Date();
-    await this.saveState();
-    await this.addLog('[REVERSAL] stop: terminated');
-  }
 
-  async onStopComplete() {
-    return this.stop({ flatten: false });
+    // Platform fee on net positive PnL — mirrors hedge's stop().
+    // Funding is included in net so the fee scales with what the bot
+    // actually delivered to the user.
+    const netPnL = (this.accumulatedRealizedPnL || 0)
+      - (this.accumulatedTradingFees || 0)
+      + (this.accumulatedFundingFees || 0);
+    if (netPnL > 0) {
+      try {
+        await this.deductPlatformFee(netPnL);
+      } catch (feeErr) {
+        console.error(`[REVERSAL] platform fee error: ${feeErr.message}`);
+      }
+    }
+
+    await this.saveState();
+
+    // AI usage summary — mirrors hedge's end-of-stop log.
+    const u = this.aiTokenUsage;
+    if (u && (u.requests || 0) > 0) {
+      try {
+        const totalCost = typeof this.getAiUsageCost === 'function' ? this.getAiUsageCost() : 0;
+        await this.addLog(
+          `AI Usage: ${u.requests} requests, ${(u.inputTokens || 0).toLocaleString()} input + ${(u.outputTokens || 0).toLocaleString()} output ` +
+          `(cache write: ${(u.cacheCreation || 0).toLocaleString()}, read: ${(u.cacheRead || 0).toLocaleString()}). ` +
+          `Est. cost (${this.aiModel}): $${totalCost.toFixed(4)}`
+        );
+      } catch (logErr) {
+        console.error(`[REVERSAL] AI usage log failed: ${logErr.message}`);
+      }
+    }
+
+    await this.addLog(reason === 'final_tp'
+      ? '[REVERSAL] Final TP — cycle complete, strategy terminated.'
+      : '[REVERSAL] stop: terminated');
+
+    // Completion notification — mirrors hedge. Helper signature is
+    // (userId, strategyData); the FCM token lookup relies on the
+    // second argument being the data object.
+    try {
+      const elapsed = this.cycleStartTime
+        ? formatDuration(Date.now() - this.cycleStartTime)
+        : 'N/A';
+      await sendStrategyCompletionNotification(this.userId, {
+        strategyId: this.strategyId,
+        symbol: this.symbol,
+        netPnL,
+        profitPercentage: this.initialCapital ? (netPnL / this.initialCapital) * 100 : 0,
+        tradeCount: this.tradeCount || (this.reversalCount + this.harvestCount + (reason === 'final_tp' ? 1 : 0)),
+        timeTaken: elapsed,
+        realizedPnL: this.accumulatedRealizedPnL || 0,
+        tradingFees: this.accumulatedTradingFees || 0,
+        fundingFees: this.accumulatedFundingFees || 0,
+      });
+    } catch (notifyErr) {
+      console.error(`[REVERSAL] notify error: ${notifyErr.message}`);
+    }
+
+    // CRITICAL: invokes the app.js callback that does
+    // `activeStrategies.delete(strategyId)`. Without this, the next start
+    // attempt for this profile is rejected with "already running".
+    try { this.onStopComplete?.(); } catch (e) {
+      console.error('[REVERSAL] onStopComplete hook failed:', e.message);
+    }
   }
 
   // ——— Price tick handling ——————————————————————————————————————————
@@ -901,80 +996,36 @@ class AiReversalStrategy extends TradingBase {
     }
   }
 
+  /**
+   * Final TP detection handler — invoked from handleRealtimePrice when
+   * price crosses finalTpPrice. v4.0.1: reduced to a thin re-entry guard
+   * around stop({flatten:true, reason:'final_tp'}). The unified stop()
+   * method does everything that used to live here (HARVEST_CLOSE, the
+   * residual check, FINAL_TP_HIT bookkeeping, WS cleanup, notification,
+   * saveState) PLUS the parity gaps that were missing before:
+   *
+   *   - Final funding flush (mirrors hedge.stop)
+   *   - Platform fee deduction on net positive PnL (mirrors hedge.stop)
+   *   - AI usage summary log (mirrors hedge.stop)
+   *   - onStopComplete() hook → removes the entry from app.js's
+   *     `activeStrategies` map. Without this hook the next start
+   *     attempt for this profile is rejected with "already running"
+   *     until the VM restarts. This was the user-reported bug.
+   */
   async _handleFinalTpHit() {
-    if (this.executionState === 'EXECUTING') return;
+    // Re-entry guard: two ticks could pass the `isRunning` check in
+    // handleRealtimePrice before stop() flips isRunning to false. The
+    // executionState lock prevents the second call from double-stopping.
+    if (this.executionState === 'EXECUTING' || this.executionState === 'TERMINATED') return;
     this.executionState = 'EXECUTING';
     try {
-      const exitPrice = this.currentPrice;
-      const exitSide = this.currentSide;
-      await this.addLog(`[REVERSAL] Final TP hit at ${exitPrice} — closing cycle`);
-      await this.executor.executeAction({ type: 'HARVEST_CLOSE', reason: 'final_tp' });
-
-      // Verify Binance actually flattened the position. HARVEST_CLOSE sends
-      // a market order, but if it errors or only partially fills the user is
-      // left exposed. Refresh from REST + warn if residual remains; don't
-      // null activePosition until we've confirmed it's actually flat.
-      await this._refreshCurrentPosition();
-      if (this.activePosition && this.activePosition.quantity > 0) {
-        await this.addLog(`[REVERSAL] WARNING: Final TP close left residual ${this.currentSide} ${this.activePosition.quantity} on Binance — close it manually`);
-      }
-
-      this.activePosition = null;
-      this.currentSide = null;
-      this.harvestPrice = null;
-      this.subState = 'EXITED';
-      this.executionState = 'TERMINATED';
-      this.isRunning = false;
-      this.strategyEndTime = new Date();
-      // Clear all background timers since the cycle is over (mirrors stop()).
-      if (this._fundingPollTimeout) { clearTimeout(this._fundingPollTimeout); this._fundingPollTimeout = null; }
-      if (this.listenKeyRefreshInterval) { clearInterval(this.listenKeyRefreshInterval); this.listenKeyRefreshInterval = null; }
-      await this._postExecuteBookkeeping('FINAL_TP_HIT', { exitPrice });
-
-      // Drop both WS streams (cycle is over, no more level-touch dispatch).
-      try {
-        if (typeof this.cleanupWebSockets === 'function') this.cleanupWebSockets();
-      } catch (cleanupErr) {
-        console.error(`[REVERSAL] Final TP cleanupWebSockets failed: ${cleanupErr.message}`);
-      }
-
-      // Push notification. Helper signature is (userId, strategyData) — the
-      // previous single-object call meant strategyData was undefined and
-      // sendPushNotification got the object as userId, so the FCM token
-      // lookup silently failed. Fields mirror hedge's payload.
-      try {
-        const elapsed = this.cycleStartTime
-          ? formatDuration(Date.now() - this.cycleStartTime)
-          : 'N/A';
-        const netPnL = (this.accumulatedRealizedPnL || 0)
-          - (this.accumulatedTradingFees || 0)
-          + (this.accumulatedFundingFees || 0);
-        await sendStrategyCompletionNotification(this.userId, {
-          strategyId: this.strategyId,
-          symbol: this.symbol,
-          netPnL,
-          profitPercentage: this.initialCapital ? (netPnL / this.initialCapital) * 100 : 0,
-          tradeCount: this.tradeCount || (this.reversalCount + this.harvestCount + 1),
-          timeTaken: elapsed,
-          realizedPnL: this.accumulatedRealizedPnL || 0,
-          tradingFees: this.accumulatedTradingFees || 0,
-          fundingFees: this.accumulatedFundingFees || 0,
-        });
-      } catch (notifyErr) {
-        await this.addLog(`[REVERSAL] notify error: ${notifyErr.message}`);
-      }
-
-      // Persist the terminal state — required for the frontend's
-      // useStrategyCompletionListener to see isRunning=false on a doc
-      // tagged type='AI_REVERSAL' and surface the in-app notification.
-      try {
-        await this.saveState();
-      } catch (saveErr) {
-        console.error(`[REVERSAL] Final TP saveState failed: ${saveErr.message}`);
-      }
+      await this.addLog(`[REVERSAL] Final TP hit at ${this.currentPrice} — closing cycle`);
+      await this.stop({ flatten: true, reason: 'final_tp' });
     } catch (err) {
       await this.addLog(`[REVERSAL] _handleFinalTpHit error: ${err.message}`);
-    } finally {
+      // If stop() never reached TERMINATED (e.g. threw very early), release
+      // the lock so a future tick or a /ai-reversal/stop request can try
+      // again. If stop() succeeded, executionState is already TERMINATED.
       if (this.executionState !== 'TERMINATED') this.executionState = 'IDLE';
     }
   }
@@ -1491,6 +1542,59 @@ class AiReversalStrategy extends TradingBase {
     const { apiKey } = await response.json();
     if (!apiKey) throw new Error('No DeepSeek API key configured.');
     return apiKey;
+  }
+
+  // ——— Platform Fee ————————————————————————————————————————————————
+
+  /**
+   * Deducts the platform fee from the user's wallet on net positive PnL.
+   * Mirrors AiHedgeStrategy.deductPlatformFee verbatim — duplicated for
+   * the same reason _fetchAnthropicApiKey is duplicated (reversal extends
+   * TradingBase, not hedge; follow-up: refactor down to TradingBase).
+   * Called from stop() when netPnL > 0.
+   */
+  async deductPlatformFee(profitAmount) {
+    try {
+      if (!this.userId) return;
+      const userDocRef = this.firestore.collection('users').doc(this.userId);
+      const userDoc = await userDocRef.get();
+      if (!userDoc.exists) return;
+
+      const platformFeePercent = userDoc.data().platformFeePercent ?? 15;
+      if (platformFeePercent <= 0) return;
+
+      const platformFee = profitAmount * (platformFeePercent / 100);
+      await this.addLog(`Platform Fee: ${this._formatNotional(platformFee)} USDT (${platformFeePercent}% of ${this._formatNotional(profitAmount)})`);
+
+      const walletRef = userDocRef.collection('wallets').doc('default');
+      const walletDoc = await walletRef.get();
+      if (!walletDoc.exists) return;
+
+      const currentBalance = walletDoc.data().balance || 0;
+      const newBalance = currentBalance - platformFee;
+      if (newBalance < 0) {
+        await this.addLog(`Warning: Fee would cause negative balance. Skipping.`);
+        return;
+      }
+
+      await walletRef.update({ balance: newBalance, updatedAt: new Date() });
+      await this.addLog(`Fee deducted. Balance: ${this._formatNotional(newBalance)} USDT`);
+
+      await this.firestore.collection('reload_balance_history').add({
+        userId: this.userId,
+        profileId: this.profileId,
+        strategyId: this.strategyId,
+        timestamp: new Date(),
+        balance: newBalance,
+        type: 'platform_fee',
+        amount: -platformFee,
+        description: `Platform fee (${platformFeePercent}%) on profit of $${this._formatNotional(profitAmount)}`,
+        metadata: { totalPnL: profitAmount, feePercentage: platformFeePercent },
+      });
+    } catch (error) {
+      console.error(`Platform fee error: ${error.message}`);
+      await this.addLog(`ERROR: [PLATFORM_FEE] ${error.message}`);
+    }
   }
 
   // ——— Status snapshot (consumed by /ai-reversal/status) ——————————————
