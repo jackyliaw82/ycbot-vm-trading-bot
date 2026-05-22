@@ -1645,6 +1645,87 @@ app.post('/ai-reversal/replan', async (req, res) => {
   }
 });
 
+// Manual user-driven bull/bear level adjustment. Always allowed while
+// running (any subState). The bot's adjustLevels() returns a warnings
+// array describing any new level that's already on the trigger side of
+// current price; the frontend pre-checks the same condition and asks
+// the user to confirm before calling this endpoint with
+// confirmTrigger=true. Endpoint refuses to apply such a move unless
+// confirmTrigger is set, so an accidental call from a stale UI can't
+// silently fire a reversal.
+app.post('/ai-reversal/adjust-levels', async (req, res) => {
+  try {
+    const { strategyId, bullLevel, bearLevel, confirmTrigger, source } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+    if (bullLevel == null && bearLevel == null) {
+      return res.status(400).json({ error: 'At least one of bullLevel/bearLevel is required.' });
+    }
+
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AiReversalStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running AI Reversal strategy with ID ${strategyId}` });
+    }
+
+    // Tick-side pre-check: detect any move that would fire on the next
+    // price tick and require explicit confirmTrigger before proceeding.
+    const px = strategy.currentPrice;
+    const nextBull = bullLevel != null ? bullLevel : strategy.bullLevel;
+    const nextBear = bearLevel != null ? bearLevel : strategy.bearLevel;
+    const wouldTriggerWarnings = [];
+    if (Number.isFinite(px) && px > 0) {
+      if (strategy.subState === 'WAITING') {
+        if (nextBull != null && px >= nextBull) wouldTriggerWarnings.push(`bullLevel ${nextBull} ≤ current ${px}: will OPEN LONG next tick`);
+        if (nextBear != null && px <= nextBear) wouldTriggerWarnings.push(`bearLevel ${nextBear} ≥ current ${px}: will OPEN SHORT next tick`);
+      } else if (strategy.subState === 'LONG_HELD') {
+        if (nextBear != null && px <= nextBear) wouldTriggerWarnings.push(`bearLevel ${nextBear} ≥ current ${px}: will REVERSE LONG→SHORT next tick`);
+      } else if (strategy.subState === 'SHORT_HELD') {
+        if (nextBull != null && px >= nextBull) wouldTriggerWarnings.push(`bullLevel ${nextBull} ≤ current ${px}: will REVERSE SHORT→LONG next tick`);
+      }
+    }
+    if (wouldTriggerWarnings.length > 0 && !confirmTrigger) {
+      return res.status(409).json({
+        error: 'confirmation_required',
+        warnings: wouldTriggerWarnings,
+        currentPrice: px,
+        subState: strategy.subState,
+      });
+    }
+
+    const result = await strategy.adjustLevels({
+      bullLevel: bullLevel != null ? Number(bullLevel) : undefined,
+      bearLevel: bearLevel != null ? Number(bearLevel) : undefined,
+      source: source || 'manual',
+    });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// User-driven AI consult — free-form question. Returns the AI's rationale
+// + optional proposed level changes; does NOT mutate state. Frontend
+// shows the response and triggers /ai-reversal/adjust-levels separately
+// if the user clicks Approve on a proposed change.
+app.post('/ai-reversal/ask-ai', async (req, res) => {
+  try {
+    const { strategyId, question } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+    if (typeof question !== 'string' || !question.trim()) {
+      return res.status(400).json({ error: 'question text is required.' });
+    }
+
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AiReversalStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running AI Reversal strategy with ID ${strategyId}` });
+    }
+
+    const response = await strategy.askAi(question.trim());
+    res.json({ success: true, ...response });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Plan-history audit trail for AI Reversal. Reads from
 // strategies/{strategyId}/aiPlans subcollection populated by
 // AiReversalStrategy._savePlanToFirestore on every consult.

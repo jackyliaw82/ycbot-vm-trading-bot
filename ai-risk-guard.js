@@ -154,6 +154,16 @@ class AiRiskGuard {
           }
         }
       }
+    } else if (consultContext === 'user_question') {
+      // Advisory consult — bot does not act on the response. Only enforce
+      // the shape constraint (planner already did this) plus the standard
+      // forbidden-verb check at the top. Proposed levels are NOT validated
+      // here because the user may legitimately ask about a "wrong-side"
+      // level (e.g. "what if I move bear to 110% of current?"). The
+      // adjust-levels endpoint validates and warns at apply time.
+      if (plan.decision !== 'ADVISE') {
+        reasons.push(`user_question: expected ADVISE, got ${plan.decision}`);
+      }
     } else {
       reasons.push(`Unknown consult context: ${consultContext}`);
     }

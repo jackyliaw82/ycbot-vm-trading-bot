@@ -494,6 +494,20 @@ class AiPlanner {
       if (decision === 'REDUCE' && typeof plan.newSize !== 'number') {
         throw new Error('Reversal plan (REDUCE): newSize required');
       }
+    } else if (consultContext === 'user_question') {
+      if (decision !== 'ADVISE') {
+        throw new Error(`Reversal plan (user_question): expected decision=ADVISE, got ${decision}`);
+      }
+      if (typeof plan.rationale !== 'string' || !plan.rationale.trim()) {
+        throw new Error('Reversal plan (user_question): rationale required');
+      }
+      const bullOk = plan.proposedBullLevel == null
+        || (typeof plan.proposedBullLevel === 'number' && Number.isFinite(plan.proposedBullLevel));
+      const bearOk = plan.proposedBearLevel == null
+        || (typeof plan.proposedBearLevel === 'number' && Number.isFinite(plan.proposedBearLevel));
+      if (!bullOk || !bearOk) {
+        throw new Error('Reversal plan (user_question): proposedBullLevel/proposedBearLevel must be null or finite numbers');
+      }
     } else {
       throw new Error(`Reversal plan: unknown consult context ${consultContext}`);
     }
@@ -501,7 +515,7 @@ class AiPlanner {
 
   /**
    * Build the user message for reversal AI consults.
-   * Three consult contexts are supported: plan, harvest_price, veto.
+   * Four consult contexts are supported: plan, harvest_price, veto, user_question.
    * The context object is built by AiMarketContext.buildReversalContext.
    */
   _buildReversalUserMessage(context) {
@@ -684,6 +698,13 @@ class AiPlanner {
     } else if (ctx === 'veto') {
       parts.push(`Bot proposes New size: ${context.proposedNewSize} USDT (already passed deterministic margin-headroom projection).`);
       parts.push(`Decide: CONTINUE (approve) or REDUCE (provide smaller newSize ≥ ${(context.minNotional * 2).toFixed(2)} USDT).`);
+    } else if (ctx === 'user_question') {
+      parts.push(`The user has typed a free-form question into the running strategy's "Ask AI" panel. Read the question, ground your answer in the market context above, and respond with the ADVISE schema.`);
+      parts.push(`If the question references a possible level change (e.g., "should I move bear to X?", "is bull too tight?"), put your proposed numeric values in proposedBullLevel/proposedBearLevel; otherwise leave them null and answer in rationale only.`);
+      parts.push(`Your output is ADVISORY — the bot will NOT apply level changes automatically. The user reviews your rationale and explicitly clicks Approve to apply.`);
+      parts.push('');
+      parts.push(`## USER QUESTION`);
+      parts.push(context.userQuestion || '(no question text provided)');
     }
 
     parts.push('');

@@ -880,6 +880,134 @@ class AiReversalStrategy extends TradingBase {
     }
   }
 
+  /**
+   * Manual user-driven level adjustment. Mutates bullLevel/bearLevel,
+   * recomputes Final TP, saves state, logs. Does NOT consult AI.
+   *
+   * Returns a structured result so the HTTP layer can surface what
+   * actually changed and any safety warnings (e.g. the new level is on
+   * the wrong side of current price and will fire on the next tick).
+   *
+   * No state-machine transitions — subState/executionState stay as-is.
+   * That's intentional: the user may adjust while flat OR in-position,
+   * and any consequent reversal/open is driven by handleRealtimePrice
+   * on the next tick using the new levels.
+   */
+  async adjustLevels({ bullLevel, bearLevel, source = 'manual' } = {}) {
+    if (!this.isRunning) {
+      throw new Error('Cannot adjust levels: strategy is not running');
+    }
+    const before = { bullLevel: this.bullLevel, bearLevel: this.bearLevel };
+    const changes = {};
+    const warnings = [];
+
+    if (bullLevel != null) {
+      if (typeof bullLevel !== 'number' || !Number.isFinite(bullLevel) || bullLevel <= 0) {
+        throw new Error(`Invalid bullLevel: ${bullLevel}`);
+      }
+      this.bullLevel = bullLevel;
+      changes.bullLevel = { from: before.bullLevel, to: bullLevel };
+    }
+    if (bearLevel != null) {
+      if (typeof bearLevel !== 'number' || !Number.isFinite(bearLevel) || bearLevel <= 0) {
+        throw new Error(`Invalid bearLevel: ${bearLevel}`);
+      }
+      this.bearLevel = bearLevel;
+      changes.bearLevel = { from: before.bearLevel, to: bearLevel };
+    }
+
+    // Tick-level safety surface: report any new level that's already on
+    // the trigger side of current price. The HTTP layer pre-checks this
+    // and asks the user for confirmation, but echo back the same warnings
+    // so the log + audit trail capture what actually fired.
+    const px = this.currentPrice;
+    if (Number.isFinite(px) && px > 0) {
+      if (this.subState === 'WAITING') {
+        if (this.bullLevel != null && px >= this.bullLevel) warnings.push(`bullLevel ${this.bullLevel} ≤ current ${px} — will OPEN LONG on next tick`);
+        if (this.bearLevel != null && px <= this.bearLevel) warnings.push(`bearLevel ${this.bearLevel} ≥ current ${px} — will OPEN SHORT on next tick`);
+      } else if (this.subState === 'LONG_HELD') {
+        if (this.bearLevel != null && px <= this.bearLevel) warnings.push(`bearLevel ${this.bearLevel} ≥ current ${px} — will REVERSE LONG→SHORT on next tick`);
+      } else if (this.subState === 'SHORT_HELD') {
+        if (this.bullLevel != null && px >= this.bullLevel) warnings.push(`bullLevel ${this.bullLevel} ≥ current ${px} — will REVERSE SHORT→LONG on next tick`);
+      }
+    }
+
+    this._recomputeFinalTpPrice();
+    await this.saveState();
+
+    const changeParts = [];
+    if (changes.bullLevel) changeParts.push(`bull ${changes.bullLevel.from} → ${changes.bullLevel.to}`);
+    if (changes.bearLevel) changeParts.push(`bear ${changes.bearLevel.from} → ${changes.bearLevel.to}`);
+    if (changeParts.length > 0) {
+      await this.addLog(`[REVERSAL] manual level adjust (${source}): ${changeParts.join(', ')}` + (warnings.length ? ` — WARNINGS: ${warnings.join('; ')}` : ''));
+    }
+
+    return {
+      changes,
+      warnings,
+      bullLevel: this.bullLevel,
+      bearLevel: this.bearLevel,
+      currentPrice: this.currentPrice,
+      subState: this.subState,
+      finalTpPrice: this.finalTpPrice,
+    };
+  }
+
+  /**
+   * User-driven free-form AI consult. Does NOT mutate strategy state —
+   * the AI's response (rationale + optional proposed levels) is returned
+   * raw so the frontend can show it and optionally call adjustLevels()
+   * if the user clicks Approve.
+   *
+   * Persisted to aiPlans subcollection with consultContext='user_question'
+   * so the existing /ai-reversal/plan-history endpoint surfaces it in the
+   * decision history modal.
+   */
+  async askAi(question) {
+    if (!this.isRunning) {
+      throw new Error('Cannot ask AI: strategy is not running');
+    }
+    if (typeof question !== 'string' || !question.trim()) {
+      throw new Error('Question text required');
+    }
+    if (!this.planner || !this.marketContext) {
+      throw new Error('AI modules not initialized');
+    }
+    await this.addLog(`[REVERSAL] _askAi: "${question.slice(0, 120)}${question.length > 120 ? '…' : ''}"`);
+    try {
+      const ctx = await this.marketContext.buildReversalContext(this._buildStrategyState({
+        consultContext: 'user_question',
+        userQuestion: question,
+      }));
+      this._cacheVolumeContext(ctx);
+      const plan = await this.planner.generatePlan(ctx, 'reversal');
+      this._accumulateAiUsage(plan);
+      const validation = this.riskGuard.validatePlan(plan, ctx);
+      if (!validation.valid) {
+        await this.addLog(`[REVERSAL] _askAi validation soft-fail: ${validation.reasons.join('; ')} — returning raw response anyway (advisory)`);
+      }
+      // Persist for audit (visible in /ai-reversal/plan-history).
+      this._savePlanToFirestore(plan, 'user_question').catch(() => {});
+      // Save state so the recomputed Final TP from _accumulateAiUsage lands.
+      await this.saveState();
+      return {
+        decision: plan.decision,
+        rationale: plan.rationale,
+        proposedBullLevel: plan.proposedBullLevel ?? null,
+        proposedBearLevel: plan.proposedBearLevel ?? null,
+        confidence: plan.confidence ?? null,
+        currentBullLevel: this.bullLevel,
+        currentBearLevel: this.bearLevel,
+        currentPrice: this.currentPrice,
+        subState: this.subState,
+        validationReasons: validation.valid ? [] : validation.reasons,
+      };
+    } catch (err) {
+      await this.addLog(`[REVERSAL] _askAi error: ${err.message}`);
+      throw err;
+    }
+  }
+
   async _handlePlanResponse(plan, reason) {
     this.bullLevel = plan.bullLevel;
     this.bearLevel = plan.bearLevel;
