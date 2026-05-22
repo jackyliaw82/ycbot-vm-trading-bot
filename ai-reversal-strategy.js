@@ -262,6 +262,12 @@ class AiReversalStrategy extends TradingBase {
 
     this._startWebSocketHealthMonitoring();
 
+    // Background refresh of volume primitives (VP24h/VP7d/CVD/orderbook/ATR).
+    // Independent of AI consult cadence so the chart's POC/HVN/Final TP
+    // overlays + Volume Analytics panel stay populated during long
+    // position holds where no consult fires.
+    this._scheduleVolumeRefresh();
+
     // Reconcile against Binance — pick up any pre-existing position (e.g., manual trade or VM restart).
     await this.detectCurrentPosition(true);
     await this._refreshCurrentPosition();
@@ -440,6 +446,16 @@ class AiReversalStrategy extends TradingBase {
 
     this._startWebSocketHealthMonitoring();
 
+    // Background volume snapshot refresh. CRITICAL on resume: when a
+    // position is already held, resume() does NOT fire a fresh PLAN
+    // consult, so the volume primitives (VP/CVD/orderbook/ATR) would
+    // otherwise stay null until the next reversal/harvest — leaving the
+    // chart's POC/HVN/Final TP overlays + Volume Analytics panel blank.
+    // Fire one immediate refresh in addition to the recurring schedule
+    // so the user sees data within seconds, not 5 minutes.
+    this._scheduleVolumeRefresh();
+    this._refreshVolumeSnapshot().catch(() => {});
+
     // Preload _wsHandledOrderIds from Firestore trades subcollection BEFORE
     // L3 reconcile fires. The in-memory dedup map is empty on every restart;
     // without this preload, L3 sees every historical fill as "unhandled"
@@ -544,6 +560,10 @@ class AiReversalStrategy extends TradingBase {
     if (this.listenKeyRefreshInterval) {
       clearInterval(this.listenKeyRefreshInterval);
       this.listenKeyRefreshInterval = null;
+    }
+    if (this._volumeRefreshInterval) {
+      clearInterval(this._volumeRefreshInterval);
+      this._volumeRefreshInterval = null;
     }
 
     const exitPrice = this.currentPrice;
@@ -940,6 +960,26 @@ class AiReversalStrategy extends TradingBase {
     if (changes.bearLevel) changeParts.push(`bear ${changes.bearLevel.from} → ${changes.bearLevel.to}`);
     if (changeParts.length > 0) {
       await this.addLog(`[REVERSAL] manual level adjust (${source}): ${changeParts.join(', ')}` + (warnings.length ? ` — WARNINGS: ${warnings.join('; ')}` : ''));
+    }
+
+    // Append a synthetic entry to the aiPlans subcollection so the
+    // position chart's bull/bear/Final-TP history-segment trail picks
+    // up the manual change on its next re-seed (~60s while running, or
+    // immediately on page reload). Without this, the chart re-seeds
+    // from aiPlans on refresh and reverts to the most recent AI-set
+    // values. Only emits the legs that actually changed, so we don't
+    // create duplicate points on the unchanged side. Fire-and-forget —
+    // a write failure shouldn't break the adjust response.
+    if (changeParts.length > 0) {
+      this._savePlanToFirestore(
+        {
+          decision: 'MANUAL_ADJUST',
+          bullLevel: changes.bullLevel ? changes.bullLevel.to : null,
+          bearLevel: changes.bearLevel ? changes.bearLevel.to : null,
+          rationale: `Manual user adjustment (${source}): ${changeParts.join(', ')}${warnings.length ? ` — accepted with warnings: ${warnings.join('; ')}` : ''}`,
+        },
+        'manual_adjust',
+      ).catch(() => {});
     }
 
     return {
@@ -1587,11 +1627,66 @@ class AiReversalStrategy extends TradingBase {
    */
   _cacheVolumeContext(ctx) {
     if (!ctx) return;
-    if (ctx.volumeProfile24h !== undefined) this._lastVolumeProfile24h = ctx.volumeProfile24h;
-    if (ctx.volumeProfile7d !== undefined) this._lastVolumeProfile7d = ctx.volumeProfile7d;
-    if (ctx.cvd !== undefined) this._lastCvd = ctx.cvd;
-    if (ctx.orderbookDepth !== undefined) this._lastOrderbookDepth = ctx.orderbookDepth;
-    if (ctx.volatility !== undefined) this._lastVolatility = ctx.volatility;
+    // Merge-only: never overwrite a previously-cached non-null value
+    // with a null/undefined fresh value. A transient Binance kline fetch
+    // failure inside marketContext._getVolumeProfile / _getCvdSnapshot
+    // would otherwise wipe good data the chart was already rendering.
+    if (ctx.volumeProfile24h != null) this._lastVolumeProfile24h = ctx.volumeProfile24h;
+    if (ctx.volumeProfile7d != null) this._lastVolumeProfile7d = ctx.volumeProfile7d;
+    if (ctx.cvd != null) this._lastCvd = ctx.cvd;
+    if (ctx.orderbookDepth != null) this._lastOrderbookDepth = ctx.orderbookDepth;
+    if (ctx.volatility != null) this._lastVolatility = ctx.volatility;
+  }
+
+  /**
+   * Refresh the volume primitives (VP24h/VP7d/CVD/orderbook/ATR) outside
+   * of an AI consult. Needed because:
+   *   - Heartbeat was removed; AI consults only fire on cycle start /
+   *     post-harvest / reversals / harvest-gate / user ask-AI.
+   *   - resume() deliberately does NOT fire a fresh PLAN when a position
+   *     is already held, so after a force-update the cached primitives
+   *     start empty and stay empty until the user reverses/harvests —
+   *     which means the chart's POC/VAH/VAL/HVN/ATR/CVD panels all
+   *     render "—" until then.
+   *
+   * Calls the per-primitive fetchers directly (each has its own internal
+   * TTL cache, so a 5-min cadence here is cheap — first call after the
+   * cache lapses hits Binance, subsequent calls within the TTL no-op).
+   * Fire-and-forget; cache update goes through _cacheVolumeContext which
+   * is merge-only (above) so a transient fetch failure can't blank the
+   * chart.
+   */
+  async _refreshVolumeSnapshot() {
+    if (!this.isRunning || !this.marketContext) return;
+    try {
+      const [vp24h, vp7d, cvd, depth, volatility] = await Promise.all([
+        this.marketContext._getVolumeProfile('24h'),
+        this.marketContext._getVolumeProfile('7d'),
+        this.marketContext._getCvdSnapshot(),
+        this.marketContext._getOrderbookSnapshot(),
+        this.marketContext._getVolatility(),
+      ]);
+      this._cacheVolumeContext({
+        volumeProfile24h: vp24h,
+        volumeProfile7d: vp7d,
+        cvd,
+        orderbookDepth: depth,
+        volatility,
+      });
+    } catch (err) {
+      console.error(`[REVERSAL] _refreshVolumeSnapshot error: ${err.message}`);
+    }
+  }
+
+  _scheduleVolumeRefresh() {
+    if (this._volumeRefreshInterval) clearInterval(this._volumeRefreshInterval);
+    // 5-minute cadence. Each fetcher caches internally (VP TTL 10min,
+    // CVD ~5min, etc.) so this is cheap when nothing has expired and
+    // keeps the chart fresh during long position holds.
+    this._volumeRefreshInterval = setInterval(() => {
+      if (!this.isRunning) return;
+      this._refreshVolumeSnapshot().catch(() => {});
+    }, 5 * 60 * 1000);
   }
 
   _accumulateAiUsage(plan) {
