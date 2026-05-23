@@ -626,14 +626,20 @@ class AiHedgeStrategy extends TradingBase {
       try {
         await this._refreshHedgePositions();
 
+        // Close legs at their EXACT Binance-reported quantity. _refreshHedgePositions
+        // just pulled fresh state above, and Binance only ever holds step-aligned
+        // qty (it enforced stepSize at every order entry). Routing this through
+        // roundQuantity would re-introduce a FP edge case where e.g. 1.18 / 0.01
+        // evaluates to 117.99999999999999 and floors to 1.17 — leaving a 1-step
+        // residual on Binance after stop+flatten.
         if (this.longPosition && this.longPosition.quantity > 0) {
-          const qty = this.roundQuantity(this.longPosition.quantity);
+          const qty = this.longPosition.quantity;
           await this.addLog(`Closing LONG: SELL ${qty}`);
           const result = await this.placeMarketOrder(this.symbol, 'SELL', qty, 'LONG');
           longCloseOrderId = result?.orderId;
         }
         if (this.shortPosition && this.shortPosition.quantity > 0) {
-          const qty = this.roundQuantity(this.shortPosition.quantity);
+          const qty = this.shortPosition.quantity;
           await this.addLog(`Closing SHORT: BUY ${qty}`);
           const result = await this.placeMarketOrder(this.symbol, 'BUY', qty, 'SHORT');
           shortCloseOrderId = result?.orderId;

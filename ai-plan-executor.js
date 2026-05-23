@@ -290,17 +290,21 @@ class AiPlanExecutor {
     // which would silently fail the CUT and leave the strategy in deadlock.
     // The clamped qty is re-rounded (floor) so the request stays on a stepSize
     // multiple even after clamp.
+    // Clamp to leg qty from Binance — already step-aligned by definition
+    // (Binance enforced step at order entry), so we pass it through raw.
+    // Routing it back through roundQuantity would re-introduce a FP edge
+    // case where `qty / step` lands one ULP below an integer.
     if (action.type === 'CUT_LONG' && strategy.longPosition && strategy.longPosition.quantity > 0) {
       if (quantity > strategy.longPosition.quantity) {
         const before = quantity;
-        quantity = strategy.roundQuantity(strategy.longPosition.quantity);
+        quantity = strategy.longPosition.quantity;
         await strategy.addLog(`[AI] CUT_LONG clamp: requested ${before} > leg qty ${strategy.longPosition.quantity}, capped at ${quantity}`);
       }
     }
     if (action.type === 'CUT_SHORT' && strategy.shortPosition && strategy.shortPosition.quantity > 0) {
       if (quantity > strategy.shortPosition.quantity) {
         const before = quantity;
-        quantity = strategy.roundQuantity(strategy.shortPosition.quantity);
+        quantity = strategy.shortPosition.quantity;
         await strategy.addLog(`[AI] CUT_SHORT clamp: requested ${before} > leg qty ${strategy.shortPosition.quantity}, capped at ${quantity}`);
       }
     }
@@ -446,7 +450,11 @@ class AiPlanExecutor {
       throw new Error(`Cannot ${action.type}: no current ${fromSide} position to reverse`);
     }
 
-    const closeQty = strategy.roundQuantity(currentPos.quantity);
+    // Close the FULL existing leg. activePosition.quantity comes from
+    // Binance (WS ORDER_TRADE_UPDATE / REST positionRisk) and is already
+    // step-aligned, so passing it through roundQuantity would be a no-op
+    // in the happy case and a 1-step residual bug in the FP edge case.
+    const closeQty = currentPos.quantity;
     // Closing a SHORT = BUY; closing a LONG = SELL.
     // For one-way mode, this is also the direction we'd open the new opposite side,
     // but we split into two market orders so per-fill PnL is cleanly attributable.
@@ -490,7 +498,10 @@ class AiPlanExecutor {
     if (!currentPos || !currentPos.quantity || currentPos.quantity <= 0) {
       throw new Error('HARVEST_CLOSE: no current position to harvest');
     }
-    const closeQty = strategy.roundQuantity(currentPos.quantity);
+    // Close the full position raw — currentPos.quantity comes from Binance
+    // and is already step-aligned. See `_executeReverse` for the same
+    // reasoning around dodging FP edge cases in roundQuantity.
+    const closeQty = currentPos.quantity;
     const closeSide = currentSide === 'LONG' ? 'SELL' : 'BUY';
 
     await strategy.addLog(`[AI] HARVEST_CLOSE: closing ${currentSide} ${closeQty} @ market — ${action.reason || 'AI harvest'}`);

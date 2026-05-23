@@ -1026,11 +1026,15 @@ class AiReversalStrategy extends TradingBase {
       if (!validation.valid) {
         await this.addLog(`[REVERSAL] _askAi validation soft-fail: ${validation.reasons.join('; ')} — returning raw response anyway (advisory)`);
       }
-      // Persist for audit (visible in /ai-reversal/plan-history).
-      this._savePlanToFirestore(plan, 'user_question').catch(() => {});
+      // Persist for audit (visible in /ai-reversal/plan-history) and surface
+      // the planId so the frontend can pass it back on /adjust-levels to mark
+      // the proposal applied. We AWAIT here (unlike other consult contexts)
+      // because the planId is part of the response contract.
+      const planId = await this._savePlanToFirestore(plan, 'user_question', { userQuestion: question });
       // Save state so the recomputed Final TP from _accumulateAiUsage lands.
       await this.saveState();
       return {
+        planId: planId || null,
         decision: plan.decision,
         rationale: plan.rationale,
         proposedBullLevel: plan.proposedBullLevel ?? null,
@@ -2010,6 +2014,18 @@ class AiReversalStrategy extends TradingBase {
         maxPositionSizeUSDT: this.maxPositionSizeUSDT,
         aiModel: this.aiModel,
         aiTokenUsage: this.aiTokenUsage,
+        // Strategy settings surfaced at top-level so the Historical tab's
+        // summary card can render them without descending into config.
+        // (HistoricalDataTab reads d.desiredProfitUSDT / d.positionSizeUSDT /
+        // d.priceType / d.recoveryFactor etc. directly.)
+        desiredProfitUSDT: this.desiredProfitUSDT,
+        positionSizeUSDT: this.currentInitialSize,
+        priceType: this.priceType,
+        recoveryFactor: this.recoveryFactor,
+        recoveryDistance: this.recoveryDistance,
+        harvestLossThreshold: this.harvestLossThreshold,
+        recoveryFactorDecay: this.recoveryFactorDecay,
+        recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
         config: {
           recoveryFactor: this.recoveryFactor,
           recoveryDistance: this.recoveryDistance,
@@ -2035,20 +2051,27 @@ class AiReversalStrategy extends TradingBase {
    * /ai-reversal/plan-history endpoint can return a real audit trail.
    * Stores the consult context (plan / veto) for filtering.
    */
-  async _savePlanToFirestore(plan, consultContext) {
-    if (!this.firestore || !this.strategyId) return;
+  async _savePlanToFirestore(plan, consultContext, extras = {}) {
+    if (!this.firestore || !this.strategyId) return null;
     try {
-      await this.firestore.collection('strategies').doc(this.strategyId).collection('aiPlans').add({
+      const ref = await this.firestore.collection('strategies').doc(this.strategyId).collection('aiPlans').add({
         consultContext: consultContext || 'plan',
         plan: {
           decision: plan.decision || null,
           bullLevel: plan.bullLevel ?? null,
           bearLevel: plan.bearLevel ?? null,
+          // user_question consults return proposedBull/BearLevel (not bull/bearLevel).
+          // Persisting them lets the chat UI replay the proposal across reloads.
+          proposedBullLevel: plan.proposedBullLevel ?? null,
+          proposedBearLevel: plan.proposedBearLevel ?? null,
           newInitialSize: plan.newInitialSize ?? null,
           newSize: plan.newSize ?? null,
           rationale: plan.rationale || null,
           confidence: typeof plan.confidence === 'number' ? plan.confidence : null,
         },
+        // The raw user question for user_question consults — surfaced as the
+        // "You: ..." line in the chat replay. Other consult contexts pass null.
+        userQuestion: extras.userQuestion || null,
         usage: plan._usage || null,
         cycleSnapshot: {
           currentSide: this.currentSide,
@@ -2063,8 +2086,33 @@ class AiReversalStrategy extends TradingBase {
         },
         timestamp: new Date(),
       });
+      return ref.id;
     } catch (err) {
       console.error(`Failed to save reversal plan: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Mark a previously-persisted user_question aiPlans doc as applied.
+   * Called from /ai-reversal/adjust-levels when the request carries a
+   * sourcePlanId, so the chat replay can restore the "Applied" pill
+   * across reloads / devices. No-op if the doc does not exist.
+   */
+  async _markPlanApplied(planId, appliedBullLevel, appliedBearLevel) {
+    if (!this.firestore || !this.strategyId || !planId) return;
+    try {
+      await this.firestore.collection('strategies').doc(this.strategyId)
+        .collection('aiPlans').doc(planId).set({
+          userActions: {
+            applied: true,
+            appliedAt: new Date(),
+            appliedBullLevel: appliedBullLevel ?? null,
+            appliedBearLevel: appliedBearLevel ?? null,
+          },
+        }, { merge: true });
+    } catch (err) {
+      console.error(`Failed to mark plan ${planId} applied: ${err.message}`);
     }
   }
 }

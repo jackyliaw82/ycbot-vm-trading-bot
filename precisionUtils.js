@@ -121,18 +121,25 @@ class PrecisionFormatter {
    *
    * Implementation: floor on the stepSize multiple, then toFixed to clean up
    * floating-point representation noise (e.g., 1.0049999...).
+   *
+   * The +1e-9 epsilon before Math.floor compensates for division FP noise:
+   * `1.18 / 0.01` evaluates to `117.99999999999999`, which would otherwise
+   * floor to 117 → 1.17 and leave a 1-step residual on every close of a
+   * 1.18-sized position. The epsilon is far above division ULP error
+   * (~1e-14) and far below any realistic sub-step quantity, so it only
+   * snaps FP-noise inputs up to the nearest step without ever overshooting.
    */
   roundQuantity(quantity, symbol) {
     if (!symbol || !this.precisionCache[symbol]) return quantity;
     const { stepSize, quantityPrecision } = this.precisionCache[symbol];
     if (typeof stepSize === 'number' && stepSize > 0) {
-      const floored = Math.floor(quantity / stepSize) * stepSize;
+      const floored = Math.floor(quantity / stepSize + 1e-9) * stepSize;
       return parseFloat(floored.toFixed(quantityPrecision));
     }
     // Fallback when stepSize is unavailable (shouldn't happen post-cache):
     // floor by precision instead of toFixed (which is banker's rounding).
     const factor = Math.pow(10, quantityPrecision);
-    return Math.floor(quantity * factor) / factor;
+    return Math.floor(quantity * factor + 1e-9) / factor;
   }
 
   /**

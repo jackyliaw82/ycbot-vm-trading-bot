@@ -1655,7 +1655,7 @@ app.post('/ai-reversal/replan', async (req, res) => {
 // silently fire a reversal.
 app.post('/ai-reversal/adjust-levels', async (req, res) => {
   try {
-    const { strategyId, bullLevel, bearLevel, confirmTrigger, source } = req.body;
+    const { strategyId, bullLevel, bearLevel, confirmTrigger, source, sourcePlanId } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
     if (bullLevel == null && bearLevel == null) {
       return res.status(400).json({ error: 'At least one of bullLevel/bearLevel is required.' });
@@ -1696,6 +1696,19 @@ app.post('/ai-reversal/adjust-levels', async (req, res) => {
       bearLevel: bearLevel != null ? Number(bearLevel) : undefined,
       source: source || 'manual',
     });
+
+    // If the adjust came from an Ask-AI proposal (chat panel "Apply" pill),
+    // mark the source aiPlans doc as applied so the chat replay can restore
+    // the Applied pill across reloads / devices. Fire-and-forget — the
+    // adjust itself already succeeded, this is audit metadata only.
+    if (sourcePlanId) {
+      strategy._markPlanApplied(
+        sourcePlanId,
+        bullLevel != null ? Number(bullLevel) : null,
+        bearLevel != null ? Number(bearLevel) : null,
+      ).catch(() => {});
+    }
+
     res.json({ success: true, ...result });
   } catch (error) {
     res.status(500).json({ error: error.message });
