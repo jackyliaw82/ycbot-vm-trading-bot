@@ -548,7 +548,7 @@ class AiPlanner {
     parts.push(`Reversal Count: ${context.reversalCount}`);
     parts.push(`Harvest Count: ${context.harvestCount}`);
     parts.push(`Cycle Accumulated Loss: ${context.cycleAccumulatedLoss} USDT`);
-    parts.push(`  (= -Σ realized PnL + Σ trading fees + Σ funding fees)`);
+    parts.push(`  (= max(0, −(Σ realized PnL + Σ trading fees + Σ funding fees))  — each summand signed; fees always ≤ 0)`);
     parts.push(`Σ Realized PnL: ${context.accumulatedRealizedPnL} USDT`);
     parts.push(`Σ Trading Fees: ${context.accumulatedTradingFees} USDT`);
     parts.push(`Σ Funding Fees: ${context.accumulatedFundingFees} USDT`);

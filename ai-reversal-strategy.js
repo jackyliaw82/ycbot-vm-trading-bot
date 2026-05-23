@@ -1108,8 +1108,27 @@ class AiReversalStrategy extends TradingBase {
     const verb = newSide === 'LONG' ? 'REVERSE_TO_LONG' : 'REVERSE_TO_SHORT';
     let finalSize = 0;
     try {
+      // Project the closing leg's realized PnL + close fee into accLoss
+      // BEFORE sizing the new leg. Without this, the new leg is sized
+      // to recover the PRIOR cycle loss only, missing the loss we're
+      // about to realize on the close — every reversal under-sizes by
+      // the magnitude of its own closing loss. The open fee for the
+      // new leg is omitted (chicken-and-egg with size); ~0.0005 USDT
+      // gap lost in stepSize rounding.
+      const closeQty   = this.activePosition?.quantity || 0;
+      const closePrice = this.currentPrice || 0;
+      const entryPrice = this.activePosition?.entryPrice || this.activePosition?.avgEntry || 0;
+      const closeRealized = (this.currentSide === 'LONG'  ? (closePrice - entryPrice) :
+                             this.currentSide === 'SHORT' ? (entryPrice - closePrice) :
+                             0) * closeQty;
+      const closeFee = closePrice * closeQty * FEE_RATE;
+      const projectedAccLoss = this._computeAccLoss({
+        extraRealized: closeRealized,
+        extraFees:     closeFee,
+      });
+
       // Compute new size (formula + margin projection + AI veto).
-      const proposed = this._computeFormulaSize();
+      const proposed = this._computeFormulaSize(projectedAccLoss);
       const projected = this._applyMarginHeadroomCap(proposed);
       finalSize = await this._requestVeto(projected);
       const targetLevel = newSide === 'LONG' ? this.bullLevel : this.bearLevel;
@@ -1205,9 +1224,17 @@ class AiReversalStrategy extends TradingBase {
    *   Recovery size   = accumulated_loss × recovery_factor
    *   Additional size = Recovery size / recovery_distance
    *   New size        = Initial size + Additional size
+   *
+   * Optional `accLossOverride` lets callers pass a forward-projected
+   * accLoss instead of the in-memory `cycleAccumulatedLoss`. Used by
+   * _performReversal to size the new leg based on the post-close
+   * accLoss (i.e. including the realized loss + close fee from closing
+   * the current position). Without that projection, every reversal
+   * sizes the new leg to recover the PRIOR cycle loss, missing the
+   * loss it's about to realize on the leg being closed.
    */
-  _computeFormulaSize() {
-    const loss = Math.max(0, this.cycleAccumulatedLoss || 0);
+  _computeFormulaSize(accLossOverride) {
+    const loss = Math.max(0, accLossOverride != null ? accLossOverride : (this.cycleAccumulatedLoss || 0));
     const recoverySize = loss * this.recoveryFactor;
     const additional = this.recoveryDistance > 0 ? recoverySize / this.recoveryDistance : 0;
     const newSize = (this.currentInitialSize || 0) + additional;
@@ -1324,11 +1351,7 @@ class AiReversalStrategy extends TradingBase {
         || actionType === 'REVERSE_TO_LONG'
         || actionType === 'REVERSE_TO_SHORT';
       await this._refreshCurrentPosition(expectNonEmpty);
-      this.cycleAccumulatedLoss = Math.max(0,
-        -(this.accumulatedRealizedPnL || 0)
-        + (this.accumulatedTradingFees || 0)
-        + (this.accumulatedFundingFees || 0)
-      );
+      this.cycleAccumulatedLoss = this._computeAccLoss();
       this._recomputeFinalTpPrice();
       await this.saveState();
       this._writeMetricsSample().catch(() => {});
@@ -1336,6 +1359,43 @@ class AiReversalStrategy extends TradingBase {
     } catch (err) {
       console.error(`[REVERSAL] _postExecuteBookkeeping error: ${err.message}`);
     }
+  }
+
+  /**
+   * Compute the cycle's accumulated loss in USDT (always ≥ 0).
+   *
+   * Sign-consistent formulation — each component carries its own signed
+   * wallet impact, and we just sum them. accLoss is the positive
+   * magnitude of the drawdown when net is negative, 0 otherwise.
+   *
+   *   netSignedPnL = realized + fees + funding
+   *
+   *   where each component is the signed wallet delta:
+   *     realized:  + profit              / − loss
+   *     fees:      always negative       (every fill subtracts from wallet)
+   *     funding:   + received            / − paid
+   *
+   *   accLoss      = max(0, −netSignedPnL)
+   *
+   * Note on storage: `this.accumulatedTradingFees` is kept by TradingBase
+   * as a POSITIVE MAGNITUDE (cost size), so we negate it inside this
+   * helper to convert to the signed convention above. callers' `extraFees`
+   * are similarly passed as positive magnitudes and negated here. This
+   * lets us keep the broader codebase's existing storage shape while the
+   * formula reads cleanly with all three terms in the same sign space.
+   *
+   * Optional `extraRealized` / `extraFees` / `extraFunding` arguments
+   * project hypothetical add-ons onto the current state — used by
+   * _performReversal to fold in the closing leg's realized PnL + close
+   * fee BEFORE sizing the new leg, otherwise every reversal under-sizes
+   * the recovery by the amount it's about to realize on the close.
+   */
+  _computeAccLoss({ extraRealized = 0, extraFees = 0, extraFunding = 0 } = {}) {
+    const realized = (this.accumulatedRealizedPnL  || 0) + extraRealized;       // signed
+    const fees     = -((this.accumulatedTradingFees || 0) + extraFees);          // → signed (always negative)
+    const funding  = (this.accumulatedFundingFees   || 0) + extraFunding;        // signed
+    const netSignedPnL = realized + fees + funding;
+    return netSignedPnL < 0 ? -netSignedPnL : 0;
   }
 
   /**
@@ -1420,14 +1480,13 @@ class AiReversalStrategy extends TradingBase {
       }
       this._lastFundingPollTs = maxTime;
 
-      // Funding flows into accumulated_loss with the same sign convention
-      // as fees (positive = cost, increases the loss the strategy needs
-      // to recover). negative funding (rebate) reduces loss.
-      this.cycleAccumulatedLoss = Math.max(0,
-        -(this.accumulatedRealizedPnL || 0)
-        + (this.accumulatedTradingFees || 0)
-        + (this.accumulatedFundingFees || 0)
-      );
+      // accumulatedFundingFees is stored SIGNED (− paid / + received) per
+      // the parse loop above; _computeAccLoss treats it as a signed
+      // wallet event identical in semantics to realized PnL. Funding
+      // PAID now correctly INCREASES accLoss (the v4.1.1 formula
+      // subtracted it, under-sizing recovery on every funding-heavy
+      // cycle — see _computeAccLoss for the full rationale).
+      this.cycleAccumulatedLoss = this._computeAccLoss();
       this._recomputeFinalTpPrice();
 
       await this.addLog(

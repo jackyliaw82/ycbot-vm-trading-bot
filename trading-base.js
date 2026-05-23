@@ -212,13 +212,12 @@ class TradingBase {
     // don't need aggressive recovery, just eventual recovery.
     this._liquidationBackgroundRetry = null;
 
-    // Diagnostic tracing (temporary — see plan: silent WS stall investigation)
+    // Per-WS instance id counters — referenced in stall warnings and
+    // ws_error logs to correlate failures with which connection
+    // instance produced them across reconnect cycles.
     this._realtimeWsIdCounter = 0;
     this._userDataWsIdCounter = 0;
     this._liquidationWsIdCounter = 0;
-    this._realtimeMessagesSeen = 0;
-    this._userDataMessagesSeen = 0;
-    this._liquidationMessagesSeen = 0;
 
     // User-data reconcile flag: set by attemptUserDataReconnection so the next
     // connectUserDataStream() open handler triggers a REST position sync.
@@ -1313,19 +1312,16 @@ class TradingBase {
 
     const wsUrl = this._buildRelayWsUrl(tickerStream);
     const wsId = ++this._realtimeWsIdCounter;
-    this._realtimeMessagesSeen = 0;
     // Tracks whether this specific WS instance ever transitioned to OPEN. Used in
     // the close handler to distinguish "stalled after open" (existing watchdog
     // already counts this) from "couldn't even open" (relay unreachable / network
     // outage / kernel routing block) — both should count toward REST fallback.
     let wsEverOpened = false;
-    this.addLog(`[DIAG] connectRealtimeWebSocket called. prevReadyState=${prevReadyState}, newWsId=${wsId}, url=${wsUrl}`);
     this.realtimeWs = new WebSocket(wsUrl);
     const currentWs = this.realtimeWs;
 
     this.realtimeWs.on('open', async () => {
       wsEverOpened = true;
-      await this.addLog(`[DIAG] WS ${wsId} OPEN`);
       await this.addLog('[WebSocket] Real-time price WS connected.');
       this.realtimeWsConnected = true;
       this.realtimeReconnectAttempts = 0;
@@ -1389,11 +1385,6 @@ class TradingBase {
           this._firstStallAt = null;
         }
 
-        // Log only the first 3 messages per socket for diagnostics, then silent.
-        if (this._realtimeMessagesSeen < 3) {
-          this._realtimeMessagesSeen++;
-          await this.addLog(`[DIAG] WS ${wsId} MESSAGE #${this._realtimeMessagesSeen} e=${message.e}`);
-        }
         if (this.priceType === 'LAST' && message.e === '24hrTicker') {
           await this.handleRealtimePrice(parseFloat(message.c));
         } else if (this.priceType === 'MARK' && message.e === 'markPriceUpdate') {
@@ -1412,8 +1403,7 @@ class TradingBase {
 
     this.realtimeWs.on('close', async (code, reason) => {
       this.realtimeWsConnected = false;
-      await this.addLog(`[DIAG] WS ${wsId} CLOSE code=${code} reason=${reason || 'none'}`);
-      await this.addLog('[WebSocket] Real-time price WebSocket closed.');
+      await this.addLog(`[WebSocket] Real-time price WebSocket closed. Code: ${code}, Reason: ${reason || 'none'}`);
       if (this.realtimeWsPingInterval) clearInterval(this.realtimeWsPingInterval);
       if (this.realtimeWsPingTimeout) clearTimeout(this.realtimeWsPingTimeout);
       if (this.realtimeWsStaleWatcher) clearInterval(this.realtimeWsStaleWatcher);
@@ -1726,12 +1716,9 @@ class TradingBase {
 
     const userDataUrl = `${wsBaseUrl}/${this.listenKey}`;
     const wsId = ++this._userDataWsIdCounter;
-    this._userDataMessagesSeen = 0;
-    this.addLog(`[DIAG] connectUserDataStream called. newWsId=${wsId}`);
     this.userDataWs = new WebSocket(userDataUrl);
 
     this.userDataWs.on('open', async () => {
-      await this.addLog(`[DIAG] User Data WS ${wsId} OPEN`);
       await this.addLog('[WebSocket] User Data WS connected.');
       this.userDataWsConnected = true;
       // L2 health flag: log only on transition from unhealthy → healthy.
@@ -1771,11 +1758,6 @@ class TradingBase {
         const message = JSON.parse(data.toString());
         this._lastUserDataMessageAt = Date.now();
 
-        if (this._userDataMessagesSeen < 3) {
-          this._userDataMessagesSeen++;
-          await this.addLog(`[DIAG] User Data WS ${wsId} MESSAGE #${this._userDataMessagesSeen} e=${message.e}`);
-        }
-
         // ORDER_TRADE_UPDATE — trade fills, PnL, fees
         if (message.e === 'ORDER_TRADE_UPDATE' && message.o.s === this.symbol) {
           await this._handleOrderTradeUpdate(message.o);
@@ -1803,7 +1785,6 @@ class TradingBase {
         await this.addLog('[USER-DATA-WS] healthy → unhealthy, REST fallback active');
         this._userDataWsHealthy = false;
       }
-      await this.addLog(`[DIAG] User Data WS ${wsId} CLOSE code=${code} reason=${reason || 'none'}`);
       await this.addLog(`[WebSocket] User Data Stream WebSocket closed. Code: ${code}, Reason: ${reason || 'none'}, isRunning: ${this.isRunning}`);
 
       if (this.userDataWsPingInterval) clearInterval(this.userDataWsPingInterval);
@@ -2053,13 +2034,10 @@ class TradingBase {
     const stream = `${this.symbol.toLowerCase()}@forceOrder`;
 
     const wsId = ++this._liquidationWsIdCounter;
-    this._liquidationMessagesSeen = 0;
-    this.addLog(`[DIAG] connectLiquidationWebSocket called. newWsId=${wsId}`);
     this.liquidationWs = new WebSocket(this._buildRelayWsUrl(stream));
     const currentWs = this.liquidationWs;
 
     this.liquidationWs.on('open', async () => {
-      await this.addLog(`[DIAG] Liquidation WS ${wsId} OPEN`);
       await this.addLog('[WebSocket] Liquidation WS connected.');
       this.liquidationWsConnected = true;
       this._liqWsLastConnectedAt = Date.now();
@@ -2096,10 +2074,6 @@ class TradingBase {
       try {
         const message = JSON.parse(data.toString());
         this.lastLiquidationTickAt = Date.now();
-        if (this._liquidationMessagesSeen < 3) {
-          this._liquidationMessagesSeen++;
-          await this.addLog(`[DIAG] Liquidation WS ${wsId} MESSAGE #${this._liquidationMessagesSeen} e=${message.e}`);
-        }
         if (message.e !== 'forceOrder' || !message.o) return;
         const o = message.o;
         const avgPrice = parseFloat(o.ap);
@@ -2123,8 +2097,7 @@ class TradingBase {
 
     this.liquidationWs.on('close', async (code, reason) => {
       this.liquidationWsConnected = false;
-      await this.addLog(`[DIAG] Liquidation WS ${wsId} CLOSE code=${code} reason=${reason || 'none'}`);
-      await this.addLog('[WebSocket] Liquidation WebSocket closed.');
+      await this.addLog(`[WebSocket] Liquidation WebSocket closed. Code: ${code}, Reason: ${reason || 'none'}`);
       if (this.liquidationWsPingInterval) clearInterval(this.liquidationWsPingInterval);
       if (this.liquidationWsPingTimeout) clearTimeout(this.liquidationWsPingTimeout);
 
@@ -2437,20 +2410,40 @@ class TradingBase {
     }
     this._stopWebSocketHealthMonitoring();
 
+    // Close + null each WS, then emit a single confirmation per channel
+    // so the user-facing strategy log shows the teardown explicitly when
+    // the strategy stops (manual or Final TP). cleanupWebSockets() is
+    // only called from stop() paths — reconnect cycles don't pass
+    // through here — so these don't add noise during normal operation.
+    // addLog is fire-and-forget: cleanupWebSockets stays sync (callers
+    // don't await it) and the Firestore write completes after return.
     if (this.realtimeWs) {
       this.realtimeWs.removeAllListeners();
       this.realtimeWs.close();
       this.realtimeWs = null;
+      this.addLog('[WebSocket] Real-time price WS disconnected.').catch(() => {});
     }
     if (this.userDataWs) {
       this.userDataWs.removeAllListeners();
       this.userDataWs.close();
       this.userDataWs = null;
+      this.addLog('[WebSocket] User Data WS disconnected.').catch(() => {});
     }
     if (this.liquidationWs) {
       this.liquidationWs.removeAllListeners();
       this.liquidationWs.close();
       this.liquidationWs = null;
+      this.addLog('[WebSocket] Liquidation WS disconnected.').catch(() => {});
+    }
+
+    // Clear the cached listenKey. Binance auto-invalidates after 60 min
+    // of no refresh, so an explicit DELETE isn't strictly required —
+    // but dropping the reference makes the teardown explicit in the
+    // log and prevents a stale key from being reused if start() runs
+    // again on the same instance.
+    if (this.listenKey) {
+      this.listenKey = null;
+      this.addLog('[WebSocket] listenKey cleared.').catch(() => {});
     }
 
     this.realtimeWsConnected = false;

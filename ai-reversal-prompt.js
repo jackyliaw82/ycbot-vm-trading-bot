@@ -18,7 +18,17 @@ This is a volume-driven, single-sided reversal strategy:
     Recovery size      = accumulated_loss × recovery_factor   (default 20%)
     Additional size    = Recovery size / recovery_distance     (default 0.5%)
     New size           = Initial size + Additional size
-- accumulated_loss = -(Σ realized PnL) + Σ trading fees + Σ funding fees
+- accumulated_loss is the positive magnitude of the cycle's net wallet drawdown:
+    net_signed_pnl   = Σ realized PnL + Σ trading fees + Σ funding fees
+    accumulated_loss = max(0, −net_signed_pnl)
+  Each component is a SIGNED wallet delta:
+    realized: + profit / − loss
+    fees:     always negative (every fill is a wallet debit)
+    funding:  + received / − paid
+  accumulated_loss is 0 when the cycle is break-even or ahead. On every
+  reversal, sizing folds in the realized PnL and close fee of the leg being
+  closed BEFORE the new leg is sized, so the new leg targets the full
+  post-close drawdown — not just the prior cycle state.
 - Final TP price is the price at which (realized + unrealized PnL) ≥ accumulated_loss + desired_profit + ai_consult_cost. AI consult cost is the running DeepSeek/Anthropic USD spend across all consults in this cycle — the cycle's true breakeven includes it. Recalculated after every event AND after every AI consult. When Final TP price is touched, the cycle ends successfully.
 
 IMPORTANT — LEVELS ARE PERMANENT FOR THE CYCLE: For Context 1 (PLAN), you are consulted EXACTLY ONCE at cycle start. After that, bullLevel and bearLevel are frozen for the entire cycle. There is NO periodic level rethink. Pick levels that you are willing to defend for potentially many hours of price action.
