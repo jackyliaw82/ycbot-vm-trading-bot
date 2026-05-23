@@ -752,7 +752,8 @@ class AiMarketContext {
       planHistory,
       vetoMode,                  // Context 2 flag — bot is asking for size approval
       proposedNewSize,           // for Context 2
-      consultContext,            // 'plan' | 'veto'
+      consultContext,            // 'plan' | 'veto' | 'harvest_price' | 'user_question'
+      userQuestion,              // Context 4 — free-form question from Ask AI panel
     } = strategyState;
 
     // Fetch parallel.
@@ -825,6 +826,11 @@ class AiMarketContext {
       // Consult-context-specific fields.
       vetoMode: !!vetoMode,
       proposedNewSize: proposedNewSize || null,
+      // Context 4 — user's free-form question text. Read by
+      // ai-planner._buildReversalUserMessage to inject under the
+      // "USER QUESTION" footer. Forgetting this propagation makes the
+      // AI respond with "no question text was provided by the user".
+      userQuestion: userQuestion || null,
 
       // History.
       previousPlan: previousPlan || null,
