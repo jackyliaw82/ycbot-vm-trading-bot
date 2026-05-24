@@ -167,6 +167,12 @@ class AiReversalStrategy extends TradingBase {
     // yet) but stored so the startup log reflects what the form sent.
     this.recoveryFactorDecay = !!config.recoveryFactorDecay;
     this.recoveryDistanceAutoWiden = !!config.recoveryDistanceAutoWiden;
+    // AI size veto on reversal — when true, _performReversal calls
+    // _requestVeto (CONTINUE / REDUCE) before opening the new opposite
+    // leg. When false, skip the AI consult and use the formula's
+    // projected size directly (faster reversals, deterministic sizing,
+    // lower DeepSeek cost). Defaults false (matches frontend default).
+    this.aiVetoOnReversal = !!config.aiVetoOnReversal;
 
     if (!this.symbol) throw new Error('AiReversalStrategy.start: missing symbol');
     if (!this.currentInitialSize || this.currentInitialSize <= 0) {
@@ -195,7 +201,8 @@ class AiReversalStrategy extends TradingBase {
       `harvestLossThreshold=${(this.harvestLossThreshold * 100).toFixed(0)}%, ` +
       `desiredProfitUSDT=${this.desiredProfitUSDT} ` +
       `| recoveryFactorDecay=${this.recoveryFactorDecay ? 'on' : 'off'}, ` +
-      `recoveryDistanceAutoWiden=${this.recoveryDistanceAutoWiden ? 'on' : 'off'}`
+      `recoveryDistanceAutoWiden=${this.recoveryDistanceAutoWiden ? 'on' : 'off'}, ` +
+      `aiVetoOnReversal=${this.aiVetoOnReversal ? 'on' : 'off'}`
     );
 
     try {
@@ -345,6 +352,7 @@ class AiReversalStrategy extends TradingBase {
     // Restore advanced toggles too (advisory, but tracked for log parity).
     this.recoveryFactorDecay = !!snapshot.config?.recoveryFactorDecay;
     this.recoveryDistanceAutoWiden = !!snapshot.config?.recoveryDistanceAutoWiden;
+    this.aiVetoOnReversal = !!snapshot.config?.aiVetoOnReversal;
 
     // Restore cycle state
     this.currentSide = snapshot.currentSide || null;
@@ -1131,10 +1139,19 @@ class AiReversalStrategy extends TradingBase {
         extraFees:     closeFee,
       });
 
-      // Compute new size (formula + margin projection + AI veto).
+      // Compute new size (formula + margin projection + optional AI veto).
+      // When aiVetoOnReversal is disabled the projected size is used as-is
+      // (faster reversals, deterministic sizing). Harvest detection /
+      // harvest-price consult / post-harvest PLAN consult are all on
+      // independent code paths and remain active regardless.
       const proposed = this._computeFormulaSize(projectedAccLoss);
       const projected = this._applyMarginHeadroomCap(proposed);
-      finalSize = await this._requestVeto(projected);
+      if (this.aiVetoOnReversal) {
+        finalSize = await this._requestVeto(projected);
+      } else {
+        finalSize = projected;
+        await this.addLog(`[REVERSAL] AI size veto disabled — using projected size ${finalSize} USDT`);
+      }
       const targetLevel = newSide === 'LONG' ? this.bullLevel : this.bearLevel;
       const newQty = await this._calculateAdjustedQuantity(this.symbol, finalSize, targetLevel || this.currentPrice, verb);
 
@@ -1919,6 +1936,7 @@ class AiReversalStrategy extends TradingBase {
       maxPositionSizeUSDT: this.maxPositionSizeUSDT,
       recoveryFactorDecay: this.recoveryFactorDecay,
       recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
+      aiVetoOnReversal: this.aiVetoOnReversal,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
@@ -2026,6 +2044,7 @@ class AiReversalStrategy extends TradingBase {
         harvestLossThreshold: this.harvestLossThreshold,
         recoveryFactorDecay: this.recoveryFactorDecay,
         recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
+        aiVetoOnReversal: this.aiVetoOnReversal,
         config: {
           recoveryFactor: this.recoveryFactor,
           recoveryDistance: this.recoveryDistance,
@@ -2034,6 +2053,7 @@ class AiReversalStrategy extends TradingBase {
           initialSize: this.currentInitialSize,
           recoveryFactorDecay: this.recoveryFactorDecay,
           recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
+          aiVetoOnReversal: this.aiVetoOnReversal,
         },
         criticalError: this.criticalError || null,
         lastUpdated: new Date(),

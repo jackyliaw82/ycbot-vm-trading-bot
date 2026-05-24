@@ -1760,6 +1760,30 @@ app.get('/ai-reversal/plan-history', async (req, res) => {
   }
 });
 
+// strategyFlow audit trail for AI Reversal. Reads from
+// strategies/{strategyId}/strategyFlow subcollection populated by
+// AiReversalStrategy._writeStrategyFlow inside _postExecuteBookkeeping
+// on every position event (open / reverse / harvest / final_tp_hit).
+// Used by the position chart to place TP segment boundaries at EXACT
+// reversal moments instead of heartbeat-resolution aiPlans timestamps.
+app.get('/ai-reversal/strategy-flow', async (req, res) => {
+  try {
+    const { strategyId, limit: queryLimit } = req.query;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+
+    const flowLimit = parseInt(queryLimit) || 200;
+    const flowRef = firestore.collection('strategies').doc(strategyId).collection('strategyFlow');
+    const snapshot = await flowRef.orderBy('timestamp', 'desc').limit(flowLimit).get();
+
+    const flow = [];
+    snapshot.forEach(doc => flow.push({ id: doc.id, ...doc.data() }));
+
+    res.json({ flow, count: flow.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Start the server
 server.listen(PORT, async () => {
   startupStatus.serverReady = true;
