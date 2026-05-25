@@ -4,6 +4,7 @@ import { AiPlanner } from './ai-planner.js';
 import { AiPlanExecutor } from './ai-plan-executor.js';
 import { AiRiskGuard, FEE_RATE } from './ai-risk-guard.js';
 import { AiMarketContext } from './ai-market-context.js';
+import wsBroadcast from './ws-broadcast.js';
 
 // Per-model pricing in USD per million tokens. Mirrors ai-hedge-strategy.js.
 const MODEL_PRICING = {
@@ -1428,6 +1429,7 @@ class AiReversalStrategy extends TradingBase {
   async _writeStrategyFlow(actionType, extra = {}) {
     if (!this.firestore || !this.strategyId) return;
     try {
+      const timestamp = new Date();
       await this.firestore.collection('strategies').doc(this.strategyId).collection('strategyFlow').add({
         actionType,
         side: this.currentSide || null,
@@ -1442,8 +1444,21 @@ class AiReversalStrategy extends TradingBase {
         harvestCount: this.harvestCount,
         finalTpPrice: this.finalTpPrice,
         ...extra,
-        timestamp: new Date(),
+        timestamp,
       });
+
+      // Real-time push for the chart's TP segment boundaries. Slim payload —
+      // only the four fields HedgePositionChart's buildTpFromFlow walker
+      // reads. Future consumers needing position / cycleAccumulatedLoss /
+      // etc. can extend this.
+      try {
+        wsBroadcast.pushFlowEvent(this.strategyId, {
+          actionType,
+          side: this.currentSide || null,
+          finalTpPrice: this.finalTpPrice ?? null,
+          timestamp: timestamp.toISOString(),
+        });
+      } catch (_) { /* push is best-effort; REST poll catches stragglers */ }
     } catch (err) {
       console.error(`[REVERSAL] _writeStrategyFlow failed: ${err.message}`);
     }
@@ -2074,6 +2089,7 @@ class AiReversalStrategy extends TradingBase {
   async _savePlanToFirestore(plan, consultContext, extras = {}) {
     if (!this.firestore || !this.strategyId) return null;
     try {
+      const timestamp = new Date();
       const ref = await this.firestore.collection('strategies').doc(this.strategyId).collection('aiPlans').add({
         consultContext: consultContext || 'plan',
         plan: {
@@ -2104,8 +2120,38 @@ class AiReversalStrategy extends TradingBase {
           // segments on reload. Side-aware coloring uses currentSide above.
           finalTpPrice: this.finalTpPrice ?? null,
         },
-        timestamp: new Date(),
+        timestamp,
       });
+
+      // Push a SLIM real-time copy to all connected WS clients so the chart
+      // (bull/bear overlay) + chat thread (user_question replay) update
+      // instantly instead of waiting for the next REST poll / 60s re-seed.
+      // marketContext / usage / newInitialSize etc. are intentionally
+      // omitted — current consumers don't read them, and stripping them
+      // keeps the per-consult broadcast at ~500 B instead of ~10–50 KB
+      // (mostly the orderbookDepth blob inside marketContext).
+      // Extend this payload if a future panel needs more fields.
+      try {
+        wsBroadcast.pushPlanUpdate(this.strategyId, {
+          id: ref.id,
+          consultContext: consultContext || 'plan',
+          timestamp: timestamp.toISOString(),
+          userQuestion: extras.userQuestion || null,
+          plan: {
+            bullLevel: plan.bullLevel ?? null,
+            bearLevel: plan.bearLevel ?? null,
+            proposedBullLevel: plan.proposedBullLevel ?? null,
+            proposedBearLevel: plan.proposedBearLevel ?? null,
+            rationale: plan.rationale || null,
+            confidence: typeof plan.confidence === 'number' ? plan.confidence : null,
+          },
+          cycleSnapshot: {
+            bullLevel: this.bullLevel,
+            bearLevel: this.bearLevel,
+          },
+        });
+      } catch (_) { /* push is best-effort; REST poll catches stragglers */ }
+
       return ref.id;
     } catch (err) {
       console.error(`Failed to save reversal plan: ${err.message}`);
