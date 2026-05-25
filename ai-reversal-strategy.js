@@ -721,6 +721,16 @@ class AiReversalStrategy extends TradingBase {
     if (!Number.isFinite(price) || price <= 0) return;
     this.currentPrice = price;
 
+    // Per-tick price push for the chart's candle wick. Slim — currentPrice
+    // + ISO timestamp only. The 10s strategy_update interval still carries
+    // the full status payload (position, plans, levels) at its own cadence.
+    try {
+      wsBroadcast.pushPriceTick(this.strategyId, {
+        currentPrice: price,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (_) { /* best-effort */ }
+
     // Keep the in-memory position's unrealized PnL fresh on every tick.
     // Cheap (multiplication + sign branch); needed so getStatus() and
     // Final TP gating see the latest unrealized value.

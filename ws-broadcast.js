@@ -76,6 +76,17 @@ class WsBroadcast {
   }
 
   /**
+   * Push a per-tick price update. Slim payload — used by HedgePositionChart
+   * to drive smooth 1Hz candle-wick updates instead of the 10s strategy_update
+   * cadence. Called from each strategy's handleRealtimePrice (~1 msg/sec from
+   * the Binance markPrice@1s upstream). Bot-side cost is negligible
+   * (currentPrice is already in scope); per-tab egress is ~155 B/sec.
+   */
+  pushPriceTick(strategyId, tickData) {
+    this._broadcast({ type: 'price_tick', strategyId, data: tickData });
+  }
+
+  /**
    * Push health data.
    */
   pushHealth(healthData) {

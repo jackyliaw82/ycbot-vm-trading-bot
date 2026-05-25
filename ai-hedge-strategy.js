@@ -4,6 +4,7 @@ import { AiPlanner } from './ai-planner.js';
 import { AiPlanExecutor } from './ai-plan-executor.js';
 import { AiRiskGuard, FEE_RATE } from './ai-risk-guard.js';
 import { AiMarketContext } from './ai-market-context.js';
+import wsBroadcast from './ws-broadcast.js';
 import fetch from 'node-fetch';
 
 // Per-model pricing in USD per million tokens. Sourced from Anthropic published
@@ -772,6 +773,16 @@ class AiHedgeStrategy extends TradingBase {
     this.currentPrice = price;
     this.lastProcessedPrice = price;
     this._updateUnrealizedPnL(price);
+
+    // Per-tick price push for the chart's candle wick. Slim — currentPrice
+    // + ISO timestamp only. The 10s strategy_update interval still carries
+    // the full status payload (positions, plans, levels) at its own cadence.
+    try {
+      wsBroadcast.pushPriceTick(this.strategyId, {
+        currentPrice: price,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (_) { /* best-effort */ }
 
     // Auto-stop check with hysteresis (C3): totalPnL >= effectiveTarget
     // must hold for N consecutive ticks AND a minimum elapsed duration
