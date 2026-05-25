@@ -315,6 +315,15 @@ class TradingBase {
 
       // Broadcast trade to connected WebSocket clients
       wsBroadcast.pushTrade(this.strategyId, tradeData);
+      // Fire an immediate slim heartbeat — accumulatedRealizedPnL /
+      // accumulatedTradingFees / currentPosition / currentSide just
+      // changed from this fill. Without this push, frontend would see
+      // stale accumulators until the next 30s safety-net heartbeat.
+      // Hook is optional — strategies that implement _pushHeartbeatNow
+      // (AiHedgeStrategy + AiReversalStrategy) opt in; others no-op.
+      if (typeof this._pushHeartbeatNow === 'function') {
+        try { this._pushHeartbeatNow(); } catch (_) { /* non-fatal */ }
+      }
     } catch (error) {
       console.error(`Failed to save trade to Firestore: ${error.message}`);
     }

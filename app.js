@@ -357,18 +357,27 @@ function buildHealthPayload() {
   };
 }
 
-// Periodic health + strategy_update broadcast to all connected WebSocket clients
+// Periodic health + strategy_update broadcast to all connected WebSocket clients.
+// Cadence: 30s safety-net heartbeat. Strategies also fire pushStrategyUpdate
+// immediately after every bookkeeping change (trade fill, flow event, AI consult,
+// harvest-price set) so the frontend sees sub-second updates in practice — the
+// 30s tick is purely re-sync insurance against a dropped event frame.
+// Payload: getHeartbeatPayload() returns only TRUE LIVE fields (executionState,
+// subState, isRunning, position state, accumulators, AI cost). Static config
+// fields (leverage, priceType, recovery params, etc.) are loaded once via the
+// initial REST fetch — sending them every push wasted ~75% of the bandwidth.
 setInterval(() => {
   if (wss.clients.size > 0) {
     wsBroadcast.pushHealth(buildHealthPayload());
-    // Send full strategy status for each active strategy (drives frontend UI updates)
     activeStrategies.forEach((strategy, strategyId) => {
-      if (strategy.isRunning && typeof strategy.getStatus === 'function') {
-        wsBroadcast.pushStrategyUpdate(strategyId, strategy.getStatus());
-      }
+      if (!strategy.isRunning) return;
+      const payload = typeof strategy.getHeartbeatPayload === 'function'
+        ? strategy.getHeartbeatPayload()
+        : (typeof strategy.getStatus === 'function' ? strategy.getStatus() : null);
+      if (payload) wsBroadcast.pushStrategyUpdate(strategyId, payload);
     });
   }
-}, 10000);
+}, 30000);
 
 // Health check endpoint
 app.get('/health', (req, res) => {

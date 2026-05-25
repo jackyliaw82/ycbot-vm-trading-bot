@@ -1388,6 +1388,13 @@ class AiReversalStrategy extends TradingBase {
       await this.saveState();
       this._writeMetricsSample().catch(() => {});
       this._writeStrategyFlow(actionType, extra).catch(() => {});
+      // Immediate heartbeat — currentPosition / currentSide / cycleAccumLoss /
+      // reversalCount / harvestCount / accumulated*PnL just changed. Without
+      // this push, frontend would see stale state for up to 30s (next safety-
+      // net interval). _writeStrategyFlow above also fires its own flow_event
+      // push with a slim per-event payload; this heartbeat carries the full
+      // TRUE LIVE state snapshot so the frontend can re-sync without waiting.
+      this._pushHeartbeatNow();
     } catch (err) {
       console.error(`[REVERSAL] _postExecuteBookkeeping error: ${err.message}`);
     }
@@ -1540,6 +1547,10 @@ class AiReversalStrategy extends TradingBase {
         `(cumulative ${this.accumulatedFundingFees >= 0 ? '+' : ''}${this.accumulatedFundingFees.toFixed(4)} USDT, ${incomes.length} entries)`
       );
       await this.saveState();
+      // accumulatedFundingFees + cycleAccumulatedLoss just changed; push so
+      // frontend sees the funding settlement at sub-second latency instead
+      // of waiting up to 30s for the next safety-net heartbeat.
+      this._pushHeartbeatNow();
       return { added, count: incomes.length };
     } catch (err) {
       console.error(`[REVERSAL] funding poll error: ${err.message}`);
@@ -1988,6 +1999,54 @@ class AiReversalStrategy extends TradingBase {
     };
   }
 
+  /**
+   * Slim TRUE LIVE snapshot for WS heartbeat broadcasts. Excludes:
+   *   - Static config (leverage / priceType / recovery params / etc.) — loaded
+   *     once by frontend's initial REST fetch of getStatus().
+   *   - Fields covered by other event pushes (currentPrice via price_tick;
+   *     bullLevel/bearLevel/activePlan/finalTpPrice via plan_update / flow_event).
+   *   - AI-consult cache (volumeProfile / cvd / orderbookDepth / volatility)
+   *     which only changes on consults — pushed via plan_update.context.
+   *   - Derivable fields (cycleDuration = Date.now() - cycleStartTime).
+   * Fires on the 30s safety-net interval AND immediately after every
+   * bookkeeping change via _pushHeartbeatNow(). Frontend merges into existing
+   * state (setStatus(prev => ({...prev, ...payload}))).
+   */
+  getHeartbeatPayload() {
+    return {
+      strategyId: this.strategyId,
+      executionState: this.executionState,
+      subState: this.subState,
+      isRunning: this.isRunning,
+      currentSide: this.currentSide,
+      currentPosition: this.activePosition,
+      cycleAccumulatedLoss: this.cycleAccumulatedLoss,
+      reversalCount: this.reversalCount,
+      harvestCount: this.harvestCount,
+      harvestPrice: this.harvestPrice,
+      accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
+      accumulatedTradingFees: this.accumulatedTradingFees || 0,
+      accumulatedFundingFees: this.accumulatedFundingFees || 0,
+      aiTokenUsage: this.aiTokenUsage,
+      aiUsageCostUSD: this.getAiUsageCost(),
+    };
+  }
+
+  /**
+   * Immediate heartbeat broadcast — called from every bookkeeping path that
+   * mutates TRUE LIVE state (trade fills via _postExecuteBookkeeping; AI
+   * consults via _savePlanToFirestore caller; harvest-price set/clear).
+   * Combined with the 30s safety-net interval in app.js, this means frontend
+   * sees state mutations at sub-second latency without waiting for the next
+   * tick. Best-effort — wrapped in try/catch so a broadcast hiccup never
+   * disturbs the trading logic.
+   */
+  _pushHeartbeatNow() {
+    try {
+      wsBroadcast.pushStrategyUpdate(this.strategyId, this.getHeartbeatPayload());
+    } catch (_) { /* non-fatal */ }
+  }
+
   // ——— Firestore persistence ——————————————————————————————————————————
 
   /**
@@ -2133,14 +2192,13 @@ class AiReversalStrategy extends TradingBase {
         timestamp,
       });
 
-      // Push a SLIM real-time copy to all connected WS clients so the chart
-      // (bull/bear overlay) + chat thread (user_question replay) update
-      // instantly instead of waiting for the next REST poll / 60s re-seed.
-      // marketContext / usage / newInitialSize etc. are intentionally
-      // omitted — current consumers don't read them, and stripping them
-      // keeps the per-consult broadcast at ~500 B instead of ~10–50 KB
-      // (mostly the orderbookDepth blob inside marketContext).
-      // Extend this payload if a future panel needs more fields.
+      // Slim real-time plan_update push for chart bull/bear overlay + chat
+      // replay. Extended in this batch with `context` (AI consult cache —
+      // volume profiles / CVD / orderbookDepth / volatility), which only
+      // refreshes on consults so it now travels here exclusively, not on
+      // every 30s heartbeat. Frontend merges `context` into status state.
+      // marketContext / newInitialSize / etc. remain stripped — consumers
+      // don't read them and they'd balloon the payload by 10-50 KB.
       try {
         wsBroadcast.pushPlanUpdate(this.strategyId, {
           id: ref.id,
@@ -2159,8 +2217,23 @@ class AiReversalStrategy extends TradingBase {
             bullLevel: this.bullLevel,
             bearLevel: this.bearLevel,
           },
+          // AI consult cache — only refreshed on consults, so heartbeat no
+          // longer carries these. Frontend merges into status so the chart's
+          // VPVR overlay + Volume Analytics panel stay live across reloads.
+          context: {
+            volumeProfile24h: this._lastVolumeProfile24h,
+            volumeProfile7d: this._lastVolumeProfile7d,
+            cvd: this._lastCvd,
+            orderbookDepth: this._lastOrderbookDepth,
+            volatility: this._lastVolatility,
+          },
         });
       } catch (_) { /* push is best-effort; REST poll catches stragglers */ }
+
+      // Heartbeat fire — aiUsageCostUSD / aiTokenUsage just incremented from
+      // this consult. Without immediate push, frontend would see stale cost
+      // for up to 30s (next safety-net interval).
+      this._pushHeartbeatNow();
 
       return ref.id;
     } catch (err) {

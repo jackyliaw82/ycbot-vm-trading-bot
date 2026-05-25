@@ -1662,6 +1662,75 @@ class AiHedgeStrategy extends TradingBase {
     };
   }
 
+  /**
+   * Slim TRUE LIVE snapshot for WS heartbeat broadcasts. Excludes static
+   * config (leverage / priceType / aiModel / maxPositionSizeUSDT / etc.
+   * that are loaded once by the frontend's initial REST fetch of getStatus())
+   * and currentPrice (delivered at 1Hz via price_tick instead). Recomputed
+   * derivations (estimatedClosingFees / effectiveTarget / progressToTarget)
+   * stay because they're cheap and the frontend already reads them directly.
+   *
+   * Fires every 30s on the safety-net interval AND immediately after every
+   * fill (via trading-base's saveTrade hook). Frontend merges into existing
+   * state (setStatus(prev => ({...prev, ...payload}))) so static config is
+   * preserved across heartbeats.
+   */
+  getHeartbeatPayload() {
+    const longNotional = this.longPosition?.notional || 0;
+    const shortNotional = this.shortPosition?.notional || 0;
+    const estimatedClosingFees = (longNotional + shortNotional) * FEE_RATE;
+    return {
+      strategyId: this.strategyId,
+      isRunning: this.isRunning,
+      phase: this.phase,
+      executionState: this.executionState,
+      longPosition: this.longPosition,
+      shortPosition: this.shortPosition,
+      hedgeGap: this.hedgeGap,
+      lockedProfit: this.lockedProfit,
+      positionPnL: this.positionPnL,
+      totalPnL: this.totalPnL,
+      longPositionPnL: this.longPositionPnL,
+      shortPositionPnL: this.shortPositionPnL,
+      accumulatedRealizedPnL: this.accumulatedRealizedPnL,
+      accumulatedTradingFees: this.accumulatedTradingFees,
+      accumulatedFundingFees: this.accumulatedFundingFees,
+      estimatedClosingFees,
+      effectiveTarget: this.desiredProfitUSDT ? this.desiredProfitUSDT + estimatedClosingFees : null,
+      progressToTarget: this.desiredProfitUSDT ? (this.totalPnL / (this.desiredProfitUSDT + estimatedClosingFees)) * 100 : null,
+      tradeCount: this.tradeCount,
+      planHistoryCount: this.planHistory.length,
+      aiTokenUsage: this.aiTokenUsage,
+      aiCostUsd: this._computeAiCost().totalCost,
+      aiStale: this._aiStale,
+      staleCount: this._staleCount,
+      nextRetryAt: this._nextRetryAt,
+      realtimeWsConnected: this.realtimeWsConnected,
+      userDataWsConnected: this.userDataWsConnected,
+      streamMode: this.streamMode || 'WS',
+      priceFeedStale: !!this._priceFeedStale,
+      firstPositionPrice: this.firstPositionPrice,
+      criticalError: this.criticalError,
+      // activePlan + volatility/microstructure intentionally omitted — they
+      // change only on AI consults (rare) and the initial REST fetch loads
+      // them. If hedge ever wires plan_update broadcasts (currently only
+      // reversal does), they'd flow there.
+    };
+  }
+
+  /**
+   * Immediate heartbeat broadcast — called from trading-base.saveTrade hook
+   * after every fill, so frontend sees new position/PnL state at sub-second
+   * latency instead of waiting up to 30s for the next safety-net interval.
+   * Best-effort — wrapped in try/catch so a broadcast hiccup never disturbs
+   * the trading logic.
+   */
+  _pushHeartbeatNow() {
+    try {
+      wsBroadcast.pushStrategyUpdate(this.strategyId, this.getHeartbeatPayload());
+    } catch (_) { /* non-fatal */ }
+  }
+
   async manualReplan() {
     if (!this.isRunning) throw new Error('Strategy is not running.');
     this._lastReplanTime = 0;
