@@ -174,9 +174,33 @@ export async function sendPushNotification(userId, notificationData) {
       }
     }
 
+    const isCapitalProtection = data.type === 'capital_protection';
+    // tag/thread-id groups notifications per strategy so a newer push for
+    // the same cycle replaces the older one on the device instead of
+    // stacking — same semantic on Web Push, APNs (thread-id), and
+    // Android FCM (tag).
+    const tagId = data.strategyId || 'strategy-notification';
+    const linkPath = data.strategyId ? `/?strategyId=${data.strategyId}` : '/';
+
     const message = {
-      // Data-only payload: prevents Android FCM from auto-displaying the
-      // notification in addition to the service worker's showNotification call.
+      // Top-level notification — FCM auto-displays this on the device when
+      // the app is in the background. Replaces the prior data-only path
+      // that (a) was invisible on iOS because aps.content-available:1
+      // with no alert is a silent background push, and (b) on Android
+      // depended on the SW being woken in time (Doze/battery-saver could
+      // suppress it). When `notification` is present, the SW's
+      // onBackgroundMessage does NOT fire — FCM handles display directly,
+      // so no double-display. Foreground onMessage still fires with the
+      // full payload, so in-app banners keep working unchanged.
+      notification: {
+        title: title,
+        body: body,
+      },
+      // data — consumed by the SW's notificationclick handler for
+      // strategyId-based navigation, and by the foreground onMessage
+      // listener to render the in-app banner. title/body kept inside
+      // data so the foreground listener (which reads payload.data)
+      // doesn't change shape.
       data: {
         ...data,
         title: title,
@@ -185,16 +209,51 @@ export async function sendPushNotification(userId, notificationData) {
       tokens: tokens,
       android: {
         priority: 'high',
+        notification: {
+          sound: 'default',
+          tag: tagId,
+          // sticky = ongoing notification (Android equivalent of
+          // requireInteraction). Capital-protection alerts shouldn't be
+          // auto-dismissed before the user acts on them.
+          sticky: isCapitalProtection,
+        },
       },
       apns: {
-        headers: { 'apns-priority': '10' },
+        headers: {
+          'apns-priority': '10',
+          // Required on iOS 13+ for visible alert pushes.
+          'apns-push-type': 'alert',
+        },
         payload: {
           aps: {
-            'content-available': 1,
+            alert: {
+              title: title,
+              body: body,
+            },
             sound: 'default',
             badge: 1,
+            'thread-id': tagId,
+            // time-sensitive interruption level pierces Focus modes on
+            // iOS 15+. Reserved for capital-protection where the user
+            // needs the alert immediately even if Do-Not-Disturb is on.
+            ...(isCapitalProtection ? { 'interruption-level': 'time-sensitive' } : {}),
           },
         },
+      },
+      webpush: {
+        headers: { Urgency: 'high' },
+        notification: {
+          icon: '/icon-light-192.png',
+          badge: '/icon-light-192.png',
+          tag: tagId,
+          vibrate: [200, 100, 200],
+          requireInteraction: isCapitalProtection,
+          actions: [
+            { action: 'view', title: 'View Details' },
+            { action: 'dismiss', title: 'Dismiss' },
+          ],
+        },
+        fcmOptions: { link: linkPath },
       },
     };
 
