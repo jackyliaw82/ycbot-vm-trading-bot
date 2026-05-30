@@ -765,6 +765,26 @@ class AiReversalStrategy extends TradingBase {
     }
 
     // Level-touch dispatch.
+    //
+    // Defense-in-depth (v4.4.5). The WAITING branch routes to
+    // _openInitialPosition (OPEN at fixed initial size), the *_HELD
+    // branches route to _performReversal (atomic close+open with recovery
+    // sizing). If subState says WAITING but a position actually exists,
+    // those two assumptions collide — the OPEN would silently net
+    // against the existing position in Binance one-way mode. Detect that
+    // desync HERE, before _openInitialPosition's own refusal kicks in,
+    // so the log makes the source of the corruption obvious.
+    const positionOpen = this.activePosition && this.activePosition.quantity > 0;
+    if (this.subState === 'WAITING' && positionOpen) {
+      if (!this._loggedWaitingDesync) {
+        this._loggedWaitingDesync = true;
+        this.addLog(`[REVERSAL] dispatch skipped: subState=WAITING but ${this.currentSide || '?'} position open (qty=${this.activePosition.quantity}). State desync — stop+flatten to recover.`).catch(() => {});
+      }
+      return;
+    }
+    // Clear the desync log latch once state is consistent again.
+    if (this._loggedWaitingDesync) this._loggedWaitingDesync = false;
+
     if (this.subState === 'WAITING' && this.bullLevel != null && this.bearLevel != null) {
       if (price >= this.bullLevel) {
         await this._openInitialPosition('LONG', this.bullLevel);
@@ -810,6 +830,26 @@ class AiReversalStrategy extends TradingBase {
 
   async _requestPlan(reason) {
     if (this.executionState === 'TERMINATED') return;
+    // Defense-in-depth (v4.4.5). _handlePlanResponse unconditionally resets
+    // subState to WAITING — safe ONLY between cycles (cycle_start before
+    // first open, post_harvest after close to flat, resume_recovery when
+    // !activePosition). Firing it mid-position desyncs the dispatcher in
+    // handleRealtimePrice: it sees subState=WAITING + existing position
+    // and routes the next level touch to _openInitialPosition (OPEN at
+    // fixed initial size) instead of _performReversal (REVERSE with
+    // recovery sizing). Binance one-way mode then nets the OPEN against
+    // the existing position, leaving residue and corrupting Final TP.
+    // The /ai-reversal/replan endpoint that triggered this was removed in
+    // v4.4.5, but guard here defends against any future caller (refactor,
+    // stale-retry of a pre-4.4.5 manual_replan reason, etc.).
+    const inFlight = this.subState === 'LONG_HELD'
+      || this.subState === 'SHORT_HELD'
+      || this.subState === 'HARVESTING';
+    const allowedInFlightReasons = new Set(['post_harvest']);
+    if (inFlight && !allowedInFlightReasons.has(reason)) {
+      await this.addLog(`[REVERSAL] _requestPlan(${reason}) refused: subState=${this.subState} (mid-position). Use Adjust or Ask AI to change levels.`);
+      return;
+    }
     this.executionState = 'PLANNING';
     await this.addLog(`[REVERSAL] _requestPlan(${reason})`);
     try {
@@ -1104,6 +1144,18 @@ class AiReversalStrategy extends TradingBase {
 
   async _openInitialPosition(side, levelPrice) {
     if (this.executionState === 'EXECUTING') return;
+    // Defense-in-depth (v4.4.5). OPEN_*_AT_LEVEL assumes flat — it executes
+    // a market BUY/SELL at currentInitialSize with no recovery sizing. If
+    // an active position exists at call time, subState and reality are
+    // already desynced (the dispatcher should have routed to
+    // _performReversal). Binance one-way mode would net the OPEN against
+    // the existing position, leaving residue. Refuse loudly instead — the
+    // strategy idles, surfacing the desync in the log so the operator can
+    // stop+flatten and restart.
+    if (this.activePosition && this.activePosition.quantity > 0) {
+      await this.addLog(`[REVERSAL] _openInitialPosition(${side}) refused: existing ${this.currentSide || '?'} position qty=${this.activePosition.quantity} (subState=${this.subState}). State desync — stop+flatten to recover.`);
+      return;
+    }
     this.executionState = 'EXECUTING';
     const verb = side === 'LONG' ? 'OPEN_LONG_AT_LEVEL' : 'OPEN_SHORT_AT_LEVEL';
     try {

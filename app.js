@@ -1627,32 +1627,18 @@ app.get('/ai-reversal/status', (req, res) => {
   res.json({ strategies: reversalStrategies, count: Object.keys(reversalStrategies).length });
 });
 
-app.post('/ai-reversal/replan', async (req, res) => {
-  try {
-    const { strategyId } = req.body;
-    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
-
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AiReversalStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running AI Reversal strategy with ID ${strategyId}` });
-    }
-
-    // Manual replan is allowed ONLY when flat. Bull/bear levels are now
-    // permanent for an open cycle — the heartbeat-driven mid-cycle rethink
-    // was removed. Calling _requestPlan mid-position would also corrupt
-    // subState (it resets to WAITING via _handlePlanResponse). If the user
-    // really needs new levels, they must stop and restart the strategy.
-    if (strategy.currentPosition && strategy.currentPosition.quantity > 0) {
-      return res.status(400).json({
-        error: 'Cannot replan while a position is open. Bull/bear levels are fixed for the cycle. Stop the strategy to set new levels.',
-      });
-    }
-    strategy._requestPlan('manual_replan').catch(() => {});
-    res.json({ success: true, message: 'Replan triggered', strategyId });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// /ai-reversal/replan endpoint removed in v4.4.5. The endpoint's
+// position-open guard was checking `.quantity` on a STRING field
+// (TradingBase's this.currentPosition is 'LONG' | 'SHORT' | 'NONE',
+// not the rich-object this.activePosition) — so it never rejected
+// mid-position calls. Any click on the frontend Replan button while
+// in *_HELD corrupted subState via _handlePlanResponse(line 1093),
+// the next price tick fired _openInitialPosition (wrong verb, no
+// recovery sizing), and Binance one-way mode netted the BUY/SELL
+// against the existing position leaving a tiny residue. Final TP
+// then computed entry - needed/qty with qty≈0.01 → garbage negative
+// value. Adjust + Ask AI cover the level-change use case safely;
+// no need for a separate replan surface.
 
 // Manual user-driven bull/bear level adjustment. Always allowed while
 // running (any subState). The bot's adjustLevels() returns a warnings
