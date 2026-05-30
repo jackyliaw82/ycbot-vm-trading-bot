@@ -24,7 +24,11 @@ module.exports = {
       // Phase 2: route all Binance WS through the shared ycbot-ws-relay. VM IP
       // never talks directly to Binance, avoiding the IP-reputation class of
       // bans. Leave unset to fall back to direct Binance.
-      RELAY_WS_URL: 'ws://34.80.183.147:8080/ws',
+      // v4.4.7: relay migrated from Taiwan (34.80.183.147, asia-east1) to
+      // Singapore (34.158.49.25, asia-southeast1) to co-locate with bot VMs.
+      // Saves ~48ms per market data round-trip (was TW↔SG cross-region,
+      // now intra-region <2ms).
+      RELAY_WS_URL: 'ws://34.158.49.25:8080/ws',
       // C5 admin gate: comma-separated list of Firebase UIDs allowed to call
       // /system/* and /test/* endpoints (requireAdmin middleware). Without
       // this set, all admin endpoints reject with "Forbidden — uid is not
