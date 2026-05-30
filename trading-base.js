@@ -1125,7 +1125,7 @@ class TradingBase {
 
   // ─── Order placement ───────────────────────────────────────────────────────
 
-  async placeMarketOrder(symbol, side, quantity, positionSide) {
+  async placeMarketOrder(symbol, side, quantity, positionSide, options = {}) {
     if (quantity <= 0) throw new Error('Calculated quantity is zero or negative.');
 
     return new Promise(async (resolve, reject) => {
@@ -1138,6 +1138,13 @@ class TradingBase {
           newOrderRespType: 'FULL',
         };
         if (positionSide) orderParams.positionSide = positionSide;
+        // reduceOnly (v4.4.6) — opt-in close-only flag. Bypasses Binance's
+        // notional check so sub-minNotional residue can still be closed.
+        // ONE-WAY mode only (Binance rejects reduceOnly in HEDGE mode;
+        // hedge closes use positionSide=LONG/SHORT which encodes direction).
+        // Reversal close paths (_executeHarvestClose, _executeReverse close
+        // leg) pass reduceOnly=true.
+        if (options.reduceOnly) orderParams.reduceOnly = 'true';
         const result = await this.makeProxyRequest('/fapi/v1/order', 'POST', orderParams, true, 'futures');
 
         if (result && result.orderId) {

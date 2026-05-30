@@ -460,13 +460,19 @@ class AiPlanExecutor {
     // but we split into two market orders so per-fill PnL is cleanly attributable.
     const closeSide = isToLong ? 'BUY' : 'SELL';
     await strategy.addLog(`[AI] ${action.type} step 1/2: closing ${fromSide} ${closeQty} @ market`);
-    const closeResult = await strategy.placeMarketOrder(symbol, closeSide, closeQty, 'BOTH');
+    // reduceOnly on the close leg (v4.4.6) — defensive. Binance rejects
+    // sub-minNotional orders unless reduceOnly is set. Normal reversal
+    // closes are always well above minNotional, but this protects against
+    // any residue edge case (e.g., partial fills) from leaving the cycle
+    // stuck mid-reverse.
+    const closeResult = await strategy.placeMarketOrder(symbol, closeSide, closeQty, 'BOTH', { reduceOnly: true });
     if (closeResult && closeResult.orderId) {
       strategy._scheduleRestFallback(closeResult.orderId, symbol, closeSide, 'BOTH');
     }
 
     // Open the new opposite side. After the close, the account is flat; the
-    // same-direction market order now opens the new position.
+    // same-direction market order now opens the new position. No reduceOnly
+    // here — this leg IS opening fresh exposure.
     const openQty = strategy.roundQuantity(action.newQuantity || action.quantity);
     if (!openQty || openQty <= 0) {
       throw new Error(`Cannot ${action.type}: invalid new quantity ${openQty}`);
@@ -505,7 +511,12 @@ class AiPlanExecutor {
     const closeSide = currentSide === 'LONG' ? 'SELL' : 'BUY';
 
     await strategy.addLog(`[AI] HARVEST_CLOSE: closing ${currentSide} ${closeQty} @ market — ${action.reason || 'AI harvest'}`);
-    const result = await strategy.placeMarketOrder(symbol, closeSide, closeQty, 'BOTH');
+    // reduceOnly (v4.4.6) — bypasses Binance's notional check so
+    // sub-minNotional residue can close. Critical for stop+flatten on
+    // a stuck cycle (e.g., 0.01 SOL residue from a pre-4.4.5 replan
+    // mishap = ~$0.83 notional, far below $5 min — without reduceOnly
+    // Binance rejects with error -4164).
+    const result = await strategy.placeMarketOrder(symbol, closeSide, closeQty, 'BOTH', { reduceOnly: true });
     if (result && result.orderId) {
       strategy._scheduleRestFallback(result.orderId, symbol, closeSide, 'BOTH');
     }
