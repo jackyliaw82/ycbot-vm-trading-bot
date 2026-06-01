@@ -1181,48 +1181,67 @@ class AiReversalStrategy extends TradingBase {
     if (this.executionState === 'EXECUTING') return;
     this.executionState = 'EXECUTING';
     const verb = newSide === 'LONG' ? 'REVERSE_TO_LONG' : 'REVERSE_TO_SHORT';
+    const fromSide = this.currentSide;
     let finalSize = 0;
     try {
-      // Project the closing leg's realized PnL + close fee into accLoss
-      // BEFORE sizing the new leg. Without this, the new leg is sized
-      // to recover the PRIOR cycle loss only, missing the loss we're
-      // about to realize on the close — every reversal under-sizes by
-      // the magnitude of its own closing loss. The open fee for the
-      // new leg is omitted (chicken-and-egg with size); ~0.0005 USDT
-      // gap lost in stepSize rounding.
-      const closeQty   = this.activePosition?.quantity || 0;
-      const closePrice = this.currentPrice || 0;
-      const entryPrice = this.activePosition?.entryPrice || this.activePosition?.avgEntry || 0;
-      const closeRealized = (this.currentSide === 'LONG'  ? (closePrice - entryPrice) :
-                             this.currentSide === 'SHORT' ? (entryPrice - closePrice) :
-                             0) * closeQty;
-      const closeFee = closePrice * closeQty * FEE_RATE;
-      const projectedAccLoss = this._computeAccLoss({
-        extraRealized: closeRealized,
-        extraFees:     closeFee,
-      });
+      const closeQty = this.activePosition?.quantity || 0;
+      if (!closeQty || closeQty <= 0) {
+        throw new Error(`no ${fromSide || '?'} position to reverse`);
+      }
 
-      // Compute new size (formula + margin projection + optional AI veto).
-      // When aiVetoOnReversal is disabled the projected size is used as-is
-      // (faster reversals, deterministic sizing). Harvest detection /
-      // harvest-price consult / post-harvest PLAN consult are all on
-      // independent code paths and remain active regardless.
-      const proposed = this._computeFormulaSize(projectedAccLoss);
+      // ===== Step 1: close current leg =====
+      // Mirrors hedge's "rely on Binance, not projection" model: close
+      // first, let the WS update populate accumulatedRealizedPnL +
+      // accumulatedTradingFees with TRUE values, then size the new leg
+      // from `cycleAccumulatedLoss` directly. FEE_RATE is reserved for
+      // Final-TP effective-target math only (see _recomputeFinalTpPrice).
+      const closeSide = fromSide === 'LONG' ? 'SELL' : 'BUY';
+      await this.addLog(`[AI] ${verb} step 1/2: closing ${fromSide} ${closeQty} @ market`);
+      const closeResult = await this.placeMarketOrder(this.symbol, closeSide, closeQty, 'BOTH', { reduceOnly: true });
+      if (closeResult?.orderId) {
+        this._scheduleRestFallback(closeResult.orderId, this.symbol, closeSide, 'BOTH');
+      }
+
+      // ===== Step 2: wait for WS to deliver the close fill =====
+      // 2000ms covers Binance's typical <100ms WS propagation with
+      // generous headroom for the REST fallback if WS misses. After
+      // confirmation _handleOrderTradeUpdate has folded the close's
+      // realized PnL + commission into the accumulators.
+      let wsConfirmed = false;
+      if (closeResult?.orderId) {
+        wsConfirmed = await this._waitForOrderFillConfirmation(closeResult.orderId, 2000);
+      }
+      if (!wsConfirmed) {
+        await this.addLog(`[REVERSAL] close fill not WS-confirmed within 2s — sizing may use stale accLoss; next reversal self-corrects`);
+      }
+
+      // Recompute accLoss from current (now-actual) accumulators. No
+      // projection — same source-of-truth model as hedge.
+      this.cycleAccumulatedLoss = this._computeAccLoss();
+
+      // ===== Step 3: size new leg from actual accLoss =====
+      const proposed = this._computeFormulaSize();
       const projected = this._applyMarginHeadroomCap(proposed);
       if (this.aiVetoOnReversal) {
         finalSize = await this._requestVeto(projected);
       } else {
         finalSize = projected;
-        await this.addLog(`[REVERSAL] AI size veto disabled — using projected size ${finalSize} USDT`);
+        await this.addLog(`[REVERSAL] AI size veto disabled — using projected size ${finalSize} USDT (accLoss ${this.cycleAccumulatedLoss.toFixed(4)})`);
       }
+
+      // ===== Step 4: open new opposite leg =====
       const targetLevel = newSide === 'LONG' ? this.bullLevel : this.bearLevel;
       const newQty = await this._calculateAdjustedQuantity(this.symbol, finalSize, targetLevel || this.currentPrice, verb);
-
-      await this.executor.executeAction({
-        type: verb,
-        newQuantity: newQty,
-        sizeUSDT: finalSize,
-      });
+      if (!newQty || newQty <= 0) {
+        throw new Error(`invalid new quantity ${newQty} for ${verb}`);
+      }
+      const openSide = newSide === 'LONG' ? 'BUY' : 'SELL';
+      await this.addLog(`[AI] ${verb} step 2/2: opening ${newSide} ${newQty} @ market`);
+      const openResult = await this.placeMarketOrder(this.symbol, openSide, newQty, 'BOTH');
+      if (openResult?.orderId) {
+        this._scheduleRestFallback(openResult.orderId, this.symbol, openSide, 'BOTH');
+      }
+      if (this.riskGuard) this.riskGuard.recordAction();
 
       this.reversalCount += 1;
       this.subState = newSide === 'LONG' ? 'LONG_HELD' : 'SHORT_HELD';
@@ -1309,16 +1328,12 @@ class AiReversalStrategy extends TradingBase {
    *   Additional size = Recovery size / recovery_distance
    *   New size        = Initial size + Additional size
    *
-   * Optional `accLossOverride` lets callers pass a forward-projected
-   * accLoss instead of the in-memory `cycleAccumulatedLoss`. Used by
-   * _performReversal to size the new leg based on the post-close
-   * accLoss (i.e. including the realized loss + close fee from closing
-   * the current position). Without that projection, every reversal
-   * sizes the new leg to recover the PRIOR cycle loss, missing the
-   * loss it's about to realize on the leg being closed.
+   * Reads `cycleAccumulatedLoss` from current accumulators (Binance-truth).
+   * Caller (_performReversal) is responsible for refreshing accumulators
+   * via WS confirmation before invoking — no forward projection.
    */
-  _computeFormulaSize(accLossOverride) {
-    const loss = Math.max(0, accLossOverride != null ? accLossOverride : (this.cycleAccumulatedLoss || 0));
+  _computeFormulaSize() {
+    const loss = Math.max(0, this.cycleAccumulatedLoss || 0);
     const recoverySize = loss * this.recoveryFactor;
     const additional = this.recoveryDistance > 0 ? recoverySize / this.recoveryDistance : 0;
     const newSize = (this.currentInitialSize || 0) + additional;
@@ -1351,13 +1366,20 @@ class AiReversalStrategy extends TradingBase {
 
   /**
    * Final TP price — solves for price where unrealized PnL on the current
-   * position covers accumulated_loss + desired_profit + ai_consult_cost.
+   * position covers accumulated_loss + desired_profit + ai_consult_cost +
+   * estimated_closing_fee.
    *
-   *   needed = accLoss + desiredProfit + aiCost
+   *   needed = accLoss + desiredProfit + aiCost + estimatedClosingFee
    *   LONG:  qty × (price - entryAvg) ≥ needed
    *          price ≥ entryAvg + needed / qty
    *   SHORT: qty × (entryAvg - price) ≥ needed
    *          price ≤ entryAvg - needed / qty
+   *
+   * `estimatedClosingFee = notional × FEE_RATE` mirrors hedge's
+   * effectiveTarget pattern (ai-hedge-strategy.js:793). FEE_RATE = 0.08%
+   * = 0.05% taker + 0.03% slippage buffer; it ensures the realized exit
+   * (after fee + slippage on the close) lands as close to desiredProfit
+   * as possible rather than under-shooting by the close cost.
    *
    * AI cost is folded in so the cycle exits at TRUE breakeven-plus-profit
    * including the running DeepSeek/Anthropic consult cost. Recomputed after
@@ -1372,7 +1394,12 @@ class AiReversalStrategy extends TradingBase {
     const qty = this.activePosition.quantity;
     const entry = this.activePosition.entryPrice || this.activePosition.avgEntry;
     const aiCost = typeof this.getAiUsageCost === 'function' ? (this.getAiUsageCost() || 0) : 0;
-    const needed = (this.cycleAccumulatedLoss || 0) + (this.desiredProfitUSDT || 0) + aiCost;
+    const notional = this.activePosition.notional || (entry * qty) || 0;
+    const estimatedClosingFee = notional * FEE_RATE;
+    const needed = (this.cycleAccumulatedLoss || 0)
+      + (this.desiredProfitUSDT || 0)
+      + aiCost
+      + estimatedClosingFee;
     if (!entry || qty <= 0) {
       this.finalTpPrice = null;
       return;
@@ -1470,21 +1497,14 @@ class AiReversalStrategy extends TradingBase {
    *
    * Note on storage: `this.accumulatedTradingFees` is kept by TradingBase
    * as a POSITIVE MAGNITUDE (cost size), so we negate it inside this
-   * helper to convert to the signed convention above. callers' `extraFees`
-   * are similarly passed as positive magnitudes and negated here. This
-   * lets us keep the broader codebase's existing storage shape while the
-   * formula reads cleanly with all three terms in the same sign space.
-   *
-   * Optional `extraRealized` / `extraFees` / `extraFunding` arguments
-   * project hypothetical add-ons onto the current state — used by
-   * _performReversal to fold in the closing leg's realized PnL + close
-   * fee BEFORE sizing the new leg, otherwise every reversal under-sizes
-   * the recovery by the amount it's about to realize on the close.
+   * helper to convert to the signed convention above. This lets us keep
+   * the broader codebase's existing storage shape while the formula
+   * reads cleanly with all three terms in the same sign space.
    */
-  _computeAccLoss({ extraRealized = 0, extraFees = 0, extraFunding = 0 } = {}) {
-    const realized = (this.accumulatedRealizedPnL  || 0) + extraRealized;       // signed
-    const fees     = -((this.accumulatedTradingFees || 0) + extraFees);          // → signed (always negative)
-    const funding  = (this.accumulatedFundingFees   || 0) + extraFunding;        // signed
+  _computeAccLoss() {
+    const realized = (this.accumulatedRealizedPnL  || 0);                        // signed
+    const fees     = -(this.accumulatedTradingFees || 0);                        // → signed (always negative)
+    const funding  = (this.accumulatedFundingFees   || 0);                       // signed
     const netSignedPnL = realized + fees + funding;
     return netSignedPnL < 0 ? -netSignedPnL : 0;
   }

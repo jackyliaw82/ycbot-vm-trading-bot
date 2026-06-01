@@ -266,9 +266,6 @@ class AiPlanExecutor {
     if (action.type === 'OPEN_LONG_AT_LEVEL' || action.type === 'OPEN_SHORT_AT_LEVEL') {
       return await this._executeOpenAtLevel(action);
     }
-    if (action.type === 'REVERSE_TO_LONG' || action.type === 'REVERSE_TO_SHORT') {
-      return await this._executeReverse(action);
-    }
     if (action.type === 'HARVEST_CLOSE') {
       return await this._executeHarvestClose(action);
     }
@@ -426,66 +423,6 @@ class AiPlanExecutor {
     }
     if (strategy.riskGuard) strategy.riskGuard.recordAction();
     return { status: 'OPENED', side: isLong ? 'LONG' : 'SHORT', quantity, result };
-  }
-
-  /**
-   * REVERSE_TO_LONG / REVERSE_TO_SHORT — close current opposite-side position
-   * + open new same-direction position with new size. Two sequential market
-   * orders so per-fill PnL is cleanly attributable.
-   *
-   * action.newQuantity = size from the dynamic-sizing formula (post AI veto).
-   */
-  async _executeReverse(action) {
-    const strategy = this.strategy;
-    const symbol = strategy.symbol;
-    const isToLong = action.type === 'REVERSE_TO_LONG';
-    const fromSide = isToLong ? 'SHORT' : 'LONG';
-    // Reversal stores its position OBJECT on `activePosition` to avoid
-    // colliding with TradingBase's `currentPosition` (which is the
-    // STRING 'LONG'|'SHORT'|'NONE' that gets overwritten on every WS
-    // ACCOUNT_UPDATE event).
-    const currentPos = strategy.activePosition;
-
-    if (!currentPos || !currentPos.quantity || currentPos.quantity <= 0) {
-      throw new Error(`Cannot ${action.type}: no current ${fromSide} position to reverse`);
-    }
-
-    // Close the FULL existing leg. activePosition.quantity comes from
-    // Binance (WS ORDER_TRADE_UPDATE / REST positionRisk) and is already
-    // step-aligned, so passing it through roundQuantity would be a no-op
-    // in the happy case and a 1-step residual bug in the FP edge case.
-    const closeQty = currentPos.quantity;
-    // Closing a SHORT = BUY; closing a LONG = SELL.
-    // For one-way mode, this is also the direction we'd open the new opposite side,
-    // but we split into two market orders so per-fill PnL is cleanly attributable.
-    const closeSide = isToLong ? 'BUY' : 'SELL';
-    await strategy.addLog(`[AI] ${action.type} step 1/2: closing ${fromSide} ${closeQty} @ market`);
-    // reduceOnly on the close leg (v4.4.6) — defensive. Binance rejects
-    // sub-minNotional orders unless reduceOnly is set. Normal reversal
-    // closes are always well above minNotional, but this protects against
-    // any residue edge case (e.g., partial fills) from leaving the cycle
-    // stuck mid-reverse.
-    const closeResult = await strategy.placeMarketOrder(symbol, closeSide, closeQty, 'BOTH', { reduceOnly: true });
-    if (closeResult && closeResult.orderId) {
-      strategy._scheduleRestFallback(closeResult.orderId, symbol, closeSide, 'BOTH');
-    }
-
-    // Open the new opposite side. After the close, the account is flat; the
-    // same-direction market order now opens the new position. No reduceOnly
-    // here — this leg IS opening fresh exposure.
-    const openQty = strategy.roundQuantity(action.newQuantity || action.quantity);
-    if (!openQty || openQty <= 0) {
-      throw new Error(`Cannot ${action.type}: invalid new quantity ${openQty}`);
-    }
-    const openSide = closeSide;
-    await strategy.addLog(`[AI] ${action.type} step 2/2: opening ${isToLong ? 'LONG' : 'SHORT'} ${openQty} @ market`);
-    const openResult = await strategy.placeMarketOrder(symbol, openSide, openQty, 'BOTH');
-    if (openResult && openResult.orderId) {
-      strategy._scheduleRestFallback(openResult.orderId, symbol, openSide, 'BOTH');
-    }
-
-    if (strategy.riskGuard) strategy.riskGuard.recordAction();
-    return { status: 'REVERSED', closeResult, openResult, newSide: isToLong ? 'LONG' : 'SHORT', closeQty, openQty };
   }
 
   /**
