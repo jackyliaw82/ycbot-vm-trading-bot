@@ -562,9 +562,14 @@ class TradingBase {
           count++;
         }
       });
-      console.log(`[RECOVERY] Preloaded ${count} orderId(s) from trades/ subcollection into WS dedup map (strategyId=${this.strategyId || ''})`);
+      // `count` is per-document (each Binance partial fill is its own doc
+      // keyed by tradeId); a single market order can span 2-3 fills. The
+      // dedup Map keys on orderId, so its `.size` is the true count of
+      // unique orders. Log both so the relationship is obvious.
+      const uniqueOrderIds = this._wsHandledOrderIds.size;
+      console.log(`[RECOVERY] Preloaded ${count} fill record(s) (${uniqueOrderIds} unique orderId(s)) from trades/ subcollection into WS dedup map (strategyId=${this.strategyId || ''})`);
       if (count > 0) {
-        await this.addLog(`[RECOVERY] Preloaded ${count} orderId(s) for L3 dedup`);
+        await this.addLog(`[RECOVERY] Preloaded ${count} fill record(s) (${uniqueOrderIds} unique orderIds) for L3 dedup`);
       }
     } catch (err) {
       console.error(`[RECOVERY] _preloadWsHandledOrderIdsFromFirestore failed: ${err.message}`);
