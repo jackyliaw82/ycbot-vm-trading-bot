@@ -1464,6 +1464,25 @@ class AiReversalStrategy extends TradingBase {
       await this._refreshCurrentPosition(expectNonEmpty);
       this.cycleAccumulatedLoss = this._computeAccLoss();
       this._recomputeFinalTpPrice();
+      // TEMP: record recomputed Final TP after open / reversal / harvest — remove after testing.
+      // On HARVEST_CLOSE the position is flat, so finalTpPrice is null by design (no active
+      // target); the meaningful fresh target appears on the subsequent OPEN_*_AT_LEVEL line.
+      const TEMP_TP_LOG_ACTIONS = new Set([
+        'OPEN_LONG_AT_LEVEL', 'OPEN_SHORT_AT_LEVEL',
+        'REVERSE_TO_LONG', 'REVERSE_TO_SHORT',
+        'HARVEST_CLOSE',
+      ]);
+      if (TEMP_TP_LOG_ACTIONS.has(actionType)) {
+        await this.addLog(
+          `[TEMP] Final TP recomputed after ${actionType}: ` +
+          `finalTpPrice=${this.finalTpPrice ?? 'null'} ` +
+          `(side=${this.currentSide ?? 'FLAT'}, ` +
+          `entry=${this.activePosition?.entryPrice ?? this.activePosition?.avgEntry ?? 'n/a'}, ` +
+          `qty=${this.activePosition?.quantity ?? 'n/a'}, ` +
+          `reversals=${this.reversalCount}, harvests=${this.harvestCount}, ` +
+          `accLoss=${this.cycleAccumulatedLoss.toFixed(4)})`
+        );
+      }
       await this.saveState();
       this._writeMetricsSample().catch(() => {});
       this._writeStrategyFlow(actionType, extra).catch(() => {});
