@@ -1008,15 +1008,19 @@ class AiReversalStrategy extends TradingBase {
     // the trigger side of current price. The HTTP layer pre-checks this
     // and asks the user for confirmation, but echo back the same warnings
     // so the log + audit trail capture what actually fired.
+    // Only warn about a leg the user actually CHANGED — an unchanged level
+    // already on the trigger side is a pre-existing condition, not introduced
+    // by this adjust, and must not block editing the other leg. Mirrors the
+    // HTTP pre-check gate in app.js (/ai-reversal/adjust-levels).
     const px = this.currentPrice;
     if (Number.isFinite(px) && px > 0) {
       if (this.subState === 'WAITING') {
-        if (this.bullLevel != null && px >= this.bullLevel) warnings.push(`bullLevel ${this.bullLevel} ≤ current ${px} — will OPEN LONG on next tick`);
-        if (this.bearLevel != null && px <= this.bearLevel) warnings.push(`bearLevel ${this.bearLevel} ≥ current ${px} — will OPEN SHORT on next tick`);
+        if (changes.bullLevel && this.bullLevel != null && px >= this.bullLevel) warnings.push(`bullLevel ${this.bullLevel} ≤ current ${px} — will OPEN LONG on next tick`);
+        if (changes.bearLevel && this.bearLevel != null && px <= this.bearLevel) warnings.push(`bearLevel ${this.bearLevel} ≥ current ${px} — will OPEN SHORT on next tick`);
       } else if (this.subState === 'LONG_HELD') {
-        if (this.bearLevel != null && px <= this.bearLevel) warnings.push(`bearLevel ${this.bearLevel} ≥ current ${px} — will REVERSE LONG→SHORT on next tick`);
+        if (changes.bearLevel && this.bearLevel != null && px <= this.bearLevel) warnings.push(`bearLevel ${this.bearLevel} ≥ current ${px} — will REVERSE LONG→SHORT on next tick`);
       } else if (this.subState === 'SHORT_HELD') {
-        if (this.bullLevel != null && px >= this.bullLevel) warnings.push(`bullLevel ${this.bullLevel} ≥ current ${px} — will REVERSE SHORT→LONG on next tick`);
+        if (changes.bullLevel && this.bullLevel != null && px >= this.bullLevel) warnings.push(`bullLevel ${this.bullLevel} ≥ current ${px} — will REVERSE SHORT→LONG on next tick`);
       }
     }
 

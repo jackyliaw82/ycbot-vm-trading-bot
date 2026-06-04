@@ -1666,15 +1666,23 @@ app.post('/ai-reversal/adjust-levels', async (req, res) => {
     const px = strategy.currentPrice;
     const nextBull = bullLevel != null ? bullLevel : strategy.bullLevel;
     const nextBear = bearLevel != null ? bearLevel : strategy.bearLevel;
+    // Only gate on a level the user is actually CHANGING. An unchanged level
+    // that already sits on the trigger side of price is a pre-existing
+    // condition (e.g. price drifted past a dormant bull while LONG is held) —
+    // it must not block editing the OTHER level, which the user couldn't fix
+    // via this edit anyway. Without this, changing only bear while bull is
+    // already below price returned a spurious "will OPEN LONG" 409.
+    const bullChanged = bullLevel != null;
+    const bearChanged = bearLevel != null;
     const wouldTriggerWarnings = [];
     if (Number.isFinite(px) && px > 0) {
       if (strategy.subState === 'WAITING') {
-        if (nextBull != null && px >= nextBull) wouldTriggerWarnings.push(`bullLevel ${nextBull} ≤ current ${px}: will OPEN LONG next tick`);
-        if (nextBear != null && px <= nextBear) wouldTriggerWarnings.push(`bearLevel ${nextBear} ≥ current ${px}: will OPEN SHORT next tick`);
+        if (bullChanged && nextBull != null && px >= nextBull) wouldTriggerWarnings.push(`bullLevel ${nextBull} ≤ current ${px}: will OPEN LONG next tick`);
+        if (bearChanged && nextBear != null && px <= nextBear) wouldTriggerWarnings.push(`bearLevel ${nextBear} ≥ current ${px}: will OPEN SHORT next tick`);
       } else if (strategy.subState === 'LONG_HELD') {
-        if (nextBear != null && px <= nextBear) wouldTriggerWarnings.push(`bearLevel ${nextBear} ≥ current ${px}: will REVERSE LONG→SHORT next tick`);
+        if (bearChanged && nextBear != null && px <= nextBear) wouldTriggerWarnings.push(`bearLevel ${nextBear} ≥ current ${px}: will REVERSE LONG→SHORT next tick`);
       } else if (strategy.subState === 'SHORT_HELD') {
-        if (nextBull != null && px >= nextBull) wouldTriggerWarnings.push(`bullLevel ${nextBull} ≤ current ${px}: will REVERSE SHORT→LONG next tick`);
+        if (bullChanged && nextBull != null && px >= nextBull) wouldTriggerWarnings.push(`bullLevel ${nextBull} ≤ current ${px}: will REVERSE SHORT→LONG next tick`);
       }
     }
     if (wouldTriggerWarnings.length > 0 && !confirmTrigger) {
