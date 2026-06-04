@@ -785,6 +785,15 @@ class AiReversalStrategy extends TradingBase {
     // Clear the desync log latch once state is consistent again.
     if (this._loggedWaitingDesync) this._loggedWaitingDesync = false;
 
+    // Only dispatch a new position action when nothing else is in flight.
+    // During PLANNING (the async cycle-start / post-harvest consult) or
+    // EXECUTING (a close/open mid-flight), a concurrent tick must NOT open or
+    // reverse — that's the window the post-harvest stale-level open slipped
+    // through (executionState was 'PLANNING', which the per-action guards
+    // didn't block). Reversals are unaffected: a held position only ever ticks
+    // with executionState IDLE (no plan runs mid-position).
+    if (this.executionState !== 'IDLE') return;
+
     if (this.subState === 'WAITING' && this.bullLevel != null && this.bearLevel != null) {
       if (price >= this.bullLevel) {
         await this._openInitialPosition('LONG', this.bullLevel);
@@ -1159,7 +1168,20 @@ class AiReversalStrategy extends TradingBase {
     this.executionState = 'EXECUTING';
     const verb = side === 'LONG' ? 'OPEN_LONG_AT_LEVEL' : 'OPEN_SHORT_AT_LEVEL';
     try {
-      const sizeUSDT = this.currentInitialSize;
+      // Dynamic sizing — size the entry to recover the cycle's carried-over
+      // accumulated loss, using the SAME pipeline as a reversal. At cycle start
+      // accLoss=0, so _computeFormulaSize returns exactly currentInitialSize (no
+      // behavior change); after a harvest the carried accLoss (reduced by the
+      // banked profit) augments the size so the fresh entry recovers faster.
+      // Margin-headroom cap, then the AI size veto — both mirroring
+      // _performReversal: when aiVetoOnReversal is on the AI may REDUCE the
+      // recovery size for this entry too. executionState is already 'EXECUTING'
+      // here, so the dispatch guard blocks any concurrent open/reverse while the
+      // veto consult is in flight.
+      this.cycleAccumulatedLoss = this._computeAccLoss();
+      const proposed = this._computeFormulaSize();
+      const projected = this._applyMarginHeadroomCap(proposed);
+      const sizeUSDT = this.aiVetoOnReversal ? await this._requestVeto(projected) : projected;
       const quantity = await this._calculateAdjustedQuantity(this.symbol, sizeUSDT, levelPrice, verb);
       await this.executor.executeAction({
         type: verb,
@@ -1168,7 +1190,7 @@ class AiReversalStrategy extends TradingBase {
         sizeUSDT,
       });
       this.subState = side === 'LONG' ? 'LONG_HELD' : 'SHORT_HELD';
-      await this.addLog(`[REVERSAL] initial ${side} opened at level ${levelPrice} (size ${sizeUSDT} USDT)`);
+      await this.addLog(`[REVERSAL] initial ${side} opened at level ${levelPrice} (size ${sizeUSDT} USDT, accLoss ${this.cycleAccumulatedLoss.toFixed(4)})`);
     } catch (err) {
       await this.addLog(`[REVERSAL] _openInitialPosition error: ${err.message}`);
     } finally {
@@ -1275,6 +1297,16 @@ class AiReversalStrategy extends TradingBase {
       await this._refreshCurrentPosition();
       this.activePosition = null;
       this.currentSide = null;
+      // Clear the prior cycle's levels BEFORE returning to WAITING. The
+      // post-harvest PLAN below is async (~tens of seconds); without this, a
+      // price tick during that window would see subState=WAITING + the STALE
+      // bull/bear still set and open an initial position at the old level
+      // (then the landing PLAN resets subState=WAITING over the open position →
+      // "state desync → stop+flatten"). With levels null, the WAITING dispatch
+      // stays inert until _handlePlanResponse installs fresh levels — matching
+      // cycle-start, where levels also begin null.
+      this.bullLevel = null;
+      this.bearLevel = null;
       this.subState = 'WAITING';
       await this._postExecuteBookkeeping('HARVEST_CLOSE', { reason: reason || null });
       // Immediately request fresh PLAN.
