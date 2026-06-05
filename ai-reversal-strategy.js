@@ -828,6 +828,18 @@ class AiReversalStrategy extends TradingBase {
   _isHarvestGateOpen() {
     if (this.executionState !== 'IDLE') return false;
     if (!this.activePosition || !this.activePosition.quantity) return false;
+    // Position state must be SETTLED before we consult. After a reversal,
+    // subState flips (LONG_HELD/SHORT_HELD) immediately, but currentSide +
+    // activePosition.entryPrice are refreshed slightly later by
+    // _refreshCurrentPosition. Firing the consult in that window feeds the AI
+    // AND the risk-guard direction check the JUST-CLOSED leg's side/entry — so
+    // the AI plans a harvest for the old side and the guard validates against
+    // it, producing a harvestPrice on the wrong side of the NEW entry → an
+    // immediate loss-making harvest. Wait until currentSide agrees with subState
+    // (both are set together in _refreshCurrentPosition, so a match means the
+    // entry is fresh too).
+    if (this.subState === 'LONG_HELD' && this.currentSide !== 'LONG') return false;
+    if (this.subState === 'SHORT_HELD' && this.currentSide !== 'SHORT') return false;
     if (this.harvestPrice != null) return false;
     if (this._harvestConsultPending) return false;
     if (this.initialCapital <= 0) return false;
