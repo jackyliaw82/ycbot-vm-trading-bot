@@ -1157,7 +1157,13 @@ class AiReversalStrategy extends TradingBase {
 
     this.subState = 'WAITING';
     this.executionState = 'IDLE';
-    await this.addLog(`[REVERSAL] PLAN accepted: bull=${plan.bullLevel} bear=${plan.bearLevel} size=${this.currentInitialSize} (${plan.rationale || 'no rationale'})`);
+    // Show the PROJECTED dynamic size the next open will actually use
+    // (_computeFormulaSize from currentInitialSize + carried accLoss), not the
+    // bare currentInitialSize — at cycle start accLoss=0 so this is the base
+    // size, but post-harvest / resume it reflects the recovery-augmented size.
+    // The real open still applies the margin-headroom cap (+ AI veto if on), so
+    // this is an estimate, hence "size≈".
+    await this.addLog(`[REVERSAL] PLAN accepted: bull=${plan.bullLevel} bear=${plan.bearLevel} size≈${this._computeFormulaSize().toFixed(2)} (accLoss ${this.cycleAccumulatedLoss.toFixed(2)}) (${plan.rationale || 'no rationale'})`);
     this._recomputeFinalTpPrice();
     await this.saveState();
     // Persist the plan to the aiPlans subcollection for audit trail
