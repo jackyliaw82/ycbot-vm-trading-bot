@@ -6,7 +6,7 @@ import { AiRiskGuard, FEE_RATE } from './ai-risk-guard.js';
 import { AiMarketContext } from './ai-market-context.js';
 import wsBroadcast from './ws-broadcast.js';
 
-// Per-model pricing in USD per million tokens. Mirrors ai-hedge-strategy.js.
+// Per-model pricing in USD per million tokens.
 const MODEL_PRICING = {
   // Anthropic — Claude.
   'claude-sonnet-4-6': { input: 3.0,   output: 15.0, cacheWrite5m: 3.75,   cacheRead: 0.30 },
@@ -121,8 +121,7 @@ class AiReversalStrategy extends TradingBase {
     this._lastCvd = null;
     this._lastOrderbookDepth = null;
     // ATR / volatility snapshot — feeds the Volume Analytics panel's ATR
-    // cell. Populated by _cacheVolumeContext on every AI consult; mirrors
-    // hedge's _lastVolatility pattern.
+    // cell. Populated by _cacheVolumeContext on every AI consult.
     this._lastVolatility = null;
 
     // Token usage accumulators
@@ -132,7 +131,7 @@ class AiReversalStrategy extends TradingBase {
     this._staleRetryAttempt = 0;
     this._staleRetryTimer = null;
 
-    // Lifecycle infrastructure (mirrors AiHedgeStrategy fields). Tracked
+    // Lifecycle infrastructure. Tracked
     // here so stop() can clear every interval/timeout deterministically
     // and start()/resume() can restart them. Leaving any unset means a
     // restart will leak the prior session's timer.
@@ -208,8 +207,8 @@ class AiReversalStrategy extends TradingBase {
 
     try {
       await this.setLeverage(this.symbol, this.leverage);
-      // ONE-WAY position mode — reversal is single-sided. Mutually exclusive
-      // with AI Hedge (which uses hedge mode) at the Binance account level.
+      // ONE-WAY position mode — reversal is single-sided. Force it in case the
+      // Binance account was left in dual-side (hedge) position mode.
       try {
         await this.setPositionMode(false);
         await this.addLog('Binance position mode set to ONE-WAY (single-sided).');
@@ -237,7 +236,7 @@ class AiReversalStrategy extends TradingBase {
     this.initialCapital = this.initialWalletBalance || this.currentInitialSize;
     await this.addLog(`Wallet balance: ${this._formatNotional(this.initialWalletBalance)} USDT — using as initialCapital.`);
 
-    // AI modules — same instantiation order as ai-hedge-strategy.
+    // AI modules.
     this.marketContext = new AiMarketContext(this);
     this.riskGuard = new AiRiskGuard({
       maxPositionSizeUSDT: this.maxPositionSizeUSDT,
@@ -258,7 +257,7 @@ class AiReversalStrategy extends TradingBase {
 
     // WebSocket setup — listen key first, then user-data + realtime price.
     // No liquidation WS: reversal's AI consult / sizing math never reads
-    // liquidation data (unlike hedge). One less stream to keep alive.
+    // liquidation data. One less stream to keep alive.
     await this._retryListenKeyRequest(false);
     this.connectUserDataStream();
     this.connectRealtimeWebSocket();
@@ -281,8 +280,7 @@ class AiReversalStrategy extends TradingBase {
     await this._refreshCurrentPosition();
 
     // Funding poll baseline + scheduler. Anchor at strategy start so the
-    // first poll only catches entries from THIS cycle. Mirrors hedge's
-    // pattern at ai-hedge-strategy.js:310-311.
+    // first poll only catches entries from THIS cycle.
     this._lastFundingPollTs = this.strategyStartTime.getTime();
     this._scheduleNextFundingPoll();
 
@@ -301,7 +299,7 @@ class AiReversalStrategy extends TradingBase {
    * Resume a strategy from a Firestore snapshot. Called by app.js boot-scan
    * (recoverActiveStrategies) when a `type: 'AI_REVERSAL'` doc has
    * `isRunning: true` but no in-memory instance exists (i.e. PM2 restart
-   * / VM force-update). Mirrors AiHedgeStrategy.resume (line 328+).
+   * / VM force-update).
    *
    * Critical contract (see audit C3+C4+C5):
    *   - Restore identifiers FIRST so addLog can write under the right strategyId
@@ -444,7 +442,7 @@ class AiReversalStrategy extends TradingBase {
     // WS lifecycle — listen-key request FIRST (avoids stale-key races),
     // then user-data stream, then realtime price feed, then refresh
     // interval + health monitor. No liquidation WS: reversal's AI consult
-    // and sizing math never read liquidation data (unlike hedge).
+    // and sizing math never read liquidation data.
     await this._retryListenKeyRequest(false);
     this.connectUserDataStream();
     this.connectRealtimeWebSocket();
@@ -476,8 +474,7 @@ class AiReversalStrategy extends TradingBase {
 
     // L3 catch-up: sweep any fills Binance executed during VM downtime
     // BEFORE the next scheduled listenKey refresh (30 min) does it
-    // automatically. Mirrors hedge's resume() pattern at
-    // ai-hedge-strategy.js:571. Best-effort; swallow errors — the
+    // automatically. Best-effort; swallow errors — the
     // automatic 30-min L3 will catch anything we miss here.
     this._reconcileRecentTrades().catch((err) => {
       console.error(`[REVERSAL] L3 reconcile on resume failed: ${err.message}`);
@@ -522,8 +519,8 @@ class AiReversalStrategy extends TradingBase {
 
   /**
    * Single termination path — used for BOTH manual stop and Final TP
-   * auto-stop (v4.0.1 consolidation). Mirrors AiHedgeStrategy.stop's
-   * "one method to rule them all" pattern: position close (when
+   * auto-stop (v4.0.1 consolidation). "One method to rule them all":
+   * position close (when
    * requested), final funding flush, WS cleanup, platform fee
    * deduction, AI usage log, completion notification, saveState, and
    * the onStopComplete hook that unregisters from app.js's
@@ -550,8 +547,7 @@ class AiReversalStrategy extends TradingBase {
     // race (first call sets isRunning=false synchronously before any
     // await, so the second microtask-queued call bails). The
     // TERMINATED check catches a stop attempt AFTER a previous stop
-    // already completed. Mirrors hedge's `if (!this.isRunning) return;`
-    // guard at ai-hedge-strategy.js:611.
+    // already completed (the `if (!this.isRunning) return;` guard).
     if (!this.isRunning || this.executionState === 'TERMINATED') return;
 
     this.isRunning = false;
@@ -582,7 +578,7 @@ class AiReversalStrategy extends TradingBase {
       // null in-memory while Binance still holds an open position (state lost
       // across a partial restart, missed WS update, etc.) — without this
       // refresh the close silently no-ops and the user is left with an open
-      // position. Mirrors hedge's stop() pattern which always closes.
+      // position. stop() always closes.
       try {
         await this._refreshCurrentPosition();
       } catch (err) {
@@ -646,7 +642,7 @@ class AiReversalStrategy extends TradingBase {
     this.subState = 'EXITED';
     this.strategyEndTime = new Date();
 
-    // Platform fee on net positive PnL — mirrors hedge's stop().
+    // Platform fee on net positive PnL.
     // Funding is included in net so the fee scales with what the bot
     // actually delivered to the user.
     const netPnL = (this.accumulatedRealizedPnL || 0)
@@ -662,7 +658,7 @@ class AiReversalStrategy extends TradingBase {
 
     await this.saveState();
 
-    // AI usage summary — mirrors hedge's end-of-stop log.
+    // AI usage summary — end-of-stop log.
     const u = this.aiTokenUsage;
     if (u && (u.requests || 0) > 0) {
       try {
@@ -681,7 +677,7 @@ class AiReversalStrategy extends TradingBase {
       ? '[REVERSAL] Final TP — cycle complete, strategy terminated.'
       : '[REVERSAL] stop: terminated');
 
-    // Completion notification — mirrors hedge. Helper signature is
+    // Completion notification. Helper signature is
     // (userId, strategyData); the FCM token lookup relies on the
     // second argument being the data object.
     try {
@@ -1234,7 +1230,7 @@ class AiReversalStrategy extends TradingBase {
       }
 
       // ===== Step 1: close current leg =====
-      // Mirrors hedge's "rely on Binance, not projection" model: close
+      // "Rely on Binance, not projection": close
       // first, let the WS update populate accumulatedRealizedPnL +
       // accumulatedTradingFees with TRUE values, then size the new leg
       // from `cycleAccumulatedLoss` directly. FEE_RATE is reserved for
@@ -1260,7 +1256,7 @@ class AiReversalStrategy extends TradingBase {
       }
 
       // Recompute accLoss from current (now-actual) accumulators. No
-      // projection — same source-of-truth model as hedge.
+      // projection — Binance is the source of truth.
       this.cycleAccumulatedLoss = this._computeAccLoss();
 
       // ===== Step 3: size new leg from actual accLoss =====
@@ -1348,9 +1344,9 @@ class AiReversalStrategy extends TradingBase {
    * residual check, FINAL_TP_HIT bookkeeping, WS cleanup, notification,
    * saveState) PLUS the parity gaps that were missing before:
    *
-   *   - Final funding flush (mirrors hedge.stop)
-   *   - Platform fee deduction on net positive PnL (mirrors hedge.stop)
-   *   - AI usage summary log (mirrors hedge.stop)
+   *   - Final funding flush
+   *   - Platform fee deduction on net positive PnL
+   *   - AI usage summary log
    *   - onStopComplete() hook → removes the entry from app.js's
    *     `activeStrategies` map. Without this hook the next start
    *     attempt for this profile is rejected with "already running"
@@ -1429,8 +1425,7 @@ class AiReversalStrategy extends TradingBase {
    *   SHORT: qty × (entryAvg - price) ≥ needed
    *          price ≤ entryAvg - needed / qty
    *
-   * `estimatedClosingFee = notional × FEE_RATE` mirrors hedge's
-   * effectiveTarget pattern (ai-hedge-strategy.js:793). FEE_RATE = 0.08%
+   * `estimatedClosingFee = notional × FEE_RATE`. FEE_RATE = 0.08%
    * = 0.05% taker + 0.03% slippage buffer; it ensures the realized exit
    * (after fee + slippage on the close) lands as close to desiredProfit
    * as possible rather than under-shooting by the close cost.
@@ -1585,8 +1580,7 @@ class AiReversalStrategy extends TradingBase {
   /**
    * Audit-trail record per strategy action. Enables the frontend chart
    * to correlate fills with the originating verb (OPEN_LONG_AT_LEVEL vs
-   * REVERSE_TO_SHORT vs HARVEST_CLOSE) by timestamp proximity. Mirrors
-   * hedge's strategyFlow subcollection.
+   * REVERSE_TO_SHORT vs HARVEST_CLOSE) by timestamp proximity.
    */
   async _writeStrategyFlow(actionType, extra = {}) {
     if (!this.firestore || !this.strategyId) return;
@@ -1610,7 +1604,7 @@ class AiReversalStrategy extends TradingBase {
       });
 
       // Real-time push for the chart's TP segment boundaries. Slim payload —
-      // only the four fields HedgePositionChart's buildTpFromFlow walker
+      // only the four fields ReversalPositionChart's buildTpFromFlow walker
       // reads. Future consumers needing position / cycleAccumulatedLoss /
       // etc. can extend this.
       try {
@@ -1645,8 +1639,7 @@ class AiReversalStrategy extends TradingBase {
   /**
    * Poll Binance income endpoint for FUNDING_FEE entries since the last
    * recorded high-water mark. Idempotent: re-running with the same
-   * `_lastFundingPollTs` is a no-op if no new entries. Mirrors
-   * AiHedgeStrategy._pollFundingIncome (ai-hedge-strategy.js:1344-1384).
+   * `_lastFundingPollTs` is a no-op if no new entries.
    *
    * On success, advances `_lastFundingPollTs` to the maximum entry time
    * (NOT Date.now() — that would skip any future entries with
@@ -1706,8 +1699,7 @@ class AiReversalStrategy extends TradingBase {
   /**
    * Schedule the next funding-fee poll aligned to the next 8h UTC
    * settlement boundary + 60s safety buffer. Self-rescheduling.
-   * Cancellable via clearTimeout(this._fundingPollTimeout). Mirrors
-   * AiHedgeStrategy._scheduleNextFundingPoll (ai-hedge-strategy.js:1395-1424).
+   * Cancellable via clearTimeout(this._fundingPollTimeout).
    *
    * If the primary poll at +60s returns zero entries (Binance lagged on
    * ledgering the settlement), retries once at +5min then resumes the
@@ -1814,7 +1806,6 @@ class AiReversalStrategy extends TradingBase {
    * retry we'd persist activePosition=null right after the order
    * acknowledges, leaving the Firestore doc + frontend in a stale
    * "no position" state until the next tick or external trigger.
-   * Mirrors AiHedgeStrategy._refreshHedgePositions (ai-hedge-strategy.js:1268).
    */
   async _refreshCurrentPosition(expectNonEmpty = false) {
     try {
@@ -1978,11 +1969,9 @@ class AiReversalStrategy extends TradingBase {
   }
 
   /**
-   * Fetches the Anthropic API key for this profile. Mirrors
-   * AiHedgeStrategy._fetchAnthropicApiKey (env var override, then GCF proxy
-   * to the user's Secret Manager binding). Duplicated here rather than
-   * inherited because AiReversalStrategy extends TradingBase, not
-   * AiHedgeStrategy — follow-up: refactor to TradingBase.
+   * Fetches the Anthropic API key for this profile (env var override, then
+   * GCF proxy to the user's Secret Manager binding). Lives here rather than
+   * on TradingBase — follow-up: refactor down to TradingBase.
    */
   async _fetchAnthropicApiKey() {
     const envKey = process.env.ANTHROPIC_API_KEY;
@@ -2032,9 +2021,8 @@ class AiReversalStrategy extends TradingBase {
 
   /**
    * Deducts the platform fee from the user's wallet on net positive PnL.
-   * Mirrors AiHedgeStrategy.deductPlatformFee verbatim — duplicated for
-   * the same reason _fetchAnthropicApiKey is duplicated (reversal extends
-   * TradingBase, not hedge; follow-up: refactor down to TradingBase).
+   * Lives here rather than on TradingBase for the same reason
+   * _fetchAnthropicApiKey does; follow-up: refactor down to TradingBase.
    * Called from stop() when netPnL > 0.
    */
   async deductPlatformFee(profitAmount) {
@@ -2296,8 +2284,8 @@ class AiReversalStrategy extends TradingBase {
 
   /**
    * Persist a single AI plan response to the strategies/{id}/aiPlans
-   * subcollection. Mirrors AiHedgeStrategy._savePlanToFirestore so the
-   * /ai-reversal/plan-history endpoint can return a real audit trail.
+   * subcollection so the /ai-reversal/plan-history endpoint can return a
+   * real audit trail.
    * Stores the consult context (plan / veto) for filtering.
    */
   async _savePlanToFirestore(plan, consultContext, extras = {}) {

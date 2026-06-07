@@ -1,6 +1,5 @@
 import express from 'express';
 import cors from 'cors';
-import { AiHedgeStrategy } from './ai-hedge-strategy.js';
 import { AiReversalStrategy } from './ai-reversal-strategy.js';
 
 // TradFi-Perps symbols are gated by Binance behind a separate trading agreement
@@ -404,7 +403,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Generic Firestore query endpoints (used by AI hedge strategy)
+// Generic Firestore query endpoints (used by AI strategies)
 
 // New endpoint to fetch strategy-specific trades
 app.get('/strategy/:strategyId/trades', async (req, res) => {
@@ -576,7 +575,7 @@ app.get('/strategies/:strategyId', async (req, res) => {
 // the new process can reattach via the boot recovery scan. The latest state
 // is already in Firestore; we just save once more for freshness and exit.
 //
-// User-initiated stop still goes through the /ai-hedge/stop HTTP endpoint,
+// User-initiated stop still goes through the /ai-reversal/stop HTTP endpoint,
 // which does close positions. SIGTERM is reserved for restart-recovery.
 const shutdown = async () => {
   console.log('[SHUTDOWN] Received signal — saving state and exiting (positions preserved for restart recovery).');
@@ -643,17 +642,23 @@ async function recoverActiveStrategies() {
       const isReversal = data.type === 'AI_REVERSAL'
         || data.strategyType === 'reversal'
         || strategyId.startsWith('ai_reversal_');
-      const isHedge = data.type === 'AI_HEDGE'
-        || strategyId.startsWith('ai_hedge_');
 
-      if (!isReversal && !isHedge) {
+      // AI Hedge was removed. A stale AI_HEDGE / ai_hedge_ doc with
+      // isRunning:true can still exist in Firestore from before removal — do
+      // NOT resume it (the class no longer exists). Warn so any open Binance
+      // hedge position is surfaced for manual closing rather than silently left.
+      if (data.type === 'AI_HEDGE' || strategyId.startsWith('ai_hedge_')) {
+        console.warn(`[RECOVERY] Skipping ${strategyId} — AI Hedge strategy has been removed; not resuming. Close any open hedge positions on Binance manually.`);
+        continue;
+      }
+
+      if (!isReversal) {
         console.log(`[RECOVERY] Skipping ${strategyId} — unknown strategy type (data.type=${data.type})`);
         continue;
       }
 
       try {
-        const StrategyClass = isReversal ? AiReversalStrategy : AiHedgeStrategy;
-        const strategy = new StrategyClass(
+        const strategy = new AiReversalStrategy(
           data.gcfProxyUrl || null,
           data.profileId,
           data.sharedVmProxyGcfUrl || null
@@ -675,7 +680,7 @@ async function recoverActiveStrategies() {
 
         activeStrategies.set(strategyId, strategy);
 
-        // Resume in background — same non-blocking pattern as /ai-hedge/start.
+        // Resume in background — same non-blocking pattern as /ai-reversal/start.
         strategy.resume(data)
           .then(() => {
             // Only continue wallet snapshot loop if resume left strategy running.
@@ -1037,10 +1042,10 @@ app.post('/system/force-update', requireAdmin, async (req, res) => {
   //   1. PM2 restart sends SIGTERM → shutdown handler (line ~552) saves
   //      each strategy's state to Firestore with isRunning: true.
   //   2. New bot process boots → recoverActiveStrategies queries Firestore
-  //      for isRunning + AI_HEDGE strategies and calls strategy.resume()
+  //      for isRunning + AI_REVERSAL strategies and calls strategy.resume()
   //      on each, which reconciles positions against Binance and reattaches
   //      WS streams.
-  //   3. User-initiated stop (/ai-hedge/stop) is still the only path that
+  //   3. User-initiated stop (/ai-reversal/stop) is still the only path that
   //      closes positions + processes platform fees. Force-update is now
   //      strictly a fast-restart-with-state-preservation operation.
   const activeCount = activeStrategies.size;
@@ -1301,191 +1306,6 @@ async function reportVersionOnStartup(retryCount = 0) {
   }
 }
 
-// ─── AI Hedge Strategy Endpoints ─────────────────────────────────────────────
-
-// Start AI hedge strategy
-// Pre-warm the relay's upstream for a symbol the user has selected on the config
-// page but hasn't started a strategy on yet. Idempotent — calling with the same
-// symbol while already-warmed is a no-op. Switching symbols closes the previous
-// warm subscription and opens a new one.
-app.post('/ai-hedge/prepare-symbol', (req, res) => {
-  const { symbol } = req.body || {};
-  if (!symbol || typeof symbol !== 'string') {
-    return res.status(400).json({ error: 'symbol is required' });
-  }
-  const normalized = symbol.toUpperCase();
-  if (warmSymbol === normalized && warmWs && warmWs.readyState === WsClient.OPEN) {
-    return res.json({ ok: true, alreadyWarm: true, symbol: normalized });
-  }
-  _closeWarmWs('switching symbol');
-  _openWarmWs(normalized);
-  return res.json({ ok: true, symbol: normalized });
-});
-
-app.post('/ai-hedge/start', async (req, res) => {
-  if (isUpdating) {
-    return res.status(503).json({ error: 'VM is currently updating.', code: 'VM_UPDATING' });
-  }
-
-  try {
-    const { profileId, gcpProxyUrl, sharedVmProxyGcfUrl, config, userId } = req.body;
-
-    if (!profileId || !gcpProxyUrl || !sharedVmProxyGcfUrl || !config) {
-      return res.status(400).json({ error: 'profileId, gcpProxyUrl, sharedVmProxyGcfUrl, and config are required.' });
-    }
-
-    // Check if any strategy already exists for this profile (running or starting)
-    for (const [sId, strategy] of activeStrategies.entries()) {
-      if (strategy.profileId === profileId) {
-        return res.status(400).json({
-          error: `A strategy for profile ${profileId} is already running`,
-          strategyId: sId
-        });
-      }
-    }
-
-    const strategy = new AiHedgeStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
-    strategy.userId = userId;
-
-    // Generate strategyId HERE (before start()) so it's available immediately
-    const strategyId = `ai_hedge_${profileId}_${Date.now()}`;
-    strategy.strategyId = strategyId;
-
-    // Mark as running IMMEDIATELY so /health reports it and frontend transitions
-    strategy.isRunning = true;
-
-    // Register so /health and /status can track it
-    activeStrategies.set(strategyId, strategy);
-
-    // Wallet snapshot lifecycle — initial snapshot after start() resolves, then hourly.
-    let walletSnapshotInterval = null;
-
-    // Unregister on any stop path (manual, TP, capital protection, etc.)
-    strategy.onStopComplete = () => {
-      if (walletSnapshotInterval) {
-        clearInterval(walletSnapshotInterval);
-        walletSnapshotInterval = null;
-      }
-      // Final snapshot to capture end-of-session balance
-      _snapshotWallet(strategy).catch(() => { /* logged inside */ });
-      activeStrategies.delete(strategyId);
-    };
-
-    // Respond immediately — strategy starts in background
-    console.log(`✓ AI Hedge Strategy ${strategyId} starting (non-blocking)...`);
-    res.json({
-      success: true,
-      strategyId,
-      message: 'AI Hedge Strategy starting',
-    });
-
-    // Start strategy in background — errors are logged, not sent to client
-    strategy.start(config)
-      .then(() => {
-        // Initial snapshot now that wallet is fetchable, then hourly cadence
-        _snapshotWallet(strategy).catch(() => { /* logged inside */ });
-        walletSnapshotInterval = setInterval(
-          () => _snapshotWallet(strategy).catch(() => { /* logged inside */ }),
-          WALLET_SNAPSHOT_INTERVAL_MS
-        );
-      })
-      .catch((error) => {
-        console.error(`Failed to start AI Hedge Strategy ${strategyId}:`, error);
-        strategy.isRunning = false;
-        activeStrategies.delete(strategyId);
-      });
-  } catch (error) {
-    console.error('Failed to start AI Hedge Strategy:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Stop AI hedge strategy
-app.post('/ai-hedge/stop', async (req, res) => {
-  try {
-    const { strategyId } = req.body;
-    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
-
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AiHedgeStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No AI Hedge strategy running with ID ${strategyId}` });
-    }
-
-    res.json({ success: true, stopping: true, message: 'AI Hedge Strategy stop initiated', strategyId });
-
-    setImmediate(async () => {
-      try {
-        await strategy.stop('manual');
-        activeStrategies.delete(strategyId);
-      } catch (error) {
-        console.error(`Error stopping AI Hedge Strategy ${strategyId}:`, error);
-      }
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get AI hedge strategy status
-app.get('/ai-hedge/status', (req, res) => {
-  const { strategyId } = req.query;
-
-  if (strategyId) {
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AiHedgeStrategy)) {
-      return res.status(404).json({ error: `AI Hedge strategy ${strategyId} not found.` });
-    }
-    return res.json(strategy.getStatus());
-  }
-
-  // Return all AI hedge strategies
-  const hedgeStrategies = {};
-  activeStrategies.forEach((strategy, sId) => {
-    if (strategy instanceof AiHedgeStrategy) {
-      hedgeStrategies[sId] = strategy.getStatus();
-    }
-  });
-
-  res.json({ strategies: hedgeStrategies, count: Object.keys(hedgeStrategies).length });
-});
-
-// Manually trigger AI replan
-app.post('/ai-hedge/replan', async (req, res) => {
-  try {
-    const { strategyId } = req.body;
-    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
-
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AiHedgeStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running AI Hedge strategy with ID ${strategyId}` });
-    }
-
-    await strategy.manualReplan();
-    res.json({ success: true, message: 'Replan triggered', strategyId });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get AI plan history
-app.get('/ai-hedge/plan-history', async (req, res) => {
-  try {
-    const { strategyId, limit: queryLimit } = req.query;
-    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
-
-    const planLimit = parseInt(queryLimit) || 20;
-    const plansRef = firestore.collection('strategies').doc(strategyId).collection('aiPlans');
-    const snapshot = await plansRef.orderBy('timestamp', 'desc').limit(planLimit).get();
-
-    const plans = [];
-    snapshot.forEach(doc => plans.push({ id: doc.id, ...doc.data() }));
-
-    res.json({ plans, count: plans.length });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
 // ——— AI Reversal Strategy endpoints ——————————————————————————————————
 
 app.post('/ai-reversal/prepare-symbol', (req, res) => {
@@ -1527,7 +1347,7 @@ app.post('/ai-reversal/start', async (req, res) => {
       });
     }
 
-    // One strategy per profile (matches existing model). User must stop AI Hedge first.
+    // One strategy per profile (matches existing model). User must stop the running strategy first.
     for (const [sId, strategy] of activeStrategies.entries()) {
       if (strategy.profileId === profileId) {
         return res.status(400).json({

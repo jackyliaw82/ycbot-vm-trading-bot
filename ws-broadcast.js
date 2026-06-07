@@ -76,7 +76,7 @@ class WsBroadcast {
   }
 
   /**
-   * Push a per-tick price update. Slim payload — used by HedgePositionChart
+   * Push a per-tick price update. Slim payload — used by ReversalPositionChart
    * to drive smooth 1Hz candle-wick updates instead of the 10s strategy_update
    * cadence. Called from each strategy's handleRealtimePrice (~1 msg/sec from
    * the Binance markPrice@1s upstream). Bot-side cost is negligible

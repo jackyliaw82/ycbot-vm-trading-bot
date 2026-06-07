@@ -320,7 +320,7 @@ class TradingBase {
       // changed from this fill. Without this push, frontend would see
       // stale accumulators until the next 30s safety-net heartbeat.
       // Hook is optional — strategies that implement _pushHeartbeatNow
-      // (AiHedgeStrategy + AiReversalStrategy) opt in; others no-op.
+      // (AiReversalStrategy) opt in; others no-op.
       if (typeof this._pushHeartbeatNow === 'function') {
         try { this._pushHeartbeatNow(); } catch (_) { /* non-fatal */ }
       }
@@ -867,7 +867,7 @@ class TradingBase {
     // baseline; scales DOWN proportionally when current is significantly
     // higher. Floored at VOL_SIZING_FLOOR so we don't shrink below
     // executable size.
-    const isAdd = actionType === 'ADD' || actionType === 'ADD_LONG' || actionType === 'ADD_SHORT' || actionType === 'OPEN_HEDGE';
+    const isAdd = actionType === 'ADD' || actionType === 'ADD_LONG' || actionType === 'ADD_SHORT';
     const startAtr = this._atrPctAtStart;
     const curAtr = this._lastVolatility?.atrPercent;
     if (isAdd && startAtr && curAtr && curAtr > startAtr * 1.5) {
@@ -1077,55 +1077,6 @@ class TradingBase {
     } catch (error) {
       console.error(`Failed to detect current position for ${this.symbol}: ${error.message}`);
     }
-  }
-
-  /**
-   * Detect per-side positions for hedge mode (returns structured data).
-   * Unlike detectCurrentPosition which updates the legacy single-position fields,
-   * this returns a clean object with both sides.
-   */
-  async detectHedgePositions() {
-    const [positions, riskMap] = await Promise.all([
-      this.getCurrentPositions(),
-      this.getPositionRiskMap(),
-    ]);
-    const longPos = positions.find(p => parseFloat(p.positionAmt) > 0);
-    const shortPos = positions.find(p => parseFloat(p.positionAmt) < 0);
-
-    const result = {
-      long: longPos ? {
-        entryPrice: parseFloat(longPos.entryPrice),
-        quantity: Math.abs(parseFloat(longPos.positionAmt)),
-        notional: Math.abs(parseFloat(longPos.notional)),
-        unrealizedPnl: parseFloat(longPos.unRealizedProfit || 0),
-        liquidationPrice: riskMap.LONG,
-      } : null,
-      short: shortPos ? {
-        entryPrice: parseFloat(shortPos.entryPrice),
-        quantity: Math.abs(parseFloat(shortPos.positionAmt)),
-        notional: Math.abs(parseFloat(shortPos.notional)),
-        unrealizedPnl: parseFloat(shortPos.unRealizedProfit || 0),
-        liquidationPrice: riskMap.SHORT,
-      } : null,
-    };
-
-    // Update internal per-side fields too
-    if (result.long) {
-      this._longEntryPrice = result.long.entryPrice;
-      this._longPositionSize = result.long.notional;
-    } else {
-      this._longEntryPrice = null;
-      this._longPositionSize = null;
-    }
-    if (result.short) {
-      this._shortEntryPrice = result.short.entryPrice;
-      this._shortPositionSize = result.short.notional;
-    } else {
-      this._shortEntryPrice = null;
-      this._shortPositionSize = null;
-    }
-
-    return result;
   }
 
   // ─── Order placement ───────────────────────────────────────────────────────
@@ -1915,8 +1866,8 @@ class TradingBase {
    *
    * Mirrors each per-side update into both the legacy internal fields
    * (_longEntryPrice / _shortEntryPrice / ...) and the structured per-side
-   * objects (longPosition / shortPosition) that the AI hedge strategy,
-   * frontend, risk guard, and status payload all read from. This makes the
+   * objects (longPosition / shortPosition) that the strategy, frontend, risk
+   * guard, and status payload all read from. This makes the
    * WS push the primary source of truth for position state — REST polling
    * becomes a reconciliation fallback only.
    */
@@ -1990,16 +1941,6 @@ class TradingBase {
         const prevShortLiq = this.shortPosition?.liquidationPrice ?? null;
         this.shortPosition = { entryPrice, quantity: qty, notional, unrealizedPnl, liquidationPrice: prevShortLiq };
       }
-    }
-
-    // Recompute derived hedge metrics after all per-side updates in this event
-    if (this.longPosition && this.shortPosition) {
-      this.hedgeGap = this.shortPosition.entryPrice - this.longPosition.entryPrice;
-      const minQty = Math.min(this.longPosition.quantity, this.shortPosition.quantity);
-      this.lockedProfit = this.hedgeGap * minQty;
-    } else {
-      this.hedgeGap = 0;
-      this.lockedProfit = 0;
     }
 
     this.lastPositionUpdateFromWebSocket = Date.now();
@@ -2249,9 +2190,7 @@ class TradingBase {
    * M1 — wait for WS to confirm an orderId fill (via _handleOrderTradeUpdate
    * setting _wsHandledOrderIds) before reading positions. The race we're
    * closing: REST ACK can land before the WS ACCOUNT_UPDATE for the same
-   * fill, leaving longPosition/shortPosition reflecting the PRE-fill state.
-   * The existing _refreshHedgePositions retry only triggers when both sides
-   * are empty, so it doesn't catch "one side has the OLD quantity".
+   * fill, leaving the position reflecting the PRE-fill state.
    *
    * Bounded by timeoutMs (default 1500ms — well past Binance's typical WS
    * propagation). Returns true if confirmed within the window, false on
@@ -2382,7 +2321,7 @@ class TradingBase {
       // Removed in v1.0.24: the 30-min stale-message check on user-data WS.
       // It produced false-alarm warnings during legitimate quiet periods because
       // Binance only pushes user-data events on actual position/balance changes
-      // — a healthy hedge with no triggers can be silent for hours. Replaced
+      // — a healthy strategy with no triggers can be silent for hours. Replaced
       // by the L1+L2+L3 defense (pong-driven health flag, conditional REST
       // fallback when unhealthy, periodic 30-min reconciliation) which catches
       // missed fills without false-alarming.

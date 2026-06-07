@@ -1,31 +1,19 @@
 // Abnormality thresholds — metric is included in AI prompt only when exceeded.
 // FLOORS only — the actual threshold is max(floor, symbol-relative baseline)
-// computed in _computeSymbolBaselines (M4 + M5 fix). The constants below
-// guarantee BTC won't flag every 0.5% OI swing as "abnormal", and ensure
-// extremely quiet symbols still have a meaningful trip threshold.
+// computed in _computeSymbolBaselines. The constants below guarantee BTC won't
+// flag every 0.5% OI swing as "abnormal", and ensure extremely quiet symbols
+// still have a meaningful trip threshold.
 const OI_CHANGE_1H_THRESHOLD = 2;          // floor: |oiChange1h| > 2%
 const LIQ_VOLUME_15M_THRESHOLD = 1_000_000; // floor: liqs > $1M in 15m
-const VOLUME_RATIO_HIGH = 3.0;             // already symbol-relative (ratio)
-const VOLUME_RATIO_LOW = 0.3;              // already symbol-relative (ratio)
-const TAKER_RATIO_HIGH = 1.5;              // floor: hard ceiling regardless of baseline
-const TAKER_RATIO_LOW = 0.6;               // floor: hard floor regardless of baseline
 
-// M4 + M5 — symbol-relative scaling. Recomputed every 6h.
+// Symbol-relative scaling. Recomputed every 6h.
 const SYMBOL_BASELINE_TTL_MS = 6 * 60 * 60 * 1000;
 const LIQ_VOLUME_PCT_OF_15M_VOLUME = 0.05;   // flag liqs > 5% of typical 15m volume
 
-// Liquidation-aware sizing (Phase 2 hard ceiling, Phase 1 soft target).
-// Each ADD must keep that leg's projected liq distance >= MIN_LIQ_DISTANCE_PCT.
+// Liquidation-aware sizing soft target. Reversal reports each leg's projected
+// liq distance >= MIN_LIQ_DISTANCE_PCT as a safety reference in its context.
 // 8% leaves a meaningful safety margin even with sub-second adverse moves.
 const MIN_LIQ_DISTANCE_PCT = 8;
-
-// Paired-trigger Hedge Phase (v3.0.0+): hedge-ratio band and shadow trigger distance.
-// Shadow qty is clamped at the executor layer so post-fill ratio stays within
-// the band on a one-sided fill. Shadow distance defines the gap between a
-// primary trigger and its paired shadow on the opposite leg (1×ATR).
-const RATIO_BAND_LOWER = 0.85;
-const RATIO_BAND_UPPER = 1.15;
-const SHADOW_DISTANCE_ATR = 1;
 
 // AI Reversal Strategy — volume profile, CVD, orderbook depth.
 const DEPTH_CACHE_TTL_MS = 30 * 1000;       // 30s depth snapshot cadence
@@ -75,16 +63,6 @@ class AiMarketContext {
     this._oiCacheTime = 0;
     this._oiCacheTTL = 5 * 60 * 1000;
 
-    // Taker buy/sell ratio cache
-    this._cachedTakerRatio = null;
-    this._takerRatioCacheTime = 0;
-    this._takerRatioCacheTTL = 5 * 60 * 1000;
-
-    // Global long/short account ratio cache
-    this._cachedGlobalLSRatio = null;
-    this._globalLSRatioCacheTime = 0;
-    this._globalLSRatioCacheTTL = 5 * 60 * 1000;
-
     // M4 + M5 — symbol-relative threshold cache. Refreshed every 6h.
     this._symbolBaselines = null;
     this._symbolBaselinesAt = 0;
@@ -104,16 +82,15 @@ class AiMarketContext {
   }
 
   /**
-   * M4 + M5 — compute symbol-relative thresholds from recent baseline data.
-   * Cached for SYMBOL_BASELINE_TTL_MS. Each threshold is `max(floor, baseline)`
-   * so very low-vol symbols still have meaningful trip thresholds and very
-   * high-vol symbols don't flag every routine fluctuation.
+   * Compute the symbol-relative liquidation-volume threshold from recent
+   * baseline data. Cached for SYMBOL_BASELINE_TTL_MS. The threshold is
+   * `max(floor, 5% of typical 15m quote volume)` so very low-vol symbols still
+   * have a meaningful trip line and very high-vol symbols don't flag routine
+   * fluctuations.
    *
-   * Sources:
-   *   - liquidation threshold ← /fapi/v1/ticker/24hr quoteVolume / 96 (15m windows)
-   *   - taker ratio band      ← /futures/data/takerlongshortRatio period=1h, limit=24
+   * Source: liquidation threshold ← /fapi/v1/ticker/24hr quoteVolume / 96 (15m windows)
    *
-   * Caller (buildContext) awaits this before evaluating any abnormality flags.
+   * Caller (_getLiquidations) awaits this before evaluating the abnormality flag.
    */
   async _computeSymbolBaselines() {
     const now = Date.now();
@@ -123,38 +100,16 @@ class AiMarketContext {
     const symbol = this.strategy.symbol;
     const baselines = {
       liqVolumeThreshold: LIQ_VOLUME_15M_THRESHOLD,
-      takerRatioHigh: TAKER_RATIO_HIGH,
-      takerRatioLow: TAKER_RATIO_LOW,
     };
     try {
-      const [ticker24h, takerHistory] = await Promise.all([
-        this.strategy.makeProxyRequest('/fapi/v1/ticker/24hr', 'GET', { symbol }, false, 'futures').catch(() => null),
-        this.strategy.makeProxyRequest('/futures/data/takerlongshortRatio', 'GET', { symbol, period: '1h', limit: 24 }, false, 'futures').catch(() => null),
-      ]);
+      const ticker24h = await this.strategy.makeProxyRequest('/fapi/v1/ticker/24hr', 'GET', { symbol }, false, 'futures').catch(() => null);
 
-      // M4: liquidation threshold = max($1M floor, 5% of typical 15m quote volume).
+      // Liquidation threshold = max($1M floor, 5% of typical 15m quote volume).
       if (ticker24h && ticker24h.quoteVolume) {
         const quoteVolume24h = parseFloat(ticker24h.quoteVolume);
         const typical15m = quoteVolume24h / 96;
         const scaled = typical15m * LIQ_VOLUME_PCT_OF_15M_VOLUME;
         baselines.liqVolumeThreshold = Math.max(LIQ_VOLUME_15M_THRESHOLD, scaled);
-      }
-
-      // M5: taker ratio band = max(floor, p90)/min(floor, p10) of 24h history.
-      // Memecoins routinely sit at 1.5+ baseline; this lifts the trip line so
-      // we only flag when CURRENT taker ratio exceeds even the symbol's own
-      // recent extremes. Conservative buffer (+/- 0.1) keeps a ceiling.
-      if (Array.isArray(takerHistory) && takerHistory.length >= 12) {
-        const ratios = takerHistory
-          .map(d => parseFloat(d.buySellRatio))
-          .filter(r => Number.isFinite(r) && r > 0)
-          .sort((a, b) => a - b);
-        if (ratios.length >= 12) {
-          const p10 = ratios[Math.floor(ratios.length * 0.10)];
-          const p90 = ratios[Math.floor(ratios.length * 0.90)];
-          baselines.takerRatioHigh = Math.max(TAKER_RATIO_HIGH, p90 + 0.1);
-          baselines.takerRatioLow = Math.min(TAKER_RATIO_LOW, p10 - 0.1);
-        }
       }
 
       this._symbolBaselines = baselines;
@@ -163,219 +118,6 @@ class AiMarketContext {
       console.error(`[BASELINES] failed for ${symbol}: ${err.message}`);
     }
     return baselines;
-  }
-
-  /**
-   * Build the full context object for the AI planner.
-   */
-  async buildContext(strategyState) {
-    const {
-      phase,
-      longPosition,
-      shortPosition,
-      hedgeGap,
-      lockedProfit,
-      totalPnL,
-      desiredProfitUSDT,
-      effectiveTarget,
-      walletBalance,
-      positionSizeUSDT,
-      minNotional,
-      accumulatedRealizedPnL,
-      accumulatedTradingFees,
-      accumulatedFundingFees,
-      previousPlan,
-      planHistory,
-      firstPositionPrice,
-    } = strategyState;
-
-    // Fetch all market data in parallel
-    const [recentCandles, candles15m, volatility, fundingRate, marginInfo, hourlyTrend, oiChange, liquidations, globalLSRatio] = await Promise.all([
-      this._getRecentCandles(),
-      this._get15mCandles(),
-      this._getVolatility(),
-      this._getFundingRate(longPosition, shortPosition),
-      this._getMarginInfo(),
-      this._getHourlyTrend(),
-      this._getOIChange(),
-      this._getLiquidations(),
-      this._getGlobalLSRatio(),
-    ]);
-
-    // M5: ATR-relative OI threshold — high-vol symbols tolerate bigger 1h
-    // swings before flagging as abnormal. ATR percentage of price is a clean
-    // proxy for "normal" hourly fluctuation magnitude.
-    if (oiChange && volatility?.atrPercent != null) {
-      const oiThreshold = Math.max(OI_CHANGE_1H_THRESHOLD, volatility.atrPercent);
-      oiChange.threshold = oiThreshold;
-      oiChange.isAbnormal = Math.abs(oiChange.oiChange1h) > oiThreshold;
-    }
-
-    // Compute price direction from candles for taker ratio divergence detection
-    let priceDirection = null;
-    if (recentCandles && recentCandles.length >= 2) {
-      const firstClose = recentCandles[0].close;
-      const lastClose = recentCandles[recentCandles.length - 1].close;
-      priceDirection = lastClose > firstClose ? 'UP' : 'DOWN';
-    }
-
-    // Taker ratio depends on price direction
-    const takerRatio = await this._getTakerRatio(priceDirection);
-
-    // Volume ratio computed from already-fetched candles (no API call)
-    const volumeRatio = this._getVolumeRatio(recentCandles);
-
-    // S/R levels — 15m native with per-side cascade fallback to 1h,
-    // then synthetic ±5x ATR if everything else is rejected. Every emitted level is guaranteed
-    // ≥3x ATR from current price (data-layer filter inside the cascade).
-    const supportResistance = await this._computeSRWithCascade(candles15m, volatility?.atr || 0);
-
-    return {
-      symbol: this.strategy.symbol,
-      currentPrice: this.strategy.currentPrice,
-      phase: phase || 'INITIAL',
-      walletBalance: walletBalance || 0,
-      positionSizeUSDT: positionSizeUSDT || 0,
-      minNotional: minNotional || 5,
-      maxPositionSizeUSDT: this.strategy.maxPositionSizeUSDT || 0,
-
-      longPosition: longPosition ? {
-        avgEntry: longPosition.entryPrice || longPosition.avgEntry,
-        quantity: longPosition.quantity,
-        notional: longPosition.notional,
-        unrealizedPnl: longPosition.unrealizedPnl || 0,
-      } : null,
-
-      shortPosition: shortPosition ? {
-        avgEntry: shortPosition.entryPrice || shortPosition.avgEntry,
-        quantity: shortPosition.quantity,
-        notional: shortPosition.notional,
-        unrealizedPnl: shortPosition.unrealizedPnl || 0,
-      } : null,
-
-      hedgeGap: hedgeGap || 0,
-      lockedProfit: lockedProfit || 0,
-      totalPnL: totalPnL || 0,
-      desiredProfitUSDT: desiredProfitUSDT || null,
-      effectiveTarget: effectiveTarget || null,
-      firstPositionPrice: firstPositionPrice || null,
-
-      accumulatedRealizedPnL: accumulatedRealizedPnL || 0,
-      accumulatedTradingFees: accumulatedTradingFees || 0,
-      accumulatedFundingFees: accumulatedFundingFees || 0,
-
-      volatility,
-      recentCandles,
-      candles15m,
-      fundingRate,
-      marginInfo,
-      hourlyTrend,
-      oiChange,
-      liquidations,
-      volumeRatio,
-      takerRatio,
-      globalLSRatio,
-      supportResistance,
-      previousPlan: previousPlan || null,
-      planHistory: planHistory || [],
-
-      // Liquidation-aware sizing caps. Computed per-leg from current
-      // liqDistance + leg notional. Phase 1 (no positions) skips this and
-      // uses the leverage-based projection in the system prompt instead.
-      liquidationCaps: this._computeLiquidationCaps(longPosition, shortPosition, marginInfo),
-      minLiqDistancePct: MIN_LIQ_DISTANCE_PCT,
-
-      // Paired-trigger Hedge Phase constants surfaced for the prompt + executor.
-      // The AI uses these to pre-clamp shadow qty proposals; the executor
-      // re-clamps as a safety net.
-      ratioBand: { lower: RATIO_BAND_LOWER, upper: RATIO_BAND_UPPER },
-      shadowDistanceATR: SHADOW_DISTANCE_ATR,
-      shadowDistance: (volatility?.atr || 0) * SHADOW_DISTANCE_ATR,
-    };
-  }
-
-  /**
-   * Per-leg max safe ADD notional that keeps projected liq distance
-   * >= MIN_LIQ_DISTANCE_PCT.
-   *
-   * Two cases per leg:
-   *
-   * 1. **Binding leg** — the side whose Binance-reported liq price is on the
-   *    correct side of current price (LONG liq < currentPrice, SHORT liq >
-   *    currentPrice). This is the side that would actually liquidate if price
-   *    moved against it. Cap by the inverse-notional approximation:
-   *      projectedLiqDistance ≈ currentDist × legNotional / (legNotional + addNotional)
-   *      maxAdd = legNotional × (currentDist - minDist) / minDist
-   *
-   * 2. **Non-binding leg** — the side whose reported liq is on the WRONG
-   *    side of current price (LONG liq ≥ currentPrice, OR SHORT liq ≤
-   *    currentPrice). This happens in cross-margin hedge mode when both
-   *    legs are open and Binance reports the WALLET's combined liq price
-   *    (which is on the dominant net-exposure side) for both per-side
-   *    entries. The non-binding leg is the OFFSET — adding to it shrinks
-   *    net exposure and IMPROVES liquidation safety, not worsens it.
-   *    Cap only by remaining max-position-size capacity.
-   *
-   * Without this distinction (v1.0.27 bug), the bot computed a negative
-   * liq distance for the non-binding leg (e.g. SHORT at 84.04 with reported
-   * liq 43.35 → distance = (43.35 - 84.04)/84.04 = -48%) and treated that
-   * as "below the 8% floor", blocking the only safe action. Fixed in v1.0.28.
-   *
-   * Returns null fields when the leg has no current liq data (e.g. the leg
-   * doesn't exist yet, or Binance hasn't returned a liq price).
-   */
-  _computeLiquidationCaps(longPosition, shortPosition, marginInfo) {
-    if (!marginInfo) return null;
-    const minDist = MIN_LIQ_DISTANCE_PCT;
-    const currentPrice = this.strategy.currentPrice || 0;
-    const maxTotal = this.strategy.maxPositionSizeUSDT || 0;
-
-    let maxAddLongUSDT = null;
-    let maxAddShortUSDT = null;
-    let longBinding = false;
-    let shortBinding = false;
-
-    const longNotional = longPosition?.notional || 0;
-    const shortNotional = shortPosition?.notional || 0;
-    const totalNotional = longNotional + shortNotional;
-    const remainingCapacity = Math.max(0, maxTotal - totalNotional);
-
-    const longLiqPrice = marginInfo.longLiqPrice;
-    const shortLiqPrice = marginInfo.shortLiqPrice;
-    const longDist = marginInfo.longLiqDistancePct;
-    const shortDist = marginInfo.shortLiqDistancePct;
-
-    // LONG leg: binding when liq price is BELOW current price (the natural direction).
-    if (longNotional > 0) {
-      longBinding = longLiqPrice != null && longLiqPrice > 0 && currentPrice > 0
-        && longLiqPrice < currentPrice;
-      if (longBinding && longDist != null) {
-        maxAddLongUSDT = longDist <= minDist
-          ? 0
-          : Math.max(0, longNotional * (longDist - minDist) / minDist);
-      } else {
-        // Non-binding (or no data) — fall back to position-size cap only.
-        maxAddLongUSDT = remainingCapacity;
-      }
-      // Always also bounded by remaining capacity, never above it.
-      maxAddLongUSDT = Math.min(maxAddLongUSDT, remainingCapacity);
-    }
-
-    // SHORT leg: binding when liq price is ABOVE current price.
-    if (shortNotional > 0) {
-      shortBinding = shortLiqPrice != null && shortLiqPrice > 0 && currentPrice > 0
-        && shortLiqPrice > currentPrice;
-      if (shortBinding && shortDist != null) {
-        maxAddShortUSDT = shortDist <= minDist
-          ? 0
-          : Math.max(0, shortNotional * (shortDist - minDist) / minDist);
-      } else {
-        maxAddShortUSDT = remainingCapacity;
-      }
-      maxAddShortUSDT = Math.min(maxAddShortUSDT, remainingCapacity);
-    }
-
-    return { maxAddLongUSDT, maxAddShortUSDT, longBinding, shortBinding };
   }
 
   // ——— ATR Volatility ————————————————————————————————————————————————————
@@ -727,8 +469,7 @@ class AiMarketContext {
   }
 
   // ——— AI Reversal: Build full context for the reversal planner ——————————
-  // Parallel to buildContext(); strips hedge-specific fields and adds the
-  // volume primitives + reversal cycle state.
+  // Generic market state plus the volume primitives + reversal cycle state.
 
   async buildReversalContext(strategyState) {
     const {
@@ -802,7 +543,7 @@ class AiMarketContext {
       initialCapital: initialCapital || 0,
       currentInitialSize: currentInitialSize || 0,
 
-      // Accumulators (same as hedge — included for AI awareness).
+      // Accumulators — included for AI awareness.
       accumulatedRealizedPnL: accumulatedRealizedPnL || 0,
       accumulatedTradingFees: accumulatedTradingFees || 0,
       accumulatedFundingFees: accumulatedFundingFees || 0,
@@ -813,7 +554,7 @@ class AiMarketContext {
       cvd,
       orderbookDepth: depth,
 
-      // Generic market state (reused from hedge).
+      // Generic market state.
       volatility,
       recentCandles,
       fundingRate,
@@ -1001,9 +742,9 @@ class AiMarketContext {
         liquidationDistance = ((1 - totalMaintMargin / totalMarginBalance) * 100);
       }
 
-      // Per-leg liquidation prices + distances from current price.
-      // Binance reports a separate liquidationPrice for each side in hedge
-      // mode; we surface both so the AI can size each ADD defensively.
+      // Per-side liquidation prices + distances from current price.
+      // Binance reports a liquidationPrice per position side via the risk map;
+      // we surface both so the AI can reason about liquidation risk defensively.
       const currentPrice = this.strategy.currentPrice;
       const longLiqPrice = (riskMap?.LONG && riskMap.LONG > 0) ? riskMap.LONG : null;
       const shortLiqPrice = (riskMap?.SHORT && riskMap.SHORT > 0) ? riskMap.SHORT : null;
@@ -1110,112 +851,6 @@ class AiMarketContext {
     };
   }
 
-  // ——— Relative Volume Ratio ————————————————————————————————————————
-
-  _getVolumeRatio(recentCandles) {
-    if (!recentCandles || recentCandles.length < 21) return null;
-
-    const avgWindow = recentCandles.slice(-21, -1);
-    const avgVolume = avgWindow.reduce((sum, c) => sum + c.volume, 0) / avgWindow.length;
-    if (avgVolume === 0) return null;
-
-    const latestVolume = recentCandles[recentCandles.length - 1].volume;
-    const volumeRatio = latestVolume / avgVolume;
-
-    const last5 = recentCandles.slice(-5);
-    const aboveAvgCount = last5.filter(c => c.volume > avgVolume).length;
-    let volumeTrend = 'STABLE';
-    if (aboveAvgCount >= 3) volumeTrend = 'RISING';
-    else if (last5.filter(c => c.volume < avgVolume * 0.5).length >= 3) volumeTrend = 'FALLING';
-
-    return { volumeRatio, volumeTrend, isAbnormal: volumeRatio > VOLUME_RATIO_HIGH || volumeRatio < VOLUME_RATIO_LOW };
-  }
-
-  // ——— Taker Buy/Sell Ratio ————————————————————————————————————————
-
-  async _getTakerRatio(priceDirection) {
-    const now = Date.now();
-    // M5: symbol-relative high/low band, recomputed every 6h.
-    const baselines = await this._computeSymbolBaselines();
-    const hi = baselines.takerRatioHigh;
-    const lo = baselines.takerRatioLow;
-    if (this._cachedTakerRatio && (now - this._takerRatioCacheTime) < this._takerRatioCacheTTL) {
-      const cached = { ...this._cachedTakerRatio };
-      cached.divergence = this._checkTakerDivergence(cached.takerRatio, priceDirection);
-      cached.thresholdHigh = hi;
-      cached.thresholdLow = lo;
-      cached.isAbnormal = cached.takerRatio > hi || cached.takerRatio < lo || cached.divergence;
-      return cached;
-    }
-    try {
-      const data = await this.strategy.makeProxyRequest('/futures/data/takerlongshortRatio', 'GET', { symbol: this.strategy.symbol, period: '5m', limit: 6 }, false, 'futures');
-      if (!data || data.length < 2) return null;
-
-      const takerRatio = parseFloat(data[data.length - 1].buySellRatio);
-      const firstHalf = data.slice(0, 3).map(d => parseFloat(d.buySellRatio));
-      const secondHalf = data.slice(-3).map(d => parseFloat(d.buySellRatio));
-      const firstAvg = firstHalf.reduce((s, v) => s + v, 0) / firstHalf.length;
-      const secondAvg = secondHalf.reduce((s, v) => s + v, 0) / secondHalf.length;
-
-      let takerTrend = 'STABLE';
-      if (secondAvg > firstAvg * 1.1) takerTrend = 'BUYING_INCREASING';
-      else if (secondAvg < firstAvg * 0.9) takerTrend = 'SELLING_INCREASING';
-
-      const divergence = this._checkTakerDivergence(takerRatio, priceDirection);
-      const result = { takerRatio, takerTrend, divergence, thresholdHigh: hi, thresholdLow: lo, isAbnormal: takerRatio > hi || takerRatio < lo || divergence };
-      this._cachedTakerRatio = result;
-      this._takerRatioCacheTime = now;
-      return result;
-    } catch (error) {
-      console.error(`Failed to fetch taker ratio: ${error.message}`);
-      return null;
-    }
-  }
-
-  _checkTakerDivergence(takerRatio, priceDirection) {
-    if (!priceDirection) return false;
-    return (priceDirection === 'UP' && takerRatio < 0.8) || (priceDirection === 'DOWN' && takerRatio > 1.2);
-  }
-
-  // ——— Global Long/Short Account Ratio ——————————————————————————————
-
-  async _getGlobalLSRatio() {
-    const now = Date.now();
-    if (this._cachedGlobalLSRatio && (now - this._globalLSRatioCacheTime) < this._globalLSRatioCacheTTL) {
-      return this._cachedGlobalLSRatio;
-    }
-    try {
-      const data = await this.strategy.makeProxyRequest('/futures/data/globalLongShortAccountRatio', 'GET', { symbol: this.strategy.symbol, period: '5m', limit: 6 }, false, 'futures');
-      if (!data || data.length < 2) return null;
-
-      const latest = data[data.length - 1];
-      const longAccount = parseFloat(latest.longAccount);
-      const shortAccount = parseFloat(latest.shortAccount);
-      const longShortRatio = parseFloat(latest.longShortRatio);
-
-      // Trend: compare first half vs second half
-      const firstHalf = data.slice(0, 3).map(d => parseFloat(d.longShortRatio));
-      const secondHalf = data.slice(-3).map(d => parseFloat(d.longShortRatio));
-      const firstAvg = firstHalf.reduce((s, v) => s + v, 0) / firstHalf.length;
-      const secondAvg = secondHalf.reduce((s, v) => s + v, 0) / secondHalf.length;
-
-      let trend = 'STABLE';
-      if (secondAvg > firstAvg * 1.05) trend = 'MORE_LONGS';
-      else if (secondAvg < firstAvg * 0.95) trend = 'MORE_SHORTS';
-
-      // Extreme positioning (contrarian signal)
-      const isExtreme = longAccount > 0.65 || shortAccount > 0.65;
-
-      const result = { longAccount, shortAccount, longShortRatio, trend, isExtreme };
-      this._cachedGlobalLSRatio = result;
-      this._globalLSRatioCacheTime = now;
-      return result;
-    } catch (error) {
-      console.error(`Failed to fetch global L/S ratio: ${error.message}`);
-      return null;
-    }
-  }
-
   // ——— Cache Management ————————————————————————————————————————————
 
   invalidateCache() {
@@ -1229,10 +864,6 @@ class AiMarketContext {
     this._fundingRateCacheTime = 0;
     this._cachedOIHistory = null;
     this._oiCacheTime = 0;
-    this._cachedTakerRatio = null;
-    this._takerRatioCacheTime = 0;
-    this._cachedGlobalLSRatio = null;
-    this._globalLSRatioCacheTime = 0;
     // AI Reversal caches.
     this._cached24hCandles5m = null;
     this._candle24hCacheTime = 0;
