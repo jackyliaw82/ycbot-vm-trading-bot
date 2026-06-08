@@ -92,6 +92,11 @@ class AiReversalStrategy extends TradingBase {
     this.cycleStartTime = null;
     this.executionState = 'IDLE';           // IDLE | PLANNING | EXECUTING | TERMINATED
     this.subState = 'INITIAL';              // INITIAL | WAITING | LONG_HELD | SHORT_HELD | HARVESTING | EXITED
+    // How the cycle ended — set in stop() to 'final_tp' or 'manual' and persisted
+    // on the strategy doc so the PnL / History completion-type classifier can read
+    // it directly instead of inferring from the strategyFlow audit trail. null
+    // while the strategy is running.
+    this.stopReason = null;
 
     // Sizing config
     this.recoveryFactor = DEFAULT_RECOVERY_FACTOR;
@@ -641,6 +646,10 @@ class AiReversalStrategy extends TradingBase {
     this.executionState = 'TERMINATED';
     this.subState = 'EXITED';
     this.strategyEndTime = new Date();
+    // Record how the cycle ended ('final_tp' | 'manual'). Read by the PnL /
+    // History completion-type classifier so a Final TP auto-exit is no longer
+    // mislabeled as a Manual Stop.
+    this.stopReason = reason;
 
     // Platform fee on net positive PnL.
     // Funding is included in net so the fee scales with what the bot
@@ -2212,6 +2221,8 @@ class AiReversalStrategy extends TradingBase {
         isRunning: this.isRunning,
         executionState: this.executionState,
         subState: this.subState,
+        // 'final_tp' | 'manual' | null — how the cycle ended (set in stop()).
+        stopReason: this.stopReason ?? null,
         currentSide: this.currentSide,
         currentPosition: this.activePosition,
         bullLevel: this.bullLevel,
