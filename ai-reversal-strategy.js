@@ -52,11 +52,19 @@ function formatDuration(ms) {
  * capital AND position is profitable. Cycle ends ONLY at Final TP, user
  * Stop, or unrecoverable system error.
  *
- * AI consult contexts:
- *   - 'plan'      → emit fresh bullLevel/bearLevel (cycle start only; bull/bear
- *                    stay fixed for the rest of the cycle. No periodic AI
- *                    rethink — the 5-min heartbeat was removed deliberately.)
- *   - 'veto'      → out-of-band before each reversal: CONTINUE / REDUCE size
+ * AI consult contexts (all event-driven — none periodic; the 5-min heartbeat
+ * was removed deliberately):
+ *   - 'plan'         → emit fresh bullLevel/bearLevel (cycle start + post-harvest
+ *                       only; bull/bear stay fixed for the rest of the cycle, no
+ *                       periodic rethink).
+ *   - 'harvest_price'→ while in position, when accLoss ≥ harvestLossThreshold ×
+ *                       initial capital, set a harvestPrice on the profitable side
+ *                       (harvest gate). harvestLossThreshold is a user config
+ *                       setting (3–80%, default HARVEST_LOSS_THRESHOLD_PCT=0.30).
+ *   - 'veto'         → before a reversal, CONTINUE / REDUCE size — ONLY when the
+ *                       aiVetoOnReversal config flag is on (default OFF). With it
+ *                       off, a reversal opens at the formula size with NO consult.
+ *   - askAi()        → manual, user-triggered advisory (out of band).
  *
  * State machine:
  *   INITIAL → WAITING → (LONG_HELD | SHORT_HELD) → (reverse or HARVESTING → WAITING) → EXITED
@@ -1902,8 +1910,10 @@ class AiReversalStrategy extends TradingBase {
   /**
    * Refresh the volume primitives (VP24h/VP7d/CVD/orderbook/ATR) outside
    * of an AI consult. Needed because:
-   *   - Heartbeat was removed; AI consults only fire on cycle start /
-   *     post-harvest / reversals / harvest-gate / user ask-AI.
+   *   - Heartbeat was removed; AI consults only fire on cycle start +
+   *     post-harvest (PLAN), the harvest gate (sets a harvest price), the
+   *     pre-reversal size veto ONLY when aiVetoOnReversal is on (default off),
+   *     and user ask-AI. A plain reversal does NOT consult the AI by default.
    *   - resume() deliberately does NOT fire a fresh PLAN when a position
    *     is already held, so after a force-update the cached primitives
    *     start empty and stay empty until the user reverses/harvests —
