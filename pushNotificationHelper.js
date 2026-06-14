@@ -133,10 +133,18 @@ export async function sendPushNotification(userId, notificationData) {
     return { success: false, error: 'Firebase Admin SDK not initialized' };
   }
 
-  // M8: rate-limit before doing any Firestore lookups. Drop quietly with
-  // a single log line — frequent drops would themselves clutter logs, but
-  // the user IS notified that limiting kicked in.
-  if (!_consumeFcmRateLimitToken(userId)) {
+  // Critical, terminal alerts bypass the rate limiter entirely. These fire at
+  // most once per cycle (strategy stopped by the circuit breaker, or cycle
+  // completed at Final TP) and the user MUST see them — a burst of frequent
+  // reversal pings must never be able to drain the bucket and starve one out.
+  // Only high-frequency types (reversal, etc.) stay rate-limited.
+  const notifType = notificationData?.data?.type;
+  const isCriticalAlert = notifType === 'capital_protection' || notifType === 'final_tp';
+
+  // M8: rate-limit non-critical pushes before doing any Firestore lookups. Drop
+  // quietly with a single log line — frequent drops would themselves clutter
+  // logs, but the user IS notified that limiting kicked in.
+  if (!isCriticalAlert && !_consumeFcmRateLimitToken(userId)) {
     console.warn(`[FCM-RATE-LIMIT] Dropping push for user ${userId}: bucket empty (>${FCM_RATE_LIMIT_PER_MIN}/min)`);
     return { success: false, error: 'rate_limited' };
   }

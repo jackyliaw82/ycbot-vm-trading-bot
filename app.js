@@ -47,6 +47,7 @@ let startupStatus = {
 app.use(cors({
   origin: [
     'https://ycbot.trade',
+    'https://app.ycbot.trade',
     'https://www.ycbot.trade'
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
