@@ -1563,6 +1563,57 @@ app.post('/ai-reversal/ask-ai', async (req, res) => {
   }
 });
 
+// Manual user-driven harvest. Banks the current profitable leg ON DEMAND —
+// even when cycleAccumulatedLoss is BELOW the auto harvest-gate threshold.
+// Closes the open leg to flat at market (reduceOnly), then runs the
+// post-harvest PLAN. The cycle CONTINUES — this does NOT stop the strategy.
+// strategy.harvestNow() validates eligibility synchronously (position open AND
+// in profit, IDLE) and fires the close-and-replan in the background, so the
+// response is an immediate eligibility verdict. Ineligibility throws → 409.
+app.post('/ai-reversal/harvest-now', async (req, res) => {
+  try {
+    const { strategyId } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AiReversalStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running AI Reversal strategy with ID ${strategyId}` });
+    }
+
+    const result = await strategy.harvestNow();
+    res.json({ success: true, ...result });
+  } catch (error) {
+    // harvestNow throws on ineligibility (no position / not in profit / busy).
+    // 409 lets the frontend surface the reason without treating it as a fault.
+    res.status(409).json({ error: error.message });
+  }
+});
+
+// Manual user-driven edit of the cycle's desired-profit % while running. The
+// bot converts the % to USDT against initialCapital (the cycle-start basis),
+// recomputes Final TP, and persists. Allowed in any subState (flat or
+// in-position) — like /ai-reversal/adjust-levels, no trade fires here; the new
+// Final TP target just takes effect on the next price tick.
+app.post('/ai-reversal/adjust-profit-target', async (req, res) => {
+  try {
+    const { strategyId, desiredProfitPercent } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+    if (desiredProfitPercent == null) {
+      return res.status(400).json({ error: 'desiredProfitPercent is required.' });
+    }
+
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AiReversalStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running AI Reversal strategy with ID ${strategyId}` });
+    }
+
+    const result = await strategy.adjustProfitTarget({ desiredProfitPercent: Number(desiredProfitPercent) });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 // Plan-history audit trail for AI Reversal. Reads from
 // strategies/{strategyId}/aiPlans subcollection populated by
 // AiReversalStrategy._savePlanToFirestore on every consult.

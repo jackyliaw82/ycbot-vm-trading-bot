@@ -5,6 +5,7 @@ import { AiPlanExecutor } from './ai-plan-executor.js';
 import { AiRiskGuard, FEE_RATE } from './ai-risk-guard.js';
 import { AiMarketContext } from './ai-market-context.js';
 import wsBroadcast from './ws-broadcast.js';
+import { FieldValue } from '@google-cloud/firestore';
 
 // Per-model pricing in USD per million tokens.
 const MODEL_PRICING = {
@@ -675,6 +676,11 @@ class AiReversalStrategy extends TradingBase {
 
     await this.saveState();
 
+    // Platform-wide hero profit (public landing page): add this cycle's net
+    // profit when positive. Idempotent (heroCounted flag) + best-effort — a
+    // failure here must never break the stop/teardown sequence.
+    await this._recordHeroProfit(netPnL);
+
     // AI usage summary — end-of-stop log.
     const u = this.aiTokenUsage;
     if (u && (u.requests || 0) > 0) {
@@ -721,6 +727,37 @@ class AiReversalStrategy extends TradingBase {
     // attempt for this profile is rejected with "already running".
     try { this.onStopComplete?.(); } catch (e) {
       console.error('[REVERSAL] onStopComplete hook failed:', e.message);
+    }
+  }
+
+  /**
+   * Add this cycle's NET profit (realized − fees + funding — the value computed
+   * in stop()) to the platform-wide hero counter at platform_stats/heroProfit,
+   * but only when positive. Read by backend-service GET /stats/hero-profit for
+   * the public landing page.
+   *
+   * Idempotent: a transaction flips a `heroCounted` flag on this strategy's doc
+   * AND bumps the counter atomically, so a retried / post-restart stop can never
+   * double-count. Best-effort: any failure is logged and swallowed so it can
+   * never break the stop/teardown sequence (worst case: this stop goes uncounted).
+   */
+  async _recordHeroProfit(netPnL) {
+    if (!(netPnL > 0)) return;
+    try {
+      const strategyRef = this.firestore.collection('strategies').doc(this.strategyId);
+      const heroRef = this.firestore.collection('platform_stats').doc('heroProfit');
+      await this.firestore.runTransaction(async (tx) => {
+        const snap = await tx.get(strategyRef);          // all reads before writes
+        if (snap.get('heroCounted') === true) return;    // already counted — no-op
+        tx.set(heroRef, {
+          totalProfitUSDT: FieldValue.increment(netPnL),
+          contributingStops: FieldValue.increment(1),
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+        tx.set(strategyRef, { heroCounted: true }, { merge: true });
+      });
+    } catch (err) {
+      console.error(`[REVERSAL] hero-profit record failed: ${err.message}`);
     }
   }
 
@@ -1091,6 +1128,54 @@ class AiReversalStrategy extends TradingBase {
   }
 
   /**
+   * Manual, user-driven edit of the cycle's desired-profit target while the
+   * strategy is running. Backend for the "Profit target" pencil in the
+   * frontend's Levels & Targets card.
+   *
+   * The frontend only knows the % (desiredProfitPercent); the bot stores the
+   * absolute desiredProfitUSDT. We convert here against `initialCapital` — the
+   * SAME cycle-start basis the frontend used to derive the initial USDT at
+   * start (initialCapital ≈ the wallet snapshot taken in `start`). Anchoring to
+   * initialCapital (not the live wallet, which drifts with unrealized PnL)
+   * keeps "1.5%" meaning exactly what it meant at cycle start.
+   *
+   * desiredProfitUSDT feeds _recomputeFinalTpPrice() (Final TP = entry ±
+   * (accLoss + desiredProfit + aiCost + fee)/qty), so the change re-derives the
+   * Final TP immediately. No state-machine transition — like adjustLevels, the
+   * cycle just continues with the new target. saveState persists it.
+   */
+  async adjustProfitTarget({ desiredProfitPercent } = {}) {
+    if (!this.isRunning) {
+      throw new Error('Cannot adjust profit target: strategy is not running');
+    }
+    const pct = Number(desiredProfitPercent);
+    if (!Number.isFinite(pct) || pct <= 0 || pct > 100) {
+      throw new Error(`Invalid desiredProfitPercent: ${desiredProfitPercent} (must be > 0 and ≤ 100)`);
+    }
+    if (!(this.initialCapital > 0)) {
+      throw new Error('Cannot adjust profit target: initialCapital is not set');
+    }
+
+    const before = this.desiredProfitUSDT || 0;
+    const newUSDT = this.initialCapital * (pct / 100);
+    this.desiredProfitUSDT = newUSDT;
+    this._recomputeFinalTpPrice();
+    await this.saveState();
+
+    await this.addLog(
+      `[REVERSAL] manual profit-target adjust: ${pct}% → ${this._formatNotional(newUSDT)} USDT ` +
+      `(was ${this._formatNotional(before)} USDT, initialCapital ${this._formatNotional(this.initialCapital)})`,
+    );
+
+    return {
+      desiredProfitPercent: pct,
+      desiredProfitUSDT: this.desiredProfitUSDT,
+      initialCapital: this.initialCapital,
+      finalTpPrice: this.finalTpPrice,
+    };
+  }
+
+  /**
    * User-driven free-form AI consult. Does NOT mutate strategy state —
    * the AI's response (rationale + optional proposed levels) is returned
    * raw so the frontend can show it and optionally call adjustLevels()
@@ -1351,6 +1436,56 @@ class AiReversalStrategy extends TradingBase {
     } finally {
       this.executionState = 'IDLE';
     }
+  }
+
+  /**
+   * Manual, user-driven harvest. Banks the current profitable leg ON DEMAND —
+   * even when cycleAccumulatedLoss is BELOW the auto harvest-gate threshold
+   * (the gate in _isHarvestGateOpen is deliberately NOT consulted here). This
+   * is the backend for the Active Position card's "Harvest now" control.
+   *
+   * Reuses the full _executeHarvest machinery (close to flat at market via
+   * reduceOnly → post-harvest PLAN → bookkeeping → cycle CONTINUES, does NOT
+   * stop). Validation runs synchronously and the (long-running) close is
+   * fired-and-forgotten so the HTTP caller gets an immediate eligibility
+   * verdict; the close itself flips executionState to EXECUTING synchronously,
+   * closing the race with a concurrent price tick.
+   *
+   * Refuses unless a position is open AND currently in profit. The UI gates
+   * the button on the same condition, but this is the safety net against a
+   * stale click. Throws on ineligibility (the route maps it to a 409).
+   */
+  async harvestNow() {
+    if (!this.isRunning) {
+      throw new Error('Strategy is not running.');
+    }
+    if (this.executionState !== 'IDLE') {
+      throw new Error('Strategy is busy — a trade or plan is in progress. Try again in a moment.');
+    }
+    const heldSide = this.subState === 'LONG_HELD' ? 'LONG'
+      : this.subState === 'SHORT_HELD' ? 'SHORT'
+        : null;
+    if (!heldSide || !this.activePosition || !(this.activePosition.quantity > 0)) {
+      throw new Error('No open position to harvest.');
+    }
+    // Refresh unrealized PnL against the latest mark before judging profit —
+    // the gate must reflect the price right now, not whatever the last tick left.
+    this._updateUnrealizedPnL(this.currentPrice);
+    const unrealized = this.activePosition.unrealizedPnl || 0;
+    if (!(unrealized > 0)) {
+      throw new Error(`Position is not in profit (unrealized ${unrealized.toFixed(4)} USDT). Harvest only banks a profitable leg.`);
+    }
+
+    // No awaits between the IDLE check above and the _executeHarvest handoff
+    // below — addLog is fire-and-forget and _updateUnrealizedPnL is sync — so
+    // no price tick can interleave and fire a reversal before _executeHarvest
+    // flips executionState to EXECUTING.
+    this.addLog(`[REVERSAL] manual harvest requested — banking ~${unrealized.toFixed(4)} USDT (${heldSide} @ ${this.currentPrice})`).catch(() => {});
+    this._executeHarvest('manual_harvest').catch((err) => {
+      this.addLog(`[REVERSAL] manual harvest error: ${err.message}`).catch(() => {});
+    });
+
+    return { harvesting: true, side: heldSide, unrealizedPnl: unrealized, price: this.currentPrice };
   }
 
   /**
