@@ -39,6 +39,11 @@ const STALE_RETRY_MAX_MS = 30 * 60 * 1000;
 const REVERSAL_TIGHTEN_SAFEGUARD_PCT = 0.01;  // instant opposite-level distance from entry
 const REVERSAL_TIGHTEN_MIN_PCT = 0.005;       // tightest refined gap
 const REVERSAL_TIGHTEN_MAX_PCT = 0.01;        // loosest refined gap (== safeguard)
+// If the PLAN's bull/bear gap is already this tight (< 1.5% of the midpoint
+// price), skip tightening entirely — the AI's placement is acceptable and
+// tightening would only second-guess a deliberately tight plan. Tightening
+// exists to rescue WIDE (≥1.5%) gaps, not to compress already-tight ones.
+const REVERSAL_TIGHTEN_SKIP_GAP_PCT = 0.015;
 
 function formatDuration(ms) {
   if (!ms || ms < 0) return 'N/A';
@@ -1440,12 +1445,22 @@ class AiReversalStrategy extends TradingBase {
       await this.addLog(`[REVERSAL] initial ${side} opened at level ${levelPrice} (size ${sizeUSDT} USDT, accLoss ${this.cycleAccumulatedLoss.toFixed(4)})`);
       // Reversal-gap tightening (once per PLAN phase). Pull the OPPOSITE level to
       // the 1% safeguard instantly, then fire the Context-5 refine consult. Only
-      // when the flag is on and this phase hasn't tightened yet.
+      // when the flag is on and this phase hasn't tightened yet — AND only when
+      // the PLAN's bull/bear gap is wide enough to be worth tightening. An
+      // already-tight plan (< 1.5% of midpoint) is left exactly as the AI placed it.
       if (this.tightenReversalGap && !this.gapTightened) {
-        this._applyReversalGapSafeguard(side);
-        this._requestReversalTightening(side).catch((err) => {
-          this.addLog(`[REVERSAL] reversal_tightening consult error: ${err.message}`).catch(() => {});
-        });
+        const mid = (this.bullLevel + this.bearLevel) / 2;
+        const gapPct = (Number.isFinite(this.bullLevel) && Number.isFinite(this.bearLevel) && mid > 0)
+          ? (this.bullLevel - this.bearLevel) / mid
+          : 0;
+        if (gapPct > 0 && gapPct < REVERSAL_TIGHTEN_SKIP_GAP_PCT) {
+          await this.addLog(`[REVERSAL] gap tighten skipped: plan gap ${(gapPct * 100).toFixed(2)}% < ${(REVERSAL_TIGHTEN_SKIP_GAP_PCT * 100).toFixed(1)}% — keeping AI plan levels (bull=${this.bullLevel} bear=${this.bearLevel})`);
+        } else {
+          this._applyReversalGapSafeguard(side);
+          this._requestReversalTightening(side).catch((err) => {
+            this.addLog(`[REVERSAL] reversal_tightening consult error: ${err.message}`).catch(() => {});
+          });
+        }
       }
     } catch (err) {
       await this.addLog(`[REVERSAL] _openInitialPosition error: ${err.message}`);
