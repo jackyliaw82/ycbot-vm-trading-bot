@@ -30,6 +30,16 @@ const DEFAULT_RECOVERY_DISTANCE = 0.005;           // 0.5%
 const STALE_RETRY_BASE_MS = 30 * 1000;
 const STALE_RETRY_MAX_MS = 30 * 60 * 1000;
 
+// Reversal-gap tightening (post-entry). After the first touch of a PLAN phase
+// opens a position, the OPPOSITE reversal level is pulled into a tight band so a
+// reversal — if it comes — is cheap, bounded, and timely. On touch the opposite
+// level is set INSTANTLY to a 1% safeguard, then a Context-5 AI consult refines
+// it to a structure-aware optimum within [0.5%, 1%] of the entry level. Tightened
+// once per phase (not per reversal); a harvest re-PLANs and re-arms it.
+const REVERSAL_TIGHTEN_SAFEGUARD_PCT = 0.01;  // instant opposite-level distance from entry
+const REVERSAL_TIGHTEN_MIN_PCT = 0.005;       // tightest refined gap
+const REVERSAL_TIGHTEN_MAX_PCT = 0.01;        // loosest refined gap (== safeguard)
+
 function formatDuration(ms) {
   if (!ms || ms < 0) return 'N/A';
   const days = Math.floor(ms / (1000 * 60 * 60 * 24));
@@ -96,6 +106,14 @@ class AiReversalStrategy extends TradingBase {
     // Guards against firing >1 in-flight harvest_price AI consult per tick.
     // Set true at consult start, cleared on success/failure/stale-retry.
     this._harvestConsultPending = false;
+    // Reversal-gap tightening (post-entry). tightenReversalGap = master flag
+    // (set from config in start()/fromSnapshot; default ON). gapTightened = true
+    // once THIS PLAN phase's opposite level has been tightened (reset on every
+    // PLAN so a post-harvest phase re-arms). _reversalTighteningConsultPending =
+    // in-flight guard for the Context-5 refine consult.
+    this.tightenReversalGap = true;
+    this.gapTightened = false;
+    this._reversalTighteningConsultPending = false;
     this.initialCapital = 0;
     this.currentInitialSize = 0;
     this.cycleStartTime = null;
@@ -187,6 +205,10 @@ class AiReversalStrategy extends TradingBase {
     // projected size directly (faster reversals, deterministic sizing,
     // lower DeepSeek cost). Defaults false (matches frontend default).
     this.aiVetoOnReversal = !!config.aiVetoOnReversal;
+    // Reversal-gap tightening — default ON (only an explicit `false` disables it,
+    // so older configs that predate the flag default to on). When off, the wide
+    // PLAN levels stick for the whole phase (pre-feature behavior).
+    this.tightenReversalGap = config.tightenReversalGap !== false;
 
     if (!this.symbol) throw new Error('AiReversalStrategy.start: missing symbol');
     if (!this.currentInitialSize || this.currentInitialSize <= 0) {
@@ -216,7 +238,8 @@ class AiReversalStrategy extends TradingBase {
       `desiredProfitUSDT=${this.desiredProfitUSDT} ` +
       `| recoveryFactorDecay=${this.recoveryFactorDecay ? 'on' : 'off'}, ` +
       `recoveryDistanceAutoWiden=${this.recoveryDistanceAutoWiden ? 'on' : 'off'}, ` +
-      `aiVetoOnReversal=${this.aiVetoOnReversal ? 'on' : 'off'}`
+      `aiVetoOnReversal=${this.aiVetoOnReversal ? 'on' : 'off'}, ` +
+      `tightenReversalGap=${this.tightenReversalGap ? 'on' : 'off'}`
     );
 
     try {
@@ -366,6 +389,7 @@ class AiReversalStrategy extends TradingBase {
     this.recoveryFactorDecay = !!snapshot.config?.recoveryFactorDecay;
     this.recoveryDistanceAutoWiden = !!snapshot.config?.recoveryDistanceAutoWiden;
     this.aiVetoOnReversal = !!snapshot.config?.aiVetoOnReversal;
+    this.tightenReversalGap = snapshot.config?.tightenReversalGap !== false;
 
     // Restore cycle state
     this.currentSide = snapshot.currentSide || null;
@@ -376,6 +400,9 @@ class AiReversalStrategy extends TradingBase {
     this.cycleAccumulatedLoss = snapshot.cycleAccumulatedLoss || 0;
     this.reversalCount = snapshot.reversalCount || 0;
     this.harvestCount = snapshot.harvestCount || 0;
+    // Restore whether this phase's opposite level was already tightened, so a
+    // mid-phase VM restart neither re-tightens nor loses the tight gap.
+    this.gapTightened = !!snapshot.gapTightened;
     // Restore the in-flight harvest target if the VM died mid-cycle while
     // an AI-set harvestPrice was being watched. Only honored if a position
     // is also restored — otherwise it'll be cleared on the next position
@@ -1002,6 +1029,102 @@ class AiReversalStrategy extends TradingBase {
     this._savePlanToFirestore(plan, 'harvest_price').catch(() => {});
   }
 
+  // ——— Reversal-gap tightening (Context 5) ————————————————————————————
+
+  /**
+   * Instantly pull the OPPOSITE reversal level to the 1% safeguard after the
+   * first touch of a phase. Synchronous (no awaits) so no price tick can
+   * interleave before the tight level is in place. Sets gapTightened so the
+   * phase tightens only once. Returns true if a valid anchor existed.
+   */
+  _applyReversalGapSafeguard(entrySide) {
+    if (entrySide === 'LONG' && Number.isFinite(this.bullLevel) && this.bullLevel > 0) {
+      this.bearLevel = this.bullLevel * (1 - REVERSAL_TIGHTEN_SAFEGUARD_PCT);
+    } else if (entrySide === 'SHORT' && Number.isFinite(this.bearLevel) && this.bearLevel > 0) {
+      this.bullLevel = this.bearLevel * (1 + REVERSAL_TIGHTEN_SAFEGUARD_PCT);
+    } else {
+      return false; // no valid anchor — leave the wide PLAN levels in place
+    }
+    this.gapTightened = true;
+    this.addLog(
+      `[REVERSAL] gap tighten: ${entrySide} entry — opposite level set to ` +
+      `${(REVERSAL_TIGHTEN_SAFEGUARD_PCT * 100).toFixed(2)}% safeguard ` +
+      `(bull=${this.bullLevel} bear=${this.bearLevel}); refining…`
+    ).catch(() => {});
+    return true;
+  }
+
+  /**
+   * Context-5 refine consult. Fired async right after the safeguard is set
+   * (the safeguard protects during the consult). Asks the AI for the
+   * structure-aware optimum within [0.5%, 1%] of the entry level. On any
+   * failure/rejection the safeguard simply stands — a valid reversal level —
+   * so there is no stale-retry here. In-flight guarded.
+   */
+  async _requestReversalTightening(entrySide) {
+    if (this._reversalTighteningConsultPending) return;
+    this._reversalTighteningConsultPending = true;
+    await this.addLog(`[REVERSAL] _requestReversalTightening(${entrySide})`);
+    try {
+      const anchor = entrySide === 'LONG' ? this.bullLevel : this.bearLevel;
+      if (!Number.isFinite(anchor) || anchor <= 0) {
+        await this.addLog('[REVERSAL] reversal_tightening: no valid anchor — keeping safeguard');
+        return;
+      }
+      // Price bounds for the refined opposite level (single source of the band
+      // math; the risk-guard validates `level ∈ [low, high]`).
+      const bounds = entrySide === 'LONG'
+        ? { low: anchor * (1 - REVERSAL_TIGHTEN_MAX_PCT), high: anchor * (1 - REVERSAL_TIGHTEN_MIN_PCT) }
+        : { low: anchor * (1 + REVERSAL_TIGHTEN_MIN_PCT), high: anchor * (1 + REVERSAL_TIGHTEN_MAX_PCT) };
+      const ctx = await this.marketContext.buildReversalContext(this._buildStrategyState({
+        consultContext: 'reversal_tightening',
+        tighteningBounds: bounds,
+      }));
+      this._cacheVolumeContext(ctx);
+      const plan = await this.planner.generatePlan(ctx, 'reversal');
+      this._accumulateAiUsage(plan);
+      const validation = this.riskGuard.validatePlan(plan, ctx);
+      if (!validation.valid) {
+        await this.addLog(`[REVERSAL] reversal_tightening validation failed: ${validation.reasons.join('; ')} — keeping ${(REVERSAL_TIGHTEN_SAFEGUARD_PCT * 100).toFixed(0)}% safeguard`);
+        return;
+      }
+      await this._handleReversalTighteningResponse(plan, entrySide);
+    } catch (err) {
+      await this.addLog(`[REVERSAL] _requestReversalTightening error: ${err.message} — keeping safeguard`);
+    } finally {
+      this._reversalTighteningConsultPending = false;
+    }
+  }
+
+  async _handleReversalTighteningResponse(plan, entrySide) {
+    // One-shot guard: install only while THIS phase is still active. A harvest /
+    // stop / re-PLAN between firing and now resets gapTightened (or terminates) —
+    // drop the stale refine and keep whatever the new phase installed.
+    if (!this.tightenReversalGap || !this.gapTightened || this.executionState === 'TERMINATED' || !this.activePosition) {
+      await this.addLog(`[REVERSAL] reversal_tightening refine dropped (phase ended): level=${plan.level}`);
+      return;
+    }
+    const level = plan.level;
+    if (entrySide === 'LONG') {
+      this.bearLevel = level;
+    } else {
+      this.bullLevel = level;
+    }
+    this.lastDecision = {
+      decision: 'REVERSAL_TIGHTENING',
+      rationale: plan.rationale,
+      timestamp: Date.now(),
+    };
+    await this.addLog(
+      `[REVERSAL] gap tighten refined: ${entrySide} entry — ` +
+      `${entrySide === 'LONG' ? 'bear' : 'bull'}Level=${level} ` +
+      `(bull=${this.bullLevel} bear=${this.bearLevel}) (${plan.rationale || 'no rationale'})`
+    );
+    this._recomputeFinalTpPrice();
+    await this.saveState();
+    this._savePlanToFirestore(plan, 'reversal_tightening').catch(() => {});
+  }
+
   async _requestVeto(proposedNewSize) {
     try {
       const ctx = await this.marketContext.buildReversalContext(this._buildStrategyState({
@@ -1255,6 +1378,10 @@ class AiReversalStrategy extends TradingBase {
 
     this.subState = 'WAITING';
     this.executionState = 'IDLE';
+    // New phase → re-arm reversal-gap tightening: the next touch (initial open)
+    // will set the safeguard + fire the Context-5 refine again. Wide PLAN levels
+    // govern entry until then.
+    this.gapTightened = false;
     // Show the PROJECTED dynamic size the next open will actually use
     // (_computeFormulaSize from currentInitialSize + carried accLoss), not the
     // bare currentInitialSize — at cycle start accLoss=0 so this is the base
@@ -1311,6 +1438,15 @@ class AiReversalStrategy extends TradingBase {
       });
       this.subState = side === 'LONG' ? 'LONG_HELD' : 'SHORT_HELD';
       await this.addLog(`[REVERSAL] initial ${side} opened at level ${levelPrice} (size ${sizeUSDT} USDT, accLoss ${this.cycleAccumulatedLoss.toFixed(4)})`);
+      // Reversal-gap tightening (once per PLAN phase). Pull the OPPOSITE level to
+      // the 1% safeguard instantly, then fire the Context-5 refine consult. Only
+      // when the flag is on and this phase hasn't tightened yet.
+      if (this.tightenReversalGap && !this.gapTightened) {
+        this._applyReversalGapSafeguard(side);
+        this._requestReversalTightening(side).catch((err) => {
+          this.addLog(`[REVERSAL] reversal_tightening consult error: ${err.message}`).catch(() => {});
+        });
+      }
     } catch (err) {
       await this.addLog(`[REVERSAL] _openInitialPosition error: ${err.message}`);
     } finally {
@@ -2260,6 +2396,8 @@ class AiReversalStrategy extends TradingBase {
       recoveryFactorDecay: this.recoveryFactorDecay,
       recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
       aiVetoOnReversal: this.aiVetoOnReversal,
+      tightenReversalGap: this.tightenReversalGap,
+      gapTightened: this.gapTightened,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
@@ -2377,6 +2515,9 @@ class AiReversalStrategy extends TradingBase {
         reversalCount: this.reversalCount,
         harvestCount: this.harvestCount,
         harvestPrice: this.harvestPrice,
+        // Whether this PLAN phase's opposite level has been tightened (restored
+        // on boot so a mid-phase restart doesn't re-tighten / re-widen).
+        gapTightened: this.gapTightened,
         initialCapital: this.initialCapital,
         initialWalletBalance: this.initialWalletBalance,
         currentInitialSize: this.currentInitialSize,
@@ -2427,6 +2568,7 @@ class AiReversalStrategy extends TradingBase {
           recoveryFactorDecay: this.recoveryFactorDecay,
           recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
           aiVetoOnReversal: this.aiVetoOnReversal,
+          tightenReversalGap: this.tightenReversalGap,
         },
         criticalError: this.criticalError || null,
         lastUpdated: new Date(),

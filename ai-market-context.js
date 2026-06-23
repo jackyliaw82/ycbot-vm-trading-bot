@@ -493,8 +493,9 @@ class AiMarketContext {
       planHistory,
       vetoMode,                  // Context 2 flag — bot is asking for size approval
       proposedNewSize,           // for Context 2
-      consultContext,            // 'plan' | 'veto' | 'harvest_price' | 'user_question'
+      consultContext,            // 'plan' | 'veto' | 'harvest_price' | 'user_question' | 'reversal_tightening'
       userQuestion,              // Context 4 — free-form question from Ask AI panel
+      tighteningBounds,          // Context 5 — { low, high } price band for the refined opposite level
     } = strategyState;
 
     // Fetch parallel.
@@ -572,6 +573,9 @@ class AiMarketContext {
       // "USER QUESTION" footer. Forgetting this propagation makes the
       // AI respond with "no question text was provided by the user".
       userQuestion: userQuestion || null,
+      // Context 5 — { low, high } price band the refined opposite reversal
+      // level must fall within. Used by the planner footer + risk-guard.
+      tighteningBounds: tighteningBounds || null,
 
       // History.
       previousPlan: previousPlan || null,

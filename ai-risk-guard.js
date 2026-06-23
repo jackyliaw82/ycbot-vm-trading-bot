@@ -128,6 +128,23 @@ class AiRiskGuard {
       if (plan.decision !== 'ADVISE') {
         reasons.push(`user_question: expected ADVISE, got ${plan.decision}`);
       }
+    } else if (consultContext === 'reversal_tightening') {
+      if (plan.decision !== 'REVERSAL_TIGHTENING') {
+        reasons.push(`reversal_tightening: expected REVERSAL_TIGHTENING, got ${plan.decision}`);
+      }
+      if (typeof plan.level !== 'number' || !Number.isFinite(plan.level) || plan.level <= 0) {
+        reasons.push('reversal_tightening: level must be a positive finite number');
+      } else {
+        // Band check — the strategy computes the [low, high] price band (0.5%–1%
+        // off the entry level, correct side) and passes it in state. A level
+        // outside it is rejected; the strategy then keeps its 1% safeguard.
+        const b = state.tighteningBounds;
+        if (!b || !Number.isFinite(b.low) || !Number.isFinite(b.high)) {
+          reasons.push('reversal_tightening: no tightening bounds to validate against');
+        } else if (plan.level < b.low || plan.level > b.high) {
+          reasons.push(`reversal_tightening: level ${plan.level} outside band [${b.low}, ${b.high}]`);
+        }
+      }
     } else {
       reasons.push(`Unknown consult context: ${consultContext}`);
     }

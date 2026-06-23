@@ -170,6 +170,13 @@ class AiPlanner {
       if (!bullOk || !bearOk) {
         throw new Error('Reversal plan (user_question): proposedBullLevel/proposedBearLevel must be null or finite numbers');
       }
+    } else if (consultContext === 'reversal_tightening') {
+      if (decision !== 'REVERSAL_TIGHTENING') {
+        throw new Error(`Reversal plan (reversal_tightening): expected decision=REVERSAL_TIGHTENING, got ${decision}`);
+      }
+      if (typeof plan.level !== 'number' || !Number.isFinite(plan.level)) {
+        throw new Error('Reversal plan (reversal_tightening): level must be a finite number');
+      }
     } else {
       throw new Error(`Reversal plan: unknown consult context ${consultContext}`);
     }
@@ -177,7 +184,8 @@ class AiPlanner {
 
   /**
    * Build the user message for reversal AI consults.
-   * Four consult contexts are supported: plan, harvest_price, veto, user_question.
+   * Five consult contexts are supported: plan, harvest_price, veto,
+   * user_question, reversal_tightening.
    * The context object is built by AiMarketContext.buildReversalContext.
    */
   _buildReversalUserMessage(context) {
@@ -367,6 +375,23 @@ class AiPlanner {
       parts.push('');
       parts.push(`## USER QUESTION`);
       parts.push(context.userQuestion || '(no question text provided)');
+    } else if (ctx === 'reversal_tightening') {
+      const side = context.currentSide;
+      const entryLevel = side === 'LONG' ? context.bullLevel : context.bearLevel;
+      const oppName = side === 'LONG' ? 'bearLevel' : 'bullLevel';
+      const dirWord = side === 'LONG' ? 'below' : 'above';
+      const b = context.tighteningBounds || {};
+      const low = b.low != null ? b.low.toFixed(6) : '?';
+      const high = b.high != null ? b.high.toFixed(6) : '?';
+      parts.push(`A ${side} position was just opened at the entry level ${entryLevel}. The opposite reversal level (${oppName}) was set to a temporary 1% safeguard. REFINE it: emit a single REVERSAL_TIGHTENING with "level" — the best ${oppName} within the tight band.`);
+      parts.push(`Hard constraint: level MUST be within [${low}, ${high}] (i.e. 0.5%–1% ${dirWord} the ${side === 'LONG' ? 'bull' : 'bear'} entry). Out-of-band is rejected and the 1% safeguard is kept.`);
+      parts.push(`Objective — place the level to MINIMIZE false / whipsaw reversals: just ${dirWord === 'below' ? 'below' : 'above'} real ${side === 'LONG' ? 'support' : 'resistance'} so noise bounces but a genuine break flips the position. Data priority for this sub-1% band:`);
+      parts.push(`  1. Orderbook ${side === 'LONG' ? 'bid' : 'ask'} walls in-band (primary) — sit just beyond the nearest significant cluster.`);
+      parts.push(`  2. Recent 5m swing ${side === 'LONG' ? 'lows' : 'highs'} — just past the latest minor swing.`);
+      parts.push(`  3. CVD direction — if the trend favors the current ${side} position, place LOOSER (toward the 1% edge) to avoid early flips; if adverse, place TIGHTER (toward 0.5%) to flip fast and ride the move.`);
+      parts.push(`  4. ATR noise floor — keep the level outside ~1 ATR of normal noise.`);
+      parts.push(`  5. Volume profile is secondary here (24h/7d bins are too coarse to resolve sub-1% structure).`);
+      parts.push(`If no clean structure sits within the band, default toward the looser (1%) edge with low confidence.`);
     }
 
     parts.push('');
