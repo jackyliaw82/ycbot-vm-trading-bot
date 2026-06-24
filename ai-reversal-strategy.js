@@ -220,14 +220,10 @@ class AiReversalStrategy extends TradingBase {
       throw new Error('AiReversalStrategy.start: invalid initialSize');
     }
 
-    // AI key comes from GCP Secret Manager — not the config form. Branch on
-    // the model-ID prefix: `deepseek-*` models go through the Anthropic
-    // SDK pointed at DeepSeek's Anthropic-compatible endpoint; everything
-    // else uses Anthropic's hosted Claude API.
-    const isDeepseek = (this.aiModel || '').startsWith('deepseek-');
-    const aiApiKey = isDeepseek
-      ? await this._fetchDeepseekApiKey()
-      : await this._fetchAnthropicApiKey();
+    // AI key comes from GCP Secret Manager — not the config form. DeepSeek is
+    // the sole provider: the @anthropic-ai/sdk client (in ai-planner) points at
+    // DeepSeek's Anthropic-compatible endpoint.
+    const aiApiKey = await this._fetchDeepseekApiKey();
 
     await this.addLog(`Starting AI Reversal Strategy for ${this.symbol}...`);
     // Surface EVERY config field — used to verify the form values made it
@@ -446,12 +442,9 @@ class AiReversalStrategy extends TradingBase {
     this.lastDecision = snapshot.lastDecision || null;
 
     // FRESH AI key — never trust a snapshot value (the snapshot shape
-    // doesn't actually store the key, but defensive anyway). Provider is
-    // derived from the model-ID prefix restored from the snapshot.
-    const isDeepseek = (this.aiModel || '').startsWith('deepseek-');
-    const aiApiKey = isDeepseek
-      ? await this._fetchDeepseekApiKey()
-      : await this._fetchAnthropicApiKey();
+    // doesn't actually store the key, but defensive anyway). DeepSeek is the
+    // sole provider.
+    const aiApiKey = await this._fetchDeepseekApiKey();
 
     try {
       await this.setLeverage(this.symbol, this.leverage);
@@ -2273,35 +2266,9 @@ class AiReversalStrategy extends TradingBase {
     );
   }
 
-  /**
-   * Fetches the Anthropic API key for this profile (env var override, then
-   * GCF proxy to the user's Secret Manager binding). Lives here rather than
-   * on TradingBase — follow-up: refactor down to TradingBase.
-   */
-  async _fetchAnthropicApiKey() {
-    const envKey = process.env.ANTHROPIC_API_KEY;
-    if (envKey) return envKey;
-
-    const response = await fetch(this.sharedVmProxyGcfUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-User-Id': this.profileId },
-      body: JSON.stringify({ apiType: 'secret', endpoint: '/secret/anthropic', profileBinanceApiGcfUrl: this.gcfProxyUrl }),
-    });
-
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      throw new Error(`Failed to fetch Anthropic key: ${response.status} - ${err.error || response.statusText}`);
-    }
-
-    const { apiKey } = await response.json();
-    if (!apiKey) throw new Error('No Anthropic API key configured.');
-    return apiKey;
-  }
-
-  // DeepSeek key fetcher — same pattern as _fetchAnthropicApiKey, hits a
-  // different /secret/* endpoint on the per-profile binance-proxy GCF.
-  // ai-planner detects the model prefix and routes the SDK to
-  // api.deepseek.com/anthropic so the key works against DeepSeek V4.
+  // DeepSeek key fetcher (the sole AI key) — env var override, then the
+  // per-profile binance-proxy /secret/deepseek endpoint. ai-planner points the
+  // @anthropic-ai/sdk at api.deepseek.com/anthropic so the key works for DeepSeek V4.
   async _fetchDeepseekApiKey() {
     const envKey = process.env.DEEPSEEK_API_KEY;
     if (envKey) return envKey;
@@ -2327,7 +2294,7 @@ class AiReversalStrategy extends TradingBase {
   /**
    * Deducts the platform fee from the user's wallet on net positive PnL.
    * Lives here rather than on TradingBase for the same reason
-   * _fetchAnthropicApiKey does; follow-up: refactor down to TradingBase.
+   * _fetchDeepseekApiKey does; follow-up: refactor down to TradingBase.
    * Called from stop() when netPnL > 0.
    */
   async deductPlatformFee(profitAmount) {

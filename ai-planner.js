@@ -9,14 +9,15 @@ import { REVERSAL_SYSTEM_PROMPT } from './ai-reversal-prompt.js';
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com/anthropic';
 
 class AiPlanner {
-  constructor(apiKey, model = 'claude-sonnet-4-6') {
-    const isDeepseek = typeof model === 'string' && model.startsWith('deepseek-');
+  constructor(apiKey, model = 'deepseek-v4-flash') {
+    // DeepSeek is the sole AI provider — always point the @anthropic-ai/sdk
+    // client at DeepSeek's Anthropic-compatible endpoint.
     this.client = new Anthropic({
       apiKey,
-      ...(isDeepseek ? { baseURL: DEEPSEEK_BASE_URL } : {}),
+      baseURL: DEEPSEEK_BASE_URL,
     });
     this.model = model;
-    this.provider = isDeepseek ? 'deepseek' : 'anthropic';
+    this.provider = 'deepseek';
     this.maxRetries = 3;
     // One-shot diagnostic flag — first successful consult logs the raw
     // response.usage shape so we can verify which cache-hit fields the
