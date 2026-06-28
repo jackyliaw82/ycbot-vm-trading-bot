@@ -2165,10 +2165,9 @@ class AiReversalStrategy extends TradingBase {
 
       const currentBalance = walletDoc.data().balance || 0;
       const newBalance = currentBalance - platformFee;
-      if (newBalance < 0) {
-        await this.addLog(`Warning: Fee would cause negative balance. Skipping.`);
-        return;
-      }
+      // Negative Reload Balance is allowed by design — the strategy-start gate
+      // (/billing/preflight) blocks new cycles until the user tops up. Deduct
+      // the full fee even if it takes the balance below 0.
 
       await walletRef.update({ balance: newBalance, updatedAt: new Date() });
       await this.addLog(`Fee deducted. Balance: ${this._formatNotional(newBalance)} USDT`);
