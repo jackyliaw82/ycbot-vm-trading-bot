@@ -197,6 +197,13 @@ class TradingBase {
     // it has saved trades for; REST fallback (_scheduleRestFallback) checks
     // this map before fetching/saving so the two paths never double-count.
     this._wsHandledOrderIds = new Map(); // orderId → timestamp
+    // Full-fill marker. Unlike _wsHandledOrderIds (set on the FIRST partial
+    // fill, for REST-fallback dedup), this is set ONLY when an order reaches
+    // status FILLED — i.e. every partial of a multi-fill market order has
+    // landed and folded into accumulatedRealizedPnL/accumulatedTradingFees.
+    // _waitForOrderFillConfirmation gates on this so callers that size off a
+    // just-closed leg (reversal recovery sizing) never read a partial accLoss.
+    this._wsFullyFilledOrderIds = new Map(); // orderId → timestamp
     this._restFallbackCount = 0;
     this._lastUserDataMessageAt = 0;
 
@@ -580,6 +587,9 @@ class TradingBase {
     const cutoff = Date.now() - 5 * 60 * 1000;
     for (const [oid, ts] of this._wsHandledOrderIds) {
       if (ts < cutoff) this._wsHandledOrderIds.delete(oid);
+    }
+    for (const [oid, ts] of this._wsFullyFilledOrderIds) {
+      if (ts < cutoff) this._wsFullyFilledOrderIds.delete(oid);
     }
   }
 
@@ -1847,6 +1857,15 @@ class TradingBase {
       }
     }
 
+    // Full-fill marker — set once the order is completely filled. Runs AFTER
+    // the TRADE block above has folded the LAST partial into the accumulators,
+    // so any sizing gated on this marker reads the complete realized PnL + fee.
+    // Independent of pendingOrders (placeMarketOrder resolves on the REST ack,
+    // not here), so this fires even when no promise is pending.
+    if (order.X === 'FILLED') {
+      this._wsFullyFilledOrderIds.set(order.i, Date.now());
+    }
+
     // Resolve/reject pending order promises
     if (this.pendingOrders.has(order.i)) {
       const { resolve, reject } = this.pendingOrders.get(order.i);
@@ -2187,23 +2206,31 @@ class TradingBase {
   }
 
   /**
-   * M1 — wait for WS to confirm an orderId fill (via _handleOrderTradeUpdate
-   * setting _wsHandledOrderIds) before reading positions. The race we're
-   * closing: REST ACK can land before the WS ACCOUNT_UPDATE for the same
-   * fill, leaving the position reflecting the PRE-fill state.
+   * M1 — wait for WS to confirm an orderId is COMPLETELY filled (via
+   * _handleOrderTradeUpdate setting _wsFullyFilledOrderIds on status FILLED)
+   * before reading positions / sizing off the result. Two races we're closing:
+   *   1. REST ACK can land before the WS ACCOUNT_UPDATE for the same fill,
+   *      leaving the position reflecting the PRE-fill state.
+   *   2. A market order that fills across MANY partials emits a TRADE (and
+   *      thus _wsHandledOrderIds) on the FIRST partial — waiting on that marker
+   *      returned true with only a fraction of the realized PnL/fee folded into
+   *      the accumulators, so reversal recovery sizing under-read accLoss and
+   *      under-sized the recovery leg. Gating on FILLED guarantees every
+   *      partial has landed before we proceed.
    *
    * Bounded by timeoutMs (default 1500ms — well past Binance's typical WS
-   * propagation). Returns true if confirmed within the window, false on
-   * timeout. Caller can still proceed on false; positions might be 100-
-   * 500ms stale and the next price tick / replan will reconcile.
+   * propagation, even for a heavily-fragmented market order). Returns true if
+   * fully filled within the window, false on timeout. Caller can still proceed
+   * on false; positions/accLoss might be momentarily partial and the next
+   * price tick / replan / post-execute recompute reconciles.
    */
   async _waitForOrderFillConfirmation(orderId, timeoutMs = 1500) {
     if (!orderId) return false;
-    if (this._wsHandledOrderIds.has(orderId)) return true;
+    if (this._wsFullyFilledOrderIds.has(orderId)) return true;
     const startedAt = Date.now();
     return new Promise((resolve) => {
       const tick = () => {
-        if (this._wsHandledOrderIds.has(orderId)) return resolve(true);
+        if (this._wsFullyFilledOrderIds.has(orderId)) return resolve(true);
         if (Date.now() - startedAt >= timeoutMs) return resolve(false);
         setTimeout(tick, 50);
       };

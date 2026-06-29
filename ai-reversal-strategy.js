@@ -1337,17 +1337,21 @@ class AiReversalStrategy extends TradingBase {
         this._scheduleRestFallback(closeResult.orderId, this.symbol, closeSide, 'BOTH');
       }
 
-      // ===== Step 2: wait for WS to deliver the close fill =====
-      // 2000ms covers Binance's typical <100ms WS propagation with
-      // generous headroom for the REST fallback if WS misses. After
-      // confirmation _handleOrderTradeUpdate has folded the close's
-      // realized PnL + commission into the accumulators.
+      // ===== Step 2: wait for WS to deliver the COMPLETE close fill =====
+      // _waitForOrderFillConfirmation now gates on status FILLED (every partial
+      // landed), not the first partial — a fragmented market-order close (seen:
+      // 34 fills, the two largest landing LAST) previously let sizing run with
+      // only a fraction of the realized loss folded, under-sizing the recovery
+      // leg. In the normal case FILLED arrives in <1s so this resolves
+      // immediately; the 3000ms ceiling only bounds the rare slow/missed-WS
+      // case (then we proceed on partial accLoss, logged below, and the next
+      // reversal / post-execute recompute self-corrects the TP).
       let wsConfirmed = false;
       if (closeResult?.orderId) {
-        wsConfirmed = await this._waitForOrderFillConfirmation(closeResult.orderId, 2000);
+        wsConfirmed = await this._waitForOrderFillConfirmation(closeResult.orderId, 3000);
       }
       if (!wsConfirmed) {
-        await this.addLog(`[REVERSAL] close fill not WS-confirmed within 2s — sizing may use stale accLoss; next reversal self-corrects`);
+        await this.addLog(`[REVERSAL] close fill not fully WS-confirmed within 3s — sizing may use partial accLoss; next reversal / TP recompute self-corrects`);
       }
 
       // Recompute accLoss from current (now-actual) accumulators. No
