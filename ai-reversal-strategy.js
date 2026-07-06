@@ -667,7 +667,18 @@ class AiReversalStrategy extends TradingBase {
       }
     }
 
-    await this.saveState();
+    // A cycle that stopped WITHOUT ever filling a position has no PnL. Don't
+    // persist it as a "completed" strategy — it would inflate the Completed
+    // count and dilute the win rate in the PnL tab. Delete the doc start()
+    // created (isRunning:true) so boot-recovery can't resurrect it either.
+    // Guarded by _hasNoTradingActivity() so a strategy that actually traded is
+    // never removed here.
+    const noTrade = this._hasNoTradingActivity();
+    if (noTrade) {
+      await this._deleteNoTradeStrategyDoc();
+    } else {
+      await this.saveState();
+    }
 
     // Platform-wide hero profit (public landing page): add this cycle's net
     // profit when positive. Idempotent (heroCounted flag) + best-effort — a
@@ -695,24 +706,27 @@ class AiReversalStrategy extends TradingBase {
 
     // Completion notification. Helper signature is
     // (userId, strategyData); the FCM token lookup relies on the
-    // second argument being the data object.
-    try {
-      const elapsed = this.cycleStartTime
-        ? formatDuration(Date.now() - this.cycleStartTime)
-        : 'N/A';
-      await sendStrategyCompletionNotification(this.userId, {
-        strategyId: this.strategyId,
-        symbol: this.symbol,
-        netPnL,
-        profitPercentage: this.initialCapital ? (netPnL / this.initialCapital) * 100 : 0,
-        tradeCount: this.tradeCount || (this.reversalCount + this.harvestCount + (reason === 'final_tp' ? 1 : 0)),
-        timeTaken: elapsed,
-        realizedPnL: this.accumulatedRealizedPnL || 0,
-        tradingFees: this.accumulatedTradingFees || 0,
-        fundingFees: this.accumulatedFundingFees || 0,
-      });
-    } catch (notifyErr) {
-      console.error(`[REVERSAL] notify error: ${notifyErr.message}`);
+    // second argument being the data object. Skipped for a no-trade cycle —
+    // there is no completed strategy to report (and its doc was just deleted).
+    if (!noTrade) {
+      try {
+        const elapsed = this.cycleStartTime
+          ? formatDuration(Date.now() - this.cycleStartTime)
+          : 'N/A';
+        await sendStrategyCompletionNotification(this.userId, {
+          strategyId: this.strategyId,
+          symbol: this.symbol,
+          netPnL,
+          profitPercentage: this.initialCapital ? (netPnL / this.initialCapital) * 100 : 0,
+          tradeCount: this.tradeCount || (this.reversalCount + this.harvestCount + (reason === 'final_tp' ? 1 : 0)),
+          timeTaken: elapsed,
+          realizedPnL: this.accumulatedRealizedPnL || 0,
+          tradingFees: this.accumulatedTradingFees || 0,
+          fundingFees: this.accumulatedFundingFees || 0,
+        });
+      } catch (notifyErr) {
+        console.error(`[REVERSAL] notify error: ${notifyErr.message}`);
+      }
     }
 
     // CRITICAL: invokes the app.js callback that does
@@ -720,6 +734,64 @@ class AiReversalStrategy extends TradingBase {
     // attempt for this profile is rejected with "already running".
     try { this.onStopComplete?.(); } catch (e) {
       console.error('[REVERSAL] onStopComplete hook failed:', e.message);
+    }
+  }
+
+  /**
+   * True when this cycle never filled a position: no trading fees (every fill
+   * incurs a taker commission), no realized PnL, no funding, and no reversals
+   * or harvests. All of these are persisted by saveState() and restored by
+   * resume(), so the check is crash-safe across a VM restart. Conservative by
+   * design — any real trading activity leaves a non-zero accumulatedTradingFees,
+   * so a strategy that actually traded can never be misclassified as no-trade.
+   */
+  _hasNoTradingActivity() {
+    return (this.accumulatedTradingFees || 0) === 0
+      && (this.accumulatedRealizedPnL || 0) === 0
+      && (this.accumulatedFundingFees || 0) === 0
+      && (this.reversalCount || 0) === 0
+      && (this.harvestCount || 0) === 0;
+  }
+
+  /**
+   * Delete a no-trade cycle's Firestore doc (created by start() with
+   * isRunning:true) plus its subcollections, instead of persisting it via
+   * saveState(). Keeps the PnL tab's Completed count honest and prevents
+   * boot-recovery from resurrecting an empty cycle. Only ever called behind
+   * _hasNoTradingActivity(). Best-effort per subcollection; on a top-level
+   * delete failure it falls back to saveState() so we never leave a dangling
+   * isRunning:true doc that recovery would try to resume.
+   */
+  async _deleteNoTradeStrategyDoc() {
+    // Suppress the remaining stop()-path addLog() writes (addLog no-ops when
+    // this flag is set) so they don't recreate the logs subcollection under the
+    // doc we're about to delete.
+    this.willBeDeleted = true;
+    const strategyRef = this.firestore.collection('strategies').doc(this.strategyId);
+    try {
+      const subs = [
+        [this.tradesCollectionRef, 'trades'],
+        [this.logsCollectionRef, 'logs'],
+        [this.strategyFlowCollectionRef, 'strategyFlow'],
+        [strategyRef.collection('metricsSamples'), 'metricsSamples'],
+        [strategyRef.collection('aiPlans'), 'aiPlans'],
+      ];
+      for (const [ref, name] of subs) {
+        if (!ref) continue;
+        try {
+          await this.deleteSubcollection(ref, name);
+        } catch (subErr) {
+          console.error(`[REVERSAL] no-trade cleanup: ${name} delete failed: ${subErr.message}`);
+        }
+      }
+      await strategyRef.delete();
+      console.log(`[REVERSAL] no-trade cycle ${this.strategyId} — strategy doc deleted (not persisted as completed).`);
+    } catch (err) {
+      console.error(`[REVERSAL] no-trade doc delete failed for ${this.strategyId}: ${err.message} — falling back to saveState()`);
+      this.willBeDeleted = false;
+      try { await this.saveState(); } catch (saveErr) {
+        console.error(`[REVERSAL] fallback saveState also failed: ${saveErr.message}`);
+      }
     }
   }
 
@@ -2185,6 +2257,9 @@ class AiReversalStrategy extends TradingBase {
         type: 'platform_fee',
         amount: -platformFee,
         description: `Platform fee (${platformFeePercent}%) on profit of $${this._formatNotional(profitAmount)}`,
+        // Traceable reference shown in the wallet ledger UI: the strategy run
+        // whose profit this fee was charged on.
+        reference: this.strategyId,
         metadata: { totalPnL: profitAmount, feePercentage: platformFeePercent },
       });
     } catch (error) {

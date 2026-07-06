@@ -22,6 +22,7 @@ import { readFileSync } from 'fs';
 import os from 'os';
 import wsBroadcast from './ws-broadcast.js';
 import { httpAuthMiddleware, requireAdmin } from './http-auth.js';
+import { checkBillingGate } from './billing-gate.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1357,6 +1358,40 @@ app.post('/ai-reversal/start', async (req, res) => {
         });
       }
     }
+
+    // ── Billing gate (server-side enforcement) ────────────────────────────
+    // Fail-closed mirror of backend-service /billing/preflight's read-only
+    // checks. The frontend calls preflight (which also lazily charges the
+    // 30 USD subscription) before reaching here, but that verdict is only
+    // *enforced* client-side — a caller that bypasses the React app would
+    // otherwise start ungated. Block unless the machine subscription is active
+    // AND Reload Balance is positive. CHECK-ONLY: does NOT charge (the 30 USD
+    // renewal stays owned by preflight + first-profile creation). Prefer the
+    // token-derived req.uid over the client-supplied body userId.
+    const billingUid = req.uid || userId;
+    let gate;
+    try {
+      gate = await checkBillingGate(firestore, billingUid);
+    } catch (gateErr) {
+      console.error(`[BILLING_GATE] Verification failed for ${billingUid}:`, gateErr.message);
+      return res.status(402).json({
+        error: 'Could not verify your machine subscription / Reload Balance. Please try again.',
+        code: 'BILLING_GATE_UNVERIFIED',
+      });
+    }
+    if (!gate.canStart) {
+      const msg =
+        gate.reason === 'subscription_unpaid'
+          ? 'Machine subscription is inactive. Reload your Balance and start from the app to renew (30 USD/mo).'
+          : gate.reason === 'negative_balance'
+          ? 'Your Reload Balance is negative. Top up above 0 USD to start a strategy.'
+          : gate.reason === 'zero_balance'
+          ? 'Your Reload Balance is 0 USD. Reload to start a strategy.'
+          : 'Reload Balance / subscription check failed. Top up and try again.';
+      console.warn(`[BILLING_GATE] Blocked start for ${billingUid} (reason=${gate.reason}, balance=${gate.balance}).`);
+      return res.status(402).json({ error: msg, code: 'BILLING_GATE_BLOCKED', reason: gate.reason });
+    }
+    // ──────────────────────────────────────────────────────────────────────
 
     const strategy = new AiReversalStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
     strategy.userId = userId;
