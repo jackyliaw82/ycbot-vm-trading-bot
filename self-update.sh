@@ -14,23 +14,34 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-sync_package_version() {
-  if [ -n "$TARGET_VERSION" ] && [ -f "package.json" ]; then
-    CURRENT_PKG_VERSION=$(node -e "console.log(require('./package.json').version)" 2>/dev/null || echo "")
-    if [ "$CURRENT_PKG_VERSION" != "$TARGET_VERSION" ]; then
-      log "Syncing package.json version: $CURRENT_PKG_VERSION -> $TARGET_VERSION"
-      node -e "
-        const fs = require('fs');
-        const pkg = JSON.parse(fs.readFileSync('./package.json', 'utf8'));
-        pkg.version = '$TARGET_VERSION';
-        fs.writeFileSync('./package.json', JSON.stringify(pkg, null, 2) + '\n');
-      " 2>&1 | tee -a "$LOG_FILE"
-      return 0
-    else
-      log "package.json version already matches target ($TARGET_VERSION)"
-    fi
+# Report the ACTUAL version + commit that the pull landed — do NOT overwrite
+# package.json to the release target.
+#
+# Stamping the target version here (the old behavior) is what let a VM report
+# the requested version while still running OLDER code: a git pull can lag a
+# freshly-pushed release, so the pull grabs an earlier commit, but the version
+# gets rewritten to the target anyway. The admin panel then shows "up to date"
+# for stale code, and updateAvailable (a version-string compare against
+# BOT_VERSION) never trips again — the update silently sticks.
+#
+# Reporting the REAL version keeps the updater self-correcting instead: if the
+# pull didn't reach the target's commit yet, BOT_VERSION stays the old value,
+# updateAvailable stays true, and the next idle poll retries until the pulled
+# code's own package.json actually reaches the target. The version can never
+# claim to be something the running code isn't.
+verify_pulled_version() {
+  local actual
+  actual=$(node -e "console.log(require('./package.json').version)" 2>/dev/null || echo "unknown")
+  log "Running commit $(git rev-parse --short HEAD 2>/dev/null || echo '?'), package.json version: ${actual}"
+  # Safety: confirm the working tree actually contains origin/master (guards a
+  # partial/failed pull from restarting on stale code).
+  if ! git merge-base --is-ancestor "$REMOTE" HEAD 2>/dev/null; then
+    log "ERROR: pulled HEAD does not contain origin/master (${REMOTE:0:8}). Aborting without restart."
+    exit 1
   fi
-  return 0
+  if [ -n "$TARGET_VERSION" ] && [ "$actual" != "$TARGET_VERSION" ]; then
+    log "WARNING: release target ${TARGET_VERSION} != master's package.json (${actual}) — reporting the ACTUAL code version. The update will re-run until master is bumped to ${TARGET_VERSION}. (Did you bump package.json before publishing the release?)"
+  fi
 }
 
 log "=== Starting self-update ==="
@@ -85,7 +96,7 @@ else
     md5sum package-lock.json | awk '{print $1}' > "$CHECKSUM_FILE"
   fi
 
-  sync_package_version || true
+  verify_pulled_version
   NEEDS_RESTART=true
 fi
 
