@@ -17,8 +17,9 @@ import { Firestore, Timestamp, FieldValue } from '@google-cloud/firestore';
 import { initializeFirebaseAdmin } from './pushNotificationHelper.js';
 import admin from 'firebase-admin';
 import { precisionFormatter } from './precisionUtils.js';
-import { execFile } from 'child_process';
+import { execFile, execSync } from 'child_process';
 import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
 import os from 'os';
 import wsBroadcast from './ws-broadcast.js';
 import { httpAuthMiddleware, requireAdmin } from './http-auth.js';
@@ -29,6 +30,20 @@ const PORT = process.env.PORT || 3000;
 
 const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
 const BOT_VERSION = pkg.version;
+// Short git commit the running code is checked out at — surfaced in the admin
+// VM Status panel so the version badge can be cross-checked against the ACTUAL
+// commit (the version string alone can lag a release; see self-update.sh's
+// verify_pulled_version note). Computed once at boot; 'unknown' if git is
+// unavailable or this isn't a checkout.
+let BOT_COMMIT = 'unknown';
+try {
+  BOT_COMMIT = execSync('git rev-parse --short HEAD', {
+    cwd: fileURLToPath(new URL('.', import.meta.url)),
+    stdio: ['ignore', 'pipe', 'ignore'],
+  }).toString().trim() || 'unknown';
+} catch {
+  /* git unavailable or not a repo — leave 'unknown' */
+}
 let updateAvailable = false;
 let targetVersion = null;
 let isUpdating = false;
@@ -352,6 +367,7 @@ function buildHealthPayload() {
     strategies: strategiesStatus,
     vmInstanceHealthy: true,
     botVersion: BOT_VERSION,
+    botCommit: BOT_COMMIT,
     updateAvailable,
     targetVersion,
     isUpdating,
@@ -399,6 +415,7 @@ app.get('/health', (req, res) => {
     strategies: strategiesStatus,
     vmInstanceHealthy: true,
     botVersion: BOT_VERSION,
+    botCommit: BOT_COMMIT,
     updateAvailable,
     targetVersion,
     isUpdating
@@ -1151,6 +1168,7 @@ async function reportUpdateStatus(status, details = {}) {
       updateStatus: status,
       updateDetails: details,
       botVersion: BOT_VERSION,
+      botCommit: BOT_COMMIT,
       lastUpdateStatusAt: Timestamp.now(),
     });
     console.log(`[UPDATE] Reported update status: ${status} for user ${userId}`);
@@ -1285,6 +1303,7 @@ async function reportVersionOnStartup(retryCount = 0) {
       const vmStatusRef = firestore.collection('users').doc(userId).collection('vm_status').doc('current');
       await vmStatusRef.set({
         botVersion: BOT_VERSION,
+        botCommit: BOT_COMMIT,
         lastReportedAt: Timestamp.now(),
         status: 'online',
         activeStrategiesCount: activeStrategies.size,
