@@ -19,10 +19,17 @@ const MIN_LIQ_DISTANCE_PCT = 8;
 const DEPTH_CACHE_TTL_MS = 30 * 1000;       // 30s depth snapshot cadence
 const DEPTH_LIMIT = 100;                     // top-100 levels each side
 const VP_CACHE_TTL_MS = 10 * 60 * 1000;      // 10 min volume profile cache
-const VP_24H_BARS = 288;                     // 5m × 288 = 24h
+const VP_24H_BARS = 288;                     // 5m × 288 = 24h (CVD source)
+const VP_24H_1M_BARS = 1440;                 // 1m × 1440 = 24h (fine profile source)
 const VP_7D_BARS = 168;                      // 1h × 168 = 7d
-const VP_BIN_COUNT = 100;                    // 100 price bins per profile
+const VP_BIN_COUNT_24H = 200;                // 24h profile bins — supported by 1m data
+const VP_BIN_COUNT_7D = 100;                 // 7d profile bins — only 168 1h candles, keep coarse
 const VP_VALUE_AREA_PCT = 0.70;              // 70% volume defines value area
+// Hybrid HVN/LVN detection — local extrema (Pine-style) + absolute-significance gate.
+const HVN_STRENGTH_FRAC = 0.05;              // HVN peak window = ±5% of bins (Pine strength, scaled to binCount)
+const LVN_STRENGTH_FRAC = 0.075;             // LVN valley window = ±7.5% of bins
+const HVN_MIN_POC_FRAC = 0.20;               // HVN peak kept only if ≥20% of POC volume (drops dead-zone micro-peaks)
+const LVN_MAX_MEAN_FRAC = 0.50;              // LVN valley kept only if ≤50% of mean bin volume (genuine thin/void zone)
 const CVD_LOOKBACK_BARS = 24;                // 24 × 5m = 2h CVD window
 const CVD_TREND_THRESHOLD_PCT = 0.05;        // 5% slope threshold for rising/falling
 
@@ -68,10 +75,16 @@ class AiMarketContext {
     this._symbolBaselinesAt = 0;
 
     // AI Reversal — 24h 5m candle cache (fuller window than _getRecentCandles).
-    // 288 bars × 5m = 24h volume profile lookback.
+    // 288 bars × 5m = 24h — now used only by the CVD snapshot.
     this._cached24hCandles5m = null;
     this._candle24hCacheTime = 0;
     this._candle24hCacheTTL = 5 * 60 * 1000;
+
+    // AI Reversal — 24h 1m candle cache. 1440 bars × 1m = 24h — the fine-grained
+    // source for the 24h volume profile (5× the resolution of the 5m window).
+    this._cached24hCandles1m = null;
+    this._candle24h1mCacheTime = 0;
+    this._candle24h1mCacheTTL = 5 * 60 * 1000;
 
     // AI Reversal — volume profile cache (keyed by `${symbol}:${windowKey}`).
     this._vpCache = new Map();
@@ -232,8 +245,8 @@ class AiMarketContext {
 
   // ——— AI Reversal: 24h 5m candle fetcher ——————————————————————————————
   // Separate cache from _getRecentCandles (which only fetches 100 bars).
-  // 288 bars × 5m = exactly 24h — used as the lookback window for the
-  // short-window volume profile and CVD snapshot.
+  // 288 bars × 5m = exactly 24h — the lookback window for the CVD snapshot.
+  // (The 24h volume profile now uses the finer 1m fetcher below.)
 
   async _get24hCandles5m() {
     const now = Date.now();
@@ -248,6 +261,28 @@ class AiMarketContext {
     } catch (error) {
       console.error(`Failed to fetch 24h (5m) candles: ${error.message}`);
       return this._cached24hCandles5m || [];
+    }
+  }
+
+  // ——— AI Reversal: 24h 1m candle fetcher ——————————————————————————————
+  // 1440 bars × 1m = exactly 24h, fetched in a single request (Binance klines
+  // cap is 1500). Feeds the 24h volume profile — 5× finer than the 5m window,
+  // which is what makes the 200-bin HVN/LVN resolution meaningful rather than
+  // just slicing the same smear thinner.
+
+  async _get24hCandles1m() {
+    const now = Date.now();
+    if (this._cached24hCandles1m && (now - this._candle24h1mCacheTime) < this._candle24h1mCacheTTL) {
+      return this._cached24hCandles1m;
+    }
+    try {
+      const klines = await this.strategy.makeProxyRequest('/fapi/v1/klines', 'GET', { symbol: this.strategy.symbol, interval: '1m', limit: VP_24H_1M_BARS }, false, 'futures');
+      this._cached24hCandles1m = this._parseKlines(klines);
+      this._candle24h1mCacheTime = now;
+      return this._cached24hCandles1m;
+    } catch (error) {
+      console.error(`Failed to fetch 24h (1m) candles: ${error.message}`);
+      return this._cached24hCandles1m || [];
     }
   }
 
@@ -266,9 +301,10 @@ class AiMarketContext {
       return cached.profile;
     }
     try {
-      const candles = windowKey === '7d' ? await this._get1hCandles() : await this._get24hCandles5m();
+      const candles = windowKey === '7d' ? await this._get1hCandles() : await this._get24hCandles1m();
       if (!candles || candles.length === 0) return null;
-      const profile = this._computeVolumeProfile(candles);
+      const binCount = windowKey === '7d' ? VP_BIN_COUNT_7D : VP_BIN_COUNT_24H;
+      const profile = this._computeVolumeProfile(candles, binCount);
       this._vpCache.set(cacheKey, { profile, at: now });
       return profile;
     } catch (error) {
@@ -293,13 +329,13 @@ class AiMarketContext {
    *     totalVolume,
    *   }
    */
-  _computeVolumeProfile(candles) {
+  _computeVolumeProfile(candles, binCount = VP_BIN_COUNT_7D) {
     if (!candles || candles.length === 0) return null;
     const priceMin = Math.min(...candles.map(c => c.low));
     const priceMax = Math.max(...candles.map(c => c.high));
     if (priceMax <= priceMin) return null;
-    const binWidth = (priceMax - priceMin) / VP_BIN_COUNT;
-    const bins = new Array(VP_BIN_COUNT).fill(0).map((_, i) => ({
+    const binWidth = (priceMax - priceMin) / binCount;
+    const bins = new Array(binCount).fill(0).map((_, i) => ({
       priceLow: priceMin + i * binWidth,
       priceHigh: priceMin + (i + 1) * binWidth,
       volume: 0,
@@ -308,7 +344,7 @@ class AiMarketContext {
     // Distribute each candle's volume uniformly across the bins its range covers.
     for (const c of candles) {
       const lowIdx = Math.max(0, Math.floor((c.low - priceMin) / binWidth));
-      const highIdx = Math.min(VP_BIN_COUNT - 1, Math.floor((c.high - priceMin) / binWidth));
+      const highIdx = Math.min(binCount - 1, Math.floor((c.high - priceMin) / binWidth));
       const span = Math.max(1, highIdx - lowIdx + 1);
       const perBin = c.volume / span;
       for (let i = lowIdx; i <= highIdx; i++) bins[i].volume += perBin;
@@ -349,13 +385,43 @@ class AiMarketContext {
     const val = bins[lo].priceLow;
     const vah = bins[hi].priceHigh;
 
-    // HVN / LVN classification — top/bottom 20% bins by volume.
-    // Bins are sorted into "magnetic" (HVN) and "void" (LVN) categories.
-    const sortedByVol = bins.map((b, i) => ({ ...b, idx: i })).sort((a, b) => b.volume - a.volume);
-    const hvnCutoff = Math.ceil(bins.length * 0.20);
-    const lvnCutoffStart = bins.length - Math.ceil(bins.length * 0.20);
-    const hvnSet = new Set(sortedByVol.slice(0, hvnCutoff).map(b => b.idx));
-    const lvnSet = new Set(sortedByVol.slice(lvnCutoffStart).map(b => b.idx));
+    // HVN / LVN classification — hybrid local-extrema + absolute-significance gate.
+    //   Shape:  a bin qualifies only if it is a local MAX (HVN) / MIN (LVN) over a
+    //           ±strength window (strength scaled as a fraction of binCount, à la Pine).
+    //   Gate:   HVN peaks must also be ≥ HVN_MIN_POC_FRAC of POC volume (drops
+    //           insignificant micro-peaks sitting in low-volume tails); LVN valleys
+    //           must be ≤ LVN_MAX_MEAN_FRAC of the mean bin volume (a genuine void,
+    //           not merely a dip between two heavy peaks). Interior voids — the
+    //           gaps price rips through — now surface instead of just the range edges.
+    const meanVol = totalVolume / bins.length;
+    const hvnStrength = Math.max(2, Math.round(bins.length * HVN_STRENGTH_FRAC));
+    const lvnStrength = Math.max(2, Math.round(bins.length * LVN_STRENGTH_FRAC));
+    const hvnMinVol = poc.volume * HVN_MIN_POC_FRAC;
+    const lvnMaxVol = meanVol * LVN_MAX_MEAN_FRAC;
+
+    // Local extremum tests over a clamped ±reach window. Ties (plateaus) pass, so a
+    // flat peak/valley run all qualifies and is merged into one range downstream.
+    const isLocalMax = (i, reach) => {
+      const v = bins[i].volume;
+      const from = Math.max(0, i - reach);
+      const to = Math.min(bins.length - 1, i + reach);
+      for (let j = from; j <= to; j++) if (j !== i && bins[j].volume > v) return false;
+      return true;
+    };
+    const isLocalMin = (i, reach) => {
+      const v = bins[i].volume;
+      const from = Math.max(0, i - reach);
+      const to = Math.min(bins.length - 1, i + reach);
+      for (let j = from; j <= to; j++) if (j !== i && bins[j].volume < v) return false;
+      return true;
+    };
+
+    const hvnSet = new Set();
+    const lvnSet = new Set();
+    for (let i = 0; i < bins.length; i++) {
+      if (bins[i].volume >= hvnMinVol && isLocalMax(i, hvnStrength)) hvnSet.add(i);
+      if (bins[i].volume <= lvnMaxVol && isLocalMin(i, lvnStrength)) lvnSet.add(i);
+    }
 
     // Merge consecutive HVN/LVN bins into contiguous ranges for AI readability.
     const mergeContiguous = (set) => {
@@ -389,6 +455,11 @@ class AiMarketContext {
       hvns: mergeContiguous(hvnSet),
       lvns: mergeContiguous(lvnSet),
       totalVolume,
+      // Compact per-bin volume array for the frontend VP histogram overlay.
+      // Rounded to integers — sub-unit precision is meaningless for a bar chart
+      // and keeps the status payload lean (the frontend rebuilds each bin's
+      // price range from priceMin + i*binWidth).
+      binVolumes: bins.map(b => Math.round(b.volume)),
     };
   }
 
@@ -867,6 +938,8 @@ class AiMarketContext {
     // AI Reversal caches.
     this._cached24hCandles5m = null;
     this._candle24hCacheTime = 0;
+    this._cached24hCandles1m = null;
+    this._candle24h1mCacheTime = 0;
     this._vpCache = new Map();
     this._cachedDepth = null;
     this._depthCacheTime = 0;
