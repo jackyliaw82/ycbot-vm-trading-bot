@@ -6,7 +6,7 @@ import { AiRiskGuard, FEE_RATE } from './ai-risk-guard.js';
 import { AiMarketContext } from './ai-market-context.js';
 import wsBroadcast from './ws-broadcast.js';
 import { FieldValue } from '@google-cloud/firestore';
-import { computeGridSetup } from './grid-levels.js';
+import { computeGridSetup, buildGridLines } from './grid-levels.js';
 import { planCrossingActions, averageOpenEntry } from './grid-crossings.js';
 
 // Per-model pricing in USD per million tokens.
@@ -566,6 +566,72 @@ class AiDualStrategy extends TradingBase {
     this.unwindTrancheFlags = new Array(this.gridLevelsPerSide).fill(false);
     this.gridMode = 'TREND';
     await this._writeStrategyFlow(direction === 'LONG' ? 'TREND_TRIGGER_L' : 'TREND_TRIGGER_S', { gridMode: 'TREND' });
+    await this.saveState();
+  }
+
+  // Flip the consolidated position (TREND -> UNWIND) at the outermost grid boundary.
+  // Closes the old consolidated side and opens the opposite direction at the SAME
+  // notional (hedge convention), then arms the tranche scale-out toward the anchor.
+  async _enterUnwind(newDirection, price) {
+    this.currentPrice = price;
+    const size = this.activePosition ? this.activePosition.notional : this.unwindConsolidatedSize;
+    await this.addLog(`===== UNWIND ${newDirection} (flip @ ${this._formatPrice(price)}) =====`);
+    await this._closeConsolidated('unwind_flip');          // close old side (hedge)
+    const qty = await this._openConsolidated(newDirection, size); // open opposite same size (hedge)
+    this.unwindDirection = newDirection;
+    this.unwindConsolidatedSize = size;
+    this.unwindConsolidatedQty = qty;
+    this.unwindTranchesRemaining = this.gridLevelsPerSide;
+    this.unwindTrancheFlags = new Array(this.gridLevelsPerSide).fill(false);
+    this.finalTpPrice = null;    // tranches handle TP during UNWIND
+    this.gridMode = 'UNWIND';
+    await this._writeStrategyFlow(newDirection === 'LONG' ? 'UNWIND_FLIP_L' : 'UNWIND_FLIP_S', { gridMode: 'UNWIND' });
+    await this.saveState();
+  }
+
+  // Tranche-TP the flipped position toward the anchor. UNWIND LONG closes as price RISES; SHORT as price FALLS.
+  async _processUnwindTranches(prevPrice, price) {
+    const N = this.gridLevelsPerSide;
+    const isLong = this.unwindDirection === 'LONG';
+    // targets: grid levels from (N-1) inward to 1, then the anchor (index N-1)
+    const targets = [];
+    for (let i = 0; i < N - 1; i++) {
+      const li = N - 1 - i;
+      const leg = this.gridLines.find(l => l.direction === this.unwindDirection && l.levelIndex === li);
+      targets.push({ idx: i, price: leg ? leg.price : null });
+    }
+    targets.push({ idx: N - 1, price: this.gridAnchor });
+
+    for (const t of targets) {
+      if (this.unwindTrancheFlags[t.idx] || t.price == null) continue;
+      const crossed = isLong ? (prevPrice < t.price && price >= t.price)
+                             : (prevPrice > t.price && price <= t.price);
+      if (!crossed) continue;
+      const trancheQty = this.roundQuantity((this.unwindConsolidatedQty || 0) / N);
+      if (trancheQty > 0) {
+        const closeSide = isLong ? 'SELL' : 'BUY';
+        await this.addLog(`UNWIND ${this.unwindDirection} tranche ${t.idx + 1}/${N} TP @ ${this._formatPrice(t.price)} qty ${trancheQty}.`);
+        await this.placeMarketOrder(this.symbol, closeSide, trancheQty, this.unwindDirection); // hedge close, no reduceOnly
+      }
+      this.unwindTrancheFlags[t.idx] = true;
+      this.unwindTranchesRemaining = Math.max(0, this.unwindTranchesRemaining - 1);
+      await this._writeStrategyFlow(isLong ? `UNWIND_TP_L${t.idx + 1}` : `UNWIND_TP_S${t.idx + 1}`, {});
+      if (this.unwindTranchesRemaining === 0) { await this._resumeRange(); return; }
+      await this.saveState();
+    }
+  }
+
+  // Resume RANGE on the SAME fixed grid (no VP recompute, no re-anchor).
+  async _resumeRange() {
+    await this.addLog('===== RANGE resumed (UNWIND complete at anchor) =====');
+    this.gridLines = buildGridLines(this.gridAnchor, this.gridUpperBoundary, this.gridLowerBoundary, this.gridLevelsPerSide);
+    this.vwapLong = null; this.vwapShort = null;
+    this.activePosition = null; this.currentSide = null; this.finalTpPrice = null;
+    this.trendDirection = null; this.unwindDirection = null;
+    this.unwindConsolidatedSize = null; this.unwindConsolidatedQty = null;
+    this.unwindTranchesRemaining = 0; this.unwindTrancheFlags = [];
+    this.gridMode = 'RANGE';
+    await this._writeStrategyFlow('RANGE_RESUME', { gridMode: 'RANGE' });
     await this.saveState();
   }
 
@@ -1218,6 +1284,27 @@ class AiDualStrategy extends TradingBase {
           finally { this._tradingSeqInProgress = false; }
           this.lastProcessedPrice = price; return;
         }
+      }
+      this.lastProcessedPrice = price;
+      return;
+    }
+    if (this.gridMode === 'UNWIND') {
+      if (this._tradingSeqInProgress) return;
+      const prev = this.lastProcessedPrice;
+      // Return to the ORIGIN LVN before anchor -> flatten remaining + re-enter TREND (origin direction).
+      if (prev != null) {
+        const backToLowerLVN = this.trendDirection === 'SHORT' && this.lowerLVN != null && prev > this.lowerLVN && price <= this.lowerLVN;
+        const backToUpperLVN = this.trendDirection === 'LONG' && this.upperLVN != null && prev < this.upperLVN && price >= this.upperLVN;
+        if (backToLowerLVN || backToUpperLVN) {
+          this._tradingSeqInProgress = true;
+          try { await this._closeConsolidated('unwind_to_trend'); await this._triggerTrend(this.trendDirection, price); }
+          finally { this._tradingSeqInProgress = false; }
+          this.lastProcessedPrice = price; return;
+        }
+      }
+      if (prev != null && prev !== price) {
+        this._tradingSeqInProgress = true;
+        try { await this._processUnwindTranches(prev, price); } finally { this._tradingSeqInProgress = false; }
       }
       this.lastProcessedPrice = price;
       return;
