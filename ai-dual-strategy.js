@@ -534,6 +534,21 @@ class AiDualStrategy extends TradingBase {
     this.recoveryDistanceAutoWiden = !!snapshot.config?.recoveryDistanceAutoWiden;
     this.aiVetoOnReversal = !!snapshot.config?.aiVetoOnReversal;
 
+    // ---- grid state ----
+    this.gridMode = snapshot.gridMode || 'RANGE';
+    this.gridAnchor = snapshot.gridAnchor ?? null;
+    this.gridUpperBoundary = snapshot.gridUpperBoundary ?? null;
+    this.gridLowerBoundary = snapshot.gridLowerBoundary ?? null;
+    this.upperLVN = snapshot.upperLVN ?? null;
+    this.lowerLVN = snapshot.lowerLVN ?? null;
+    this.gridLines = Array.isArray(snapshot.gridLines) ? snapshot.gridLines : [];
+    this.vwapLong = snapshot.vwapLong ?? null;
+    this.vwapShort = snapshot.vwapShort ?? null;
+    this.gridLevelsPerSide = Number(snapshot.config?.gridLevelsPerSide) || DEFAULT_GRID_LEVELS_PER_SIDE;
+    this.minStepPct = snapshot.config?.minStepPct != null ? Number(snapshot.config.minStepPct) : DEFAULT_MIN_STEP_PCT;
+    this.maxWidthPct = snapshot.config?.maxWidthPct != null ? Number(snapshot.config.maxWidthPct) : DEFAULT_MAX_WIDTH_PCT;
+    this.lastProcessedPrice = snapshot.lastProcessedPrice ?? null;
+
     // Restore cycle state
     this.currentSide = snapshot.currentSide || null;
     this.activePosition = snapshot.currentPosition || null;
@@ -2656,6 +2671,17 @@ class AiDualStrategy extends TradingBase {
         recoveryFactorDecay: this.recoveryFactorDecay,
         recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
         aiVetoOnReversal: this.aiVetoOnReversal,
+        // ---- grid state ----
+        gridMode: this.gridMode,
+        gridAnchor: this.gridAnchor,
+        gridUpperBoundary: this.gridUpperBoundary,
+        gridLowerBoundary: this.gridLowerBoundary,
+        upperLVN: this.upperLVN,
+        lowerLVN: this.lowerLVN,
+        gridLines: this.gridLines,          // array of flat objects (Firestore-safe: no nested arrays-of-arrays)
+        vwapLong: this.vwapLong,
+        vwapShort: this.vwapShort,
+        lastProcessedPrice: this.lastProcessedPrice,
         config: {
           recoveryFactor: this.recoveryFactor,
           recoveryDistance: this.recoveryDistance,
@@ -2665,6 +2691,9 @@ class AiDualStrategy extends TradingBase {
           recoveryFactorDecay: this.recoveryFactorDecay,
           recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
           aiVetoOnReversal: this.aiVetoOnReversal,
+          gridLevelsPerSide: this.gridLevelsPerSide,
+          minStepPct: this.minStepPct,
+          maxWidthPct: this.maxWidthPct,
         },
         criticalError: this.criticalError || null,
         lastUpdated: new Date(),
