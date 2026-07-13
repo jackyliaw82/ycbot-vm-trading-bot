@@ -1198,11 +1198,13 @@ class AiDualStrategy extends TradingBase {
       const prev = this.lastProcessedPrice;
       // Final TP -> close consolidated + STOP (covers accLoss + desired profit + fees).
       if (this.finalTpPrice && this._checkFinalTpHit(price)) {
+        // Final TP: stop() with flatten runs the hedge-consolidated close (its TREND/UNWIND
+        // branch) AND the final_tp bookkeeping (_postExecuteBookkeeping -> metrics sample,
+        // fresh accLoss, position verify, FINAL_TP_HIT strategyFlow marker). flatten:true safely
+        // no-ops the redundant close once activePosition is zeroed, so there is no double-close.
         this._tradingSeqInProgress = true;
         try {
-          await this._closeConsolidated('final_tp');
-          await this._writeStrategyFlow('FINAL_TP_HIT', { stopReason: 'final_tp' });
-          await this.stop({ reason: 'final_tp' });
+          await this.stop({ flatten: true, reason: 'final_tp' });
         } finally { this._tradingSeqInProgress = false; }
         return;
       }
