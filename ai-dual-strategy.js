@@ -563,6 +563,16 @@ class AiDualStrategy extends TradingBase {
       && this.cycleAccumulatedLoss >= this.harvestLossThreshold * this.initialCapital;
   }
 
+  // AI auto-harvest is only meaningful in TREND (a single consolidated position with a
+  // profitable side to target). Fires only when the toggle is ON and the gauge is full.
+  _isDualHarvestGateOpen() {
+    if (!this.aiAutoHarvest) return false;
+    if (this.gridMode !== 'TREND') return false;
+    if (!this.activePosition || !(this.activePosition.quantity > 0) || !this.currentSide) return false;
+    if (this.harvestPrice != null || this._harvestConsultPending) return false;
+    return this._isGaugeFull();
+  }
+
   // Dynamic recovery size for a TREND entry, with a gauge-full escalation freeze.
   _computeTrendSize() {
     this.cycleAccumulatedLoss = this._computeAccLoss();
@@ -599,6 +609,8 @@ class AiDualStrategy extends TradingBase {
     this.unwindTranchesRemaining = 0;
     this.unwindTrancheFlags = new Array(this.gridLevelsPerSide).fill(false);
     this.gridMode = 'TREND';
+    this.harvestPrice = null;
+    this._harvestConsultPending = false;
     await this._writeStrategyFlow(direction === 'LONG' ? 'TREND_TRIGGER_L' : 'TREND_TRIGGER_S', { gridMode: 'TREND' });
     await this.saveState();
   }
@@ -618,6 +630,7 @@ class AiDualStrategy extends TradingBase {
     this.unwindTranchesRemaining = this.gridLevelsPerSide;
     this.unwindTrancheFlags = new Array(this.gridLevelsPerSide).fill(false);
     this.finalTpPrice = null;    // tranches handle TP during UNWIND
+    this.harvestPrice = null;    // a harvest price set during TREND is stale after the flip
     this.gridMode = 'UNWIND';
     await this._writeStrategyFlow(newDirection === 'LONG' ? 'UNWIND_FLIP_L' : 'UNWIND_FLIP_S', { gridMode: 'UNWIND' });
     await this.saveState();
@@ -1371,6 +1384,18 @@ class AiDualStrategy extends TradingBase {
           await this.stop({ flatten: true, reason: 'final_tp' });
         } finally { this._tradingSeqInProgress = false; }
         return;
+      }
+      // AI auto-harvest (aiAutoHarvest ON): harvest price hit -> flatten to flat + re-anchor.
+      // NOTE: do NOT wrap in _tradingSeqInProgress here — `_harvestToFlat` self-guards with it
+      // (skips if already set), so an outer wrap would make it no-op. Just await it.
+      if (this.harvestPrice != null && this._checkHarvestPriceHit(price)) {
+        await this._harvestToFlat('ai_harvest_price_hit');
+        this.lastProcessedPrice = price; return;
+      }
+      // Gauge full + toggle ON + no price set yet -> ask AI for a harvest price (non-blocking).
+      if (this._isDualHarvestGateOpen()) {
+        this._requestHarvestPrice().catch(err =>
+          this.addLog(`ERROR harvest-price consult: ${err.message}`).catch(() => {}));
       }
       // UNWIND trigger: price returns across the outermost grid boundary on the origin side.
       if (prev != null) {
