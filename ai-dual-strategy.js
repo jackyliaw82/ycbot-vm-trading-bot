@@ -445,6 +445,37 @@ class AiDualStrategy extends TradingBase {
   }
 
   /**
+   * Grid crossing executor. Computes the ordered open/close actions for a
+   * `prevPrice → currentPrice` tick via the pure planner (`planCrossingActions`)
+   * and applies them in order (CLOSE before OPEN at each level, as the planner
+   * emits) through `_closeGridLeg`/`_openGridLeg`. Guarded by
+   * `_tradingSeqInProgress` so a fast tick can't re-enter while a prior
+   * crossing's orders are still in flight. OPEN actions re-check
+   * `leg.state === 'EMPTY'` immediately before opening as a defense against
+   * races with a concurrent state mutation between planning and execution.
+   */
+  async _processGridCrossings(prevPrice, currentPrice) {
+    if (this._tradingSeqInProgress) return;
+    const actions = planCrossingActions({
+      prevPrice, currentPrice, legs: this.gridLines, vwapLong: this.vwapLong, vwapShort: this.vwapShort,
+    });
+    if (!actions.length) return;
+
+    this._tradingSeqInProgress = true;
+    try {
+      for (const a of actions) {
+        if (a.kind === 'CLOSE') await this._closeGridLeg(a.leg, a.reason);
+        else if (a.kind === 'OPEN' && a.leg.state === 'EMPTY') await this._openGridLeg(a.leg);
+      }
+      await this.saveState();
+    } catch (e) {
+      await this.addLog(`ERROR grid crossing: ${e.message}`);
+    } finally {
+      this._tradingSeqInProgress = false;
+    }
+  }
+
+  /**
    * Resume a strategy from a Firestore snapshot. Called by app.js boot-scan
    * (recoverActiveStrategies) when a `type: 'AI_DUAL'` doc has
    * `isRunning: true` but no in-memory instance exists (i.e. PM2 restart
