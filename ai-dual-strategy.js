@@ -867,6 +867,15 @@ class AiDualStrategy extends TradingBase {
 
     await this.saveState();
 
+    // Mode-aware resume: RANGE rebuilds nothing (first tick / existing legs drive it);
+    // TREND re-arms Final TP from the restored consolidated position; UNWIND continues its tranche ladder.
+    if (this.gridMode === 'TREND' && this.activePosition && this.currentSide) {
+      this._recomputeFinalTpPrice();
+      await this.addLog(`Resumed in TREND ${this.currentSide}; Final TP ${this.finalTpPrice ? this._formatPrice(this.finalTpPrice) : 'n/a'}.`);
+    } else if (this.gridMode === 'UNWIND') {
+      await this.addLog(`Resumed in UNWIND ${this.unwindDirection}; ${this.unwindTranchesRemaining}/${this.gridLevelsPerSide} tranches remaining.`);
+    }
+
     // Resume policy after heartbeat removal:
     //   - In-position: do nothing. Bull/bear are restored from snapshot
     //     and stay fixed — no AI re-consult needed (the periodic rethink
