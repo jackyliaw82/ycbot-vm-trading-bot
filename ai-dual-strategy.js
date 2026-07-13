@@ -444,16 +444,17 @@ class AiDualStrategy extends TradingBase {
    * direction remain open, so the next open re-seeds it from scratch.
    */
   async _closeGridLeg(leg, reason) {
-    if (!leg.quantity || leg.quantity <= 0) { leg.state = 'EMPTY'; leg.quantity = null; return; }
+    if (!leg.quantity || leg.quantity <= 0) { leg.state = 'EMPTY'; leg.quantity = null; return null; }
     const closeSide = leg.direction === 'LONG' ? 'SELL' : 'BUY';
     await this.addLog(`Grid CLOSE ${leg.direction} L${leg.levelIndex} (${reason}) qty ${leg.quantity}.`);
     // HEDGE CLOSE: opposite side, same positionSide, NEVER reduceOnly (Binance rejects in hedge).
-    await this.placeMarketOrder(this.symbol, closeSide, leg.quantity, leg.direction);
+    const result = await this.placeMarketOrder(this.symbol, closeSide, leg.quantity, leg.direction);
     leg.state = 'EMPTY';
     leg.quantity = null;
     // If the side is now flat, null its locked vwap so the next OPEN re-seeds it.
     if (leg.direction === 'LONG' && !this.gridLines.some(l => l.direction === 'LONG' && l.state === 'POSITION_OPEN')) this.vwapLong = null;
     if (leg.direction === 'SHORT' && !this.gridLines.some(l => l.direction === 'SHORT' && l.state === 'POSITION_OPEN')) this.vwapShort = null;
+    return result?.orderId ?? null;
   }
 
   // Close every open grid leg to flat (hedge: positionSide per leg, never reduceOnly).
@@ -461,9 +462,18 @@ class AiDualStrategy extends TradingBase {
     const openLegs = this.gridLines.filter(l => l.state === 'POSITION_OPEN' && l.quantity > 0);
     if (!openLegs.length) return false;
     await this.addLog(`Flattening grid: closing ${openLegs.length} open leg(s).`);
+    const orderIds = [];
     for (const leg of openLegs) {
-      try { await this._closeGridLeg(leg, 'FLATTEN'); }
-      catch (e) { await this.addLog(`ERROR flattening ${leg.direction} L${leg.levelIndex}: ${e.message}`); }
+      try {
+        const oid = await this._closeGridLeg(leg, 'FLATTEN');
+        if (oid) orderIds.push(oid);
+      } catch (e) { await this.addLog(`ERROR flattening ${leg.direction} L${leg.levelIndex}: ${e.message}`); }
+    }
+    // Wait for close fills so accumulators (realized PnL + fees) reflect the flatten
+    // BEFORE any dynamic sizing reads them (mirrors _performReversal's fill-confirm-before-size).
+    for (const oid of orderIds) {
+      try { await this._waitForOrderFillConfirmation(oid, 3000); }
+      catch (e) { await this.addLog(`WARN flatten fill-confirm ${oid}: ${e.message}`); }
     }
     this.vwapLong = null;
     this.vwapShort = null;
