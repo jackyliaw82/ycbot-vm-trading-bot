@@ -29,12 +29,15 @@ export function computeGridSetup({ vah, val, lvns, currentPrice, gridLevelsPerSi
   );
   const hCapMax = maxWidthPct * anchor;
 
-  const h = Math.min(Math.max(h0, hNeeded), hCapLVN, hCapMax);
+  // Widen ONLY when the natural VAH/VAL step is too tight. The LVN and maxWidth
+  // caps bound the widening target — they must NOT shrink a naturally-wide value area.
+  const h = Math.max(h0, Math.min(hNeeded, hCapLVN, hCapMax));
   const upperBoundary = anchor + h;
   const lowerBoundary = anchor - h;
   const step = h / N;
   const stepPct = step / anchor;
-  const viable = stepPct >= minStepPct - 1e-12 && h > 0;
+  const priceInside = currentPrice >= lowerBoundary && currentPrice <= upperBoundary;
+  const viable = stepPct >= minStepPct - 1e-12 && h > 0 && priceInside;
 
   const gridLines = [];
   for (let k = 1; k <= N; k++) {
@@ -42,5 +45,5 @@ export function computeGridSetup({ vah, val, lvns, currentPrice, gridLevelsPerSi
     gridLines.push({ levelIndex: k, direction: 'LONG',  price: anchor - k * step, state: 'EMPTY', quantity: null });
   }
 
-  return { viable, anchor, upperBoundary, lowerBoundary, upperLVN, lowerLVN, stepPct, gridLines };
+  return { viable, anchor, upperBoundary, lowerBoundary, upperLVN, lowerLVN, stepPct, priceInside, gridLines };
 }

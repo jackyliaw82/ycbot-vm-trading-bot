@@ -51,3 +51,28 @@ test('computeGridSetup: LVNs too tight -> not viable', () => {
   // max symmetric half-width capped at nearer LVN ~0.275 => step ~0.055% < 0.25% floor
   assert.equal(r.viable, false);
 });
+
+test('computeGridSetup: naturally-wide value area is NOT shrunk by maxWidthPct', () => {
+  const wideLvns = [
+    { priceLow: 113, priceHigh: 114, volume: 8 }, // above VAH 110
+    { priceLow: 86, priceHigh: 87, volume: 8 },   // below VAL 90
+  ];
+  const r = computeGridSetup({ vah: 110, val: 90, lvns: wideLvns, currentPrice: 100,
+    gridLevelsPerSide: 5, minStepPct: 0.0025, maxWidthPct: 0.05 });
+  // h0 = 10; even though maxWidthPct*anchor = 5, the adequate VA must be kept
+  assert.equal(r.viable, true);
+  assert.equal(r.anchor, 100);
+  assert.equal(r.upperBoundary, 110);
+  assert.equal(r.lowerBoundary, 90);
+});
+
+test('computeGridSetup: current price outside the grid -> not viable', () => {
+  const lv = [
+    { priceLow: 103, priceHigh: 104, volume: 8 },
+    { priceLow: 96, priceHigh: 97, volume: 8 },
+  ];
+  const r = computeGridSetup({ vah: 102, val: 98, lvns: lv, currentPrice: 105,
+    gridLevelsPerSide: 5, minStepPct: 0.0025, maxWidthPct: 0.05 });
+  assert.equal(r.priceInside, false);
+  assert.equal(r.viable, false);
+});
