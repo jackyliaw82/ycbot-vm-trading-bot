@@ -471,6 +471,31 @@ class AiDualStrategy extends TradingBase {
     return true;
   }
 
+  // Open a single consolidated hedge position (TREND / UNWIND). positionSide encodes direction; NEVER reduceOnly.
+  async _openConsolidated(direction, sizeUSDT) {
+    const side = direction === 'LONG' ? 'BUY' : 'SELL';
+    const qty = await this._calculateAdjustedQuantity(this.symbol, sizeUSDT);
+    await this.addLog(`Consolidated OPEN ${direction} — ${this._formatNotional(sizeUSDT)} USDT, qty ${qty}.`);
+    await this.placeMarketOrder(this.symbol, side, qty, direction);
+    this.currentSide = direction;
+    this.activePosition = { quantity: qty, entryPrice: this.currentPrice, notional: sizeUSDT, unrealizedPnl: 0 };
+    this._recomputeFinalTpPrice();
+    return qty;
+  }
+
+  // Close the full consolidated hedge position to flat (opposite side, same positionSide, no reduceOnly).
+  async _closeConsolidated(reason) {
+    if (!this.activePosition || !(this.activePosition.quantity > 0) || !this.currentSide) return false;
+    const closeSide = this.currentSide === 'LONG' ? 'SELL' : 'BUY';
+    const qty = this.activePosition.quantity;
+    await this.addLog(`Consolidated CLOSE ${this.currentSide} qty ${qty} (${reason}).`);
+    await this.placeMarketOrder(this.symbol, closeSide, qty, this.currentSide);
+    this.activePosition = null;
+    this.currentSide = null;
+    this.finalTpPrice = null;
+    return true;
+  }
+
   /**
    * Grid crossing executor. Computes the ordered open/close actions for a
    * `prevPrice → currentPrice` tick via the pure planner (`planCrossingActions`)
@@ -811,6 +836,16 @@ class AiDualStrategy extends TradingBase {
           await this._flattenGrid();
         } catch (err) {
           await this.addLog(`[DUAL] stop: grid flatten failed: ${err.message}`);
+        }
+      } else if (this.activePosition && this.activePosition.quantity > 0 && (this.gridMode === 'TREND' || this.gridMode === 'UNWIND')) {
+        // Consolidated (TREND/UNWIND) hedge position — single positionSide-encoded
+        // position, not grid legs. Close it directly rather than falling through
+        // to the reversal HARVEST_CLOSE path (positionSide:'BOTH' + reduceOnly),
+        // which hedge mode rejects.
+        try {
+          await this._closeConsolidated('stop');
+        } catch (err) {
+          await this.addLog(`[DUAL] stop: consolidated close failed: ${err.message}`);
         }
       } else {
         // Source-of-truth refresh BEFORE the flatten check. activePosition can be
