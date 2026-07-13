@@ -527,6 +527,38 @@ class AiDualStrategy extends TradingBase {
     }
   }
 
+  // Dynamic recovery size for a TREND entry (Phase 3 will add the gauge-full freeze).
+  _computeTrendSize() {
+    this.cycleAccumulatedLoss = this._computeAccLoss();
+    const proposed = this._computeFormulaSize();
+    return this._applyMarginHeadroomCap(proposed);
+  }
+
+  // RANGE → TREND transition: flatten the grid, size the consolidated entry via
+  // dynamic recovery, open the single hedge position, and switch mode. Called
+  // by the LVN-breakout crossing handler (wired in Task 5) — not wired here.
+  async _triggerTrend(direction, price) {
+    this.currentPrice = price;
+    await this.addLog(`===== TREND ${direction} (LVN breakout @ ${this._formatPrice(price)}) =====`);
+    // 1) flatten the grid to flat
+    await this._flattenGrid();
+    // 2) dynamic recovery sizing
+    const sizeUSDT = this._computeTrendSize();
+    // 3) open the consolidated hedge position
+    await this._openConsolidated(direction, sizeUSDT);
+    // 4) mode + state
+    this.reversalCount++;
+    this.trendDirection = direction;
+    this.unwindDirection = null;
+    this.unwindConsolidatedSize = null;
+    this.unwindConsolidatedQty = null;
+    this.unwindTranchesRemaining = 0;
+    this.unwindTrancheFlags = new Array(this.gridLevelsPerSide).fill(false);
+    this.gridMode = 'TREND';
+    await this._writeStrategyFlow(direction === 'LONG' ? 'TREND_TRIGGER_L' : 'TREND_TRIGGER_S', { gridMode: 'TREND' });
+    await this.saveState();
+  }
+
   /**
    * Resume a strategy from a Firestore snapshot. Called by app.js boot-scan
    * (recoverActiveStrategies) when a `type: 'AI_DUAL'` doc has
