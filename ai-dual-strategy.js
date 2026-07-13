@@ -484,11 +484,21 @@ class AiDualStrategy extends TradingBase {
   // Open a single consolidated hedge position (TREND / UNWIND). positionSide encodes direction; NEVER reduceOnly.
   async _openConsolidated(direction, sizeUSDT) {
     const side = direction === 'LONG' ? 'BUY' : 'SELL';
-    const qty = await this._calculateAdjustedQuantity(this.symbol, sizeUSDT);
+    // Size against an EXPLICIT calc price (this.currentPrice) so there's no REST
+    // re-price, and with actionType 'CUT' — the documented de-risking path in
+    // trading-base._calculateAdjustedQuantity (~880) that BYPASSES the L5b
+    // ATR/volatility down-scaling (which only fires for ADD/ADD_LONG/ADD_SHORT).
+    // The consolidated size is a deliberately computed recovery notional;
+    // volatility-scaling it down would silently understate the recovery leg.
+    const qty = await this._calculateAdjustedQuantity(this.symbol, sizeUSDT, this.currentPrice, 'CUT');
     await this.addLog(`Consolidated OPEN ${direction} — ${this._formatNotional(sizeUSDT)} USDT, qty ${qty}.`);
     await this.placeMarketOrder(this.symbol, side, qty, direction);
     this.currentSide = direction;
-    this.activePosition = { quantity: qty, entryPrice: this.currentPrice, notional: sizeUSDT, unrealizedPnl: 0 };
+    // Record activePosition CONSISTENT with the actually-filled qty at the calc
+    // price: notional = qty * currentPrice (NOT the raw sizeUSDT), so
+    // _recomputeFinalTpPrice and the _enterUnwind flip size read a notional that
+    // matches the real position rather than the pre-rounding request.
+    this.activePosition = { quantity: qty, entryPrice: this.currentPrice, notional: qty * this.currentPrice, unrealizedPnl: 0 };
     this._recomputeFinalTpPrice();
     return qty;
   }
@@ -607,7 +617,10 @@ class AiDualStrategy extends TradingBase {
       const crossed = isLong ? (prevPrice < t.price && price >= t.price)
                              : (prevPrice > t.price && price <= t.price);
       if (!crossed) continue;
-      const trancheQty = this.roundQuantity((this.unwindConsolidatedQty || 0) / N);
+      const isFinal = t.idx === N - 1;
+      const trancheQty = isFinal
+        ? this.roundQuantity(this.activePosition?.quantity || 0)   // anchor tranche: sweep ALL remaining (no dust / rounds-to-zero orphan)
+        : this.roundQuantity((this.unwindConsolidatedQty || 0) / N);
       if (trancheQty > 0) {
         const closeSide = isLong ? 'SELL' : 'BUY';
         await this.addLog(`UNWIND ${this.unwindDirection} tranche ${t.idx + 1}/${N} TP @ ${this._formatPrice(t.price)} qty ${trancheQty}.`);
@@ -951,15 +964,20 @@ class AiDualStrategy extends TradingBase {
       // Grid-aware flatten. In hedge/RANGE the position is held as open grid
       // legs (positionSide LONG/SHORT, never reduceOnly), which the reversal
       // HARVEST_CLOSE path (positionSide:'BOTH' + reduceOnly) can't close — it
-      // would orphan the legs. When any grid leg is open, flatten the GRID;
-      // otherwise fall back to the reversal (single-sided) flatten path.
+      // would orphan the legs. BOTH a stray grid leg AND a consolidated
+      // (TREND/UNWIND) hedge position can be open at once (e.g. a grid leg
+      // failed to flatten on TREND entry), so close EACH that has open state;
+      // the reversal (single-sided) fallback runs ONLY if neither did.
+      let closedSomething = false;
       if (this.gridLines.some(l => l.state === 'POSITION_OPEN')) {
         try {
           await this._flattenGrid();
         } catch (err) {
           await this.addLog(`[DUAL] stop: grid flatten failed: ${err.message}`);
         }
-      } else if (this.activePosition && this.activePosition.quantity > 0 && (this.gridMode === 'TREND' || this.gridMode === 'UNWIND')) {
+        closedSomething = true;
+      }
+      if (this.activePosition && this.activePosition.quantity > 0 && (this.gridMode === 'TREND' || this.gridMode === 'UNWIND')) {
         // Consolidated (TREND/UNWIND) hedge position — single positionSide-encoded
         // position, not grid legs. Close it directly rather than falling through
         // to the reversal HARVEST_CLOSE path (positionSide:'BOTH' + reduceOnly),
@@ -969,7 +987,9 @@ class AiDualStrategy extends TradingBase {
         } catch (err) {
           await this.addLog(`[DUAL] stop: consolidated close failed: ${err.message}`);
         }
-      } else {
+        closedSomething = true;
+      }
+      if (!closedSomething) {
         // Source-of-truth refresh BEFORE the flatten check. activePosition can be
         // null in-memory while Binance still holds an open position (state lost
         // across a partial restart, missed WS update, etc.) — without this
