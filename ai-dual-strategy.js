@@ -680,27 +680,36 @@ class AiDualStrategy extends TradingBase {
   // De-risk to flat (hedge-safe) and re-anchor RANGE. accLoss is NOT reset (real carried loss);
   // the gauge only empties if the realized PnL reduces cycleAccumulatedLoss on its own.
   async _harvestToFlat(reason) {
-    await this.addLog(`===== HARVEST (${reason}) — flatten to flat + re-anchor =====`);
-    if (this.gridLines.some(l => l.state === 'POSITION_OPEN')) {
-      try { await this._flattenGrid(); } catch (e) { await this.addLog(`ERROR harvest grid flatten: ${e.message}`); }
+    if (this._tradingSeqInProgress) {
+      await this.addLog(`Harvest (${reason}) skipped — a trading sequence is already in progress; retry.`);
+      return;
     }
-    if (this.activePosition && this.activePosition.quantity > 0) {
-      try { await this._closeConsolidated('harvest'); } catch (e) { await this.addLog(`ERROR harvest consolidated close: ${e.message}`); }
+    this._tradingSeqInProgress = true;
+    try {
+      await this.addLog(`===== HARVEST (${reason}) — flatten to flat + re-anchor =====`);
+      if (this.gridLines.some(l => l.state === 'POSITION_OPEN')) {
+        try { await this._flattenGrid(); } catch (e) { await this.addLog(`ERROR harvest grid flatten: ${e.message}`); }
+      }
+      if (this.activePosition && this.activePosition.quantity > 0) {
+        try { await this._closeConsolidated('harvest'); } catch (e) { await this.addLog(`ERROR harvest consolidated close: ${e.message}`); }
+      }
+      this.harvestCount = (this.harvestCount || 0) + 1;
+      this.harvestPrice = null;
+      this._harvestConsultPending = false;
+      // Re-anchor: clear the grid so the next tick's empty-grid gate rebuilds VP around current price.
+      this.gridLines = [];
+      this._lastGridInitAttempt = null; // let the re-anchor fire on the very next tick (bypass throttle)
+      this.vwapLong = null; this.vwapShort = null;
+      this.trendDirection = null; this.unwindDirection = null;
+      this.unwindConsolidatedSize = null; this.unwindConsolidatedQty = null;
+      this.unwindTranchesRemaining = 0; this.unwindTrancheFlags = [];
+      this.gridMode = 'RANGE';
+      this._harvestRestartPending = true; // next TREND entry re-sizes fresh (freeze exception)
+      await this._writeStrategyFlow('HARVEST', { reason, gridMode: 'RANGE' });
+      await this.saveState();
+    } finally {
+      this._tradingSeqInProgress = false;
     }
-    this.harvestCount = (this.harvestCount || 0) + 1;
-    this.harvestPrice = null;
-    this._harvestConsultPending = false;
-    // Re-anchor: clear the grid so the next tick's empty-grid gate rebuilds VP around current price.
-    this.gridLines = [];
-    this._lastGridInitAttempt = null; // let the re-anchor fire on the very next tick (bypass throttle)
-    this.vwapLong = null; this.vwapShort = null;
-    this.trendDirection = null; this.unwindDirection = null;
-    this.unwindConsolidatedSize = null; this.unwindConsolidatedQty = null;
-    this.unwindTranchesRemaining = 0; this.unwindTrancheFlags = [];
-    this.gridMode = 'RANGE';
-    this._harvestRestartPending = true; // next TREND entry re-sizes fresh (freeze exception)
-    await this._writeStrategyFlow('HARVEST', { reason, gridMode: 'RANGE' });
-    await this.saveState();
   }
 
   /**
