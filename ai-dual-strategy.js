@@ -36,6 +36,7 @@ const STALE_RETRY_MAX_MS = 30 * 60 * 1000;
 const DEFAULT_GRID_LEVELS_PER_SIDE = 5;
 const DEFAULT_MIN_STEP_PCT = 0.0025;   // round-trip fee+slippage floor
 const DEFAULT_MAX_WIDTH_PCT = 0.05;    // cap on half-width fraction from anchor
+const GRID_INIT_RETRY_MS = 10000; // throttle grid-build retries (buildReversalContext makes an uncached account REST call)
 
 function formatDuration(ms) {
   if (!ms || ms < 0) return 'N/A';
@@ -1015,6 +1016,28 @@ class AiDualStrategy extends TradingBase {
         timestamp: new Date().toISOString(),
       });
     } catch (_) { /* best-effort */ }
+
+    // ---- Grid gate (Phase 1: RANGE). TREND/UNWIND fall through to the reversal body (Phase 2). ----
+    if (!this.gridLines.length) {
+      // Throttle retries: buildReversalContext issues an UNCACHED account REST call
+      // (ai-market-context._getMarginInfo), so do not rebuild every tick while the VP
+      // is not yet viable. `_lastGridInitAttempt` is lazily initialised (undefined -> retry now).
+      const nowMs = Date.now();
+      if (!this._lastGridInitAttempt || nowMs - this._lastGridInitAttempt >= GRID_INIT_RETRY_MS) {
+        this._lastGridInitAttempt = nowMs;
+        await this.initializeGrid(price);
+      }
+      this.lastProcessedPrice = price;
+      return;
+    }
+    if (this.gridMode === 'RANGE') {
+      if (this.lastProcessedPrice != null && this.lastProcessedPrice !== price) {
+        await this._processGridCrossings(this.lastProcessedPrice, price);
+      }
+      this.lastProcessedPrice = price;
+      return;
+    }
+    // gridMode TREND/UNWIND -> continue into the reversal-derived logic below (wired in Phase 2).
 
     // Keep the in-memory position's unrealized PnL fresh on every tick.
     // Cheap (multiplication + sign branch); needed so getStatus() and
