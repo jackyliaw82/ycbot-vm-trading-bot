@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pickBoundaryLVNs, computeGridSetup } from '../grid-levels.js';
+import { pickBoundaryLVNs, computeGridSetup, buildGridLines } from '../grid-levels.js';
 
 const lvns = [
   { priceLow: 96, priceHigh: 97, volume: 10 },   // below VAL
@@ -75,4 +75,17 @@ test('computeGridSetup: current price outside the grid -> not viable', () => {
     gridLevelsPerSide: 5, minStepPct: 0.0025, maxWidthPct: 0.05 });
   assert.equal(r.priceInside, false);
   assert.equal(r.viable, false);
+});
+
+test('buildGridLines: symmetric EMPTY legs at the boundaries', () => {
+  const legs = buildGridLines(100, 102, 98, 5);
+  assert.equal(legs.length, 10);
+  const s5 = legs.find(l => l.direction === 'SHORT' && l.levelIndex === 5);
+  const l5 = legs.find(l => l.direction === 'LONG' && l.levelIndex === 5);
+  assert.equal(s5.price, 102);   // outermost short at upper boundary
+  assert.equal(l5.price, 98);    // outermost long at lower boundary
+  assert.equal(s5.state, 'EMPTY');
+  assert.equal(s5.quantity, null);
+  const s1 = legs.find(l => l.direction === 'SHORT' && l.levelIndex === 1);
+  assert.ok(Math.abs(s1.price - 100.4) < 1e-9); // anchor + 1*step, step=0.4
 });

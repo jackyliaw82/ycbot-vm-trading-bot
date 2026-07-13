@@ -15,6 +15,18 @@ export function pickBoundaryLVNs(lvns, vah, val) {
   };
 }
 
+// Build EMPTY grid legs from a fixed anchor + boundaries (used by computeGridSetup and RANGE resume).
+export function buildGridLines(anchor, upperBoundary, lowerBoundary, gridLevelsPerSide) {
+  const N = gridLevelsPerSide;
+  const step = (upperBoundary - lowerBoundary) / (2 * N);
+  const legs = [];
+  for (let k = 1; k <= N; k++) {
+    legs.push({ levelIndex: k, direction: 'SHORT', price: anchor + k * step, state: 'EMPTY', quantity: null });
+    legs.push({ levelIndex: k, direction: 'LONG',  price: anchor - k * step, state: 'EMPTY', quantity: null });
+  }
+  return legs;
+}
+
 // Build the fixed grid geometry for a RANGE cycle.
 export function computeGridSetup({ vah, val, lvns, currentPrice, gridLevelsPerSide, minStepPct, maxWidthPct }) {
   const N = gridLevelsPerSide;
@@ -39,11 +51,7 @@ export function computeGridSetup({ vah, val, lvns, currentPrice, gridLevelsPerSi
   const priceInside = currentPrice >= lowerBoundary && currentPrice <= upperBoundary;
   const viable = stepPct >= minStepPct - 1e-12 && h > 0 && priceInside;
 
-  const gridLines = [];
-  for (let k = 1; k <= N; k++) {
-    gridLines.push({ levelIndex: k, direction: 'SHORT', price: anchor + k * step, state: 'EMPTY', quantity: null });
-    gridLines.push({ levelIndex: k, direction: 'LONG',  price: anchor - k * step, state: 'EMPTY', quantity: null });
-  }
+  const gridLines = buildGridLines(anchor, upperBoundary, lowerBoundary, N);
 
   return { viable, anchor, upperBoundary, lowerBoundary, upperLVN, lowerLVN, stepPct, priceInside, gridLines };
 }
