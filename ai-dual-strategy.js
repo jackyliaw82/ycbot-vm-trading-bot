@@ -183,6 +183,14 @@ class AiDualStrategy extends TradingBase {
     this.minStepPct = DEFAULT_MIN_STEP_PCT;
     this.maxWidthPct = DEFAULT_MAX_WIDTH_PCT;
     this._tradingSeqInProgress = false; // grid crossing reentrancy guard
+
+    // ---- TREND / UNWIND state ----
+    this.trendDirection = null;         // origin breakout direction ('LONG'|'SHORT')
+    this.unwindDirection = null;        // flipped direction during UNWIND
+    this.unwindConsolidatedSize = null; // USDT notional carried into UNWIND
+    this.unwindConsolidatedQty = null;  // base-asset qty carried into UNWIND
+    this.unwindTranchesRemaining = 0;
+    this.unwindTrancheFlags = [];       // bool[] length gridLevelsPerSide
   }
 
   // ——— Lifecycle ——————————————————————————————————————————————————————
@@ -566,6 +574,14 @@ class AiDualStrategy extends TradingBase {
     this.minStepPct = snapshot.config?.minStepPct != null ? Number(snapshot.config.minStepPct) : DEFAULT_MIN_STEP_PCT;
     this.maxWidthPct = snapshot.config?.maxWidthPct != null ? Number(snapshot.config.maxWidthPct) : DEFAULT_MAX_WIDTH_PCT;
     this.lastProcessedPrice = snapshot.lastProcessedPrice ?? null;
+
+    // ---- TREND / UNWIND state ----
+    this.trendDirection = snapshot.trendDirection ?? null;
+    this.unwindDirection = snapshot.unwindDirection ?? null;
+    this.unwindConsolidatedSize = snapshot.unwindConsolidatedSize ?? null;
+    this.unwindConsolidatedQty = snapshot.unwindConsolidatedQty ?? null;
+    this.unwindTranchesRemaining = snapshot.unwindTranchesRemaining ?? 0;
+    this.unwindTrancheFlags = Array.isArray(snapshot.unwindTrancheFlags) ? snapshot.unwindTrancheFlags : [];
 
     // Restore cycle state
     this.currentSide = snapshot.currentSide || null;
@@ -2716,6 +2732,13 @@ class AiDualStrategy extends TradingBase {
         vwapLong: this.vwapLong,
         vwapShort: this.vwapShort,
         lastProcessedPrice: this.lastProcessedPrice,
+        // ---- TREND / UNWIND state ----
+        trendDirection: this.trendDirection,
+        unwindDirection: this.unwindDirection,
+        unwindConsolidatedSize: this.unwindConsolidatedSize,
+        unwindConsolidatedQty: this.unwindConsolidatedQty,
+        unwindTranchesRemaining: this.unwindTranchesRemaining,
+        unwindTrancheFlags: this.unwindTrancheFlags,
         config: {
           recoveryFactor: this.recoveryFactor,
           recoveryDistance: this.recoveryDistance,
