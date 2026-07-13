@@ -1173,13 +1173,53 @@ class AiDualStrategy extends TradingBase {
       // A crossing sequence is still in flight: skip this tick WITHOUT advancing
       // lastProcessedPrice, so the intervening band is re-evaluated on the next free tick.
       if (this._tradingSeqInProgress) return;
+      // LVN breakout -> TREND (immediate; no confirmation, no buffer).
+      const prev = this.lastProcessedPrice;
+      if (prev != null) {
+        if (this.upperLVN != null && prev < this.upperLVN && price >= this.upperLVN) {
+          this._tradingSeqInProgress = true;
+          try { await this._triggerTrend('LONG', price); } finally { this._tradingSeqInProgress = false; }
+          this.lastProcessedPrice = price; return;
+        }
+        if (this.lowerLVN != null && prev > this.lowerLVN && price <= this.lowerLVN) {
+          this._tradingSeqInProgress = true;
+          try { await this._triggerTrend('SHORT', price); } finally { this._tradingSeqInProgress = false; }
+          this.lastProcessedPrice = price; return;
+        }
+      }
       if (this.lastProcessedPrice != null && this.lastProcessedPrice !== price) {
         await this._processGridCrossings(this.lastProcessedPrice, price);
       }
       this.lastProcessedPrice = price;
       return;
     }
-    // gridMode TREND/UNWIND -> continue into the reversal-derived logic below (wired in Phase 2).
+    if (this.gridMode === 'TREND') {
+      if (this._tradingSeqInProgress) return;
+      const prev = this.lastProcessedPrice;
+      // Final TP -> close consolidated + STOP (covers accLoss + desired profit + fees).
+      if (this.finalTpPrice && this._checkFinalTpHit(price)) {
+        this._tradingSeqInProgress = true;
+        try {
+          await this._closeConsolidated('final_tp');
+          await this._writeStrategyFlow('FINAL_TP_HIT', { stopReason: 'final_tp' });
+          await this.stop({ reason: 'final_tp' });
+        } finally { this._tradingSeqInProgress = false; }
+        return;
+      }
+      // UNWIND trigger: price returns across the outermost grid boundary on the origin side.
+      if (prev != null) {
+        const backDown = this.trendDirection === 'LONG' && prev > this.gridUpperBoundary && price <= this.gridUpperBoundary;
+        const backUp   = this.trendDirection === 'SHORT' && prev < this.gridLowerBoundary && price >= this.gridLowerBoundary;
+        if (backDown || backUp) {
+          this._tradingSeqInProgress = true;
+          try { await this._enterUnwind(this.trendDirection === 'LONG' ? 'SHORT' : 'LONG', price); }
+          finally { this._tradingSeqInProgress = false; }
+          this.lastProcessedPrice = price; return;
+        }
+      }
+      this.lastProcessedPrice = price;
+      return;
+    }
 
     // Keep the in-memory position's unrealized PnL fresh on every tick.
     // Cheap (multiplication + sign branch); needed so getStatus() and
