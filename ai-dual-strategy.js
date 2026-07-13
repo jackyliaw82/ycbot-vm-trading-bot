@@ -196,6 +196,7 @@ class AiDualStrategy extends TradingBase {
     this.aiAutoHarvest = false;         // config: AI sets a harvest price during TREND (default OFF = manual only)
     this._lastTrendSize = null;         // last dynamic TREND size (for gauge-full freeze)
     this._harvestRestartPending = false;// next TREND sizes fresh after a harvest-to-flat
+    this._manualHarvestRequested = false; // latch: harvestNow() sets this; honored on the next free tick (transient, not persisted)
   }
 
   // ——— Lifecycle ——————————————————————————————————————————————————————
@@ -685,6 +686,7 @@ class AiDualStrategy extends TradingBase {
     this.trendDirection = null; this.unwindDirection = null;
     this.unwindConsolidatedSize = null; this.unwindConsolidatedQty = null;
     this.unwindTranchesRemaining = 0; this.unwindTrancheFlags = [];
+    this.harvestPrice = null;
     this.gridMode = 'RANGE';
     await this._writeStrategyFlow('RANGE_RESUME', { gridMode: 'RANGE' });
     await this.saveState();
@@ -708,6 +710,7 @@ class AiDualStrategy extends TradingBase {
       }
       this.harvestCount = (this.harvestCount || 0) + 1;
       this.harvestPrice = null;
+      this.finalTpPrice = null;
       this._harvestConsultPending = false;
       // Re-anchor: clear the grid so the next tick's empty-grid gate rebuilds VP around current price.
       this.gridLines = [];
@@ -1346,6 +1349,15 @@ class AiDualStrategy extends TradingBase {
       this.lastProcessedPrice = price;
       return;
     }
+
+    // Honor a queued manual harvest on the next free tick (harvestNow sets the latch).
+    if (this._manualHarvestRequested && !this._tradingSeqInProgress) {
+      this._manualHarvestRequested = false;
+      await this._harvestToFlat('manual_harvest');
+      this.lastProcessedPrice = price;
+      return;
+    }
+
     if (this.gridMode === 'RANGE') {
       // A crossing sequence is still in flight: skip this tick WITHOUT advancing
       // lastProcessedPrice, so the intervening band is re-evaluated on the next free tick.
@@ -2104,8 +2116,10 @@ class AiDualStrategy extends TradingBase {
    *
    * Delegates to `_harvestToFlat` (hedge-safe: `_flattenGrid` + `_closeConsolidated`,
    * never reduceOnly, never the one-way `_executeHarvest`/HARVEST_CLOSE path).
-   * The flatten is fired-and-forgotten so the HTTP caller gets an immediate
-   * ack; the strategy re-anchors RANGE on the next tick once it lands.
+   * `_harvestToFlat` self-guards on `_tradingSeqInProgress` and SKIPS if a
+   * trading sequence is momentarily in flight, so this sets a latch instead
+   * of firing directly — `handleRealtimePrice` honors it on the next free
+   * tick, guaranteeing the harvest actually runs (no silent no-op).
    *
    * Refuses only when there is nothing open. Throws on ineligibility (the
    * route maps it to a 409).
@@ -2119,10 +2133,8 @@ class AiDualStrategy extends TradingBase {
     if (!hasGrid && !hasConsolidated) {
       throw new Error('Nothing open to harvest.');
     }
-    // Fire-and-forget so the HTTP handler returns immediately; harvest runs to completion.
-    this._harvestToFlat('manual_harvest').catch(err =>
-      this.addLog(`ERROR manual harvest: ${err.message}`).catch(() => {}));
-    return { harvesting: true, mode: this.gridMode, price: this.currentPrice };
+    this._manualHarvestRequested = true; // honored on the next free tick (see handleRealtimePrice)
+    return { harvesting: true, queued: true, mode: this.gridMode, price: this.currentPrice };
   }
 
   /**
