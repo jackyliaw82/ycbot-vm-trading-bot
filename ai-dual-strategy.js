@@ -304,9 +304,16 @@ class AiDualStrategy extends TradingBase {
       await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
       throw new Error(msg);
     }
-    if (minNotional && this.currentInitialSize < this.gridLevelsPerSide * minNotional) {
-      throw new Error(`AiDualStrategy.start: initialSize ${this.currentInitialSize} too small for ${this.gridLevelsPerSide} grid levels/side — need >= ${this.gridLevelsPerSide * minNotional} (minNotional ${minNotional}). Grid deploys up to 2N legs each >= minNotional.`);
-    }
+    // Grid geometry auto-fits the capital: each grid leg is initialSize / N and
+    // must clear minNotional, so cap levels-per-side at floor(initialSize / minNotional)
+    // (up to the default). A modest account runs a thinner grid rather than failing —
+    // grid geometry is auto-derived, not a user knob. (A size below one leg's worth
+    // was already rejected above.)
+    this.gridLevelsPerSide = Math.min(
+      DEFAULT_GRID_LEVELS_PER_SIDE,
+      Math.floor(this.currentInitialSize / minNotional)
+    );
+    await this.addLog(`Grid levels/side auto-set to ${this.gridLevelsPerSide} (initialSize ${this.currentInitialSize} USDT / minNotional ${minNotional} USDT, cap ${DEFAULT_GRID_LEVELS_PER_SIDE}).`);
 
     // Initial capital snapshot — drives the harvest gate and the sizing self-regulation loop.
     this.initialWalletBalance = await this.getWalletBalance();
