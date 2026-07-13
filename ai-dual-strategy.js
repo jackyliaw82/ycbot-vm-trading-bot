@@ -234,7 +234,7 @@ class AiDualStrategy extends TradingBase {
     // DeepSeek's Anthropic-compatible endpoint.
     const aiApiKey = await this._fetchDeepseekApiKey();
 
-    await this.addLog(`Starting AI Reversal Strategy for ${this.symbol}...`);
+    await this.addLog(`Starting AI Dual Strategy for ${this.symbol}...`);
     // Surface EVERY config field — used to verify the form values made it
     // through to the VM untouched. Three groups separated by `|` for
     // readability: identity/sizing | recovery knobs | advanced toggles.
@@ -275,6 +275,9 @@ class AiDualStrategy extends TradingBase {
       const msg = `Initial size (${this.currentInitialSize} USDT) below minimum notional (${minNotional} USDT)`;
       await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
       throw new Error(msg);
+    }
+    if (minNotional && this.currentInitialSize < this.gridLevelsPerSide * minNotional) {
+      throw new Error(`AiDualStrategy.start: initialSize ${this.currentInitialSize} too small for ${this.gridLevelsPerSide} grid levels/side — need >= ${this.gridLevelsPerSide * minNotional} (minNotional ${minNotional}). Grid deploys up to 2N legs each >= minNotional.`);
     }
 
     // Initial capital snapshot — drives the harvest gate and the sizing self-regulation loop.
@@ -443,6 +446,21 @@ class AiDualStrategy extends TradingBase {
     // If the side is now flat, null its locked vwap so the next OPEN re-seeds it.
     if (leg.direction === 'LONG' && !this.gridLines.some(l => l.direction === 'LONG' && l.state === 'POSITION_OPEN')) this.vwapLong = null;
     if (leg.direction === 'SHORT' && !this.gridLines.some(l => l.direction === 'SHORT' && l.state === 'POSITION_OPEN')) this.vwapShort = null;
+  }
+
+  // Close every open grid leg to flat (hedge: positionSide per leg, never reduceOnly).
+  async _flattenGrid() {
+    const openLegs = this.gridLines.filter(l => l.state === 'POSITION_OPEN' && l.quantity > 0);
+    if (!openLegs.length) return false;
+    await this.addLog(`Flattening grid: closing ${openLegs.length} open leg(s).`);
+    for (const leg of openLegs) {
+      try { await this._closeGridLeg(leg, 'FLATTEN'); }
+      catch (e) { await this.addLog(`ERROR flattening ${leg.direction} L${leg.levelIndex}: ${e.message}`); }
+    }
+    this.vwapLong = null;
+    this.vwapShort = null;
+    await this.saveState();
+    return true;
   }
 
   /**
@@ -767,35 +785,48 @@ class AiDualStrategy extends TradingBase {
     const exitPrice = this.currentPrice;
 
     if (flatten) {
-      // Source-of-truth refresh BEFORE the flatten check. activePosition can be
-      // null in-memory while Binance still holds an open position (state lost
-      // across a partial restart, missed WS update, etc.) — without this
-      // refresh the close silently no-ops and the user is left with an open
-      // position. stop() always closes.
-      try {
-        await this._refreshCurrentPosition();
-      } catch (err) {
-        await this.addLog(`[REVERSAL] stop: pre-flatten position refresh failed: ${err.message}`);
-      }
-
-      if (this.activePosition && this.activePosition.quantity > 0) {
-        const closeReason = reason === 'final_tp' ? 'final_tp' : 'user-stop';
+      // Grid-aware flatten. In hedge/RANGE the position is held as open grid
+      // legs (positionSide LONG/SHORT, never reduceOnly), which the reversal
+      // HARVEST_CLOSE path (positionSide:'BOTH' + reduceOnly) can't close — it
+      // would orphan the legs. When any grid leg is open, flatten the GRID;
+      // otherwise fall back to the reversal (single-sided) flatten path.
+      if (this.gridLines.some(l => l.state === 'POSITION_OPEN')) {
         try {
-          await this.addLog(`[REVERSAL] stop: flattening ${this.currentSide} ${this.activePosition.quantity} (${closeReason})`);
-          await this.executor.executeAction({ type: 'HARVEST_CLOSE', reason: closeReason });
-          // Verify the close actually flattened — if Binance still reports a
-          // residual position, log a warning so it's surfaced in the log feed.
-          await this._refreshCurrentPosition();
-          if (this.activePosition && this.activePosition.quantity > 0) {
-            await this.addLog(`[REVERSAL] WARNING: stop+flatten left residual ${this.currentSide} ${this.activePosition.quantity} on Binance — close it manually`);
-          } else {
-            await this.addLog('[REVERSAL] stop: position confirmed flat');
-          }
+          await this._flattenGrid();
         } catch (err) {
-          await this.addLog(`[REVERSAL] stop: flatten failed: ${err.message}`);
+          await this.addLog(`[DUAL] stop: grid flatten failed: ${err.message}`);
         }
       } else {
-        await this.addLog('[REVERSAL] stop: no open position on Binance — nothing to flatten');
+        // Source-of-truth refresh BEFORE the flatten check. activePosition can be
+        // null in-memory while Binance still holds an open position (state lost
+        // across a partial restart, missed WS update, etc.) — without this
+        // refresh the close silently no-ops and the user is left with an open
+        // position. stop() always closes.
+        try {
+          await this._refreshCurrentPosition();
+        } catch (err) {
+          await this.addLog(`[REVERSAL] stop: pre-flatten position refresh failed: ${err.message}`);
+        }
+
+        if (this.activePosition && this.activePosition.quantity > 0) {
+          const closeReason = reason === 'final_tp' ? 'final_tp' : 'user-stop';
+          try {
+            await this.addLog(`[REVERSAL] stop: flattening ${this.currentSide} ${this.activePosition.quantity} (${closeReason})`);
+            await this.executor.executeAction({ type: 'HARVEST_CLOSE', reason: closeReason });
+            // Verify the close actually flattened — if Binance still reports a
+            // residual position, log a warning so it's surfaced in the log feed.
+            await this._refreshCurrentPosition();
+            if (this.activePosition && this.activePosition.quantity > 0) {
+              await this.addLog(`[REVERSAL] WARNING: stop+flatten left residual ${this.currentSide} ${this.activePosition.quantity} on Binance — close it manually`);
+            } else {
+              await this.addLog('[REVERSAL] stop: position confirmed flat');
+            }
+          } catch (err) {
+            await this.addLog(`[REVERSAL] stop: flatten failed: ${err.message}`);
+          }
+        } else {
+          await this.addLog('[REVERSAL] stop: no open position on Binance — nothing to flatten');
+        }
       }
 
       // Final TP: write the strategyFlow audit record + metricsSample so
@@ -1046,6 +1077,9 @@ class AiDualStrategy extends TradingBase {
       return;
     }
     if (this.gridMode === 'RANGE') {
+      // A crossing sequence is still in flight: skip this tick WITHOUT advancing
+      // lastProcessedPrice, so the intervening band is re-evaluated on the next free tick.
+      if (this._tradingSeqInProgress) return;
       if (this.lastProcessedPrice != null && this.lastProcessedPrice !== price) {
         await this._processGridCrossings(this.lastProcessedPrice, price);
       }
