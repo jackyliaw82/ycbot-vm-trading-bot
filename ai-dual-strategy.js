@@ -615,6 +615,11 @@ class AiDualStrategy extends TradingBase {
       }
       this.unwindTrancheFlags[t.idx] = true;
       this.unwindTranchesRemaining = Math.max(0, this.unwindTranchesRemaining - 1);
+      // Keep the in-memory consolidated size in sync so _closeConsolidated (re-trigger / stop)
+      // closes only the REMAINING quantity, not the stale full original (hedge over-close guard).
+      if (this.activePosition) {
+        this.activePosition.quantity = Math.max(0, this.roundQuantity((this.activePosition.quantity || 0) - trancheQty));
+      }
       await this._writeStrategyFlow(isLong ? `UNWIND_TP_L${t.idx + 1}` : `UNWIND_TP_S${t.idx + 1}`, {});
       if (this.unwindTranchesRemaining === 0) { await this._resumeRange(); return; }
       await this.saveState();
