@@ -191,6 +191,11 @@ class AiDualStrategy extends TradingBase {
     this.unwindConsolidatedQty = null;  // base-asset qty carried into UNWIND
     this.unwindTranchesRemaining = 0;
     this.unwindTrancheFlags = [];       // bool[] length gridLevelsPerSide
+
+    // ---- Phase 3: harvest-gauge cap ----
+    this.aiAutoHarvest = false;         // config: AI sets a harvest price during TREND (default OFF = manual only)
+    this._lastTrendSize = null;         // last dynamic TREND size (for gauge-full freeze)
+    this._harvestRestartPending = false;// next TREND sizes fresh after a harvest-to-flat
   }
 
   // ——— Lifecycle ——————————————————————————————————————————————————————
@@ -226,6 +231,10 @@ class AiDualStrategy extends TradingBase {
     // projected size directly (faster reversals, deterministic sizing,
     // lower DeepSeek cost). Defaults false (matches frontend default).
     this.aiVetoOnReversal = !!config.aiVetoOnReversal;
+    // AI auto-harvest — when true, AI is permitted to set a harvest price
+    // during TREND (harvest-gauge cap). Defaults false (manual harvest only,
+    // matches frontend default).
+    this.aiAutoHarvest = !!config.aiAutoHarvest;
 
     // ---- Grid (dual/hedge) config ----
     this.gridLevelsPerSide = Number(config.gridLevelsPerSide) || DEFAULT_GRID_LEVELS_PER_SIDE;
@@ -256,7 +265,8 @@ class AiDualStrategy extends TradingBase {
       `desiredProfitUSDT=${this.desiredProfitUSDT} ` +
       `| recoveryFactorDecay=${this.recoveryFactorDecay ? 'on' : 'off'}, ` +
       `recoveryDistanceAutoWiden=${this.recoveryDistanceAutoWiden ? 'on' : 'off'}, ` +
-      `aiVetoOnReversal=${this.aiVetoOnReversal ? 'on' : 'off'}`
+      `aiVetoOnReversal=${this.aiVetoOnReversal ? 'on' : 'off'}, ` +
+      `aiAutoHarvest=${this.aiAutoHarvest ? 'on' : 'off'}`
     );
 
     try {
@@ -710,6 +720,7 @@ class AiDualStrategy extends TradingBase {
     this.recoveryFactorDecay = !!snapshot.config?.recoveryFactorDecay;
     this.recoveryDistanceAutoWiden = !!snapshot.config?.recoveryDistanceAutoWiden;
     this.aiVetoOnReversal = !!snapshot.config?.aiVetoOnReversal;
+    this.aiAutoHarvest = !!snapshot.config?.aiAutoHarvest;
 
     // ---- grid state ----
     this.gridMode = snapshot.gridMode || 'RANGE';
@@ -733,6 +744,10 @@ class AiDualStrategy extends TradingBase {
     this.unwindConsolidatedQty = snapshot.unwindConsolidatedQty ?? null;
     this.unwindTranchesRemaining = snapshot.unwindTranchesRemaining ?? 0;
     this.unwindTrancheFlags = Array.isArray(snapshot.unwindTrancheFlags) ? snapshot.unwindTrancheFlags : [];
+
+    // ---- Phase 3: harvest-gauge cap state ----
+    this._lastTrendSize = snapshot._lastTrendSize ?? null;
+    this._harvestRestartPending = !!snapshot._harvestRestartPending;
 
     // Restore cycle state
     this.currentSide = snapshot.currentSide || null;
@@ -2803,6 +2818,9 @@ class AiDualStrategy extends TradingBase {
       recoveryFactorDecay: this.recoveryFactorDecay,
       recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
       aiVetoOnReversal: this.aiVetoOnReversal,
+      aiAutoHarvest: this.aiAutoHarvest,
+      _lastTrendSize: this._lastTrendSize,
+      _harvestRestartPending: this._harvestRestartPending,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
@@ -2961,6 +2979,7 @@ class AiDualStrategy extends TradingBase {
         recoveryFactorDecay: this.recoveryFactorDecay,
         recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
         aiVetoOnReversal: this.aiVetoOnReversal,
+        aiAutoHarvest: this.aiAutoHarvest,
         // ---- grid state ----
         gridMode: this.gridMode,
         gridAnchor: this.gridAnchor,
@@ -2979,6 +2998,9 @@ class AiDualStrategy extends TradingBase {
         unwindConsolidatedQty: this.unwindConsolidatedQty,
         unwindTranchesRemaining: this.unwindTranchesRemaining,
         unwindTrancheFlags: this.unwindTrancheFlags,
+        // ---- Phase 3: harvest-gauge cap state ----
+        _lastTrendSize: this._lastTrendSize,
+        _harvestRestartPending: this._harvestRestartPending,
         config: {
           recoveryFactor: this.recoveryFactor,
           recoveryDistance: this.recoveryDistance,
@@ -2988,6 +3010,7 @@ class AiDualStrategy extends TradingBase {
           recoveryFactorDecay: this.recoveryFactorDecay,
           recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
           aiVetoOnReversal: this.aiVetoOnReversal,
+          aiAutoHarvest: this.aiAutoHarvest,
           gridLevelsPerSide: this.gridLevelsPerSide,
           minStepPct: this.minStepPct,
           maxWidthPct: this.maxWidthPct,
