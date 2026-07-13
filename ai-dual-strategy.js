@@ -350,6 +350,51 @@ class AiDualStrategy extends TradingBase {
   }
 
   /**
+   * Build the RANGE grid from the 24h volume profile's Value Area
+   * (VAH/VAL) + LVN triggers. Called from the tick handler (Task 8) once
+   * gridLines is empty — safe to call repeatedly: if the profile isn't
+   * ready yet or the value area is too tight for a viable step, this
+   * logs and returns with gridLines still empty so the next tick retries.
+   */
+  async initializeGrid(currentPrice) {
+    let ctx;
+    try {
+      ctx = await this.marketContext.buildReversalContext(this._buildStrategyState({ consultContext: 'plan' }));
+    } catch (e) {
+      await this.addLog(`Grid init: market context unavailable (${e.message}); will retry next tick.`);
+      return;
+    }
+    const vp = ctx?.volumeProfile24h;
+    if (!vp || !Number.isFinite(vp.vah) || !Number.isFinite(vp.val)) {
+      await this.addLog('Grid init: VP (VAH/VAL) not ready; will retry next tick.');
+      return;
+    }
+
+    const setup = computeGridSetup({
+      vah: vp.vah, val: vp.val, lvns: vp.lvns || [], currentPrice,
+      gridLevelsPerSide: this.gridLevelsPerSide, minStepPct: this.minStepPct, maxWidthPct: this.maxWidthPct,
+    });
+    if (!setup.viable) {
+      await this.addLog(`Grid init: value area / LVNs too tight for a viable step (stepPct=${(setup.stepPct * 100).toFixed(3)}%); waiting for a wider profile.`);
+      return;
+    }
+
+    this.gridAnchor = setup.anchor;
+    this.gridUpperBoundary = setup.upperBoundary;
+    this.gridLowerBoundary = setup.lowerBoundary;
+    this.upperLVN = setup.upperLVN;
+    this.lowerLVN = setup.lowerLVN;
+    this.gridLines = setup.gridLines;
+    this.vwapLong = null;
+    this.vwapShort = null;
+    this.gridMode = 'RANGE';
+
+    await this.addLog(`===== GRID BUILT =====`);
+    await this.addLog(`Anchor ${this._formatPrice(setup.anchor)} | boundaries ${this._formatPrice(setup.lowerBoundary)}–${this._formatPrice(setup.upperBoundary)} | step ${(setup.stepPct * 100).toFixed(3)}% | LVN triggers ${setup.lowerLVN ? this._formatPrice(setup.lowerLVN) : 'n/a'}/${setup.upperLVN ? this._formatPrice(setup.upperLVN) : 'n/a'}`);
+    await this.saveState();
+  }
+
+  /**
    * Resume a strategy from a Firestore snapshot. Called by app.js boot-scan
    * (recoverActiveStrategies) when a `type: 'AI_DUAL'` doc has
    * `isRunning: true` but no in-memory instance exists (i.e. PM2 restart
