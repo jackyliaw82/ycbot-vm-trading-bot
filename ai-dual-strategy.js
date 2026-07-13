@@ -238,9 +238,18 @@ class AiDualStrategy extends TradingBase {
     this.aiAutoHarvest = !!config.aiAutoHarvest;
 
     // ---- Grid (dual/hedge) config ----
-    this.gridLevelsPerSide = Number(config.gridLevelsPerSide) || DEFAULT_GRID_LEVELS_PER_SIDE;
-    this.minStepPct = config.minStepPct != null ? Number(config.minStepPct) : DEFAULT_MIN_STEP_PCT;
-    this.maxWidthPct = config.maxWidthPct != null ? Number(config.maxWidthPct) : DEFAULT_MAX_WIDTH_PCT;
+    // These are no longer user-configurable knobs — the frontend dropped the
+    // form fields. gridLevelsPerSide/maxWidthPct come from the module
+    // defaults; minStepPct is DERIVED from FEE_RATE (round-trip fee +
+    // slippage + margin) so the grid step always clears the actual cost of
+    // a round trip regardless of what FEE_RATE is tuned to later.
+    // FEE_RATE is per-side (0.0008 = 0.08%); round trip = 2×. ×3 leaves
+    // headroom for slippage/margin. Floored at 0.0025 (the prior static
+    // default) so a very low fee tier never produces a step so tight the
+    // grid whipsaws on noise.
+    this.gridLevelsPerSide = DEFAULT_GRID_LEVELS_PER_SIDE;
+    this.minStepPct = Math.max(0.0025, FEE_RATE * 3);
+    this.maxWidthPct = DEFAULT_MAX_WIDTH_PCT;
 
     if (!this.symbol) throw new Error('AiDualStrategy.start: missing symbol');
     if (!this.currentInitialSize || this.currentInitialSize <= 0) {
@@ -2870,6 +2879,23 @@ class AiDualStrategy extends TradingBase {
       initialCapital: this.initialCapital,
       currentInitialSize: this.currentInitialSize,
       desiredProfitUSDT: this.desiredProfitUSDT,
+
+      // Grid (dual/hedge) state — the frontend's Phase 4 Dual view renders
+      // these directly. `mode` is the alias the frontend actually reads
+      // (status.mode, not status.gridMode).
+      mode: this.gridMode,
+      gridAnchor: this.gridAnchor,
+      gridUpperBoundary: this.gridUpperBoundary,
+      gridLowerBoundary: this.gridLowerBoundary,
+      upperLVN: this.upperLVN,
+      lowerLVN: this.lowerLVN,
+      gridLines: this.gridLines,
+      vwapLong: this.vwapLong,
+      vwapShort: this.vwapShort,
+      gridLevelsPerSide: this.gridLevelsPerSide,
+      trendDirection: this.trendDirection,
+      unwindDirection: this.unwindDirection,
+      unwindTranchesRemaining: this.unwindTranchesRemaining,
       // Running config — surfaced so the frontend's Active Config panel
       // can show the values the bot is ACTUALLY using rather than the
       // form's DEFAULT_CONFIG (which is what reversal's frontend used
@@ -2919,31 +2945,59 @@ class AiDualStrategy extends TradingBase {
    *   - Static config (leverage / priceType / recovery params / etc.) — loaded
    *     once by frontend's initial REST fetch of getStatus().
    *   - Fields covered by other event pushes (currentPrice via price_tick;
-   *     bullLevel/bearLevel/activePlan/finalTpPrice via plan_update / flow_event).
+   *     bullLevel/bearLevel/activePlan via plan_update / flow_event).
    *   - AI-consult cache (volumeProfile / cvd / orderbookDepth / volatility)
    *     which only changes on consults — pushed via plan_update.context.
    *   - Derivable fields (cycleDuration = Date.now() - cycleStartTime).
+   * Grid/mode fields (mode, gridAnchor/gridLines/etc., trendDirection,
+   * unwindDirection, finalTpPrice, ...) ARE included here — unlike reversal,
+   * a live Dual WS session needs them on every heartbeat because RANGE/TREND/
+   * UNWIND transitions and grid rebuilds happen mid-cycle, not just at plan
+   * boundaries, and the frontend merges this payload directly into `status`
+   * (setStatus(prev => ({...prev, ...payload}))) so a value missing here
+   * would only ever reach the frontend via the next full REST getStatus().
    * Fires on the 30s safety-net interval AND immediately after every
-   * bookkeeping change via _pushHeartbeatNow(). Frontend merges into existing
-   * state (setStatus(prev => ({...prev, ...payload}))).
+   * bookkeeping change via _pushHeartbeatNow().
    */
   getHeartbeatPayload() {
     return {
       strategyId: this.strategyId,
+      strategyType: 'dual',
       executionState: this.executionState,
       subState: this.subState,
       isRunning: this.isRunning,
+      currentPrice: this.currentPrice,
       currentSide: this.currentSide,
       currentPosition: this.activePosition,
+      finalTpPrice: this.finalTpPrice,
       cycleAccumulatedLoss: this.cycleAccumulatedLoss,
       reversalCount: this.reversalCount,
       harvestCount: this.harvestCount,
       harvestPrice: this.harvestPrice,
+      initialCapital: this.initialCapital,
+      harvestLossThreshold: this.harvestLossThreshold,
+      aiAutoHarvest: this.aiAutoHarvest,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
       aiTokenUsage: this.aiTokenUsage,
       aiUsageCostUSD: this.getAiUsageCost(),
+
+      // Grid (dual/hedge) state — see docstring: included here (unlike
+      // reversal's heartbeat) because mode/grid transitions happen mid-cycle.
+      mode: this.gridMode,
+      gridAnchor: this.gridAnchor,
+      gridUpperBoundary: this.gridUpperBoundary,
+      gridLowerBoundary: this.gridLowerBoundary,
+      upperLVN: this.upperLVN,
+      lowerLVN: this.lowerLVN,
+      gridLines: this.gridLines,
+      vwapLong: this.vwapLong,
+      vwapShort: this.vwapShort,
+      gridLevelsPerSide: this.gridLevelsPerSide,
+      trendDirection: this.trendDirection,
+      unwindDirection: this.unwindDirection,
+      unwindTranchesRemaining: this.unwindTranchesRemaining,
     };
   }
 
