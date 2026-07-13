@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { AiReversalStrategy } from './ai-reversal-strategy.js';
+import { AiDualStrategy } from './ai-dual-strategy.js';
 
 // TradFi-Perps symbols are gated by Binance behind a separate trading agreement
 // (error -4411 fires for unsigned accounts). The reversal strategy's symbol
@@ -661,6 +662,67 @@ async function recoverActiveStrategies() {
       const isReversal = data.type === 'AI_REVERSAL'
         || data.strategyType === 'reversal'
         || strategyId.startsWith('ai_reversal_');
+
+      // AI Dual (grid/hedge) — checked before the AI_HEDGE hard-skip below so
+      // an `ai_dual_` prefix is never mistaken for the removed AI_HEDGE class.
+      const isDual = data.type === 'AI_DUAL'
+        || data.strategyType === 'dual'
+        || strategyId.startsWith('ai_dual_');
+
+      if (isDual) {
+        try {
+          const strategy = new AiDualStrategy(
+            data.gcfProxyUrl || null,
+            data.profileId,
+            data.sharedVmProxyGcfUrl || null
+          );
+          strategy.strategyId = strategyId;
+          strategy.profileId = data.profileId;
+          strategy.userId = data.userId;
+          strategy.isRunning = true;
+
+          let walletSnapshotInterval = null;
+          strategy.onStopComplete = () => {
+            if (walletSnapshotInterval) {
+              clearInterval(walletSnapshotInterval);
+              walletSnapshotInterval = null;
+            }
+            _snapshotWallet(strategy).catch(() => { /* logged inside */ });
+            activeStrategies.delete(strategyId);
+          };
+
+          activeStrategies.set(strategyId, strategy);
+
+          // Resume in background — same non-blocking pattern as /ai-dual/start.
+          strategy.resume(data)
+            .then(() => {
+              // Only continue wallet snapshot loop if resume left strategy running.
+              if (strategy.isRunning) {
+                _snapshotWallet(strategy).catch(() => {});
+                walletSnapshotInterval = setInterval(
+                  () => _snapshotWallet(strategy).catch(() => {}),
+                  WALLET_SNAPSHOT_INTERVAL_MS
+                );
+                console.log(`[RECOVERY] ✓ ${strategyId} recovered (symbol=${data.symbol}, gridMode=${strategy.gridMode}, legs=${Array.isArray(strategy.gridLines) ? strategy.gridLines.length : 0})`);
+              } else {
+                console.log(`[RECOVERY] ${strategyId} marked stopped during resume (positions gone)`);
+              }
+            })
+            .catch((error) => {
+              console.error(`[RECOVERY] ✗ Failed to resume ${strategyId}:`, error);
+              strategy.isRunning = false;
+              activeStrategies.delete(strategyId);
+              firestore.collection('strategies').doc(strategyId).update({
+                isRunning: false,
+                criticalError: `recovery_failed: ${error.message}`,
+                lastUpdated: new Date(),
+              }).catch(() => {});
+            });
+        } catch (err) {
+          console.error(`[RECOVERY] ✗ Failed to instantiate strategy ${strategyId}:`, err.message);
+        }
+        continue; // do not fall through to the reversal/hedge branches below
+      }
 
       // AI Hedge was removed. A stale AI_HEDGE / ai_hedge_ doc with
       // isRunning:true can still exist in Firestore from before removal — do
@@ -1500,6 +1562,181 @@ app.get('/ai-reversal/status', (req, res) => {
   });
 
   res.json({ strategies: reversalStrategies, count: Object.keys(reversalStrategies).length });
+});
+
+// ─── AI Dual (grid/hedge) routes — Phase 1 ───────────────────────────────────
+// Mirrors /ai-reversal/start's validation, one-strategy-per-profile guard,
+// billing gate, and non-blocking start pattern (see above). strategyId uses
+// the `ai_dual_` prefix so boot recovery + /ai-reversal/* instanceof guards
+// never collide with it.
+app.post('/ai-dual/start', async (req, res) => {
+  if (isUpdating) {
+    return res.status(503).json({ error: 'VM is currently updating.', code: 'VM_UPDATING' });
+  }
+
+  try {
+    const { profileId, gcpProxyUrl, sharedVmProxyGcfUrl, config, userId } = req.body;
+
+    if (!profileId || !gcpProxyUrl || !sharedVmProxyGcfUrl || !config) {
+      return res.status(400).json({ error: 'profileId, gcpProxyUrl, sharedVmProxyGcfUrl, and config are required.' });
+    }
+
+    if (isTradFiPerps(config.symbol)) {
+      return res.status(400).json({
+        error: `${config.symbol} is a TradFi-Perps contract; not supported by AI Dual.`,
+        code: 'TRADFI_PERPS_BLOCKED',
+      });
+    }
+
+    // One strategy per profile (matches existing model). User must stop the running strategy first.
+    for (const [sId, strategy] of activeStrategies.entries()) {
+      if (strategy.profileId === profileId) {
+        return res.status(400).json({
+          error: `A strategy for profile ${profileId} is already running. Stop it before starting AI Dual.`,
+          strategyId: sId,
+        });
+      }
+    }
+
+    // ── Billing gate (server-side enforcement) — identical check to
+    // /ai-reversal/start; see the comment there for the full rationale.
+    const billingUid = req.uid || userId;
+    let gate;
+    try {
+      gate = await checkBillingGate(firestore, billingUid);
+    } catch (gateErr) {
+      console.error(`[BILLING_GATE] Verification failed for ${billingUid}:`, gateErr.message);
+      return res.status(402).json({
+        error: 'Could not verify your machine subscription / Reload Balance. Please try again.',
+        code: 'BILLING_GATE_UNVERIFIED',
+      });
+    }
+    if (!gate.canStart) {
+      const msg =
+        gate.reason === 'subscription_unpaid'
+          ? 'Machine subscription is inactive. Reload your Balance and start from the app to renew (30 USD/mo).'
+          : gate.reason === 'negative_balance'
+          ? 'Your Reload Balance is negative. Top up above 0 USD to start a strategy.'
+          : gate.reason === 'zero_balance'
+          ? 'Your Reload Balance is 0 USD. Reload to start a strategy.'
+          : 'Reload Balance / subscription check failed. Top up and try again.';
+      console.warn(`[BILLING_GATE] Blocked start for ${billingUid} (reason=${gate.reason}, balance=${gate.balance}).`);
+      return res.status(402).json({ error: msg, code: 'BILLING_GATE_BLOCKED', reason: gate.reason });
+    }
+    // ──────────────────────────────────────────────────────────────────────
+
+    const strategy = new AiDualStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
+    strategy.userId = userId;
+
+    const strategyId = `ai_dual_${profileId}_${Date.now()}`;
+    strategy.strategyId = strategyId;
+    strategy.isRunning = true;
+    activeStrategies.set(strategyId, strategy);
+
+    let walletSnapshotInterval = null;
+    strategy.onStopComplete = () => {
+      if (walletSnapshotInterval) {
+        clearInterval(walletSnapshotInterval);
+        walletSnapshotInterval = null;
+      }
+      _snapshotWallet(strategy).catch(() => { /* logged inside */ });
+      activeStrategies.delete(strategyId);
+    };
+
+    console.log(`✓ AI Dual Strategy ${strategyId} starting (non-blocking)...`);
+    res.json({
+      success: true,
+      strategyId,
+      message: 'AI Dual Strategy starting',
+    });
+
+    strategy.start(config)
+      .then(() => {
+        _snapshotWallet(strategy).catch(() => { /* logged inside */ });
+        walletSnapshotInterval = setInterval(
+          () => _snapshotWallet(strategy).catch(() => { /* logged inside */ }),
+          WALLET_SNAPSHOT_INTERVAL_MS
+        );
+      })
+      .catch((error) => {
+        console.error(`Failed to start AI Dual Strategy ${strategyId}:`, error);
+        strategy.isRunning = false;
+        activeStrategies.delete(strategyId);
+      });
+  } catch (error) {
+    console.error('Failed to start AI Dual Strategy:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/ai-dual/stop', async (req, res) => {
+  try {
+    const { strategyId, flatten } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AiDualStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No AI Dual strategy running with ID ${strategyId}` });
+    }
+
+    res.json({ success: true, stopping: true, message: 'AI Dual Strategy stop initiated', strategyId });
+
+    setImmediate(async () => {
+      try {
+        await strategy.stop({ flatten: !!flatten });
+        activeStrategies.delete(strategyId);
+      } catch (error) {
+        console.error(`Error stopping AI Dual Strategy ${strategyId}:`, error);
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/ai-dual/status', (req, res) => {
+  const { strategyId } = req.query;
+
+  if (strategyId) {
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AiDualStrategy)) {
+      return res.status(404).json({ error: `AI Dual strategy ${strategyId} not found.` });
+    }
+    return res.json({
+      ...strategy.getStatus(),
+      gridMode: strategy.gridMode,
+      gridAnchor: strategy.gridAnchor,
+      gridUpperBoundary: strategy.gridUpperBoundary,
+      gridLowerBoundary: strategy.gridLowerBoundary,
+      upperLVN: strategy.upperLVN,
+      lowerLVN: strategy.lowerLVN,
+      gridLines: strategy.gridLines,
+      vwapLong: strategy.vwapLong,
+      vwapShort: strategy.vwapShort,
+      lastProcessedPrice: strategy.lastProcessedPrice,
+    });
+  }
+
+  const dualStrategies = {};
+  activeStrategies.forEach((strategy, sId) => {
+    if (strategy instanceof AiDualStrategy) {
+      dualStrategies[sId] = {
+        ...strategy.getStatus(),
+        gridMode: strategy.gridMode,
+        gridAnchor: strategy.gridAnchor,
+        gridUpperBoundary: strategy.gridUpperBoundary,
+        gridLowerBoundary: strategy.gridLowerBoundary,
+        upperLVN: strategy.upperLVN,
+        lowerLVN: strategy.lowerLVN,
+        gridLines: strategy.gridLines,
+        vwapLong: strategy.vwapLong,
+        vwapShort: strategy.vwapShort,
+        lastProcessedPrice: strategy.lastProcessedPrice,
+      };
+    }
+  });
+
+  res.json({ strategies: dualStrategies, count: Object.keys(dualStrategies).length });
 });
 
 // /ai-reversal/replan endpoint removed in v4.4.5. The endpoint's
