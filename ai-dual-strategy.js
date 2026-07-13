@@ -557,11 +557,25 @@ class AiDualStrategy extends TradingBase {
     }
   }
 
-  // Dynamic recovery size for a TREND entry (Phase 3 will add the gauge-full freeze).
+  // Harvest gauge is full once accumulated loss reaches the configured threshold of initial capital.
+  _isGaugeFull() {
+    return this.initialCapital > 0
+      && this.cycleAccumulatedLoss >= this.harvestLossThreshold * this.initialCapital;
+  }
+
+  // Dynamic recovery size for a TREND entry, with a gauge-full escalation freeze.
   _computeTrendSize() {
     this.cycleAccumulatedLoss = this._computeAccLoss();
+    // Gauge-full escalation freeze: once the gauge is full, stop GROWING live exposure —
+    // reuse the last size. EXCEPTION: a harvest restart (flat -> fresh) always re-sizes.
+    if (this._isGaugeFull() && !this._harvestRestartPending && this._lastTrendSize != null) {
+      return this._lastTrendSize;
+    }
     const proposed = this._computeFormulaSize();
-    return this._applyMarginHeadroomCap(proposed);
+    const sized = this._applyMarginHeadroomCap(proposed);
+    this._lastTrendSize = sized;
+    this._harvestRestartPending = false; // consumed: the fresh post-harvest size is now applied
+    return sized;
   }
 
   // RANGE → TREND transition: flatten the grid, size the consolidated entry via
