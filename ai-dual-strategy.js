@@ -395,6 +395,56 @@ class AiDualStrategy extends TradingBase {
   }
 
   /**
+   * Per-leg notional in USDT — the total configured initial size split
+   * evenly across the grid levels on one side. Used to size every
+   * individual leg open (each leg is an independent hedge-mode position).
+   */
+  _legNotional() {
+    const n = this.gridLevelsPerSide || 1;
+    return (this.currentInitialSize || 0) / n;
+  }
+
+  /**
+   * Open one grid leg in hedge mode. `side` (BUY/SELL) encodes market
+   * direction; `positionSide` (LONG/SHORT) — set to the leg's own
+   * direction — tells Binance which hedge-mode side to book it under.
+   * After the fill, recomputes that side's locked VWAP across all
+   * currently-open legs on the same direction via `averageOpenEntry`.
+   */
+  async _openGridLeg(leg) {
+    const side = leg.direction === 'LONG' ? 'BUY' : 'SELL';
+    const qty = await this._calculateAdjustedQuantity(this.symbol, this._legNotional());
+    await this.addLog(`Grid OPEN ${leg.direction} L${leg.levelIndex} @~${this._formatPrice(leg.price)} qty ${qty}.`);
+    await this.placeMarketOrder(this.symbol, side, qty, leg.direction); // hedge: positionSide encodes leg
+    leg.state = 'POSITION_OPEN';
+    leg.quantity = qty;
+    // Recompute locked vwap for this side to include the new leg (locked until side flat).
+    if (leg.direction === 'LONG') this.vwapLong = averageOpenEntry(this.gridLines, 'LONG');
+    else this.vwapShort = averageOpenEntry(this.gridLines, 'SHORT');
+  }
+
+  /**
+   * Close one grid leg in hedge mode. `closeSide` is the OPPOSITE market
+   * side from the open, but `positionSide` stays the leg's own direction
+   * — Binance hedge mode encodes direction via positionSide, not
+   * reduceOnly, and REJECTS reduceOnly entirely in hedge mode, so it is
+   * never passed here. Nulls the side's locked VWAP once no legs on that
+   * direction remain open, so the next open re-seeds it from scratch.
+   */
+  async _closeGridLeg(leg, reason) {
+    if (!leg.quantity || leg.quantity <= 0) { leg.state = 'EMPTY'; leg.quantity = null; return; }
+    const closeSide = leg.direction === 'LONG' ? 'SELL' : 'BUY';
+    await this.addLog(`Grid CLOSE ${leg.direction} L${leg.levelIndex} (${reason}) qty ${leg.quantity}.`);
+    // HEDGE CLOSE: opposite side, same positionSide, NEVER reduceOnly (Binance rejects in hedge).
+    await this.placeMarketOrder(this.symbol, closeSide, leg.quantity, leg.direction);
+    leg.state = 'EMPTY';
+    leg.quantity = null;
+    // If the side is now flat, null its locked vwap so the next OPEN re-seeds it.
+    if (leg.direction === 'LONG' && !this.gridLines.some(l => l.direction === 'LONG' && l.state === 'POSITION_OPEN')) this.vwapLong = null;
+    if (leg.direction === 'SHORT' && !this.gridLines.some(l => l.direction === 'SHORT' && l.state === 'POSITION_OPEN')) this.vwapShort = null;
+  }
+
+  /**
    * Resume a strategy from a Firestore snapshot. Called by app.js boot-scan
    * (recoverActiveStrategies) when a `type: 'AI_DUAL'` doc has
    * `isRunning: true` but no in-memory instance exists (i.e. PM2 restart
