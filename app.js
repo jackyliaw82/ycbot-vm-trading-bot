@@ -1739,6 +1739,21 @@ app.get('/ai-dual/status', (req, res) => {
   res.json({ strategies: dualStrategies, count: Object.keys(dualStrategies).length });
 });
 
+app.post('/ai-dual/harvest-now', async (req, res) => {
+  try {
+    const { strategyId } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AiDualStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running AI Dual strategy with ID ${strategyId}` });
+    }
+    const result = await strategy.harvestNow();
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(409).json({ error: error.message });
+  }
+});
+
 // /ai-reversal/replan endpoint removed in v4.4.5. The endpoint's
 // position-open guard was checking `.quantity` on a STRING field
 // (TradingBase's this.currentPosition is 'LONG' | 'SHORT' | 'NONE',
