@@ -677,6 +677,32 @@ class AiDualStrategy extends TradingBase {
     await this.saveState();
   }
 
+  // De-risk to flat (hedge-safe) and re-anchor RANGE. accLoss is NOT reset (real carried loss);
+  // the gauge only empties if the realized PnL reduces cycleAccumulatedLoss on its own.
+  async _harvestToFlat(reason) {
+    await this.addLog(`===== HARVEST (${reason}) — flatten to flat + re-anchor =====`);
+    if (this.gridLines.some(l => l.state === 'POSITION_OPEN')) {
+      try { await this._flattenGrid(); } catch (e) { await this.addLog(`ERROR harvest grid flatten: ${e.message}`); }
+    }
+    if (this.activePosition && this.activePosition.quantity > 0) {
+      try { await this._closeConsolidated('harvest'); } catch (e) { await this.addLog(`ERROR harvest consolidated close: ${e.message}`); }
+    }
+    this.harvestCount = (this.harvestCount || 0) + 1;
+    this.harvestPrice = null;
+    this._harvestConsultPending = false;
+    // Re-anchor: clear the grid so the next tick's empty-grid gate rebuilds VP around current price.
+    this.gridLines = [];
+    this._lastGridInitAttempt = null; // let the re-anchor fire on the very next tick (bypass throttle)
+    this.vwapLong = null; this.vwapShort = null;
+    this.trendDirection = null; this.unwindDirection = null;
+    this.unwindConsolidatedSize = null; this.unwindConsolidatedQty = null;
+    this.unwindTranchesRemaining = 0; this.unwindTrancheFlags = [];
+    this.gridMode = 'RANGE';
+    this._harvestRestartPending = true; // next TREND entry re-sizes fresh (freeze exception)
+    await this._writeStrategyFlow('HARVEST', { reason, gridMode: 'RANGE' });
+    await this.saveState();
+  }
+
   /**
    * Resume a strategy from a Firestore snapshot. Called by app.js boot-scan
    * (recoverActiveStrategies) when a `type: 'AI_DUAL'` doc has
@@ -2035,53 +2061,34 @@ class AiDualStrategy extends TradingBase {
   }
 
   /**
-   * Manual, user-driven harvest. Banks the current profitable leg ON DEMAND —
-   * even when cycleAccumulatedLoss is BELOW the auto harvest-gate threshold
-   * (the gate in _isHarvestGateOpen is deliberately NOT consulted here). This
-   * is the backend for the Active Position card's "Harvest now" control.
+   * Manual, user-driven harvest. Flattens whatever is open ON DEMAND — grid
+   * legs and/or a consolidated TREND/UNWIND position — regardless of
+   * cycleAccumulatedLoss vs the auto harvest-gate threshold, and regardless
+   * of per-leg profit (the dual grid can have simultaneous LONG+SHORT legs,
+   * so there's no single "the position" to profit-gate). This is the backend
+   * for the Active Position card's "Harvest now" control.
    *
-   * Reuses the full _executeHarvest machinery (close to flat at market via
-   * reduceOnly → post-harvest PLAN → bookkeeping → cycle CONTINUES, does NOT
-   * stop). Validation runs synchronously and the (long-running) close is
-   * fired-and-forgotten so the HTTP caller gets an immediate eligibility
-   * verdict; the close itself flips executionState to EXECUTING synchronously,
-   * closing the race with a concurrent price tick.
+   * Delegates to `_harvestToFlat` (hedge-safe: `_flattenGrid` + `_closeConsolidated`,
+   * never reduceOnly, never the one-way `_executeHarvest`/HARVEST_CLOSE path).
+   * The flatten is fired-and-forgotten so the HTTP caller gets an immediate
+   * ack; the strategy re-anchors RANGE on the next tick once it lands.
    *
-   * Refuses unless a position is open AND currently in profit. The UI gates
-   * the button on the same condition, but this is the safety net against a
-   * stale click. Throws on ineligibility (the route maps it to a 409).
+   * Refuses only when there is nothing open. Throws on ineligibility (the
+   * route maps it to a 409).
    */
   async harvestNow() {
     if (!this.isRunning) {
       throw new Error('Strategy is not running.');
     }
-    if (this.executionState !== 'IDLE') {
-      throw new Error('Strategy is busy — a trade or plan is in progress. Try again in a moment.');
+    const hasGrid = this.gridLines.some(l => l.state === 'POSITION_OPEN');
+    const hasConsolidated = !!(this.activePosition && this.activePosition.quantity > 0);
+    if (!hasGrid && !hasConsolidated) {
+      throw new Error('Nothing open to harvest.');
     }
-    const heldSide = this.subState === 'LONG_HELD' ? 'LONG'
-      : this.subState === 'SHORT_HELD' ? 'SHORT'
-        : null;
-    if (!heldSide || !this.activePosition || !(this.activePosition.quantity > 0)) {
-      throw new Error('No open position to harvest.');
-    }
-    // Refresh unrealized PnL against the latest mark before judging profit —
-    // the gate must reflect the price right now, not whatever the last tick left.
-    this._updateUnrealizedPnL(this.currentPrice);
-    const unrealized = this.activePosition.unrealizedPnl || 0;
-    if (!(unrealized > 0)) {
-      throw new Error(`Position is not in profit (unrealized ${unrealized.toFixed(4)} USDT). Harvest only banks a profitable leg.`);
-    }
-
-    // No awaits between the IDLE check above and the _executeHarvest handoff
-    // below — addLog is fire-and-forget and _updateUnrealizedPnL is sync — so
-    // no price tick can interleave and fire a reversal before _executeHarvest
-    // flips executionState to EXECUTING.
-    this.addLog(`[REVERSAL] manual harvest requested — banking ~${unrealized.toFixed(4)} USDT (${heldSide} @ ${this.currentPrice})`).catch(() => {});
-    this._executeHarvest('manual_harvest').catch((err) => {
-      this.addLog(`[REVERSAL] manual harvest error: ${err.message}`).catch(() => {});
-    });
-
-    return { harvesting: true, side: heldSide, unrealizedPnl: unrealized, price: this.currentPrice };
+    // Fire-and-forget so the HTTP handler returns immediately; harvest runs to completion.
+    this._harvestToFlat('manual_harvest').catch(err =>
+      this.addLog(`ERROR manual harvest: ${err.message}`).catch(() => {}));
+    return { harvesting: true, mode: this.gridMode, price: this.currentPrice };
   }
 
   /**
