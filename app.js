@@ -1754,6 +1754,23 @@ app.post('/ai-dual/harvest-now', async (req, res) => {
   }
 });
 
+// Manual LVN-trigger adjustment (RANGE only) — moves upperLVN / lowerLVN without
+// touching the grid geometry. The bot validates ordering + side-of-price + beyond-VA.
+app.post('/ai-dual/adjust-lvn', async (req, res) => {
+  try {
+    const { strategyId, upperLVN, lowerLVN } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AiDualStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running AI Dual strategy with ID ${strategyId}` });
+    }
+    const result = await strategy.adjustLvn(upperLVN, lowerLVN);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(409).json({ error: error.message });
+  }
+});
+
 // /ai-reversal/replan endpoint removed in v4.4.5. The endpoint's
 // position-open guard was checking `.quantity` on a STRING field
 // (TradingBase's this.currentPosition is 'LONG' | 'SHORT' | 'NONE',

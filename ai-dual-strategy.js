@@ -112,7 +112,9 @@ class AiDualStrategy extends TradingBase {
     // Set true at consult start, cleared on success/failure/stale-retry.
     this._harvestConsultPending = false;
     this.initialCapital = 0;
-    this.currentInitialSize = 0;
+    this.currentInitialSize = 0;         // base for DYNAMIC trend sizing (original config size; never overwritten → no compounding)
+    this._gridBaseSize = 0;              // base the GRID is sized from: initial size, then the last consolidated notional after a harvest
+    this._lastConsolidatedNotional = 0;  // notional of the most recent TREND/UNWIND consolidated open (carried into the post-harvest grid)
     this.cycleStartTime = null;
     this.executionState = 'IDLE';           // IDLE | PLANNING | EXECUTING | TERMINATED
     this.subState = 'INITIAL';              // INITIAL | WAITING | LONG_HELD | SHORT_HELD | HARVESTING | EXITED
@@ -193,7 +195,6 @@ class AiDualStrategy extends TradingBase {
     this.unwindTrancheFlags = [];       // bool[] length gridLevelsPerSide
 
     // ---- Phase 3: harvest-gauge cap ----
-    this.aiAutoHarvest = false;         // config: AI sets a harvest price during TREND (default OFF = manual only)
     this._lastTrendSize = null;         // last dynamic TREND size (for gauge-full freeze)
     this._harvestRestartPending = false;// next TREND sizes fresh after a harvest-to-flat
     this._manualHarvestRequested = false; // latch: harvestNow() sets this; honored on the next free tick (transient, not persisted)
@@ -221,6 +222,7 @@ class AiDualStrategy extends TradingBase {
     this.harvestLossThreshold = config.harvestLossThreshold ?? HARVEST_LOSS_THRESHOLD_PCT;
     this.desiredProfitUSDT = config.desiredProfitUSDT || 0;
     this.currentInitialSize = config.initialSize || 0;
+    this._gridBaseSize = this.currentInitialSize; // initial grid uses the initial size; a harvest later carries the last consolidated notional
     this.maxPositionSizeUSDT = config.maxPositionSizeUSDT || (this.currentInitialSize * 10);
     // Advanced toggles — currently advisory (sizing math doesn't act on them
     // yet) but stored so the startup log reflects what the form sent.
@@ -232,10 +234,6 @@ class AiDualStrategy extends TradingBase {
     // projected size directly (faster reversals, deterministic sizing,
     // lower DeepSeek cost). Defaults false (matches frontend default).
     this.aiVetoOnReversal = !!config.aiVetoOnReversal;
-    // AI auto-harvest — when true, AI is permitted to set a harvest price
-    // during TREND (harvest-gauge cap). Defaults false (manual harvest only,
-    // matches frontend default).
-    this.aiAutoHarvest = !!config.aiAutoHarvest;
 
     // ---- Grid (dual/hedge) config ----
     // These are no longer user-configurable knobs — the frontend dropped the
@@ -275,8 +273,7 @@ class AiDualStrategy extends TradingBase {
       `desiredProfitUSDT=${this.desiredProfitUSDT} ` +
       `| recoveryFactorDecay=${this.recoveryFactorDecay ? 'on' : 'off'}, ` +
       `recoveryDistanceAutoWiden=${this.recoveryDistanceAutoWiden ? 'on' : 'off'}, ` +
-      `aiVetoOnReversal=${this.aiVetoOnReversal ? 'on' : 'off'}, ` +
-      `aiAutoHarvest=${this.aiAutoHarvest ? 'on' : 'off'}`
+      `aiVetoOnReversal=${this.aiVetoOnReversal ? 'on' : 'off'}`
     );
 
     try {
@@ -309,11 +306,8 @@ class AiDualStrategy extends TradingBase {
     // (up to the default). A modest account runs a thinner grid rather than failing —
     // grid geometry is auto-derived, not a user knob. (A size below one leg's worth
     // was already rejected above.)
-    this.gridLevelsPerSide = Math.min(
-      DEFAULT_GRID_LEVELS_PER_SIDE,
-      Math.floor(this.currentInitialSize / minNotional)
-    );
-    await this.addLog(`Grid levels/side auto-set to ${this.gridLevelsPerSide} (initialSize ${this.currentInitialSize} USDT / minNotional ${minNotional} USDT, cap ${DEFAULT_GRID_LEVELS_PER_SIDE}).`);
+    this.gridLevelsPerSide = this._deriveGridLevelsPerSide();
+    await this.addLog(`Grid levels/side auto-set to ${this.gridLevelsPerSide} (gridBase ${this._gridBaseSize} USDT / minNotional ${minNotional} USDT, cap ${DEFAULT_GRID_LEVELS_PER_SIDE}).`);
 
     // Initial capital snapshot — drives the harvest gate and the sizing self-regulation loop.
     this.initialWalletBalance = await this.getWalletBalance();
@@ -438,9 +432,18 @@ class AiDualStrategy extends TradingBase {
    * evenly across the grid levels on one side. Used to size every
    * individual leg open (each leg is an independent hedge-mode position).
    */
+  // Grid levels/side auto-fit the current grid base: each leg is base / N and
+  // must clear minNotional, so cap at floor(base / minNotional) (≥1, ≤ default).
+  _deriveGridLevelsPerSide() {
+    const mn = this.minNotional || 5;
+    return Math.max(1, Math.min(DEFAULT_GRID_LEVELS_PER_SIDE, Math.floor((this._gridBaseSize || 0) / mn)));
+  }
+
   _legNotional() {
     const n = this.gridLevelsPerSide || 1;
-    return (this.currentInitialSize || 0) / n;
+    // Grid is sized from _gridBaseSize (initial size, or the last consolidated
+    // notional carried in after a harvest). Falls back to currentInitialSize.
+    return (this._gridBaseSize || this.currentInitialSize || 0) / n;
   }
 
   /**
@@ -540,6 +543,9 @@ class AiDualStrategy extends TradingBase {
     // entry: notional = qty * entryPrice, so _recomputeFinalTpPrice and the
     // _enterUnwind flip size read a notional that matches the real position.
     this.activePosition = { quantity: qty, entryPrice, notional: qty * entryPrice, unrealizedPnl: 0 };
+    // Remember this (recovery-grown) consolidated notional — a harvest carries it
+    // forward as the fresh grid base (see _harvestToFlat).
+    this._lastConsolidatedNotional = qty * entryPrice;
     this._recomputeFinalTpPrice();
     return qty;
   }
@@ -599,15 +605,6 @@ class AiDualStrategy extends TradingBase {
       && this.cycleAccumulatedLoss >= this.harvestLossThreshold * this.initialCapital;
   }
 
-  // AI auto-harvest is only meaningful in TREND (a single consolidated position with a
-  // profitable side to target). Fires only when the toggle is ON and the gauge is full.
-  _isDualHarvestGateOpen() {
-    if (!this.aiAutoHarvest) return false;
-    if (this.gridMode !== 'TREND') return false;
-    if (!this.activePosition || !(this.activePosition.quantity > 0) || !this.currentSide) return false;
-    if (this.harvestPrice != null || this._harvestConsultPending) return false;
-    return this._isGaugeFull();
-  }
 
   // Dynamic recovery size for a TREND entry, with a gauge-full escalation freeze.
   _computeTrendSize() {
@@ -747,6 +744,15 @@ class AiDualStrategy extends TradingBase {
       this.harvestPrice = null;
       this.finalTpPrice = null;
       this._harvestConsultPending = false;
+      // Grid-base carry-forward: size the fresh post-harvest grid from the LAST
+      // consolidated (TREND/UNWIND) position notional — the recovery-grown exposure —
+      // instead of the base initial size. Falls back to initialSize if no consolidated
+      // position happened this cycle. Kept SEPARATE from currentInitialSize (the
+      // dynamic-sizing base) so it never feeds back into trend sizing → no compounding.
+      // The consolidated notional is itself margin-capped, so no extra cap is needed.
+      this._gridBaseSize = (this._lastConsolidatedNotional > 0) ? this._lastConsolidatedNotional : this.currentInitialSize;
+      this.gridLevelsPerSide = this._deriveGridLevelsPerSide();
+      await this.addLog(`Grid base carried to ${this._formatNotional(this._gridBaseSize)} USDT (last consolidated notional) → ${this.gridLevelsPerSide} levels/side.`);
       // Re-anchor: clear the grid so the next tick's empty-grid gate rebuilds VP around current price.
       this.gridLines = [];
       this._lastGridInitAttempt = null; // let the re-anchor fire on the very next tick (bypass throttle)
@@ -816,11 +822,12 @@ class AiDualStrategy extends TradingBase {
     this.harvestLossThreshold = snapshot.config?.harvestLossThreshold ?? HARVEST_LOSS_THRESHOLD_PCT;
     this.desiredProfitUSDT = snapshot.config?.desiredProfitUSDT || 0;
     this.currentInitialSize = snapshot.currentInitialSize || snapshot.config?.initialSize || 0;
+    this._gridBaseSize = snapshot.gridBaseSize || this.currentInitialSize; // grown grid base survives restarts (else grid shrinks to initial)
+    this._lastConsolidatedNotional = snapshot.lastConsolidatedNotional || 0;
     // Restore advanced toggles too (advisory, but tracked for log parity).
     this.recoveryFactorDecay = !!snapshot.config?.recoveryFactorDecay;
     this.recoveryDistanceAutoWiden = !!snapshot.config?.recoveryDistanceAutoWiden;
     this.aiVetoOnReversal = !!snapshot.config?.aiVetoOnReversal;
-    this.aiAutoHarvest = !!snapshot.config?.aiAutoHarvest;
 
     // ---- grid state ----
     this.gridMode = snapshot.gridMode || 'RANGE';
@@ -1436,18 +1443,7 @@ class AiDualStrategy extends TradingBase {
         } finally { this._tradingSeqInProgress = false; }
         return;
       }
-      // AI auto-harvest (aiAutoHarvest ON): harvest price hit -> flatten to flat + re-anchor.
-      // NOTE: do NOT wrap in _tradingSeqInProgress here — `_harvestToFlat` self-guards with it
-      // (skips if already set), so an outer wrap would make it no-op. Just await it.
-      if (this.harvestPrice != null && this._checkHarvestPriceHit(price)) {
-        await this._harvestToFlat('ai_harvest_price_hit');
-        this.lastProcessedPrice = price; return;
-      }
-      // Gauge full + toggle ON + no price set yet -> ask AI for a harvest price (non-blocking).
-      if (this._isDualHarvestGateOpen()) {
-        this._requestHarvestPrice().catch(err =>
-          this.addLog(`ERROR harvest-price consult: ${err.message}`).catch(() => {}));
-      }
+      // (AI auto-harvest removed — harvest is manual only, via harvestNow().)
       // UNWIND trigger: price returns across the outermost grid boundary on the origin side.
       if (prev != null) {
         const backDown = this.trendDirection === 'LONG' && prev > this.gridUpperBoundary && price <= this.gridUpperBoundary;
@@ -2177,6 +2173,43 @@ class AiDualStrategy extends TradingBase {
   }
 
   /**
+   * Manual LVN-trigger adjustment (RANGE only). Moves upperLVN / lowerLVN — the
+   * breakout triggers — WITHOUT touching the grid geometry (anchor/boundaries/legs).
+   * Each must stay on the correct side of the current price and BEYOND its value-area
+   * boundary (LVN triggers sit outside the grid). Persists + logs; the chart picks up
+   * the new levels on the next status poll.
+   */
+  async adjustLvn(upperLVN, lowerLVN) {
+    if (!this.isRunning) throw new Error('Strategy is not running.');
+    if (this.gridMode !== 'RANGE') {
+      throw new Error(`LVN can only be adjusted in RANGE mode (currently ${this.gridMode}).`);
+    }
+    const up = Number(upperLVN), lo = Number(lowerLVN);
+    if (!Number.isFinite(up) || !Number.isFinite(lo) || up <= 0 || lo <= 0) {
+      throw new Error('Both LVN+ and LVN- must be positive numbers.');
+    }
+    if (up <= lo) throw new Error('LVN+ must be above LVN-.');
+    const price = this.currentPrice;
+    if (Number.isFinite(price) && price > 0) {
+      if (up <= price) throw new Error(`LVN+ (${this._formatPrice(up)}) must be above the current price (${this._formatPrice(price)}).`);
+      if (lo >= price) throw new Error(`LVN- (${this._formatPrice(lo)}) must be below the current price (${this._formatPrice(price)}).`);
+    }
+    if (this.gridUpperBoundary != null && up <= this.gridUpperBoundary) {
+      throw new Error(`LVN+ (${this._formatPrice(up)}) must be above VAH (${this._formatPrice(this.gridUpperBoundary)}).`);
+    }
+    if (this.gridLowerBoundary != null && lo >= this.gridLowerBoundary) {
+      throw new Error(`LVN- (${this._formatPrice(lo)}) must be below VAL (${this._formatPrice(this.gridLowerBoundary)}).`);
+    }
+    const prevUp = this.upperLVN, prevLo = this.lowerLVN;
+    this.upperLVN = up;
+    this.lowerLVN = lo;
+    await this.addLog(`LVN adjusted (manual): LVN+ ${this._formatPrice(prevUp)}→${this._formatPrice(up)}, LVN- ${this._formatPrice(prevLo)}→${this._formatPrice(lo)}.`);
+    await this._writeStrategyFlow('LVN_ADJUST', { upperLVN: up, lowerLVN: lo }).catch(() => {});
+    await this.saveState();
+    return { upperLVN: up, lowerLVN: lo };
+  }
+
+  /**
    * Final TP detection handler — invoked from handleRealtimePrice when
    * price crosses finalTpPrice. v4.0.1: reduced to a thin re-entry guard
    * around stop({flatten:true, reason:'final_tp'}). The unified stop()
@@ -2611,6 +2644,8 @@ class AiDualStrategy extends TradingBase {
       harvestCount: this.harvestCount,
       initialCapital: this.initialCapital,
       currentInitialSize: this.currentInitialSize,
+      gridBaseSize: this._gridBaseSize,
+      lastConsolidatedNotional: this._lastConsolidatedNotional,
       walletBalance: this.lastWalletSnapshot?.totalMarginBalance || 0,
       positionSizeUSDT: this.currentInitialSize,
       minNotional: this.minNotional || 5,
@@ -2912,6 +2947,8 @@ class AiDualStrategy extends TradingBase {
       harvestPrice: this.harvestPrice,
       initialCapital: this.initialCapital,
       currentInitialSize: this.currentInitialSize,
+      gridBaseSize: this._gridBaseSize,
+      lastConsolidatedNotional: this._lastConsolidatedNotional,
       desiredProfitUSDT: this.desiredProfitUSDT,
 
       // Grid (dual/hedge) state — the frontend's Phase 4 Dual view renders
@@ -2945,7 +2982,6 @@ class AiDualStrategy extends TradingBase {
       recoveryFactorDecay: this.recoveryFactorDecay,
       recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
       aiVetoOnReversal: this.aiVetoOnReversal,
-      aiAutoHarvest: this.aiAutoHarvest,
       _lastTrendSize: this._lastTrendSize,
       _harvestRestartPending: this._harvestRestartPending,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
@@ -3011,7 +3047,6 @@ class AiDualStrategy extends TradingBase {
       harvestPrice: this.harvestPrice,
       initialCapital: this.initialCapital,
       harvestLossThreshold: this.harvestLossThreshold,
-      aiAutoHarvest: this.aiAutoHarvest,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
@@ -3097,6 +3132,8 @@ class AiDualStrategy extends TradingBase {
         initialCapital: this.initialCapital,
         initialWalletBalance: this.initialWalletBalance,
         currentInitialSize: this.currentInitialSize,
+        gridBaseSize: this._gridBaseSize,
+        lastConsolidatedNotional: this._lastConsolidatedNotional,
         accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
         accumulatedTradingFees: this.accumulatedTradingFees || 0,
         accumulatedFundingFees: this.accumulatedFundingFees || 0,
@@ -3135,7 +3172,6 @@ class AiDualStrategy extends TradingBase {
         recoveryFactorDecay: this.recoveryFactorDecay,
         recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
         aiVetoOnReversal: this.aiVetoOnReversal,
-        aiAutoHarvest: this.aiAutoHarvest,
         // ---- grid state ----
         gridMode: this.gridMode,
         gridAnchor: this.gridAnchor,
@@ -3166,7 +3202,6 @@ class AiDualStrategy extends TradingBase {
           recoveryFactorDecay: this.recoveryFactorDecay,
           recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
           aiVetoOnReversal: this.aiVetoOnReversal,
-          aiAutoHarvest: this.aiAutoHarvest,
           gridLevelsPerSide: this.gridLevelsPerSide,
           minStepPct: this.minStepPct,
           maxWidthPct: this.maxWidthPct,
