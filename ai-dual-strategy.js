@@ -447,19 +447,61 @@ class AiDualStrategy extends TradingBase {
   }
 
   /**
+   * Resolve an order's ACTUAL fill (avg price + filled qty) from the user-data
+   * WS, so open paths book position state from the real fill rather than the
+   * requested qty at the target price. Waits for the WS FILLED marker, then
+   * reads the captured summary (TradingBase.getWsOrderFill). Falls back, in
+   * order, to the REST-ack FULL response (executedQty/avgPrice) and finally to
+   * the requested qty at `fallbackPrice`. `source` records which path won.
+   */
+  async _resolveFill(orderId, restResult, requestedQty, fallbackPrice) {
+    let filledQty = requestedQty;
+    let fillPrice = fallbackPrice;
+    try {
+      if (orderId != null) {
+        const confirmed = await this._waitForOrderFillConfirmation(orderId, 3000);
+        const wf = this.getWsOrderFill(orderId);
+        if (confirmed && wf && wf.filledQty > 0) {
+          filledQty = wf.filledQty;
+          if (Number.isFinite(wf.avgPrice) && wf.avgPrice > 0) fillPrice = wf.avgPrice;
+          return { filledQty, fillPrice, source: 'ws' };
+        }
+      }
+    } catch (e) {
+      await this.addLog(`Fill-confirm ${orderId} failed (${e.message}); using REST/fallback.`);
+    }
+    // REST-ack fallback: the FULL market response may already carry the fill.
+    const restQty = parseFloat(restResult?.executedQty);
+    const restPrice = parseFloat(restResult?.avgPrice);
+    if (Number.isFinite(restQty) && restQty > 0) {
+      filledQty = restQty;
+      if (Number.isFinite(restPrice) && restPrice > 0) fillPrice = restPrice;
+      return { filledQty, fillPrice, source: 'rest' };
+    }
+    return { filledQty, fillPrice, source: 'fallback' };
+  }
+
+  /**
    * Open one grid leg in hedge mode. `side` (BUY/SELL) encodes market
    * direction; `positionSide` (LONG/SHORT) — set to the leg's own
    * direction — tells Binance which hedge-mode side to book it under.
-   * After the fill, recomputes that side's locked VWAP across all
-   * currently-open legs on the same direction via `averageOpenEntry`.
+   * Books the leg from the ACTUAL WS fill (qty + average price), then
+   * recomputes that side's locked VWAP across all currently-open legs on the
+   * same direction via `averageOpenEntry` (which prefers `fillPrice`).
    */
   async _openGridLeg(leg) {
     const side = leg.direction === 'LONG' ? 'BUY' : 'SELL';
     const qty = await this._calculateAdjustedQuantity(this.symbol, this._legNotional());
     await this.addLog(`Grid OPEN ${leg.direction} L${leg.levelIndex} @~${this._formatPrice(leg.price)} qty ${qty}.`);
-    await this.placeMarketOrder(this.symbol, side, qty, leg.direction); // hedge: positionSide encodes leg
+    const result = await this.placeMarketOrder(this.symbol, side, qty, leg.direction); // hedge: positionSide encodes leg
+    // Reconcile from the user-data WS fill (not the requested qty / grid target).
+    const fill = await this._resolveFill(result?.orderId, result, qty, leg.price);
     leg.state = 'POSITION_OPEN';
-    leg.quantity = qty;
+    leg.quantity = fill.filledQty;
+    leg.fillPrice = fill.fillPrice; // real average fill price → feeds the VWAP
+    if (fill.source !== 'ws') {
+      await this.addLog(`Grid OPEN ${leg.direction} L${leg.levelIndex} booked from ${fill.source} (WS fill unconfirmed): qty ${fill.filledQty} @ ${this._formatPrice(fill.fillPrice)}.`);
+    }
     // Recompute locked vwap for this side to include the new leg (locked until side flat).
     if (leg.direction === 'LONG') this.vwapLong = averageOpenEntry(this.gridLines, 'LONG');
     else this.vwapShort = averageOpenEntry(this.gridLines, 'SHORT');
@@ -474,13 +516,18 @@ class AiDualStrategy extends TradingBase {
    * direction remain open, so the next open re-seeds it from scratch.
    */
   async _closeGridLeg(leg, reason) {
-    if (!leg.quantity || leg.quantity <= 0) { leg.state = 'EMPTY'; leg.quantity = null; return null; }
+    if (!leg.quantity || leg.quantity <= 0) { leg.state = 'EMPTY'; leg.quantity = null; leg.fillPrice = null; return null; }
     const closeSide = leg.direction === 'LONG' ? 'SELL' : 'BUY';
     await this.addLog(`Grid CLOSE ${leg.direction} L${leg.levelIndex} (${reason}) qty ${leg.quantity}.`);
     // HEDGE CLOSE: opposite side, same positionSide, NEVER reduceOnly (Binance rejects in hedge).
     const result = await this.placeMarketOrder(this.symbol, closeSide, leg.quantity, leg.direction);
+    // Confirm the close actually filled on the user-data WS before dropping the
+    // leg from the book (realized PnL + fees fold in via the WS accumulators).
+    try { if (result?.orderId) await this._waitForOrderFillConfirmation(result.orderId, 3000); }
+    catch (e) { await this.addLog(`Grid CLOSE fill-confirm ${leg.direction} L${leg.levelIndex} failed (${e.message}); clearing leg anyway.`); }
     leg.state = 'EMPTY';
     leg.quantity = null;
+    leg.fillPrice = null;
     // If the side is now flat, null its locked vwap so the next OPEN re-seeds it.
     if (leg.direction === 'LONG' && !this.gridLines.some(l => l.direction === 'LONG' && l.state === 'POSITION_OPEN')) this.vwapLong = null;
     if (leg.direction === 'SHORT' && !this.gridLines.some(l => l.direction === 'SHORT' && l.state === 'POSITION_OPEN')) this.vwapShort = null;
@@ -524,30 +571,33 @@ class AiDualStrategy extends TradingBase {
     await this.addLog(`Consolidated OPEN ${direction} — ${this._formatNotional(sizeUSDT)} USDT, qty ${qty}.`);
     const result = await this.placeMarketOrder(this.symbol, side, qty, direction);
     this.currentSide = direction;
-    // Resolve the TRUE average fill price from the exchange rather than the calc
-    // price. this.currentPrice is the trigger-TICK price and drifts from the
-    // actual fill, so the reported entry (and unrealized PnL) didn't tally with
-    // Binance. Wait for the fill to settle (the WS ACCOUNT_UPDATE stamps the
-    // side's entry via `ep`), backstop with a REST positionRisk read, then use
-    // the side's exchange entry — falling back to the calc price if unavailable.
-    let entryPrice = this.currentPrice;
-    try {
-      if (result?.orderId) await this._waitForOrderFillConfirmation(result.orderId, 3000);
-      await this.getPositionRiskMap();
-      const exEntry = direction === 'LONG' ? this._longEntryPrice : this._shortEntryPrice;
-      if (Number.isFinite(exEntry) && exEntry > 0) entryPrice = exEntry;
-    } catch (e) {
-      await this.addLog(`Consolidated entry refresh failed (${e.message}); using calc price ${this._formatPrice(this.currentPrice)}.`);
+    // Book from the ACTUAL user-data WS fill (avg price + filled qty), not the
+    // requested qty / trigger-tick price. this.currentPrice is the trigger TICK
+    // and drifts from the real fill, so the reported entry (and unrealized PnL)
+    // wouldn't tally with Binance.
+    const fill = await this._resolveFill(result?.orderId, result, qty, this.currentPrice);
+    let entryPrice = fill.fillPrice;
+    const filledQty = fill.filledQty;
+    // Backstop the entry from the exchange side-position when the WS fill didn't
+    // confirm (the WS ACCOUNT_UPDATE stamps the side's entry via `ep`).
+    if (fill.source !== 'ws') {
+      try {
+        await this.getPositionRiskMap();
+        const exEntry = direction === 'LONG' ? this._longEntryPrice : this._shortEntryPrice;
+        if (Number.isFinite(exEntry) && exEntry > 0) entryPrice = exEntry;
+      } catch (e) {
+        await this.addLog(`Consolidated entry refresh failed (${e.message}); using ${this._formatPrice(entryPrice)}.`);
+      }
     }
     // Record activePosition CONSISTENT with the actually-filled qty at the real
     // entry: notional = qty * entryPrice, so _recomputeFinalTpPrice and the
     // _enterUnwind flip size read a notional that matches the real position.
-    this.activePosition = { quantity: qty, entryPrice, notional: qty * entryPrice, unrealizedPnl: 0 };
+    this.activePosition = { quantity: filledQty, entryPrice, notional: filledQty * entryPrice, unrealizedPnl: 0 };
     // Remember this (recovery-grown) consolidated notional — a harvest carries it
     // forward as the fresh grid base (see _harvestToFlat).
-    this._lastConsolidatedNotional = qty * entryPrice;
+    this._lastConsolidatedNotional = filledQty * entryPrice;
     this._recomputeFinalTpPrice();
-    return qty;
+    return filledQty;
   }
 
   // Close the full consolidated hedge position to flat (opposite side, same positionSide, no reduceOnly).
@@ -556,7 +606,11 @@ class AiDualStrategy extends TradingBase {
     const closeSide = this.currentSide === 'LONG' ? 'SELL' : 'BUY';
     const qty = this.activePosition.quantity;
     await this.addLog(`Consolidated CLOSE ${this.currentSide} qty ${qty} (${reason}).`);
-    await this.placeMarketOrder(this.symbol, closeSide, qty, this.currentSide);
+    const result = await this.placeMarketOrder(this.symbol, closeSide, qty, this.currentSide);
+    // Confirm the close filled on the user-data WS before dropping the in-memory
+    // position (realized PnL + fees fold in via the WS accumulators).
+    try { if (result?.orderId) await this._waitForOrderFillConfirmation(result.orderId, 3000); }
+    catch (e) { await this.addLog(`Consolidated close fill-confirm failed (${e.message}); clearing position anyway.`); }
     this.activePosition = null;
     this.currentSide = null;
     this.finalTpPrice = null;
@@ -698,7 +752,11 @@ class AiDualStrategy extends TradingBase {
       if (trancheQty > 0) {
         const closeSide = isLong ? 'SELL' : 'BUY';
         await this.addLog(`UNWIND ${this.unwindDirection} tranche ${t.idx + 1}/${N} TP @ ${this._formatPrice(t.price)} qty ${trancheQty}.`);
-        await this.placeMarketOrder(this.symbol, closeSide, trancheQty, this.unwindDirection); // hedge close, no reduceOnly
+        const result = await this.placeMarketOrder(this.symbol, closeSide, trancheQty, this.unwindDirection); // hedge close, no reduceOnly
+        // Confirm the tranche close filled on the WS before flagging it done +
+        // decrementing the in-memory size (realized PnL folds in via accumulators).
+        try { if (result?.orderId) await this._waitForOrderFillConfirmation(result.orderId, 3000); }
+        catch (e) { await this.addLog(`UNWIND tranche fill-confirm failed (${e.message}); advancing anyway.`); }
       }
       this.unwindTrancheFlags[t.idx] = true;
       this.unwindTranchesRemaining = Math.max(0, this.unwindTranchesRemaining - 1);

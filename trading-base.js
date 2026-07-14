@@ -204,6 +204,11 @@ class TradingBase {
     // _waitForOrderFillConfirmation gates on this so callers that size off a
     // just-closed leg (reversal recovery sizing) never read a partial accLoss.
     this._wsFullyFilledOrderIds = new Map(); // orderId → timestamp
+    // Per-order fill summary from the user-data WS (avg fill price + total
+    // filled qty), so callers can reconcile position state from the ACTUAL
+    // fill rather than the requested qty / target price. Same 5-min lifecycle
+    // as the maps above (pruned in _pruneWsHandledMap).
+    this._wsOrderFills = new Map(); // orderId → { filledQty, avgPrice, positionSide, ts }
     this._restFallbackCount = 0;
     this._lastUserDataMessageAt = 0;
 
@@ -591,6 +596,19 @@ class TradingBase {
     for (const [oid, ts] of this._wsFullyFilledOrderIds) {
       if (ts < cutoff) this._wsFullyFilledOrderIds.delete(oid);
     }
+    for (const [oid, v] of this._wsOrderFills) {
+      if ((v?.ts || 0) < cutoff) this._wsOrderFills.delete(oid);
+    }
+  }
+
+  /**
+   * Read the WS-reported fill summary for an order (avg price + total filled
+   * qty), captured by _handleOrderTradeUpdate on the FILLED event. Returns
+   * null if the order hasn't been seen FILLED on the user-data WS. Lets grid /
+   * consolidated open paths reconcile leg qty + entry from the real fill.
+   */
+  getWsOrderFill(orderId) {
+    return orderId != null ? (this._wsOrderFills.get(orderId) || null) : null;
   }
 
   /**
@@ -1864,6 +1882,18 @@ class TradingBase {
     // not here), so this fires even when no promise is pending.
     if (order.X === 'FILLED') {
       this._wsFullyFilledOrderIds.set(order.i, Date.now());
+      // Capture the authoritative fill summary for reconciliation: `z` is the
+      // order's cumulative filled qty, `ap` its average fill price. Used by the
+      // grid / consolidated open paths (getWsOrderFill) to book the leg from the
+      // REAL fill instead of the requested qty at the grid target price.
+      const filledQty = parseFloat(order.z);
+      const avgPrice = parseFloat(order.ap);
+      this._wsOrderFills.set(order.i, {
+        filledQty: Number.isFinite(filledQty) ? filledQty : 0,
+        avgPrice: Number.isFinite(avgPrice) ? avgPrice : 0,
+        positionSide: order.ps || 'BOTH',
+        ts: Date.now(),
+      });
     }
 
     // Resolve/reject pending order promises

@@ -98,7 +98,12 @@ export function planCrossingActions({ prevPrice, currentPrice, legs, vwapLong, v
 export function averageOpenEntry(legs, direction) {
   const open = legs.filter(l => l.direction === direction && l.state === 'POSITION_OPEN' && l.quantity > 0);
   if (!open.length) return null;
-  const cost = open.reduce((s, l) => s + l.price * l.quantity, 0);
+  // Prefer the leg's actual average FILL price (WS-reconciled in _openGridLeg);
+  // fall back to the grid target price for legs opened before fill-reconcile
+  // existed, or when the WS fill was unavailable. Keeps the peel-gate VWAP
+  // anchored to the real average entry rather than the theoretical grid line.
+  const px = (l) => (Number.isFinite(l.fillPrice) && l.fillPrice > 0 ? l.fillPrice : l.price);
+  const cost = open.reduce((s, l) => s + px(l) * l.quantity, 0);
   const qty = open.reduce((s, l) => s + l.quantity, 0);
   return qty > 0 ? cost / qty : null;
 }
