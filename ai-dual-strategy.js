@@ -580,6 +580,11 @@ class AiDualStrategy extends TradingBase {
         if (a.kind === 'CLOSE') await this._closeGridLeg(a.leg, a.reason);
         else if (a.kind === 'OPEN' && a.leg.state === 'EMPTY') await this._openGridLeg(a.leg);
       }
+      // Grid legs trade via placeMarketOrder directly (not the executor path that
+      // _postExecuteBookkeeping wraps), so the DERIVED acc-loss must be refreshed
+      // here too — otherwise RANGE oscillation realizes PnL/fees into the
+      // accumulators while the harvest gauge stays stale.
+      this.cycleAccumulatedLoss = this._computeAccLoss();
       await this.saveState();
     } catch (e) {
       await this.addLog(`ERROR grid crossing: ${e.message}`);
@@ -798,7 +803,7 @@ class AiDualStrategy extends TradingBase {
       return;
     }
 
-    await this.addLog(`[RECOVERY] Resuming AI Reversal Strategy after restart...`);
+    await this.addLog(`[RECOVERY] Resuming AI Dual Strategy after restart...`);
 
     // Restore config
     this.symbol = snapshot.symbol;
@@ -897,12 +902,16 @@ class AiDualStrategy extends TradingBase {
 
     try {
       await this.setLeverage(this.symbol, this.leverage);
-      // One-way mode — reversal is single-sided. Wrap in try/catch
-      // because Binance refuses the call if positions are open.
+      // Hedge (dual-side) mode — AI Dual holds long + short simultaneously
+      // (mirrors start()). Wrap in try/catch because Binance refuses the call
+      // if positions are open (harmless: an open position means it is ALREADY
+      // hedge). Critically it must NOT be setPositionMode(false) — on a restart
+      // while flat that would silently flip the account to one-way and break
+      // every subsequent hedge order.
       try {
-        await this.setPositionMode(false);
+        await this.setPositionMode(true);
       } catch (err) {
-        await this.addLog(`[RECOVERY] setPositionMode(false) note: ${err.message}`);
+        await this.addLog(`[RECOVERY] setPositionMode(true) note: ${err.message} (continuing — likely already hedge, or open positions block the switch).`);
       }
       await this._getExchangeInfo(this.symbol);
     } catch (error) {
@@ -2881,6 +2890,10 @@ class AiDualStrategy extends TradingBase {
   // ——— Status snapshot (consumed by /ai-reversal/status) ——————————————
 
   getStatus() {
+    // acc-loss is purely derived from the live (Binance-truth) accumulators, so
+    // refresh it on read — the displayed gauge then always matches the Cycle PnL
+    // Net regardless of which trade path last ran (grid crossings, harvest, ...).
+    this.cycleAccumulatedLoss = this._computeAccLoss();
     return {
       strategyId: this.strategyId,
       strategyType: 'dual',
@@ -2981,6 +2994,7 @@ class AiDualStrategy extends TradingBase {
    * bookkeeping change via _pushHeartbeatNow().
    */
   getHeartbeatPayload() {
+    this.cycleAccumulatedLoss = this._computeAccLoss(); // keep derived acc-loss live (see getStatus)
     return {
       strategyId: this.strategyId,
       strategyType: 'dual',
