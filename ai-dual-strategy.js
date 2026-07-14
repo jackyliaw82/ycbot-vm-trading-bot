@@ -1396,6 +1396,16 @@ class AiDualStrategy extends TradingBase {
       return;
     }
 
+    // Defensive: RANGE holds inventory in grid legs ONLY — never a consolidated
+    // position. Clear any stale activePosition so it can't (a) leak a phantom
+    // unrealized / est-close-fee to the UI, or (b) make a manual harvest place a
+    // spurious _closeConsolidated market order for a position the exchange doesn't
+    // have. Runs BEFORE the manual-harvest check below.
+    if (this.gridMode === 'RANGE' && this.activePosition) {
+      this.activePosition = null;
+      this.currentSide = null;
+    }
+
     // Honor a queued manual harvest on the next free tick (harvestNow sets the latch).
     if (this._manualHarvestRequested && !this._tradingSeqInProgress) {
       this._manualHarvestRequested = false;
