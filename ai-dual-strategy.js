@@ -519,13 +519,27 @@ class AiDualStrategy extends TradingBase {
     // volatility-scaling it down would silently understate the recovery leg.
     const qty = await this._calculateAdjustedQuantity(this.symbol, sizeUSDT, this.currentPrice, 'CUT');
     await this.addLog(`Consolidated OPEN ${direction} — ${this._formatNotional(sizeUSDT)} USDT, qty ${qty}.`);
-    await this.placeMarketOrder(this.symbol, side, qty, direction);
+    const result = await this.placeMarketOrder(this.symbol, side, qty, direction);
     this.currentSide = direction;
-    // Record activePosition CONSISTENT with the actually-filled qty at the calc
-    // price: notional = qty * currentPrice (NOT the raw sizeUSDT), so
-    // _recomputeFinalTpPrice and the _enterUnwind flip size read a notional that
-    // matches the real position rather than the pre-rounding request.
-    this.activePosition = { quantity: qty, entryPrice: this.currentPrice, notional: qty * this.currentPrice, unrealizedPnl: 0 };
+    // Resolve the TRUE average fill price from the exchange rather than the calc
+    // price. this.currentPrice is the trigger-TICK price and drifts from the
+    // actual fill, so the reported entry (and unrealized PnL) didn't tally with
+    // Binance. Wait for the fill to settle (the WS ACCOUNT_UPDATE stamps the
+    // side's entry via `ep`), backstop with a REST positionRisk read, then use
+    // the side's exchange entry — falling back to the calc price if unavailable.
+    let entryPrice = this.currentPrice;
+    try {
+      if (result?.orderId) await this._waitForOrderFillConfirmation(result.orderId, 3000);
+      await this.getPositionRiskMap();
+      const exEntry = direction === 'LONG' ? this._longEntryPrice : this._shortEntryPrice;
+      if (Number.isFinite(exEntry) && exEntry > 0) entryPrice = exEntry;
+    } catch (e) {
+      await this.addLog(`Consolidated entry refresh failed (${e.message}); using calc price ${this._formatPrice(this.currentPrice)}.`);
+    }
+    // Record activePosition CONSISTENT with the actually-filled qty at the real
+    // entry: notional = qty * entryPrice, so _recomputeFinalTpPrice and the
+    // _enterUnwind flip size read a notional that matches the real position.
+    this.activePosition = { quantity: qty, entryPrice, notional: qty * entryPrice, unrealizedPnl: 0 };
     this._recomputeFinalTpPrice();
     return qty;
   }
