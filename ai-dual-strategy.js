@@ -575,8 +575,12 @@ class AiDualStrategy extends TradingBase {
    */
   async _processGridCrossings(prevPrice, currentPrice) {
     if (this._tradingSeqInProgress) return;
+    const gridStep = (this.gridUpperBoundary != null && this.gridLowerBoundary != null && this.gridLevelsPerSide > 0)
+      ? (this.gridUpperBoundary - this.gridLowerBoundary) / (2 * this.gridLevelsPerSide)
+      : null;
     const actions = planCrossingActions({
       prevPrice, currentPrice, legs: this.gridLines, vwapLong: this.vwapLong, vwapShort: this.vwapShort,
+      gridStep, gridAnchor: this.gridAnchor,
     });
     if (!actions.length) return;
 
