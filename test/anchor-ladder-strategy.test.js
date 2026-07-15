@@ -277,3 +277,131 @@ test('harvest re-anchors to the CURRENT price, unlike the anchor flatten', async
   assert.equal(s.ladderMode, 'RANGE');
   assert.ok(s.ladderLines.every(l => l.state === 'EMPTY'));
 });
+
+// ——— Task 9: persistence, status, and resume ——————————————————————————
+
+// resume() does real Binance/WS/Firestore I/O beyond restoring fields
+// (setLeverage, listen-key, WS connects, L3 reconcile, funding poll, ...).
+// These tests are about the field round-trip through saveState/resume, so
+// every network- or Firestore-touching call is stubbed to a no-op.
+function stubResumeIO(s) {
+  s.setLeverage = async () => {};
+  s.setPositionMode = async () => {};
+  s._getExchangeInfo = async () => {};
+  s._retryListenKeyRequest = async () => {};
+  s.connectUserDataStream = () => {};
+  s.connectRealtimeWebSocket = () => {};
+  s._startWebSocketHealthMonitoring = () => {};
+  s._scheduleVolumeRefresh = () => {};
+  s._refreshVolumeSnapshot = async () => {};
+  s._preloadWsHandledOrderIdsFromFirestore = async () => {};
+  s._reconcileRecentTrades = async () => {};
+  s.detectCurrentPosition = async () => {};
+  s._refreshCurrentPosition = async () => {};
+  s._pollFundingIncome = async () => {};
+  s._scheduleNextFundingPoll = () => {};
+  s.saveState = async () => {};
+  return s;
+}
+
+// resume() unconditionally starts a real 30-minute listen-key refresh
+// setInterval that would otherwise keep the test process (and `node --test`)
+// alive indefinitely. Clear it once assertions are done.
+function cleanupResumeTimers(s) {
+  if (s.listenKeyRefreshInterval) clearInterval(s.listenKeyRefreshInterval);
+  if (s._fundingPollTimeout) clearTimeout(s._fundingPollTimeout);
+  if (s._volumeRefreshInterval) clearInterval(s._volumeRefreshInterval);
+}
+
+test('a ladder round-trips through saveState/resume', async () => {
+  const src = ladderStrategy({ anchor: 100, base: 12000 });
+  src.ladderMode = 'TREND';
+  src.trendDirection = 'LONG';
+  src.ladderLines.filter(l => l.direction === 'LONG').forEach((l, i) => {
+    Object.assign(l, { state: 'POSITION_OPEN', quantity: 10 + i, fillPrice: 100.3 + i * 0.3 });
+  });
+  src.lastProcessedPrice = 101.5;
+  src.cycleAccumulatedLoss = 89;
+
+  let doc = null;
+  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
+  // ladderStrategy() stubs saveState for the OTHER tests in this file (so a
+  // trading-sequence test doesn't need a firestore double); this test is
+  // specifically about persistence, so it calls the real prototype method.
+  await AnchorLadderStrategy.prototype.saveState.call(src);
+
+  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
+  cleanupResumeTimers(dst);
+
+  assert.equal(dst.anchor, 100);
+  assert.equal(dst.ladderMode, 'TREND');
+  assert.equal(dst.trendDirection, 'LONG');
+  assert.equal(dst.ladderLines.length, 10);
+  assert.equal(dst.ladderLines.filter(l => l.state === 'POSITION_OPEN').length, 5);
+  assert.equal(dst.lastProcessedPrice, 101.5);
+  assert.equal(dst._ladderBaseSize, 12000);
+});
+
+test('getStatus reports the ladder shape the frontend needs', () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.ladderMode = 'RANGE';
+  const st = s.getStatus();
+  assert.equal(st.mode, 'RANGE', 'the frontend reads status.mode, not status.ladderMode');
+  assert.equal(st.anchor, 100);
+  assert.equal(st.ladderLines.length, 10);
+  assert.equal(st.levelsPerSide, 5);
+  assert.equal(st.stepPct, 0.003);
+});
+
+test('getHeartbeatPayload reports the same ladder shape as getStatus', () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.ladderMode = 'TREND';
+  s.trendDirection = 'SHORT';
+  const hb = s.getHeartbeatPayload();
+  assert.equal(hb.mode, 'TREND', 'the frontend reads status.mode, not status.ladderMode');
+  assert.equal(hb.anchor, 100);
+  assert.equal(hb.trendDirection, 'SHORT');
+  assert.equal(hb.ladderLines.length, 10);
+  assert.equal(hb.strategyType, 'anchorLadder');
+});
+
+test('saveState writes the ANCHOR_LADDER type tags for boot recovery', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  let written = null;
+  s.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { written = d; } }) }) };
+  await AnchorLadderStrategy.prototype.saveState.call(s);
+  assert.equal(written.type, 'ANCHOR_LADDER');
+  assert.equal(written.strategyType, 'anchorLadder');
+});
+
+test('_lastLadderSize and _harvestRestartPending survive a save/resume round trip', async () => {
+  const src = ladderStrategy({ anchor: 100, base: 12000 });
+  src._lastLadderSize = 15000;
+  src._harvestRestartPending = true;
+
+  let doc = null;
+  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
+  await AnchorLadderStrategy.prototype.saveState.call(src);
+
+  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
+  cleanupResumeTimers(dst);
+
+  assert.equal(dst._lastLadderSize, 15000, 'the martingale escalation freeze must survive a restart');
+  assert.equal(dst._harvestRestartPending, true);
+});
+
+test('_recomputeFinalTpPrice keys off trendDirection, not just currentSide (resume race)', () => {
+  const s = ladderStrategy({ mode: 'TREND' });
+  s.trendDirection = 'LONG';
+  s.currentSide = null; // simulates the boot-recovery race: not yet resolved from Binance
+  s.activePosition = { quantity: 100, avgEntry: 100.9, entryPrice: 100.9, notional: 10090 };
+  s.cycleAccumulatedLoss = 89;
+  s.desiredProfitUSDT = 100;
+  s._recomputeFinalTpPrice();
+  assert.ok(s.finalTpPrice != null, 'Final TP must arm from trendDirection even when currentSide has not resolved yet');
+  assert.ok(Math.abs(s.finalTpPrice - 102.87072) < 1e-6, `got ${s.finalTpPrice}`);
+});

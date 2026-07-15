@@ -12,13 +12,6 @@ const HARVEST_LOSS_THRESHOLD_PCT = 0.30;           // 30% of initial capital —
 const DEFAULT_RECOVERY_FACTOR = 0.20;
 const DEFAULT_RECOVERY_DISTANCE = 0.005;           // 0.5%
 
-// ---- Grid (dual/hedge) defaults — legacy resume() fallbacks only; the ladder's
-// own geometry (stepPct/levelsPerSide) is fixed via LADDER_STEP_PCT /
-// LADDER_LEVELS_PER_SIDE, not these. ----
-const DEFAULT_GRID_LEVELS_PER_SIDE = 5;
-const DEFAULT_MIN_STEP_PCT = 0.0025;   // round-trip fee+slippage floor
-const DEFAULT_MAX_WIDTH_PCT = 0.05;    // cap on half-width fraction from anchor
-
 function formatDuration(ms) {
   if (!ms || ms < 0) return 'N/A';
   const days = Math.floor(ms / (1000 * 60 * 60 * 24));
@@ -64,7 +57,7 @@ class AnchorLadderStrategy extends TradingBase {
     super(gcfProxyUrl, profileId, sharedVmProxyGcfUrl);
 
     // Reversal-specific state
-    this.strategyType = 'dual';
+    this.strategyType = 'anchorLadder';
     this.currentSide = null;                // 'LONG' | 'SHORT' | null
     this.activePosition = null;            // { quantity, entryPrice, notional, unrealizedPnl }
     this.bullLevel = null;
@@ -75,8 +68,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.harvestCount = 0;
     this.initialCapital = 0;
     this.currentInitialSize = 0;         // base for DYNAMIC trend sizing (original config size; never overwritten → no compounding)
-    this._ladderBaseSize = 0;            // base the LADDER is sized from: initial size, then the last consolidated notional after a harvest
-    this._lastConsolidatedNotional = 0;  // notional of the most recent TREND/UNWIND consolidated open (carried into the post-harvest grid)
+    this._ladderBaseSize = 0;            // base the LADDER is sized from: initial size, then the dynamically re-sized base after an anchor flatten / harvest
     this.cycleStartTime = null;
     // Execution lock. KEPT (not AI state): stop() and _handleFinalTpHit use the
     // EXECUTING/TERMINATED values as the re-entry guard around termination.
@@ -578,7 +570,7 @@ class AnchorLadderStrategy extends TradingBase {
 
   /**
    * Resume a strategy from a Firestore snapshot. Called by app.js boot-scan
-   * (recoverActiveStrategies) when a `type: 'AI_DUAL'` doc has
+   * (recoverActiveStrategies) when a `type: 'ANCHOR_LADDER'` doc has
    * `isRunning: true` but no in-memory instance exists (i.e. PM2 restart
    * / VM force-update).
    *
@@ -627,33 +619,18 @@ class AnchorLadderStrategy extends TradingBase {
     this.harvestLossThreshold = snapshot.config?.harvestLossThreshold ?? HARVEST_LOSS_THRESHOLD_PCT;
     this.desiredProfitUSDT = snapshot.config?.desiredProfitUSDT || 0;
     this.currentInitialSize = snapshot.currentInitialSize || snapshot.config?.initialSize || 0;
-    this._ladderBaseSize = snapshot.gridBaseSize || this.currentInitialSize; // grown ladder base survives restarts (else ladder shrinks to initial)
-    this._lastConsolidatedNotional = snapshot.lastConsolidatedNotional || 0;
-    // Restore advanced toggles too (advisory, but tracked for log parity).
-    this.recoveryFactorDecay = !!snapshot.config?.recoveryFactorDecay;
-    this.recoveryDistanceAutoWiden = !!snapshot.config?.recoveryDistanceAutoWiden;
 
-    // ---- grid state ----
-    this.ladderMode = snapshot.gridMode || 'RANGE';
-    this.anchor = snapshot.gridAnchor ?? null;
-    this.gridUpperBoundary = snapshot.gridUpperBoundary ?? null;
-    this.gridLowerBoundary = snapshot.gridLowerBoundary ?? null;
-    this.upperLVN = snapshot.upperLVN ?? null;
-    this.lowerLVN = snapshot.lowerLVN ?? null;
-    this.ladderLines = Array.isArray(snapshot.gridLines) ? snapshot.gridLines : [];
-    this.vwapLong = snapshot.vwapLong ?? null;
-    this.vwapShort = snapshot.vwapShort ?? null;
-    this.gridLevelsPerSide = Number(snapshot.config?.gridLevelsPerSide) || DEFAULT_GRID_LEVELS_PER_SIDE;
-    this.minStepPct = snapshot.config?.minStepPct != null ? Number(snapshot.config.minStepPct) : DEFAULT_MIN_STEP_PCT;
-    this.maxWidthPct = snapshot.config?.maxWidthPct != null ? Number(snapshot.config.maxWidthPct) : DEFAULT_MAX_WIDTH_PCT;
-    this.lastProcessedPrice = snapshot.lastProcessedPrice ?? null;
-
-    // ---- TREND state ----
+    // ---- ladder state ----
+    this.ladderMode = snapshot.ladderMode || 'RANGE';
+    this.anchor = snapshot.anchor ?? null;
+    this.ladderLines = Array.isArray(snapshot.ladderLines) ? snapshot.ladderLines : [];
     this.trendDirection = snapshot.trendDirection ?? null;
-
-    // ---- Phase 3: harvest-gauge cap state ----
-    this._lastLadderSize = snapshot._lastLadderSize ?? snapshot._lastTrendSize ?? null;
+    this.lastProcessedPrice = snapshot.lastProcessedPrice ?? null;
+    this._ladderBaseSize = snapshot.ladderBaseSize || this.currentInitialSize; // grown ladder base survives restarts (else ladder shrinks to initial)
+    this._lastLadderSize = snapshot._lastLadderSize ?? null;
     this._harvestRestartPending = !!snapshot._harvestRestartPending;
+    this.stepPct = LADDER_STEP_PCT;           // fixed, never from the snapshot
+    this.levelsPerSide = LADDER_LEVELS_PER_SIDE;
 
     // Restore cycle state
     this.currentSide = snapshot.currentSide || null;
@@ -1362,6 +1339,17 @@ class AnchorLadderStrategy extends TradingBase {
    * The old AI-consult cost addend is gone (the strategy is fully mechanical),
    * so the target now moves only with accumulated loss, the desired profit, and
    * the estimated closing fee. Recomputed on every position/funding event.
+   *
+   * Side resolution mirrors `_checkFinalTpHit`: key off `trendDirection`
+   * (set synchronously in `_enterTrend` and restored directly from the
+   * snapshot in `resume`) with a `currentSide` fallback, rather than
+   * `currentSide` alone. `currentSide` is only ever populated by
+   * `_refreshCurrentPosition()` (a REST call) or restored from a snapshot,
+   * so on a boot-recovery race (resume() calls this before the position
+   * refresh resolves currentSide) keying on currentSide alone left
+   * finalTpPrice null and the Final TP call site
+   * (`if (this.finalTpPrice && this._checkFinalTpHit(price))`) silently
+   * never arms.
    */
   _recomputeFinalTpPrice() {
     if (!this.activePosition || !this.activePosition.quantity || this.activePosition.quantity <= 0) {
@@ -1381,9 +1369,10 @@ class AnchorLadderStrategy extends TradingBase {
       this.finalTpPrice = null;
       return;
     }
-    if (this.currentSide === 'LONG') {
+    const side = this.trendDirection || this.currentSide;
+    if (side === 'LONG') {
       this.finalTpPrice = entry + needed / qty;
-    } else if (this.currentSide === 'SHORT') {
+    } else if (side === 'SHORT') {
       this.finalTpPrice = entry - needed / qty;
     } else {
       this.finalTpPrice = null;
@@ -1837,7 +1826,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.cycleAccumulatedLoss = this._computeAccLoss();
     return {
       strategyId: this.strategyId,
-      strategyType: 'dual',
+      strategyType: 'anchorLadder',
       symbol: this.symbol,
       isRunning: this.isRunning,
       executionState: this.executionState,
@@ -1852,24 +1841,19 @@ class AnchorLadderStrategy extends TradingBase {
       harvestCount: this.harvestCount,
       initialCapital: this.initialCapital,
       currentInitialSize: this.currentInitialSize,
-      gridBaseSize: this._ladderBaseSize,
-      lastConsolidatedNotional: this._lastConsolidatedNotional,
       desiredProfitUSDT: this.desiredProfitUSDT,
 
-      // Grid (dual/hedge) state — the frontend's Phase 4 Dual view renders
-      // these directly. `mode` is the alias the frontend actually reads
-      // (status.mode, not status.gridMode).
-      mode: this.ladderMode,
-      gridAnchor: this.anchor,
-      gridUpperBoundary: this.gridUpperBoundary,
-      gridLowerBoundary: this.gridLowerBoundary,
-      upperLVN: this.upperLVN,
-      lowerLVN: this.lowerLVN,
-      gridLines: this.ladderLines,
-      vwapLong: this.vwapLong,
-      vwapShort: this.vwapShort,
-      gridLevelsPerSide: this.gridLevelsPerSide,
+      // Ladder state — the frontend's status/chart view renders these
+      // directly. `mode` is the alias the frontend actually reads
+      // (status.mode, not status.ladderMode).
+      mode: this.ladderMode,         // the frontend reads status.mode, not ladderMode
+      anchor: this.anchor,
+      ladderLines: this.ladderLines,
       trendDirection: this.trendDirection,
+      levelsPerSide: this.levelsPerSide,
+      stepPct: this.stepPct,
+      legNotional: this._legNotional(),
+      ladderBaseSize: this._ladderBaseSize,
       // Running config — surfaced so the frontend's Active Config panel
       // can show the values the bot is ACTUALLY using rather than the
       // form's DEFAULT_CONFIG (which is what reversal's frontend used
@@ -1881,8 +1865,6 @@ class AnchorLadderStrategy extends TradingBase {
       recoveryDistance: this.recoveryDistance,
       harvestLossThreshold: this.harvestLossThreshold,
       maxPositionSizeUSDT: this.maxPositionSizeUSDT,
-      recoveryFactorDecay: this.recoveryFactorDecay,
-      recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
       _lastLadderSize: this._lastLadderSize,
       _harvestRestartPending: this._harvestRestartPending,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
@@ -1915,10 +1897,10 @@ class AnchorLadderStrategy extends TradingBase {
    *   - AI-consult cache (volumeProfile / cvd / orderbookDepth / volatility)
    *     which only changes on consults — pushed via plan_update.context.
    *   - Derivable fields (cycleDuration = Date.now() - cycleStartTime).
-   * Grid/mode fields (mode, gridAnchor/gridLines/etc., trendDirection,
-   * unwindDirection, finalTpPrice, ...) ARE included here — unlike reversal,
-   * a live Dual WS session needs them on every heartbeat because RANGE/TREND/
-   * UNWIND transitions and grid rebuilds happen mid-cycle, not just at plan
+   * Ladder/mode fields (mode, anchor/ladderLines/etc., trendDirection,
+   * finalTpPrice, ...) ARE included here — unlike reversal, a live ladder
+   * session needs them on every heartbeat because RANGE/TREND transitions
+   * and anchor-flatten rebuilds happen mid-cycle, not just at plan
    * boundaries, and the frontend merges this payload directly into `status`
    * (setStatus(prev => ({...prev, ...payload}))) so a value missing here
    * would only ever reach the frontend via the next full REST getStatus().
@@ -1929,7 +1911,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.cycleAccumulatedLoss = this._computeAccLoss(); // keep derived acc-loss live (see getStatus)
     return {
       strategyId: this.strategyId,
-      strategyType: 'dual',
+      strategyType: 'anchorLadder',
       executionState: this.executionState,
       subState: this.subState,
       isRunning: this.isRunning,
@@ -1946,19 +1928,16 @@ class AnchorLadderStrategy extends TradingBase {
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
 
-      // Grid (dual/hedge) state — see docstring: included here (unlike
-      // reversal's heartbeat) because mode/grid transitions happen mid-cycle.
-      mode: this.ladderMode,
-      gridAnchor: this.anchor,
-      gridUpperBoundary: this.gridUpperBoundary,
-      gridLowerBoundary: this.gridLowerBoundary,
-      upperLVN: this.upperLVN,
-      lowerLVN: this.lowerLVN,
-      gridLines: this.ladderLines,
-      vwapLong: this.vwapLong,
-      vwapShort: this.vwapShort,
-      gridLevelsPerSide: this.gridLevelsPerSide,
+      // Ladder state — see docstring: included here (unlike reversal's
+      // heartbeat) because mode/ladder transitions happen mid-cycle.
+      mode: this.ladderMode,         // the frontend reads status.mode, not ladderMode
+      anchor: this.anchor,
+      ladderLines: this.ladderLines,
       trendDirection: this.trendDirection,
+      levelsPerSide: this.levelsPerSide,
+      stepPct: this.stepPct,
+      legNotional: this._legNotional(),
+      ladderBaseSize: this._ladderBaseSize,
     };
   }
 
@@ -1985,10 +1964,10 @@ class AnchorLadderStrategy extends TradingBase {
    * so all lifecycle sites have a single source-of-truth save method.
    *
    * Required fields for the bot's boot-time recovery scan:
-   *   - type: 'AI_DUAL' (queried by recoverActiveStrategies)
+   *   - type: 'ANCHOR_LADDER' (queried by recoverActiveStrategies)
    *   - isRunning: true while the strategy is alive
    *   - gcfProxyUrl + sharedVmProxyGcfUrl (C4 — without these resume()
-   *     can't reconstruct the Binance proxy or Anthropic key fetcher)
+   *     can't reconstruct the Binance proxy)
    *   - _lastFundingPollTs (so the next poll uses the correct high-water
    *     mark instead of re-scanning the last 8h)
    */
@@ -1997,8 +1976,8 @@ class AnchorLadderStrategy extends TradingBase {
     try {
       const doc = {
         // Type tag for the boot-recovery scan.
-        type: 'AI_DUAL',
-        strategyType: 'dual',  // legacy alias; kept for back-compat
+        type: 'ANCHOR_LADDER',
+        strategyType: 'anchorLadder',
         strategyId: this.strategyId,
         userId: this.userId,
         profileId: this.profileId,
@@ -2022,8 +2001,6 @@ class AnchorLadderStrategy extends TradingBase {
         initialCapital: this.initialCapital,
         initialWalletBalance: this.initialWalletBalance,
         currentInitialSize: this.currentInitialSize,
-        gridBaseSize: this._ladderBaseSize,
-        lastConsolidatedNotional: this._lastConsolidatedNotional,
         accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
         accumulatedTradingFees: this.accumulatedTradingFees || 0,
         accumulatedFundingFees: this.accumulatedFundingFees || 0,
@@ -2054,22 +2031,13 @@ class AnchorLadderStrategy extends TradingBase {
         recoveryFactor: this.recoveryFactor,
         recoveryDistance: this.recoveryDistance,
         harvestLossThreshold: this.harvestLossThreshold,
-        recoveryFactorDecay: this.recoveryFactorDecay,
-        recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
-        // ---- grid state ----
-        gridMode: this.ladderMode,
-        gridAnchor: this.anchor,
-        gridUpperBoundary: this.gridUpperBoundary,
-        gridLowerBoundary: this.gridLowerBoundary,
-        upperLVN: this.upperLVN,
-        lowerLVN: this.lowerLVN,
-        gridLines: this.ladderLines,          // array of flat objects (Firestore-safe: no nested arrays-of-arrays)
-        vwapLong: this.vwapLong,
-        vwapShort: this.vwapShort,
-        lastProcessedPrice: this.lastProcessedPrice,
-        // ---- TREND state ----
+        // ---- ladder state ----
+        ladderMode: this.ladderMode,
+        anchor: this.anchor,
+        ladderLines: this.ladderLines,   // flat objects (Firestore-safe: no nested arrays)
         trendDirection: this.trendDirection,
-        // ---- Phase 3: harvest-gauge cap state ----
+        lastProcessedPrice: this.lastProcessedPrice,
+        ladderBaseSize: this._ladderBaseSize,
         _lastLadderSize: this._lastLadderSize,
         _harvestRestartPending: this._harvestRestartPending,
         config: {
@@ -2078,11 +2046,6 @@ class AnchorLadderStrategy extends TradingBase {
           harvestLossThreshold: this.harvestLossThreshold,
           desiredProfitUSDT: this.desiredProfitUSDT,
           initialSize: this.currentInitialSize,
-          recoveryFactorDecay: this.recoveryFactorDecay,
-          recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
-          gridLevelsPerSide: this.gridLevelsPerSide,
-          minStepPct: this.minStepPct,
-          maxWidthPct: this.maxWidthPct,
         },
         criticalError: this.criticalError || null,
         lastUpdated: new Date(),
