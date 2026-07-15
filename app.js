@@ -1,7 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { AiReversalStrategy } from './ai-reversal-strategy.js';
-import { AiDualStrategy } from './ai-dual-strategy.js';
+import { AnchorLadderStrategy } from './anchor-ladder-strategy.js';
 
 // TradFi-Perps symbols are gated by Binance behind a separate trading agreement
 // (error -4411 fires for unsigned accounts). The reversal strategy's symbol
@@ -595,7 +594,7 @@ app.get('/strategies/:strategyId', async (req, res) => {
 // the new process can reattach via the boot recovery scan. The latest state
 // is already in Firestore; we just save once more for freshness and exit.
 //
-// User-initiated stop still goes through the /ai-reversal/stop HTTP endpoint,
+// User-initiated stop still goes through the /anchor-ladder/stop HTTP endpoint,
 // which does close positions. SIGTERM is reserved for restart-recovery.
 const shutdown = async () => {
   console.log('[SHUTDOWN] Received signal — saving state and exiting (positions preserved for restart recovery).');
@@ -631,10 +630,10 @@ process.on('SIGINT', () => {
 async function recoverActiveStrategies() {
   try {
     console.log('[RECOVERY] Scanning Firestore for orphaned strategies...');
-    // Single query for ALL running strategies; dispatch by strategy type
-    // in code (Firestore doesn't support OR across fields cheaply, and
-    // type-by-id-prefix is a robust forward-compat path that handles
-    // pre-v3.4.0 reversal docs missing the `type` field).
+    // Single query for ALL running strategies; the loop below allowlists on
+    // the `anchor_ladder_` id prefix and skips everything else (retired
+    // ai_reversal_ / ai_dual_ / ai_hedge_ docs) — see the allowlist comment
+    // inside the loop for the full rationale.
     const snapshot = await firestore.collection('strategies')
       .where('isRunning', '==', true)
       .get();
@@ -656,90 +655,15 @@ async function recoverActiveStrategies() {
         continue;
       }
 
-      // Dispatch by type. Prefer the explicit `type` field; fall back to
-      // strategyId prefix (handles pre-v3.4.0 reversal docs that only had
-      // strategyType: 'reversal' without the canonical type tag).
-      const isReversal = data.type === 'AI_REVERSAL'
-        || data.strategyType === 'reversal'
-        || strategyId.startsWith('ai_reversal_');
-
-      // AI Dual (grid/hedge) — checked before the AI_HEDGE hard-skip below so
-      // an `ai_dual_` prefix is never mistaken for the removed AI_HEDGE class.
-      const isDual = data.type === 'AI_DUAL'
-        || data.strategyType === 'dual'
-        || strategyId.startsWith('ai_dual_');
-
-      if (isDual) {
-        try {
-          const strategy = new AiDualStrategy(
-            data.gcfProxyUrl || null,
-            data.profileId,
-            data.sharedVmProxyGcfUrl || null
-          );
-          strategy.strategyId = strategyId;
-          strategy.profileId = data.profileId;
-          strategy.userId = data.userId;
-          strategy.isRunning = true;
-
-          let walletSnapshotInterval = null;
-          strategy.onStopComplete = () => {
-            if (walletSnapshotInterval) {
-              clearInterval(walletSnapshotInterval);
-              walletSnapshotInterval = null;
-            }
-            _snapshotWallet(strategy).catch(() => { /* logged inside */ });
-            activeStrategies.delete(strategyId);
-          };
-
-          activeStrategies.set(strategyId, strategy);
-
-          // Resume in background — same non-blocking pattern as /ai-dual/start.
-          strategy.resume(data)
-            .then(() => {
-              // Only continue wallet snapshot loop if resume left strategy running.
-              if (strategy.isRunning) {
-                _snapshotWallet(strategy).catch(() => {});
-                walletSnapshotInterval = setInterval(
-                  () => _snapshotWallet(strategy).catch(() => {}),
-                  WALLET_SNAPSHOT_INTERVAL_MS
-                );
-                console.log(`[RECOVERY] ✓ ${strategyId} recovered (symbol=${data.symbol}, gridMode=${strategy.gridMode}, legs=${Array.isArray(strategy.gridLines) ? strategy.gridLines.length : 0})`);
-              } else {
-                console.log(`[RECOVERY] ${strategyId} marked stopped during resume (positions gone)`);
-              }
-            })
-            .catch((error) => {
-              console.error(`[RECOVERY] ✗ Failed to resume ${strategyId}:`, error);
-              strategy.isRunning = false;
-              activeStrategies.delete(strategyId);
-              firestore.collection('strategies').doc(strategyId).update({
-                isRunning: false,
-                criticalError: `recovery_failed: ${error.message}`,
-                lastUpdated: new Date(),
-              }).catch(() => {});
-            });
-        } catch (err) {
-          console.error(`[RECOVERY] ✗ Failed to instantiate strategy ${strategyId}:`, err.message);
-        }
-        continue; // do not fall through to the reversal/hedge branches below
-      }
-
-      // AI Hedge was removed. A stale AI_HEDGE / ai_hedge_ doc with
-      // isRunning:true can still exist in Firestore from before removal — do
-      // NOT resume it (the class no longer exists). Warn so any open Binance
-      // hedge position is surfaced for manual closing rather than silently left.
-      if (data.type === 'AI_HEDGE' || strategyId.startsWith('ai_hedge_')) {
-        console.warn(`[RECOVERY] Skipping ${strategyId} — AI Hedge strategy has been removed; not resuming. Close any open hedge positions on Binance manually.`);
-        continue;
-      }
-
-      if (!isReversal) {
-        console.log(`[RECOVERY] Skipping ${strategyId} — unknown strategy type (data.type=${data.type})`);
-        continue;
-      }
+      // AnchorLadder is the only strategy that exists. Anything else in
+      // `strategies` is a leftover doc from a retired one (ai_reversal_ /
+      // ai_dual_ / ai_hedge_) whose persisted state is a different shape and
+      // cannot be resumed as a ladder. Skip silently — no live user can have
+      // one: every account onboarded from here only ever runs AnchorLadder.
+      if (!strategyId.startsWith('anchor_ladder_')) continue;
 
       try {
-        const strategy = new AiReversalStrategy(
+        const strategy = new AnchorLadderStrategy(
           data.gcfProxyUrl || null,
           data.profileId,
           data.sharedVmProxyGcfUrl || null
@@ -761,7 +685,7 @@ async function recoverActiveStrategies() {
 
         activeStrategies.set(strategyId, strategy);
 
-        // Resume in background — same non-blocking pattern as /ai-reversal/start.
+        // Resume in background — same non-blocking pattern as /anchor-ladder/start.
         strategy.resume(data)
           .then(() => {
             // Only continue wallet snapshot loop if resume left strategy running.
@@ -771,10 +695,9 @@ async function recoverActiveStrategies() {
                 () => _snapshotWallet(strategy).catch(() => {}),
                 WALLET_SNAPSHOT_INTERVAL_MS
               );
-              const phaseInfo = strategy.phase || strategy.subState || 'running';
-              console.log(`[RECOVERY] ✓ ${strategyId} resumed (symbol=${data.symbol}, phase=${phaseInfo})`);
+              console.log(`[RECOVERY] ✓ ${strategyId} recovered (symbol=${data.symbol}, mode=${strategy.ladderMode}, legs=${Array.isArray(strategy.ladderLines) ? strategy.ladderLines.length : 0})`);
             } else {
-              console.log(`[RECOVERY] ${strategyId} marked stopped during resume (positions gone or single leg)`);
+              console.log(`[RECOVERY] ${strategyId} marked stopped during resume (positions gone)`);
             }
           })
           .catch((error) => {
@@ -1123,10 +1046,10 @@ app.post('/system/force-update', requireAdmin, async (req, res) => {
   //   1. PM2 restart sends SIGTERM → shutdown handler (line ~552) saves
   //      each strategy's state to Firestore with isRunning: true.
   //   2. New bot process boots → recoverActiveStrategies queries Firestore
-  //      for isRunning + AI_REVERSAL strategies and calls strategy.resume()
+  //      for isRunning Anchor Ladder strategies and calls strategy.resume()
   //      on each, which reconciles positions against Binance and reattaches
   //      WS streams.
-  //   3. User-initiated stop (/ai-reversal/stop) is still the only path that
+  //   3. User-initiated stop (/anchor-ladder/stop) is still the only path that
   //      closes positions + processes platform fees. Force-update is now
   //      strictly a fast-restart-with-state-preservation operation.
   const activeCount = activeStrategies.size;
@@ -1389,9 +1312,9 @@ async function reportVersionOnStartup(retryCount = 0) {
   }
 }
 
-// ——— AI Reversal Strategy endpoints ——————————————————————————————————
+// ——— Anchor Ladder Strategy endpoints ————————————————————————————————
 
-app.post('/ai-reversal/prepare-symbol', (req, res) => {
+app.post('/anchor-ladder/prepare-symbol', (req, res) => {
   const { symbol } = req.body || {};
   if (!symbol || typeof symbol !== 'string') {
     return res.status(400).json({ error: 'symbol is required' });
@@ -1399,7 +1322,7 @@ app.post('/ai-reversal/prepare-symbol', (req, res) => {
   const normalized = symbol.toUpperCase();
   if (isTradFiPerps(normalized)) {
     return res.status(400).json({
-      error: `${normalized} is a TradFi-Perps contract; sign the Binance TradFi-Perps agreement in the UI before trading. AI Reversal does not support these symbols.`,
+      error: `${normalized} is a TradFi-Perps contract; sign the Binance TradFi-Perps agreement in the UI before trading. Anchor Ladder does not support these symbols.`,
       code: 'TRADFI_PERPS_BLOCKED',
     });
   }
@@ -1411,7 +1334,7 @@ app.post('/ai-reversal/prepare-symbol', (req, res) => {
   return res.json({ ok: true, symbol: normalized });
 });
 
-app.post('/ai-reversal/start', async (req, res) => {
+app.post('/anchor-ladder/start', async (req, res) => {
   if (isUpdating) {
     return res.status(503).json({ error: 'VM is currently updating.', code: 'VM_UPDATING' });
   }
@@ -1425,8 +1348,21 @@ app.post('/ai-reversal/start', async (req, res) => {
 
     if (isTradFiPerps(config.symbol)) {
       return res.status(400).json({
-        error: `${config.symbol} is a TradFi-Perps contract; not supported by AI Reversal.`,
+        error: `${config.symbol} is a TradFi-Perps contract; not supported by Anchor Ladder.`,
         code: 'TRADFI_PERPS_BLOCKED',
+      });
+    }
+
+    // Defence in depth — AnchorLadderStrategy.start() gates on
+    // MIN_INITIAL_SIZE_USDT (50 USDT, ladder-levels.js) too, but that check
+    // fires deep inside the non-blocking start() promise after the 200
+    // response has already gone out. Reject here up front so an
+    // under-minimum request never even mints a strategyId or touches the
+    // billing gate.
+    if (!(Number(config.initialSize) >= 50)) {
+      return res.status(400).json({
+        error: `Initial size (${config.initialSize} USDT) is below the 50 USDT minimum for a 5-level ladder.`,
+        code: 'INITIAL_SIZE_TOO_LOW',
       });
     }
 
@@ -1434,7 +1370,7 @@ app.post('/ai-reversal/start', async (req, res) => {
     for (const [sId, strategy] of activeStrategies.entries()) {
       if (strategy.profileId === profileId) {
         return res.status(400).json({
-          error: `A strategy for profile ${profileId} is already running. Stop it before starting AI Reversal.`,
+          error: `A strategy for profile ${profileId} is already running. Stop it before starting Anchor Ladder.`,
           strategyId: sId,
         });
       }
@@ -1474,10 +1410,10 @@ app.post('/ai-reversal/start', async (req, res) => {
     }
     // ──────────────────────────────────────────────────────────────────────
 
-    const strategy = new AiReversalStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
+    const strategy = new AnchorLadderStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
     strategy.userId = userId;
 
-    const strategyId = `ai_reversal_${profileId}_${Date.now()}`;
+    const strategyId = `anchor_ladder_${profileId}_${Date.now()}`;
     strategy.strategyId = strategyId;
     strategy.isRunning = true;
     activeStrategies.set(strategyId, strategy);
@@ -1492,11 +1428,11 @@ app.post('/ai-reversal/start', async (req, res) => {
       activeStrategies.delete(strategyId);
     };
 
-    console.log(`✓ AI Reversal Strategy ${strategyId} starting (non-blocking)...`);
+    console.log(`✓ Anchor Ladder Strategy ${strategyId} starting (non-blocking)...`);
     res.json({
       success: true,
       strategyId,
-      message: 'AI Reversal Strategy starting',
+      message: 'Anchor Ladder Strategy starting',
     });
 
     strategy.start(config)
@@ -1508,34 +1444,34 @@ app.post('/ai-reversal/start', async (req, res) => {
         );
       })
       .catch((error) => {
-        console.error(`Failed to start AI Reversal Strategy ${strategyId}:`, error);
+        console.error(`Failed to start Anchor Ladder Strategy ${strategyId}:`, error);
         strategy.isRunning = false;
         activeStrategies.delete(strategyId);
       });
   } catch (error) {
-    console.error('Failed to start AI Reversal Strategy:', error);
+    console.error('Failed to start Anchor Ladder Strategy:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.post('/ai-reversal/stop', async (req, res) => {
+app.post('/anchor-ladder/stop', async (req, res) => {
   try {
     const { strategyId, flatten } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
 
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AiReversalStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No AI Reversal strategy running with ID ${strategyId}` });
+    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No Anchor Ladder strategy running with ID ${strategyId}` });
     }
 
-    res.json({ success: true, stopping: true, message: 'AI Reversal Strategy stop initiated', strategyId });
+    res.json({ success: true, stopping: true, message: 'Anchor Ladder Strategy stop initiated', strategyId });
 
     setImmediate(async () => {
       try {
         await strategy.stop({ flatten: !!flatten });
         activeStrategies.delete(strategyId);
       } catch (error) {
-        console.error(`Error stopping AI Reversal Strategy ${strategyId}:`, error);
+        console.error(`Error stopping Anchor Ladder Strategy ${strategyId}:`, error);
       }
     });
   } catch (error) {
@@ -1543,381 +1479,62 @@ app.post('/ai-reversal/stop', async (req, res) => {
   }
 });
 
-app.get('/ai-reversal/status', (req, res) => {
+// AnchorLadderStrategy.getStatus() (Task 9) already returns the full ladder
+// shape directly — mode, anchor, ladderLines, trendDirection, levelsPerSide,
+// stepPct, legNotional, ladderBaseSize — alongside the base TradingBase
+// fields. Unlike the retired grid strategy's status route, no extra
+// field-bolting is needed here; getStatus() IS the response.
+app.get('/anchor-ladder/status', (req, res) => {
   const { strategyId } = req.query;
 
   if (strategyId) {
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AiReversalStrategy)) {
-      return res.status(404).json({ error: `AI Reversal strategy ${strategyId} not found.` });
+    if (!strategy || !(strategy instanceof AnchorLadderStrategy)) {
+      return res.status(404).json({ error: `Anchor Ladder strategy ${strategyId} not found.` });
     }
     return res.json(strategy.getStatus());
   }
 
-  const reversalStrategies = {};
+  const ladderStrategies = {};
   activeStrategies.forEach((strategy, sId) => {
-    if (strategy instanceof AiReversalStrategy) {
-      reversalStrategies[sId] = strategy.getStatus();
+    if (strategy instanceof AnchorLadderStrategy) {
+      ladderStrategies[sId] = strategy.getStatus();
     }
   });
 
-  res.json({ strategies: reversalStrategies, count: Object.keys(reversalStrategies).length });
-});
-
-// ─── AI Dual (grid/hedge) routes — Phase 1 ───────────────────────────────────
-// Mirrors /ai-reversal/start's validation, one-strategy-per-profile guard,
-// billing gate, and non-blocking start pattern (see above). strategyId uses
-// the `ai_dual_` prefix so boot recovery + /ai-reversal/* instanceof guards
-// never collide with it.
-app.post('/ai-dual/start', async (req, res) => {
-  if (isUpdating) {
-    return res.status(503).json({ error: 'VM is currently updating.', code: 'VM_UPDATING' });
-  }
-
-  try {
-    const { profileId, gcpProxyUrl, sharedVmProxyGcfUrl, config, userId } = req.body;
-
-    if (!profileId || !gcpProxyUrl || !sharedVmProxyGcfUrl || !config) {
-      return res.status(400).json({ error: 'profileId, gcpProxyUrl, sharedVmProxyGcfUrl, and config are required.' });
-    }
-
-    if (isTradFiPerps(config.symbol)) {
-      return res.status(400).json({
-        error: `${config.symbol} is a TradFi-Perps contract; not supported by AI Dual.`,
-        code: 'TRADFI_PERPS_BLOCKED',
-      });
-    }
-
-    // One strategy per profile (matches existing model). User must stop the running strategy first.
-    for (const [sId, strategy] of activeStrategies.entries()) {
-      if (strategy.profileId === profileId) {
-        return res.status(400).json({
-          error: `A strategy for profile ${profileId} is already running. Stop it before starting AI Dual.`,
-          strategyId: sId,
-        });
-      }
-    }
-
-    // ── Billing gate (server-side enforcement) — identical check to
-    // /ai-reversal/start; see the comment there for the full rationale.
-    const billingUid = req.uid || userId;
-    let gate;
-    try {
-      gate = await checkBillingGate(firestore, billingUid);
-    } catch (gateErr) {
-      console.error(`[BILLING_GATE] Verification failed for ${billingUid}:`, gateErr.message);
-      return res.status(402).json({
-        error: 'Could not verify your machine subscription / Reload Balance. Please try again.',
-        code: 'BILLING_GATE_UNVERIFIED',
-      });
-    }
-    if (!gate.canStart) {
-      const msg =
-        gate.reason === 'subscription_unpaid'
-          ? 'Machine subscription is inactive. Reload your Balance and start from the app to renew (30 USD/mo).'
-          : gate.reason === 'negative_balance'
-          ? 'Your Reload Balance is negative. Top up above 0 USD to start a strategy.'
-          : gate.reason === 'zero_balance'
-          ? 'Your Reload Balance is 0 USD. Reload to start a strategy.'
-          : 'Reload Balance / subscription check failed. Top up and try again.';
-      console.warn(`[BILLING_GATE] Blocked start for ${billingUid} (reason=${gate.reason}, balance=${gate.balance}).`);
-      return res.status(402).json({ error: msg, code: 'BILLING_GATE_BLOCKED', reason: gate.reason });
-    }
-    // ──────────────────────────────────────────────────────────────────────
-
-    const strategy = new AiDualStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
-    strategy.userId = userId;
-
-    const strategyId = `ai_dual_${profileId}_${Date.now()}`;
-    strategy.strategyId = strategyId;
-    strategy.isRunning = true;
-    activeStrategies.set(strategyId, strategy);
-
-    let walletSnapshotInterval = null;
-    strategy.onStopComplete = () => {
-      if (walletSnapshotInterval) {
-        clearInterval(walletSnapshotInterval);
-        walletSnapshotInterval = null;
-      }
-      _snapshotWallet(strategy).catch(() => { /* logged inside */ });
-      activeStrategies.delete(strategyId);
-    };
-
-    console.log(`✓ AI Dual Strategy ${strategyId} starting (non-blocking)...`);
-    res.json({
-      success: true,
-      strategyId,
-      message: 'AI Dual Strategy starting',
-    });
-
-    strategy.start(config)
-      .then(() => {
-        _snapshotWallet(strategy).catch(() => { /* logged inside */ });
-        walletSnapshotInterval = setInterval(
-          () => _snapshotWallet(strategy).catch(() => { /* logged inside */ }),
-          WALLET_SNAPSHOT_INTERVAL_MS
-        );
-      })
-      .catch((error) => {
-        console.error(`Failed to start AI Dual Strategy ${strategyId}:`, error);
-        strategy.isRunning = false;
-        activeStrategies.delete(strategyId);
-      });
-  } catch (error) {
-    console.error('Failed to start AI Dual Strategy:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/ai-dual/stop', async (req, res) => {
-  try {
-    const { strategyId, flatten } = req.body;
-    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
-
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AiDualStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No AI Dual strategy running with ID ${strategyId}` });
-    }
-
-    res.json({ success: true, stopping: true, message: 'AI Dual Strategy stop initiated', strategyId });
-
-    setImmediate(async () => {
-      try {
-        await strategy.stop({ flatten: !!flatten });
-        activeStrategies.delete(strategyId);
-      } catch (error) {
-        console.error(`Error stopping AI Dual Strategy ${strategyId}:`, error);
-      }
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/ai-dual/status', (req, res) => {
-  const { strategyId } = req.query;
-
-  if (strategyId) {
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AiDualStrategy)) {
-      return res.status(404).json({ error: `AI Dual strategy ${strategyId} not found.` });
-    }
-    return res.json({
-      ...strategy.getStatus(),
-      gridMode: strategy.gridMode,
-      gridAnchor: strategy.gridAnchor,
-      gridUpperBoundary: strategy.gridUpperBoundary,
-      gridLowerBoundary: strategy.gridLowerBoundary,
-      upperLVN: strategy.upperLVN,
-      lowerLVN: strategy.lowerLVN,
-      gridLines: strategy.gridLines,
-      vwapLong: strategy.vwapLong,
-      vwapShort: strategy.vwapShort,
-      lastProcessedPrice: strategy.lastProcessedPrice,
-    });
-  }
-
-  const dualStrategies = {};
-  activeStrategies.forEach((strategy, sId) => {
-    if (strategy instanceof AiDualStrategy) {
-      dualStrategies[sId] = {
-        ...strategy.getStatus(),
-        gridMode: strategy.gridMode,
-        gridAnchor: strategy.gridAnchor,
-        gridUpperBoundary: strategy.gridUpperBoundary,
-        gridLowerBoundary: strategy.gridLowerBoundary,
-        upperLVN: strategy.upperLVN,
-        lowerLVN: strategy.lowerLVN,
-        gridLines: strategy.gridLines,
-        vwapLong: strategy.vwapLong,
-        vwapShort: strategy.vwapShort,
-        lastProcessedPrice: strategy.lastProcessedPrice,
-      };
-    }
-  });
-
-  res.json({ strategies: dualStrategies, count: Object.keys(dualStrategies).length });
-});
-
-app.post('/ai-dual/harvest-now', async (req, res) => {
-  try {
-    const { strategyId } = req.body;
-    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AiDualStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running AI Dual strategy with ID ${strategyId}` });
-    }
-    const result = await strategy.harvestNow();
-    res.json({ success: true, ...result });
-  } catch (error) {
-    res.status(409).json({ error: error.message });
-  }
-});
-
-// Manual LVN-trigger adjustment (RANGE only) — moves upperLVN / lowerLVN without
-// touching the grid geometry. The bot validates ordering + side-of-price + beyond-VA.
-app.post('/ai-dual/adjust-lvn', async (req, res) => {
-  try {
-    const { strategyId, upperLVN, lowerLVN } = req.body;
-    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AiDualStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running AI Dual strategy with ID ${strategyId}` });
-    }
-    const result = await strategy.adjustLvn(upperLVN, lowerLVN);
-    res.json({ success: true, ...result });
-  } catch (error) {
-    res.status(409).json({ error: error.message });
-  }
-});
-
-// /ai-reversal/replan endpoint removed in v4.4.5. The endpoint's
-// position-open guard was checking `.quantity` on a STRING field
-// (TradingBase's this.currentPosition is 'LONG' | 'SHORT' | 'NONE',
-// not the rich-object this.activePosition) — so it never rejected
-// mid-position calls. Any click on the frontend Replan button while
-// in *_HELD corrupted subState via _handlePlanResponse(line 1093),
-// the next price tick fired _openInitialPosition (wrong verb, no
-// recovery sizing), and Binance one-way mode netted the BUY/SELL
-// against the existing position leaving a tiny residue. Final TP
-// then computed entry - needed/qty with qty≈0.01 → garbage negative
-// value. Adjust + Ask AI cover the level-change use case safely;
-// no need for a separate replan surface.
-
-// Manual user-driven bull/bear level adjustment. Always allowed while
-// running (any subState). The bot's adjustLevels() returns a warnings
-// array describing any new level that's already on the trigger side of
-// current price; the frontend pre-checks the same condition and asks
-// the user to confirm before calling this endpoint with
-// confirmTrigger=true. Endpoint refuses to apply such a move unless
-// confirmTrigger is set, so an accidental call from a stale UI can't
-// silently fire a reversal.
-app.post('/ai-reversal/adjust-levels', async (req, res) => {
-  try {
-    const { strategyId, bullLevel, bearLevel, confirmTrigger, source, sourcePlanId } = req.body;
-    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
-    if (bullLevel == null && bearLevel == null) {
-      return res.status(400).json({ error: 'At least one of bullLevel/bearLevel is required.' });
-    }
-
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AiReversalStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running AI Reversal strategy with ID ${strategyId}` });
-    }
-
-    // Tick-side pre-check: detect any move that would fire on the next
-    // price tick and require explicit confirmTrigger before proceeding.
-    const px = strategy.currentPrice;
-    const nextBull = bullLevel != null ? bullLevel : strategy.bullLevel;
-    const nextBear = bearLevel != null ? bearLevel : strategy.bearLevel;
-    // Only gate on a level the user is actually CHANGING. An unchanged level
-    // that already sits on the trigger side of price is a pre-existing
-    // condition (e.g. price drifted past a dormant bull while LONG is held) —
-    // it must not block editing the OTHER level, which the user couldn't fix
-    // via this edit anyway. Without this, changing only bear while bull is
-    // already below price returned a spurious "will OPEN LONG" 409.
-    const bullChanged = bullLevel != null;
-    const bearChanged = bearLevel != null;
-    const wouldTriggerWarnings = [];
-    if (Number.isFinite(px) && px > 0) {
-      if (strategy.subState === 'WAITING') {
-        if (bullChanged && nextBull != null && px >= nextBull) wouldTriggerWarnings.push(`bullLevel ${nextBull} ≤ current ${px}: will OPEN LONG next tick`);
-        if (bearChanged && nextBear != null && px <= nextBear) wouldTriggerWarnings.push(`bearLevel ${nextBear} ≥ current ${px}: will OPEN SHORT next tick`);
-      } else if (strategy.subState === 'LONG_HELD') {
-        if (bearChanged && nextBear != null && px <= nextBear) wouldTriggerWarnings.push(`bearLevel ${nextBear} ≥ current ${px}: will REVERSE LONG→SHORT next tick`);
-      } else if (strategy.subState === 'SHORT_HELD') {
-        if (bullChanged && nextBull != null && px >= nextBull) wouldTriggerWarnings.push(`bullLevel ${nextBull} ≤ current ${px}: will REVERSE SHORT→LONG next tick`);
-      }
-    }
-    if (wouldTriggerWarnings.length > 0 && !confirmTrigger) {
-      return res.status(409).json({
-        error: 'confirmation_required',
-        warnings: wouldTriggerWarnings,
-        currentPrice: px,
-        subState: strategy.subState,
-      });
-    }
-
-    const result = await strategy.adjustLevels({
-      bullLevel: bullLevel != null ? Number(bullLevel) : undefined,
-      bearLevel: bearLevel != null ? Number(bearLevel) : undefined,
-      source: source || 'manual',
-    });
-
-    // If the adjust came from an Ask-AI proposal (chat panel "Apply" pill),
-    // mark the source aiPlans doc as applied so the chat replay can restore
-    // the Applied pill across reloads / devices. Fire-and-forget — the
-    // adjust itself already succeeded, this is audit metadata only.
-    if (sourcePlanId) {
-      strategy._markPlanApplied(
-        sourcePlanId,
-        bullLevel != null ? Number(bullLevel) : null,
-        bearLevel != null ? Number(bearLevel) : null,
-      ).catch(() => {});
-    }
-
-    res.json({ success: true, ...result });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// User-driven AI consult — free-form question. Returns the AI's rationale
-// + optional proposed level changes; does NOT mutate state. Frontend
-// shows the response and triggers /ai-reversal/adjust-levels separately
-// if the user clicks Approve on a proposed change.
-app.post('/ai-reversal/ask-ai', async (req, res) => {
-  try {
-    const { strategyId, question } = req.body;
-    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
-    if (typeof question !== 'string' || !question.trim()) {
-      return res.status(400).json({ error: 'question text is required.' });
-    }
-
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AiReversalStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running AI Reversal strategy with ID ${strategyId}` });
-    }
-
-    const response = await strategy.askAi(question.trim());
-    res.json({ success: true, ...response });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  res.json({ strategies: ladderStrategies, count: Object.keys(ladderStrategies).length });
 });
 
 // Manual user-driven harvest. Banks the current profitable leg ON DEMAND —
 // even when cycleAccumulatedLoss is BELOW the auto harvest-gate threshold.
-// Closes the open leg to flat at market (reduceOnly), then runs the
-// post-harvest PLAN. The cycle CONTINUES — this does NOT stop the strategy.
-// strategy.harvestNow() validates eligibility synchronously (position open AND
-// in profit, IDLE) and fires the close-and-replan in the background, so the
-// response is an immediate eligibility verdict. Ineligibility throws → 409.
-app.post('/ai-reversal/harvest-now', async (req, res) => {
+// Closes the open leg to flat at market (reduceOnly), then re-anchors the
+// ladder. The cycle CONTINUES — this does NOT stop the strategy.
+// strategy.harvestNow() validates eligibility synchronously (something open)
+// and queues the close via the manual-harvest latch honored on the next free
+// tick, so the response is an immediate eligibility verdict. Ineligibility
+// throws → 409.
+app.post('/anchor-ladder/harvest-now', async (req, res) => {
   try {
     const { strategyId } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
-
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AiReversalStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running AI Reversal strategy with ID ${strategyId}` });
+    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
     }
-
     const result = await strategy.harvestNow();
     res.json({ success: true, ...result });
   } catch (error) {
-    // harvestNow throws on ineligibility (no position / not in profit / busy).
-    // 409 lets the frontend surface the reason without treating it as a fault.
     res.status(409).json({ error: error.message });
   }
 });
 
 // Manual user-driven edit of the cycle's desired-profit % while running. The
 // bot converts the % to USDT against initialCapital (the cycle-start basis),
-// recomputes Final TP, and persists. Allowed in any subState (flat or
-// in-position) — like /ai-reversal/adjust-levels, no trade fires here; the new
-// Final TP target just takes effect on the next price tick.
-app.post('/ai-reversal/adjust-profit-target', async (req, res) => {
+// recomputes Final TP, and persists. Allowed in any subState — no trade
+// fires here; the new Final TP target just takes effect on the next price
+// tick. Shipped user feature carried over from AI Reversal; adjustProfitTarget
+// survives unchanged on AnchorLadderStrategy.
+app.post('/anchor-ladder/adjust-profit-target', async (req, res) => {
   try {
     const { strategyId, desiredProfitPercent } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
@@ -1926,8 +1543,8 @@ app.post('/ai-reversal/adjust-profit-target', async (req, res) => {
     }
 
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AiReversalStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running AI Reversal strategy with ID ${strategyId}` });
+    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
     }
 
     const result = await strategy.adjustProfitTarget({ desiredProfitPercent: Number(desiredProfitPercent) });
@@ -1937,34 +1554,13 @@ app.post('/ai-reversal/adjust-profit-target', async (req, res) => {
   }
 });
 
-// Plan-history audit trail for AI Reversal. Reads from
-// strategies/{strategyId}/aiPlans subcollection populated by
-// AiReversalStrategy._savePlanToFirestore on every consult.
-app.get('/ai-reversal/plan-history', async (req, res) => {
-  try {
-    const { strategyId, limit: queryLimit } = req.query;
-    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
-
-    const planLimit = parseInt(queryLimit) || 50;
-    const plansRef = firestore.collection('strategies').doc(strategyId).collection('aiPlans');
-    const snapshot = await plansRef.orderBy('timestamp', 'desc').limit(planLimit).get();
-
-    const plans = [];
-    snapshot.forEach(doc => plans.push({ id: doc.id, ...doc.data() }));
-
-    res.json({ plans, count: plans.length });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// strategyFlow audit trail for AI Reversal. Reads from
+// strategyFlow audit trail for Anchor Ladder. Reads from
 // strategies/{strategyId}/strategyFlow subcollection populated by
-// AiReversalStrategy._writeStrategyFlow inside _postExecuteBookkeeping
-// on every position event (open / reverse / harvest / final_tp_hit).
-// Used by the position chart to place TP segment boundaries at EXACT
-// reversal moments instead of heartbeat-resolution aiPlans timestamps.
-app.get('/ai-reversal/strategy-flow', async (req, res) => {
+// AnchorLadderStrategy._writeStrategyFlow inside its post-execute bookkeeping
+// on every position event (open / reverse / harvest / anchor-flatten /
+// final_tp_hit). Used by the position chart to place TP segment boundaries
+// at EXACT event moments instead of heartbeat-resolution timestamps.
+app.get('/anchor-ladder/strategy-flow', async (req, res) => {
   try {
     const { strategyId, limit: queryLimit } = req.query;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
