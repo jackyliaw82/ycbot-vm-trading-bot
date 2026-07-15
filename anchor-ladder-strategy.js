@@ -789,7 +789,7 @@ class AnchorLadderStrategy extends TradingBase {
           const closeReason = reason === 'final_tp' ? 'final_tp' : 'user-stop';
           try {
             await this.addLog(`[REVERSAL] stop: flattening ${this.currentSide} ${this.activePosition.quantity} (${closeReason})`);
-            await this.executor.executeAction({ type: 'HARVEST_CLOSE', reason: closeReason });
+            await this._closeConsolidated(closeReason);
             // Verify the close actually flattened — if Binance still reports a
             // residual position, log a warning so it's surfaced in the log feed.
             await this._refreshCurrentPosition();
