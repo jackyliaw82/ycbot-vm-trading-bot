@@ -12,11 +12,12 @@ const HARVEST_LOSS_THRESHOLD_PCT = 0.30;           // 30% of initial capital —
 const DEFAULT_RECOVERY_FACTOR = 0.20;
 const DEFAULT_RECOVERY_DISTANCE = 0.005;           // 0.5%
 
-// ---- Grid (dual/hedge) defaults ----
+// ---- Grid (dual/hedge) defaults — legacy resume() fallbacks only; the ladder's
+// own geometry (stepPct/levelsPerSide) is fixed via LADDER_STEP_PCT /
+// LADDER_LEVELS_PER_SIDE, not these. ----
 const DEFAULT_GRID_LEVELS_PER_SIDE = 5;
 const DEFAULT_MIN_STEP_PCT = 0.0025;   // round-trip fee+slippage floor
 const DEFAULT_MAX_WIDTH_PCT = 0.05;    // cap on half-width fraction from anchor
-const GRID_INIT_RETRY_MS = 10000; // throttle grid-build retries (buildReversalContext makes an uncached account REST call)
 
 function formatDuration(ms) {
   if (!ms || ms < 0) return 'N/A';
@@ -42,12 +43,13 @@ function formatDuration(ms) {
  * resolution, funding polling, Firestore persistence, bookkeeping, and the
  * unified stop()/Final-TP termination path.
  *
- * IT DOES NOT TRADE CORRECTLY YET, BY DESIGN. The tick path still references
- * methods that this task deliberately removed (initializeGrid,
- * _processGridCrossings, _openGridLeg/_closeGridLeg, _enterUnwind,
- * _processUnwindTranches). Tasks 6-9 replace those with the ladder behaviour:
+ * IT DOES NOT TRADE CORRECTLY YET, BY DESIGN. Task 6 built the ladder geometry
+ * (initializeLadder, _legNotional, one-way position mode, the size gate) but
+ * the tick path still references methods later tasks own: _processGridCrossings,
+ * _openGridLeg/_closeGridLeg, _enterUnwind, _processUnwindTranches. Tasks 7-9
+ * replace those with the ladder behaviour:
  *
- *   Task 6 — build the ladder on the anchor (buildLadder: 0.3% × 5 levels/side)
+ *   Task 6 — build the ladder on the anchor (buildLadder: 0.3% × 5 levels/side) [DONE]
  *   Task 7 — tick handling: level crossings via planLadderActions, leg open/close
  *   Task 8 — anchor-flatten reset
  *   Task 9 — outermost level → TREND
@@ -70,7 +72,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.harvestCount = 0;
     this.initialCapital = 0;
     this.currentInitialSize = 0;         // base for DYNAMIC trend sizing (original config size; never overwritten → no compounding)
-    this._gridBaseSize = 0;              // base the GRID is sized from: initial size, then the last consolidated notional after a harvest
+    this._ladderBaseSize = 0;            // base the LADDER is sized from: initial size, then the last consolidated notional after a harvest
     this._lastConsolidatedNotional = 0;  // notional of the most recent TREND/UNWIND consolidated open (carried into the post-harvest grid)
     this.cycleStartTime = null;
     // Execution lock. KEPT (not AI state): stop() and _handleFinalTpHit use the
@@ -111,21 +113,14 @@ class AnchorLadderStrategy extends TradingBase {
     this._fundingPollTimeout = null;
     this._lastFundingPollTs = null;
 
-    // ---- Grid (dual/hedge) state ----
-    this.gridMode = 'RANGE';           // Phase 1: RANGE only. TREND/UNWIND wired in Phase 2.
-    this.gridAnchor = null;
-    this.gridUpperBoundary = null;
-    this.gridLowerBoundary = null;
-    this.upperLVN = null;
-    this.lowerLVN = null;
-    this.gridLines = [];               // [{levelIndex, direction, price, state, quantity}]
-    this.vwapLong = null;              // locked average of open LONG legs
-    this.vwapShort = null;             // locked average of open SHORT legs
-    this.lastProcessedPrice = null;    // last tick price the grid crossing logic saw
-    this.gridLevelsPerSide = DEFAULT_GRID_LEVELS_PER_SIDE;
-    this.minStepPct = DEFAULT_MIN_STEP_PCT;
-    this.maxWidthPct = DEFAULT_MAX_WIDTH_PCT;
-    this._tradingSeqInProgress = false; // grid crossing reentrancy guard
+    // ---- Ladder state ----
+    this.ladderMode = 'RANGE';          // RANGE | TREND — mechanical geometry off the anchor, no AI
+    this.anchor = null;
+    this.ladderLines = [];              // [{levelIndex, direction, price, state, quantity}]
+    this.lastProcessedPrice = null;     // last tick price the ladder crossing logic saw
+    this.stepPct = LADDER_STEP_PCT;     // fixed geometry, not a user knob (see ladder-levels.js)
+    this.levelsPerSide = LADDER_LEVELS_PER_SIDE;
+    this._tradingSeqInProgress = false; // ladder crossing reentrancy guard
 
     // ---- TREND state ----
     this.trendDirection = null;         // origin breakout direction ('LONG'|'SHORT')
@@ -157,30 +152,24 @@ class AnchorLadderStrategy extends TradingBase {
     this.harvestLossThreshold = config.harvestLossThreshold ?? HARVEST_LOSS_THRESHOLD_PCT;
     this.desiredProfitUSDT = config.desiredProfitUSDT || 0;
     this.currentInitialSize = config.initialSize || 0;
-    this._gridBaseSize = this.currentInitialSize; // initial grid uses the initial size; a harvest later carries the last consolidated notional
+    this._ladderBaseSize = this.currentInitialSize; // initial ladder uses the initial size; a harvest later carries the last consolidated notional
     this.maxPositionSizeUSDT = config.maxPositionSizeUSDT || (this.currentInitialSize * 10);
-    // Advanced toggles — currently advisory (sizing math doesn't act on them
-    // yet) but stored so the startup log reflects what the form sent.
-    this.recoveryFactorDecay = !!config.recoveryFactorDecay;
-    this.recoveryDistanceAutoWiden = !!config.recoveryDistanceAutoWiden;
 
-    // ---- Grid (dual/hedge) config ----
-    // These are no longer user-configurable knobs — the frontend dropped the
-    // form fields. gridLevelsPerSide/maxWidthPct come from the module
-    // defaults; minStepPct is DERIVED from FEE_RATE (round-trip fee +
-    // slippage + margin) so the grid step always clears the actual cost of
-    // a round trip regardless of what FEE_RATE is tuned to later.
-    // FEE_RATE is per-side (0.0008 = 0.08%); round trip = 2×. ×3 leaves
-    // headroom for slippage/margin. Floored at 0.0025 (the prior static
-    // default) so a very low fee tier never produces a step so tight the
-    // grid whipsaws on noise.
-    this.gridLevelsPerSide = DEFAULT_GRID_LEVELS_PER_SIDE;
-    this.minStepPct = Math.max(0.0025, FEE_RATE * 3);
-    this.maxWidthPct = DEFAULT_MAX_WIDTH_PCT;
+    // Fixed geometry — not user knobs. The 0.3% step clears the round-trip fee
+    // floor (max(0.0025, FEE_RATE*3) = 0.25%) with headroom.
+    this.stepPct = LADDER_STEP_PCT;
+    this.levelsPerSide = LADDER_LEVELS_PER_SIDE;
 
     if (!this.symbol) throw new Error('AnchorLadderStrategy.start: missing symbol');
-    if (!this.currentInitialSize || this.currentInitialSize <= 0) {
-      throw new Error('AnchorLadderStrategy.start: invalid initialSize');
+    // Gate on the trivially-known minimum BEFORE any network call — no point
+    // burning a setLeverage/setPositionMode/exchangeInfo round trip on an
+    // input that's rejected regardless. (The tighter per-symbol minNotional
+    // check, which needs exchangeInfoCache, runs further down after
+    // _getExchangeInfo.)
+    if (!(this.currentInitialSize >= MIN_INITIAL_SIZE_USDT)) {
+      const msg = `Initial size (${this.currentInitialSize} USDT) is below the ${MIN_INITIAL_SIZE_USDT} USDT minimum for a ${LADDER_LEVELS_PER_SIDE}-level ladder.`;
+      await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
+      throw new Error(msg);
     }
 
     await this.addLog(`Starting Anchor Ladder Strategy for ${this.symbol}...`);
@@ -194,22 +183,21 @@ class AnchorLadderStrategy extends TradingBase {
       `| recoveryFactor=${(this.recoveryFactor * 100).toFixed(0)}%, ` +
       `recoveryDistance=${(this.recoveryDistance * 100).toFixed(2)}%, ` +
       `harvestLossThreshold=${(this.harvestLossThreshold * 100).toFixed(0)}%, ` +
-      `desiredProfitUSDT=${this.desiredProfitUSDT} ` +
-      `| recoveryFactorDecay=${this.recoveryFactorDecay ? 'on' : 'off'}, ` +
-      `recoveryDistanceAutoWiden=${this.recoveryDistanceAutoWiden ? 'on' : 'off'}`
+      `desiredProfitUSDT=${this.desiredProfitUSDT}`
     );
 
     try {
       await this.setLeverage(this.symbol, this.leverage);
-      // HEDGE (dual-side) position mode — the grid runs simultaneous LONG and
-      // SHORT legs. Force it in case the Binance account was left in one-way mode.
+      // One-way (single-side) mode. The ladder holds LONG legs ONLY above the
+      // anchor and SHORT legs ONLY below it, so it can never need both sides at
+      // once — hedge mode is unnecessary, and one-way lets Binance net the legs
+      // into a single position. Wrapped because Binance refuses the call while
+      // positions are open (harmless: an open position means the mode is
+      // already whatever it is).
       try {
-        await this.setPositionMode(true);
-        await this.addLog('Binance position mode set to HEDGE (dual-side).');
+        await this.setPositionMode(false);
       } catch (e) {
-        // If already in the target mode OR open positions block the switch,
-        // Binance returns an error. Non-fatal — log and continue.
-        await this.addLog(`WARN setPositionMode(true): ${e.message} (continuing — may already be hedge, or open positions block switch).`);
+        await this.addLog(`WARN setPositionMode(false): ${e.message} (continuing — may already be one-way, or open positions block the switch).`);
       }
       await this._getExchangeInfo(this.symbol);
     } catch (error) {
@@ -219,8 +207,9 @@ class AnchorLadderStrategy extends TradingBase {
 
     const minNotional = this.exchangeInfoCache[this.symbol]?.minNotional || 5;
     this.minNotional = minNotional;
-    if (this.currentInitialSize < minNotional) {
-      const msg = `Initial size (${this.currentInitialSize} USDT) below minimum notional (${minNotional} USDT)`;
+    const legNotional = this.currentInitialSize / LADDER_LEVELS_PER_SIDE;
+    if (legNotional < minNotional) {
+      const msg = `Each ladder leg would be ${legNotional.toFixed(2)} USDT, below this symbol's ${minNotional} USDT minimum notional.`;
       await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
       throw new Error(msg);
     }
@@ -236,8 +225,8 @@ class AnchorLadderStrategy extends TradingBase {
     this.strategyStartTime = new Date();
     this.subState = 'INITIAL';
     this.executionState = 'IDLE';
-    this.gridMode = 'RANGE';
-    this.gridLines = [];
+    this.ladderMode = 'RANGE';
+    this.ladderLines = [];
 
     // WebSocket setup — listen key first, then user-data + realtime price.
     // No liquidation WS: reversal's AI consult / sizing math never reads
@@ -273,15 +262,38 @@ class AnchorLadderStrategy extends TradingBase {
   }
 
   /**
-   * Per-leg notional in USDT — the total configured initial size split
-   * evenly across the grid levels on one side. Used to size every
-   * individual leg open (each leg is an independent hedge-mode position).
+   * Anchor the ladder on the live mark price. Called from the empty-ladder gate
+   * on the first tick, and again after a manual harvest re-anchors.
+   *
+   * Unlike the old VP-derived grid this needs no market data at all — the
+   * anchor IS the current price and the step is fixed — so it cannot fail and
+   * needs no retry throttle.
    */
+  async initializeLadder(currentPrice) {
+    this.anchor = currentPrice;
+    this.ladderLines = buildLadder(currentPrice, this.stepPct, this.levelsPerSide);
+    this.ladderMode = 'RANGE';
+    this.trendDirection = null;
+    this.finalTpPrice = null;
+    this.lastProcessedPrice = currentPrice;
+
+    const outer = currentPrice * this.stepPct * this.levelsPerSide;
+    await this.addLog(`===== LADDER ANCHORED =====`);
+    await this.addLog(
+      `Anchor ${this._formatPrice(currentPrice)} | step ${(this.stepPct * 100).toFixed(2)}% | ` +
+      `${this.levelsPerSide} levels/side | LONG ${this._formatPrice(currentPrice + currentPrice * this.stepPct)}` +
+      `–${this._formatPrice(currentPrice + outer)} | SHORT ${this._formatPrice(currentPrice - outer)}` +
+      `–${this._formatPrice(currentPrice - currentPrice * this.stepPct)} | ` +
+      `leg ${this._formatNotional(this._legNotional())} USDT`,
+    );
+    await this.saveState();
+  }
+
+  // Each leg is an equal slice of the ladder base. The base is the initial size
+  // at cycle start, then whatever dynamic sizing produces at each anchor
+  // flatten and post-harvest.
   _legNotional() {
-    const n = this.gridLevelsPerSide || 1;
-    // Grid is sized from _gridBaseSize (initial size, or the last consolidated
-    // notional carried in after a harvest). Falls back to currentInitialSize.
-    return (this._gridBaseSize || this.currentInitialSize || 0) / n;
+    return (this._ladderBaseSize || this.currentInitialSize || 0) / this.levelsPerSide;
   }
 
   /**
@@ -321,7 +333,7 @@ class AnchorLadderStrategy extends TradingBase {
 
   // Close every open grid leg to flat (hedge: positionSide per leg, never reduceOnly).
   async _flattenGrid() {
-    const openLegs = this.gridLines.filter(l => l.state === 'POSITION_OPEN' && l.quantity > 0);
+    const openLegs = this.ladderLines.filter(l => l.state === 'POSITION_OPEN' && l.quantity > 0);
     if (!openLegs.length) return false;
     await this.addLog(`Flattening grid: closing ${openLegs.length} open leg(s).`);
     const orderIds = [];
@@ -439,7 +451,7 @@ class AnchorLadderStrategy extends TradingBase {
     // 4) mode + state
     this.reversalCount++;
     this.trendDirection = direction;
-    this.gridMode = 'TREND';
+    this.ladderMode = 'TREND';
     await this._writeStrategyFlow(direction === 'LONG' ? 'TREND_TRIGGER_L' : 'TREND_TRIGGER_S', { gridMode: 'TREND' });
     await this.saveState();
   }
@@ -454,7 +466,7 @@ class AnchorLadderStrategy extends TradingBase {
     this._tradingSeqInProgress = true;
     try {
       await this.addLog(`===== HARVEST (${reason}) — flatten to flat + re-anchor =====`);
-      if (this.gridLines.some(l => l.state === 'POSITION_OPEN')) {
+      if (this.ladderLines.some(l => l.state === 'POSITION_OPEN')) {
         try { await this._flattenGrid(); } catch (e) { await this.addLog(`ERROR harvest grid flatten: ${e.message}`); }
       }
       if (this.activePosition && this.activePosition.quantity > 0) {
@@ -462,21 +474,20 @@ class AnchorLadderStrategy extends TradingBase {
       }
       this.harvestCount = (this.harvestCount || 0) + 1;
       this.finalTpPrice = null;
-      // Grid-base carry-forward: size the fresh post-harvest grid from the LAST
-      // consolidated (TREND/UNWIND) position notional — the recovery-grown exposure —
+      // Ladder-base carry-forward: size the fresh post-harvest ladder from the LAST
+      // consolidated (TREND) position notional — the recovery-grown exposure —
       // instead of the base initial size. Falls back to initialSize if no consolidated
       // position happened this cycle. Kept SEPARATE from currentInitialSize (the
       // dynamic-sizing base) so it never feeds back into trend sizing → no compounding.
       // The consolidated notional is itself margin-capped, so no extra cap is needed.
-      this._gridBaseSize = (this._lastConsolidatedNotional > 0) ? this._lastConsolidatedNotional : this.currentInitialSize;
-      this.gridLevelsPerSide = this._deriveGridLevelsPerSide();
-      await this.addLog(`Grid base carried to ${this._formatNotional(this._gridBaseSize)} USDT (last consolidated notional) → ${this.gridLevelsPerSide} levels/side.`);
-      // Re-anchor: clear the grid so the next tick's empty-grid gate rebuilds VP around current price.
-      this.gridLines = [];
-      this._lastGridInitAttempt = null; // let the re-anchor fire on the very next tick (bypass throttle)
+      // Levels per side are fixed (LADDER_LEVELS_PER_SIDE) — no re-derivation needed.
+      this._ladderBaseSize = (this._lastConsolidatedNotional > 0) ? this._lastConsolidatedNotional : this.currentInitialSize;
+      await this.addLog(`Ladder base carried to ${this._formatNotional(this._ladderBaseSize)} USDT (last consolidated notional).`);
+      // Re-anchor: clear the ladder so the next tick's empty-ladder gate rebuilds it around current price.
+      this.ladderLines = [];
       this.vwapLong = null; this.vwapShort = null;
       this.trendDirection = null;
-      this.gridMode = 'RANGE';
+      this.ladderMode = 'RANGE';
       this._harvestRestartPending = true; // next TREND entry re-sizes fresh (freeze exception)
       await this._writeStrategyFlow('HARVEST', { reason, gridMode: 'RANGE' });
       await this.saveState();
@@ -536,20 +547,20 @@ class AnchorLadderStrategy extends TradingBase {
     this.harvestLossThreshold = snapshot.config?.harvestLossThreshold ?? HARVEST_LOSS_THRESHOLD_PCT;
     this.desiredProfitUSDT = snapshot.config?.desiredProfitUSDT || 0;
     this.currentInitialSize = snapshot.currentInitialSize || snapshot.config?.initialSize || 0;
-    this._gridBaseSize = snapshot.gridBaseSize || this.currentInitialSize; // grown grid base survives restarts (else grid shrinks to initial)
+    this._ladderBaseSize = snapshot.gridBaseSize || this.currentInitialSize; // grown ladder base survives restarts (else ladder shrinks to initial)
     this._lastConsolidatedNotional = snapshot.lastConsolidatedNotional || 0;
     // Restore advanced toggles too (advisory, but tracked for log parity).
     this.recoveryFactorDecay = !!snapshot.config?.recoveryFactorDecay;
     this.recoveryDistanceAutoWiden = !!snapshot.config?.recoveryDistanceAutoWiden;
 
     // ---- grid state ----
-    this.gridMode = snapshot.gridMode || 'RANGE';
-    this.gridAnchor = snapshot.gridAnchor ?? null;
+    this.ladderMode = snapshot.gridMode || 'RANGE';
+    this.anchor = snapshot.gridAnchor ?? null;
     this.gridUpperBoundary = snapshot.gridUpperBoundary ?? null;
     this.gridLowerBoundary = snapshot.gridLowerBoundary ?? null;
     this.upperLVN = snapshot.upperLVN ?? null;
     this.lowerLVN = snapshot.lowerLVN ?? null;
-    this.gridLines = Array.isArray(snapshot.gridLines) ? snapshot.gridLines : [];
+    this.ladderLines = Array.isArray(snapshot.gridLines) ? snapshot.gridLines : [];
     this.vwapLong = snapshot.vwapLong ?? null;
     this.vwapShort = snapshot.vwapShort ?? null;
     this.gridLevelsPerSide = Number(snapshot.config?.gridLevelsPerSide) || DEFAULT_GRID_LEVELS_PER_SIDE;
@@ -597,16 +608,18 @@ class AnchorLadderStrategy extends TradingBase {
 
     try {
       await this.setLeverage(this.symbol, this.leverage);
-      // Hedge (dual-side) mode — AI Dual holds long + short simultaneously
-      // (mirrors start()). Wrap in try/catch because Binance refuses the call
-      // if positions are open (harmless: an open position means it is ALREADY
-      // hedge). Critically it must NOT be setPositionMode(false) — on a restart
-      // while flat that would silently flip the account to one-way and break
-      // every subsequent hedge order.
+      // One-way (single-side) mode — mirrors start(). The ladder holds LONG
+      // legs ONLY above the anchor and SHORT legs ONLY below it, so it can
+      // never need both sides at once; hedge mode is unnecessary. Wrap in
+      // try/catch because Binance refuses the call while positions are open
+      // (harmless: an open position means the mode is already whatever it is).
+      // Critically it must NOT be setPositionMode(true) — on a restart while
+      // flat that would silently flip the account to hedge mode and break
+      // every subsequent one-way order.
       try {
-        await this.setPositionMode(true);
+        await this.setPositionMode(false);
       } catch (err) {
-        await this.addLog(`[RECOVERY] setPositionMode(true) note: ${err.message} (continuing — likely already hedge, or open positions block the switch).`);
+        await this.addLog(`[RECOVERY] setPositionMode(false) note: ${err.message} (continuing — likely already one-way, or open positions block the switch).`);
       }
       await this._getExchangeInfo(this.symbol);
     } catch (error) {
@@ -686,7 +699,7 @@ class AnchorLadderStrategy extends TradingBase {
 
     // Mode-aware resume: RANGE rebuilds nothing (first tick / existing legs drive it);
     // TREND re-arms Final TP from the restored consolidated position.
-    if (this.gridMode === 'TREND' && this.activePosition && this.currentSide) {
+    if (this.ladderMode === 'TREND' && this.activePosition && this.currentSide) {
       this._recomputeFinalTpPrice();
       await this.addLog(`Resumed in TREND ${this.currentSide}; Final TP ${this.finalTpPrice ? this._formatPrice(this.finalTpPrice) : 'n/a'}.`);
     }
@@ -753,7 +766,7 @@ class AnchorLadderStrategy extends TradingBase {
       // failed to flatten on TREND entry), so close EACH that has open state;
       // the reversal (single-sided) fallback runs ONLY if neither did.
       let closedSomething = false;
-      if (this.gridLines.some(l => l.state === 'POSITION_OPEN')) {
+      if (this.ladderLines.some(l => l.state === 'POSITION_OPEN')) {
         try {
           await this._flattenGrid();
         } catch (err) {
@@ -761,7 +774,7 @@ class AnchorLadderStrategy extends TradingBase {
         }
         closedSomething = true;
       }
-      if (this.activePosition && this.activePosition.quantity > 0 && (this.gridMode === 'TREND' || this.gridMode === 'UNWIND')) {
+      if (this.activePosition && this.activePosition.quantity > 0 && (this.ladderMode === 'TREND' || this.ladderMode === 'UNWIND')) {
         // Consolidated (TREND/UNWIND) hedge position — single positionSide-encoded
         // position, not grid legs. Close it directly rather than falling through
         // to the reversal HARVEST_CLOSE path (positionSide:'BOTH' + reduceOnly),
@@ -1034,16 +1047,11 @@ class AnchorLadderStrategy extends TradingBase {
     // position lives; RANGE clears activePosition outright a few lines down.
     if (this.activePosition) this._updateUnrealizedPnL(price);
 
-    // ---- Grid gate: build the RANGE grid on the first tick. ----
-    if (!this.gridLines.length) {
-      // Throttle retries: buildReversalContext issues an UNCACHED account REST call
-      // (ai-market-context._getMarginInfo), so do not rebuild every tick while the VP
-      // is not yet viable. `_lastGridInitAttempt` is lazily initialised (undefined -> retry now).
-      const nowMs = Date.now();
-      if (!this._lastGridInitAttempt || nowMs - this._lastGridInitAttempt >= GRID_INIT_RETRY_MS) {
-        this._lastGridInitAttempt = nowMs;
-        await this.initializeGrid(price);
-      }
+    // ---- Ladder gate: anchor the ladder on the first tick. ----
+    if (!this.ladderLines.length) {
+      // No retry throttle needed: initializeLadder needs no market data (the
+      // anchor IS the current price and the step is fixed) so it cannot fail.
+      await this.initializeLadder(price);
       this.lastProcessedPrice = price;
       return;
     }
@@ -1053,7 +1061,7 @@ class AnchorLadderStrategy extends TradingBase {
     // unrealized / est-close-fee to the UI, or (b) make a manual harvest place a
     // spurious _closeConsolidated market order for a position the exchange doesn't
     // have. Runs BEFORE the manual-harvest check below.
-    if (this.gridMode === 'RANGE' && this.activePosition) {
+    if (this.ladderMode === 'RANGE' && this.activePosition) {
       this.activePosition = null;
       this.currentSide = null;
     }
@@ -1066,7 +1074,7 @@ class AnchorLadderStrategy extends TradingBase {
       return;
     }
 
-    if (this.gridMode === 'RANGE') {
+    if (this.ladderMode === 'RANGE') {
       // A crossing sequence is still in flight: skip this tick WITHOUT advancing
       // lastProcessedPrice, so the intervening band is re-evaluated on the next free tick.
       if (this._tradingSeqInProgress) return;
@@ -1090,7 +1098,7 @@ class AnchorLadderStrategy extends TradingBase {
       this.lastProcessedPrice = price;
       return;
     }
-    if (this.gridMode === 'TREND') {
+    if (this.ladderMode === 'TREND') {
       if (this._tradingSeqInProgress) return;
       const prev = this.lastProcessedPrice;
       // Final TP -> close consolidated + STOP (covers accLoss + desired profit + fees).
@@ -1120,7 +1128,7 @@ class AnchorLadderStrategy extends TradingBase {
       this.lastProcessedPrice = price;
       return;
     }
-    if (this.gridMode === 'UNWIND') {
+    if (this.ladderMode === 'UNWIND') {
       if (this._tradingSeqInProgress) return;
       const prev = this.lastProcessedPrice;
       // Return to the ORIGIN LVN before anchor -> flatten remaining + re-enter TREND (origin direction).
@@ -1216,13 +1224,13 @@ class AnchorLadderStrategy extends TradingBase {
     if (!this.isRunning) {
       throw new Error('Strategy is not running.');
     }
-    const hasGrid = this.gridLines.some(l => l.state === 'POSITION_OPEN');
+    const hasGrid = this.ladderLines.some(l => l.state === 'POSITION_OPEN');
     const hasConsolidated = !!(this.activePosition && this.activePosition.quantity > 0);
     if (!hasGrid && !hasConsolidated) {
       throw new Error('Nothing open to harvest.');
     }
     this._manualHarvestRequested = true; // honored on the next free tick (see handleRealtimePrice)
-    return { harvesting: true, queued: true, mode: this.gridMode, price: this.currentPrice };
+    return { harvesting: true, queued: true, mode: this.ladderMode, price: this.currentPrice };
   }
 
   /**
@@ -1806,20 +1814,20 @@ class AnchorLadderStrategy extends TradingBase {
       harvestCount: this.harvestCount,
       initialCapital: this.initialCapital,
       currentInitialSize: this.currentInitialSize,
-      gridBaseSize: this._gridBaseSize,
+      gridBaseSize: this._ladderBaseSize,
       lastConsolidatedNotional: this._lastConsolidatedNotional,
       desiredProfitUSDT: this.desiredProfitUSDT,
 
       // Grid (dual/hedge) state — the frontend's Phase 4 Dual view renders
       // these directly. `mode` is the alias the frontend actually reads
       // (status.mode, not status.gridMode).
-      mode: this.gridMode,
-      gridAnchor: this.gridAnchor,
+      mode: this.ladderMode,
+      gridAnchor: this.anchor,
       gridUpperBoundary: this.gridUpperBoundary,
       gridLowerBoundary: this.gridLowerBoundary,
       upperLVN: this.upperLVN,
       lowerLVN: this.lowerLVN,
-      gridLines: this.gridLines,
+      gridLines: this.ladderLines,
       vwapLong: this.vwapLong,
       vwapShort: this.vwapShort,
       gridLevelsPerSide: this.gridLevelsPerSide,
@@ -1902,13 +1910,13 @@ class AnchorLadderStrategy extends TradingBase {
 
       // Grid (dual/hedge) state — see docstring: included here (unlike
       // reversal's heartbeat) because mode/grid transitions happen mid-cycle.
-      mode: this.gridMode,
-      gridAnchor: this.gridAnchor,
+      mode: this.ladderMode,
+      gridAnchor: this.anchor,
       gridUpperBoundary: this.gridUpperBoundary,
       gridLowerBoundary: this.gridLowerBoundary,
       upperLVN: this.upperLVN,
       lowerLVN: this.lowerLVN,
-      gridLines: this.gridLines,
+      gridLines: this.ladderLines,
       vwapLong: this.vwapLong,
       vwapShort: this.vwapShort,
       gridLevelsPerSide: this.gridLevelsPerSide,
@@ -1976,7 +1984,7 @@ class AnchorLadderStrategy extends TradingBase {
         initialCapital: this.initialCapital,
         initialWalletBalance: this.initialWalletBalance,
         currentInitialSize: this.currentInitialSize,
-        gridBaseSize: this._gridBaseSize,
+        gridBaseSize: this._ladderBaseSize,
         lastConsolidatedNotional: this._lastConsolidatedNotional,
         accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
         accumulatedTradingFees: this.accumulatedTradingFees || 0,
@@ -2011,13 +2019,13 @@ class AnchorLadderStrategy extends TradingBase {
         recoveryFactorDecay: this.recoveryFactorDecay,
         recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
         // ---- grid state ----
-        gridMode: this.gridMode,
-        gridAnchor: this.gridAnchor,
+        gridMode: this.ladderMode,
+        gridAnchor: this.anchor,
         gridUpperBoundary: this.gridUpperBoundary,
         gridLowerBoundary: this.gridLowerBoundary,
         upperLVN: this.upperLVN,
         lowerLVN: this.lowerLVN,
-        gridLines: this.gridLines,          // array of flat objects (Firestore-safe: no nested arrays-of-arrays)
+        gridLines: this.ladderLines,          // array of flat objects (Firestore-safe: no nested arrays-of-arrays)
         vwapLong: this.vwapLong,
         vwapShort: this.vwapShort,
         lastProcessedPrice: this.lastProcessedPrice,
