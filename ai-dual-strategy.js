@@ -1444,7 +1444,17 @@ class AiDualStrategy extends TradingBase {
       });
     } catch (_) { /* best-effort */ }
 
-    // ---- Grid gate (Phase 1: RANGE). TREND/UNWIND fall through to the reversal body (Phase 2). ----
+    // Keep the in-memory position's unrealized PnL fresh on every tick.
+    // Cheap (multiplication + sign branch); needed so getStatus() and the
+    // 30s heartbeat surface a live figure to the frontend.
+    //
+    // MUST stay above the mode dispatch below: every RANGE/TREND/UNWIND branch
+    // returns, so anything after them never runs. Parked here (as in
+    // ai-reversal-strategy.js) this covers TREND/UNWIND, where the consolidated
+    // position lives; RANGE clears activePosition outright a few lines down.
+    if (this.activePosition) this._updateUnrealizedPnL(price);
+
+    // ---- Grid gate: build the RANGE grid on the first tick. ----
     if (!this.gridLines.length) {
       // Throttle retries: buildReversalContext issues an UNCACHED account REST call
       // (ai-market-context._getMarginInfo), so do not rebuild every tick while the VP
@@ -1552,10 +1562,12 @@ class AiDualStrategy extends TradingBase {
       return;
     }
 
-    // Keep the in-memory position's unrealized PnL fresh on every tick.
-    // Cheap (multiplication + sign branch); needed so getStatus() and
-    // Final TP gating see the latest unrealized value.
-    if (this.activePosition) this._updateUnrealizedPnL(price);
+    // NOTE: everything from here to the end of this method is UNREACHABLE — the
+    // RANGE/TREND/UNWIND branches above each return, and gridMode is always one
+    // of those three. It is the inherited reversal body, kept for now; the
+    // per-tick _updateUnrealizedPnL call that used to live here has been hoisted
+    // above the mode dispatch (that placement was the live bug). Scheduled for
+    // removal as its own change — see the AI-plan-stack sweep.
 
     // Final TP check — highest priority. If hit, close to flat and terminate cycle.
     if (this.activePosition && this.finalTpPrice && this._checkFinalTpHit(price)) {
