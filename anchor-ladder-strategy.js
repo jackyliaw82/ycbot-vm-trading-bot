@@ -380,7 +380,20 @@ class AnchorLadderStrategy extends TradingBase {
   // positionSide, which is a hedge-mode concept) — without it a sub-minNotional
   // close is rejected by Binance with -4164 "insufficient position".
   async _closeConsolidated(reason) {
-    if (!this.activePosition || !(this.activePosition.quantity > 0) || !this.currentSide) return false;
+    if (!this.activePosition || !(this.activePosition.quantity > 0)) return false;
+    if (!this.currentSide) {
+      // currentSide missing while activePosition is populated is state drift
+      // (missed WS update, partial restart, a snapshot written without it).
+      // This is the single close path for the whole strategy — silently
+      // bailing here orphans a live position on Binance. Binance is the
+      // source of truth for side, so refresh from it rather than guessing.
+      await this._refreshCurrentPosition();
+      if (!this.activePosition || !(this.activePosition.quantity > 0)) return false; // refresh resolved: nothing actually open
+      if (!this.currentSide) {
+        await this.addLog(`WARNING: _closeConsolidated: ${this.symbol} has an open position (qty ${this.activePosition.quantity}) but currentSide could not be resolved even after refreshing from Binance — position NOT closed, must be closed manually.`);
+        return false;
+      }
+    }
     const closeSide = this.currentSide === 'LONG' ? 'SELL' : 'BUY';
     const qty = this.activePosition.quantity;
     await this.addLog(`Consolidated CLOSE ${this.currentSide} qty ${qty} (${reason}).`);

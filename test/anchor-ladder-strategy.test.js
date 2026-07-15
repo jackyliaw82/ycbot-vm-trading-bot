@@ -158,3 +158,48 @@ test('_flattenAtAnchor no-ops when there is nothing open and the ladder is all-E
   assert.equal(closeCalled, false, 'no close order for a position that does not exist');
   assert.equal(sizingCalled, false, 'no re-sizing/rebuild churn on a no-op oscillation');
 });
+
+// ——— _closeConsolidated: currentSide state-drift guard ——————————————————
+
+test('_closeConsolidated: currentSide missing is repopulated by a refresh from Binance before closing', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 0.5 };
+  s.currentSide = null;
+  s._refreshCurrentPosition = async () => { s.currentSide = 'LONG'; };
+  let orderArgs = null;
+  s.placeMarketOrder = async (symbol, side, qty) => { orderArgs = { symbol, side, qty }; return {}; };
+  const result = await s._closeConsolidated('test');
+  assert.equal(result, true, 'the close fires once the refresh repopulates currentSide');
+  assert.ok(orderArgs, 'an order was placed');
+  assert.equal(orderArgs.side, 'SELL', 'closing a LONG sells');
+  assert.equal(orderArgs.qty, 0.5);
+});
+
+test('_closeConsolidated: currentSide still missing after refresh logs a WARNING and does not close', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 0.5 };
+  s.currentSide = null;
+  s._refreshCurrentPosition = async () => {}; // Binance refresh does not resolve a side either
+  let orderCalled = false;
+  s.placeMarketOrder = async () => { orderCalled = true; return {}; };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+  const result = await s._closeConsolidated('test');
+  assert.equal(result, false, 'never guess the side — refuse to close');
+  assert.equal(orderCalled, false, 'no order placed');
+  assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud warning was logged, not a silent no-op');
+});
+
+test('_closeConsolidated: nothing open returns false quietly, no order, no warning', async () => {
+  const s = ladderStrategy();
+  s.activePosition = null;
+  s.currentSide = null;
+  let orderCalled = false;
+  s.placeMarketOrder = async () => { orderCalled = true; return {}; };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+  const result = await s._closeConsolidated('test');
+  assert.equal(result, false);
+  assert.equal(orderCalled, false);
+  assert.equal(logs.length, 0, 'the normal no-op path stays quiet');
+});
