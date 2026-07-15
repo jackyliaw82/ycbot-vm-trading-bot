@@ -35,24 +35,27 @@ function formatDuration(ms) {
 /**
  * AnchorLadderStrategy — fully mechanical anchor-ladder strategy.
  *
- * SCAFFOLD STATE (Task 5). This file was copied from ai-dual-strategy.js and
- * stripped: every AI consult path (planner / risk-guard / market-context /
- * plan-executor / the AI provider client), the reversal machinery, and the whole
- * UNWIND mode are gone. What remains is infrastructure that already works and is
- * reused verbatim — Binance REST/WS plumbing, position reconciliation, fill
+ * This file was copied from ai-dual-strategy.js and stripped: every AI consult
+ * path (planner / risk-guard / market-context / plan-executor / the AI
+ * provider client), the reversal machinery, and the whole UNWIND mode are
+ * gone. What remains is infrastructure that already works and is reused
+ * verbatim — Binance REST/WS plumbing, position reconciliation, fill
  * resolution, funding polling, Firestore persistence, bookkeeping, and the
  * unified stop()/Final-TP termination path.
  *
- * IT DOES NOT TRADE CORRECTLY YET, BY DESIGN. Task 6 built the ladder geometry
- * (initializeLadder, _legNotional, one-way position mode, the size gate) but
- * the tick path still references methods later tasks own: _processGridCrossings,
- * _openGridLeg/_closeGridLeg, _enterUnwind, _processUnwindTranches. Tasks 7-9
- * replace those with the ladder behaviour:
+ * TRADES CORRECTLY as of Task 7. Task 6 built the ladder geometry
+ * (initializeLadder, _legNotional, one-way position mode, the size gate).
+ * Task 7 replaced the tick dispatch and the trading actions it drives:
  *
  *   Task 6 — build the ladder on the anchor (buildLadder: 0.3% × 5 levels/side) [DONE]
- *   Task 7 — tick handling: level crossings via planLadderActions, leg open/close
- *   Task 8 — anchor-flatten reset
- *   Task 9 — outermost level → TREND
+ *   Task 7 — tick handling (planLadderActions), leg fills (_fillLeg), the
+ *            anchor-flatten reset (_flattenAtAnchor), and the outermost-leg
+ *            -> TREND transition (_enterTrend) [DONE]
+ *
+ * One-way mode means a "leg" is bookkeeping only — Binance nets every filled
+ * leg into a single `activePosition`, so there are no partial closes anywhere
+ * in this strategy. Every close (anchor flatten, Final TP, harvest) is a full
+ * reduceOnly close of that one netted position, via `_closeConsolidated`.
  *
  * No AI is consulted anywhere: levels are pure geometry off the anchor.
  */
@@ -331,79 +334,57 @@ class AnchorLadderStrategy extends TradingBase {
     return { filledQty, fillPrice, source: 'fallback' };
   }
 
-  // Close every open grid leg to flat (hedge: positionSide per leg, never reduceOnly).
-  async _flattenGrid() {
-    const openLegs = this.ladderLines.filter(l => l.state === 'POSITION_OPEN' && l.quantity > 0);
-    if (!openLegs.length) return false;
-    await this.addLog(`Flattening grid: closing ${openLegs.length} open leg(s).`);
-    const orderIds = [];
-    for (const leg of openLegs) {
-      try {
-        const oid = await this._closeGridLeg(leg, 'FLATTEN');
-        if (oid) orderIds.push(oid);
-      } catch (e) { await this.addLog(`ERROR flattening ${leg.direction} L${leg.levelIndex}: ${e.message}`); }
+  /**
+   * Notional -> quantity conversion (tick/step rounding, minNotional floor).
+   * Thin wrapper around TradingBase._calculateAdjustedQuantity — the same
+   * conversion the old hedge-mode _openGridLeg used (default actionType
+   * 'ADD', since a leg fill is additive to the net one-way position and
+   * should still get the L5b ATR down-scaling that ADD actions receive).
+   */
+  async _quantityFor(symbol, notionalUSDT, price) {
+    return this._calculateAdjustedQuantity(symbol, notionalUSDT, price);
+  }
+
+  /**
+   * Close the net one-way position to flat: ONE reduceOnly market order via
+   * `_closeConsolidated`, then reset every ladder leg's bookkeeping to EMPTY.
+   *
+   * One-way mode nets every filled leg into a single `activePosition` — there
+   * is no such thing as a per-leg close, so the old hedge-mode per-leg
+   * `_closeGridLeg` loop is gone. This is now a thin "flatten whatever is
+   * open" primitive reused by `stop({flatten:true})` and `_harvestToFlat()`.
+   * (`_flattenAtAnchor` does NOT call this — it closes directly via
+   * `_closeConsolidated` and rebuilds the ladder from scratch.)
+   */
+  async _flattenGrid(reason = 'FLATTEN') {
+    const openLegs = this.ladderLines.filter(l => l.state === 'POSITION_OPEN');
+    const hadPosition = !!(this.activePosition && this.activePosition.quantity > 0);
+    if (!openLegs.length && !hadPosition) return false;
+
+    if (hadPosition) {
+      await this.addLog(`Flattening ladder: closing net position (${openLegs.length} leg(s) recorded open).`);
+      await this._closeConsolidated(reason);
     }
-    // Wait for close fills so accumulators (realized PnL + fees) reflect the flatten
-    // BEFORE any dynamic sizing reads them (mirrors _performReversal's fill-confirm-before-size).
-    for (const oid of orderIds) {
-      try { await this._waitForOrderFillConfirmation(oid, 3000); }
-      catch (e) { await this.addLog(`WARN flatten fill-confirm ${oid}: ${e.message}`); }
+
+    for (const leg of this.ladderLines) {
+      leg.state = 'EMPTY';
+      leg.quantity = null;
+      leg.fillPrice = null;
     }
-    this.vwapLong = null;
-    this.vwapShort = null;
+
     await this.saveState();
     return true;
   }
 
-  // Open a single consolidated hedge position (TREND / UNWIND). positionSide encodes direction; NEVER reduceOnly.
-  async _openConsolidated(direction, sizeUSDT) {
-    const side = direction === 'LONG' ? 'BUY' : 'SELL';
-    // Size against an EXPLICIT calc price (this.currentPrice) so there's no REST
-    // re-price, and with actionType 'CUT' — the documented de-risking path in
-    // trading-base._calculateAdjustedQuantity (~880) that BYPASSES the L5b
-    // ATR/volatility down-scaling (which only fires for ADD/ADD_LONG/ADD_SHORT).
-    // The consolidated size is a deliberately computed recovery notional;
-    // volatility-scaling it down would silently understate the recovery leg.
-    const qty = await this._calculateAdjustedQuantity(this.symbol, sizeUSDT, this.currentPrice, 'CUT');
-    await this.addLog(`Consolidated OPEN ${direction} — ${this._formatNotional(sizeUSDT)} USDT, qty ${qty}.`);
-    const result = await this.placeMarketOrder(this.symbol, side, qty, direction);
-    this.currentSide = direction;
-    // Book from the ACTUAL user-data WS fill (avg price + filled qty), not the
-    // requested qty / trigger-tick price. this.currentPrice is the trigger TICK
-    // and drifts from the real fill, so the reported entry (and unrealized PnL)
-    // wouldn't tally with Binance.
-    const fill = await this._resolveFill(result?.orderId, result, qty, this.currentPrice);
-    let entryPrice = fill.fillPrice;
-    const filledQty = fill.filledQty;
-    // Backstop the entry from the exchange side-position when the WS fill didn't
-    // confirm (the WS ACCOUNT_UPDATE stamps the side's entry via `ep`).
-    if (fill.source !== 'ws') {
-      try {
-        await this.getPositionRiskMap();
-        const exEntry = direction === 'LONG' ? this._longEntryPrice : this._shortEntryPrice;
-        if (Number.isFinite(exEntry) && exEntry > 0) entryPrice = exEntry;
-      } catch (e) {
-        await this.addLog(`Consolidated entry refresh failed (${e.message}); using ${this._formatPrice(entryPrice)}.`);
-      }
-    }
-    // Record activePosition CONSISTENT with the actually-filled qty at the real
-    // entry: notional = qty * entryPrice, so _recomputeFinalTpPrice and the
-    // _enterUnwind flip size read a notional that matches the real position.
-    this.activePosition = { quantity: filledQty, entryPrice, notional: filledQty * entryPrice, unrealizedPnl: 0 };
-    // Remember this (recovery-grown) consolidated notional — a harvest carries it
-    // forward as the fresh grid base (see _harvestToFlat).
-    this._lastConsolidatedNotional = filledQty * entryPrice;
-    this._recomputeFinalTpPrice();
-    return filledQty;
-  }
-
-  // Close the full consolidated hedge position to flat (opposite side, same positionSide, no reduceOnly).
+  // Close the full net one-way position to flat. reduceOnly is REQUIRED (not
+  // positionSide, which is a hedge-mode concept) — without it a sub-minNotional
+  // close is rejected by Binance with -4164 "insufficient position".
   async _closeConsolidated(reason) {
     if (!this.activePosition || !(this.activePosition.quantity > 0) || !this.currentSide) return false;
     const closeSide = this.currentSide === 'LONG' ? 'SELL' : 'BUY';
     const qty = this.activePosition.quantity;
     await this.addLog(`Consolidated CLOSE ${this.currentSide} qty ${qty} (${reason}).`);
-    const result = await this.placeMarketOrder(this.symbol, closeSide, qty, this.currentSide);
+    const result = await this.placeMarketOrder(this.symbol, closeSide, qty, undefined, { reduceOnly: true });
     // Confirm the close filled on the user-data WS before dropping the in-memory
     // position (realized PnL + fees fold in via the WS accumulators).
     try { if (result?.orderId) await this._waitForOrderFillConfirmation(result.orderId, 3000); }
@@ -420,9 +401,14 @@ class AnchorLadderStrategy extends TradingBase {
       && this.cycleAccumulatedLoss >= this.harvestLossThreshold * this.initialCapital;
   }
 
-
-  // Dynamic recovery size for a TREND entry, with a gauge-full escalation freeze.
-  _computeTrendSize() {
+  /**
+   * Dynamic re-basing of the ladder's per-leg notional, applied at every
+   * anchor flatten (formerly `_computeTrendSize`, the old grid's RANGE->TREND
+   * entry sizing — same recovery-formula + margin-headroom-cap + gauge-full
+   * freeze, repurposed: the ladder re-bases at every flatten instead of
+   * sizing a one-off consolidated TREND entry).
+   */
+  _computeLadderBaseSize() {
     this.cycleAccumulatedLoss = this._computeAccLoss();
     // Gauge-full escalation freeze: once the gauge is full, stop GROWING live exposure —
     // reuse the last size. EXCEPTION: a harvest restart (flat -> fresh) always re-sizes.
@@ -436,23 +422,101 @@ class AnchorLadderStrategy extends TradingBase {
     return sized;
   }
 
-  // RANGE → TREND transition: flatten the grid, size the consolidated entry via
-  // dynamic recovery, open the single hedge position, and switch mode. Called
-  // by the LVN-breakout crossing handler (wired in Task 5) — not wired here.
-  async _triggerTrend(direction, price) {
-    this.currentPrice = price;
-    await this.addLog(`===== TREND ${direction} (LVN breakout @ ${this._formatPrice(price)}) =====`);
-    // 1) flatten the grid to flat
-    await this._flattenGrid();
-    // 2) dynamic recovery sizing
-    const sizeUSDT = this._computeTrendSize();
-    // 3) open the consolidated hedge position
-    await this._openConsolidated(direction, sizeUSDT);
-    // 4) mode + state
-    this.reversalCount++;
-    this.trendDirection = direction;
+  /**
+   * Fill one ladder leg — a market order that ADDS to the net one-way position.
+   *
+   * In one-way mode the legs are not separate positions: Binance nets them.
+   * `leg` is bookkeeping for which level has filled; `activePosition` is the
+   * real thing. Books from the ACTUAL user-data WS fill, never the requested qty.
+   */
+  async _fillLeg(leg) {
+    const notional = this._legNotional();
+    const qty = await this._quantityFor(this.symbol, notional, leg.price);
+    const side = leg.direction === 'LONG' ? 'BUY' : 'SELL';
+
+    const res = await this.placeMarketOrder(this.symbol, side, qty); // one-way: no positionSide
+    const fill = await this._resolveFill(res?.orderId, res, qty, leg.price);
+
+    leg.state = 'POSITION_OPEN';
+    leg.quantity = fill.filledQty;
+    leg.fillPrice = fill.fillPrice;
+
+    await this.addLog(
+      `${leg.direction} ${leg.direction === 'LONG' ? 'L' : 'S'}${leg.levelIndex} filled: ` +
+      `${fill.filledQty} @ ${this._formatPrice(fill.fillPrice)} (${this._formatNotional(notional)} USDT)`,
+    );
+    await this._refreshCurrentPosition(true);
+    await this._postExecuteBookkeeping('LADDER_FILL', { direction: leg.direction, levelIndex: leg.levelIndex });
+  }
+
+  /**
+   * The anchor flatten — the ONLY close in RANGE, and one of two in TREND.
+   *
+   * Universal: identical in both modes. One reduceOnly market order closes the
+   * whole netted position (there are no partial closes in this design), then the
+   * ladder resets, dynamic sizing re-bases, and the legs are redistributed.
+   *
+   * The anchor does NOT move — price IS at the anchor when this fires, so the
+   * geometry is already correct.
+   *
+   * No-ops when there is nothing open AND every leg is already EMPTY: price
+   * oscillating across the anchor with a flat ladder otherwise re-triggers a
+   * flatten with no position on every crossing — harmless (no orders placed)
+   * but it would still re-run dynamic sizing, rebuild the ladder, and spam the
+   * log + strategyFlow audit trail on every oscillation.
+   */
+  async _flattenAtAnchor() {
+    const hadPosition = !!(this.activePosition && this.activePosition.quantity > 0);
+    const hasOpenLegs = this.ladderLines.some(l => l.state === 'POSITION_OPEN');
+    if (!hadPosition && !hasOpenLegs) return;
+
+    if (hadPosition) {
+      await this._closeConsolidated('anchor_flatten');
+    }
+
+    const prevBase = this._ladderBaseSize;
+    this.cycleAccumulatedLoss = this._computeAccLoss();
+    this._ladderBaseSize = this._computeLadderBaseSize();
+
+    this.ladderLines = buildLadder(this.anchor, this.stepPct, this.levelsPerSide);
+    this.ladderMode = 'RANGE';
+    this.trendDirection = null;
+    this.finalTpPrice = null;
+
+    await this.addLog(
+      `===== ANCHOR FLATTEN @ ${this._formatPrice(this.anchor)} ===== ` +
+      `accLoss ${this._formatNotional(this.cycleAccumulatedLoss)} USDT | ` +
+      `base ${this._formatNotional(prevBase)} → ${this._formatNotional(this._ladderBaseSize)} USDT | ` +
+      `leg ${this._formatNotional(this._legNotional())} USDT | ladder reset`,
+    );
+    await this._writeStrategyFlow('ANCHOR_FLATTEN', {
+      anchor: this.anchor, accLoss: this.cycleAccumulatedLoss, baseSize: this._ladderBaseSize,
+    }).catch(() => {});
+    await this.saveState();
+  }
+
+  /**
+   * Fully scaled -> TREND. Passive from here: the position is KEPT EXACTLY AS-IS.
+   *
+   * Deliberately does NOT flatten and re-open (which is what the old
+   * _triggerTrend did): the ladder has already built a favourable average entry
+   * — anchor+0.9% while price is at +1.5% — and re-opening would discard it and
+   * pay fees for the privilege.
+   */
+  async _enterTrend(direction) {
     this.ladderMode = 'TREND';
-    await this._writeStrategyFlow(direction === 'LONG' ? 'TREND_TRIGGER_L' : 'TREND_TRIGGER_S', { gridMode: 'TREND' });
+    this.trendDirection = direction;
+    await this._refreshCurrentPosition(true);
+    this._recomputeFinalTpPrice(); // armed HERE and only here — RANGE never checks it
+
+    const avg = averageOpenEntry(this.ladderLines, direction);
+    await this.addLog(
+      `===== TREND ${direction} (fully scaled @ ${this._formatPrice(this.currentPrice)}) ===== ` +
+      `avg entry ${this._formatPrice(avg)} | Final TP ${this._formatPrice(this.finalTpPrice)}`,
+    );
+    await this._writeStrategyFlow('TREND_ENTER', {
+      direction, avgEntry: avg, finalTpPrice: this.finalTpPrice,
+    }).catch(() => {});
     await this.saveState();
   }
 
@@ -1047,109 +1111,72 @@ class AnchorLadderStrategy extends TradingBase {
     // position lives; RANGE clears activePosition outright a few lines down.
     if (this.activePosition) this._updateUnrealizedPnL(price);
 
-    // ---- Ladder gate: anchor the ladder on the first tick. ----
+    // ---- Ladder gate: anchor on the first tick (and after a harvest). ----
+    // No market data needed — the anchor IS the price — so no retry throttle.
     if (!this.ladderLines.length) {
-      // No retry throttle needed: initializeLadder needs no market data (the
-      // anchor IS the current price and the step is fixed) so it cannot fail.
       await this.initializeLadder(price);
-      this.lastProcessedPrice = price;
       return;
     }
 
-    // Defensive: RANGE holds inventory in grid legs ONLY — never a consolidated
-    // position. Clear any stale activePosition so it can't (a) leak a phantom
-    // unrealized / est-close-fee to the UI, or (b) make a manual harvest place a
-    // spurious _closeConsolidated market order for a position the exchange doesn't
-    // have. Runs BEFORE the manual-harvest check below.
-    if (this.ladderMode === 'RANGE' && this.activePosition) {
-      this.activePosition = null;
-      this.currentSide = null;
-    }
+    if (this._tradingSeqInProgress) return; // do NOT advance lastProcessedPrice: re-scan this band next tick
 
     // Honor a queued manual harvest on the next free tick (harvestNow sets the latch).
-    if (this._manualHarvestRequested && !this._tradingSeqInProgress) {
+    if (this._manualHarvestRequested) {
       this._manualHarvestRequested = false;
       await this._harvestToFlat('manual_harvest');
       this.lastProcessedPrice = price;
       return;
     }
 
-    if (this.ladderMode === 'RANGE') {
-      // A crossing sequence is still in flight: skip this tick WITHOUT advancing
-      // lastProcessedPrice, so the intervening band is re-evaluated on the next free tick.
-      if (this._tradingSeqInProgress) return;
-      // LVN breakout -> TREND (immediate; no confirmation, no buffer).
-      const prev = this.lastProcessedPrice;
-      if (prev != null) {
-        if (this.upperLVN != null && prev < this.upperLVN && price >= this.upperLVN) {
-          this._tradingSeqInProgress = true;
-          try { await this._triggerTrend('LONG', price); } finally { this._tradingSeqInProgress = false; }
-          this.lastProcessedPrice = price; return;
-        }
-        if (this.lowerLVN != null && prev > this.lowerLVN && price <= this.lowerLVN) {
-          this._tradingSeqInProgress = true;
-          try { await this._triggerTrend('SHORT', price); } finally { this._tradingSeqInProgress = false; }
-          this.lastProcessedPrice = price; return;
-        }
-      }
-      if (this.lastProcessedPrice != null && this.lastProcessedPrice !== price) {
-        await this._processGridCrossings(this.lastProcessedPrice, price);
-      }
-      this.lastProcessedPrice = price;
-      return;
-    }
+    // ---- TREND: passive. Two exits, and only two. ----
     if (this.ladderMode === 'TREND') {
-      if (this._tradingSeqInProgress) return;
-      const prev = this.lastProcessedPrice;
-      // Final TP -> close consolidated + STOP (covers accLoss + desired profit + fees).
+      // 1) Final TP -> close + STOP. The cycle ends.
       if (this.finalTpPrice && this._checkFinalTpHit(price)) {
-        // Final TP: stop() with flatten runs the hedge-consolidated close (its TREND/UNWIND
-        // branch) AND the final_tp bookkeeping (_postExecuteBookkeeping -> metrics sample,
-        // fresh accLoss, position verify, FINAL_TP_HIT strategyFlow marker). flatten:true safely
-        // no-ops the redundant close once activePosition is zeroed, so there is no double-close.
         this._tradingSeqInProgress = true;
-        try {
-          await this.stop({ flatten: true, reason: 'final_tp' });
-        } finally { this._tradingSeqInProgress = false; }
+        try { await this.stop({ flatten: true, reason: 'final_tp' }); }
+        finally { this._tradingSeqInProgress = false; }
         return;
       }
-      // (AI auto-harvest removed — harvest is manual only, via harvestNow().)
-      // UNWIND trigger: price returns across the outermost grid boundary on the origin side.
-      if (prev != null) {
-        const backDown = this.trendDirection === 'LONG' && prev > this.gridUpperBoundary && price <= this.gridUpperBoundary;
-        const backUp   = this.trendDirection === 'SHORT' && prev < this.gridLowerBoundary && price >= this.gridLowerBoundary;
-        if (backDown || backUp) {
-          this._tradingSeqInProgress = true;
-          try { await this._enterUnwind(this.trendDirection === 'LONG' ? 'SHORT' : 'LONG', price); }
-          finally { this._tradingSeqInProgress = false; }
-          this.lastProcessedPrice = price; return;
-        }
-      }
-      this.lastProcessedPrice = price;
-      return;
-    }
-    if (this.ladderMode === 'UNWIND') {
-      if (this._tradingSeqInProgress) return;
-      const prev = this.lastProcessedPrice;
-      // Return to the ORIGIN LVN before anchor -> flatten remaining + re-enter TREND (origin direction).
-      if (prev != null) {
-        const backToLowerLVN = this.trendDirection === 'SHORT' && this.lowerLVN != null && prev > this.lowerLVN && price <= this.lowerLVN;
-        const backToUpperLVN = this.trendDirection === 'LONG' && this.upperLVN != null && prev < this.upperLVN && price >= this.upperLVN;
-        if (backToLowerLVN || backToUpperLVN) {
-          this._tradingSeqInProgress = true;
-          try { await this._closeConsolidated('unwind_to_trend'); await this._triggerTrend(this.trendDirection, price); }
-          finally { this._tradingSeqInProgress = false; }
-          this.lastProcessedPrice = price; return;
-        }
-      }
-      if (prev != null && prev !== price) {
+      // 2) Anchor reached -> flatten -> back to RANGE. Nothing else acts:
+      //    price moving back inside the ladder is deliberately a no-op.
+      const plan = planLadderActions({
+        prevPrice: this.lastProcessedPrice, currentPrice: price, anchor: this.anchor, legs: this.ladderLines,
+      });
+      if (plan.flatten) {
         this._tradingSeqInProgress = true;
-        try { await this._processUnwindTranches(prev, price); } finally { this._tradingSeqInProgress = false; }
+        try { await this._flattenAtAnchor(); } finally { this._tradingSeqInProgress = false; }
       }
       this.lastProcessedPrice = price;
       return;
     }
 
+    // ---- RANGE ----
+    const plan = planLadderActions({
+      prevPrice: this.lastProcessedPrice, currentPrice: price, anchor: this.anchor, legs: this.ladderLines,
+    });
+
+    if (plan.flatten) {
+      this._tradingSeqInProgress = true;
+      try { await this._flattenAtAnchor(); } finally { this._tradingSeqInProgress = false; }
+      this.lastProcessedPrice = price;
+      return; // two-tick rule: the opposite side opens on the NEXT tick
+    }
+
+    if (plan.fills.length) {
+      this._tradingSeqInProgress = true;
+      try {
+        for (const leg of plan.fills) {
+          if (leg.state === 'EMPTY') await this._fillLeg(leg); // re-check: state may have moved since planning
+        }
+        // Fully scaled -> TREND. The outermost leg filling IS the trigger.
+        const outermost = plan.fills.find(l => l.levelIndex === this.levelsPerSide);
+        if (outermost && outermost.state === 'POSITION_OPEN') {
+          await this._enterTrend(outermost.direction);
+        }
+      } finally { this._tradingSeqInProgress = false; }
+    }
+
+    this.lastProcessedPrice = price;
   }
 
   /**
@@ -1358,10 +1385,16 @@ class AnchorLadderStrategy extends TradingBase {
     }
   }
 
+  // TREND-only check (RANGE never calls this — see handleRealtimePrice). Keys
+  // off `trendDirection`, the mechanical direction fixed the instant TREND was
+  // entered, rather than `currentSide` — the latter is exchange-derived via
+  // `_refreshCurrentPosition` and, on a boot-recovery race, could still be
+  // unset even though the strategy doc already recorded which way TREND runs.
   _checkFinalTpHit(price) {
     if (!this.finalTpPrice) return false;
-    if (this.currentSide === 'LONG') return price >= this.finalTpPrice;
-    if (this.currentSide === 'SHORT') return price <= this.finalTpPrice;
+    const side = this.trendDirection || this.currentSide;
+    if (side === 'LONG') return price >= this.finalTpPrice;
+    if (side === 'SHORT') return price <= this.finalTpPrice;
     return false;
   }
 

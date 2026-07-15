@@ -47,3 +47,114 @@ test('start() rejects an initial size below the 50 USDT minimum', async () => {
     'the gate must name the minimum',
   );
 });
+
+// ——— Task 7: tick dispatch ——————————————————————————————————————————
+
+test('RANGE: crossing L1 fills it and opens LONG', async () => {
+  const s = ladderStrategy();
+  const orders = [];
+  s._fillLeg = async (leg) => { orders.push(leg); leg.state = 'POSITION_OPEN'; };
+  s.lastProcessedPrice = 100;
+  await s.handleRealtimePrice(100.35);
+  assert.equal(orders.length, 1);
+  assert.equal(orders[0].direction, 'LONG');
+  assert.equal(s.lastProcessedPrice, 100.35);
+});
+
+test('RANGE: a gap fills every level it jumped', async () => {
+  const s = ladderStrategy();
+  const orders = [];
+  s._fillLeg = async (leg) => { orders.push(leg); leg.state = 'POSITION_OPEN'; };
+  s.lastProcessedPrice = 100;
+  await s.handleRealtimePrice(100.95);
+  assert.equal(orders.length, 3);
+});
+
+test('RANGE: filling the outermost leg switches to TREND', async () => {
+  const s = ladderStrategy();
+  s._fillLeg = async (leg) => { leg.state = 'POSITION_OPEN'; };
+  s._recomputeFinalTpPrice = () => { s.finalTpPrice = 999; };
+  s.lastProcessedPrice = 100;
+  await s.handleRealtimePrice(101.6); // past L5 at 101.5
+  assert.equal(s.ladderMode, 'TREND');
+  assert.equal(s.trendDirection, 'LONG');
+  assert.equal(s.finalTpPrice, 999, 'Final TP is armed on entering TREND');
+});
+
+test('RANGE: crossing the anchor flattens', async () => {
+  const s = ladderStrategy();
+  let flattened = false;
+  s._flattenAtAnchor = async () => { flattened = true; };
+  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
+  s.lastProcessedPrice = 100.35;
+  await s.handleRealtimePrice(99.9);
+  assert.equal(flattened, true);
+});
+
+test('TREND is passive: retreating inside the ladder does nothing', async () => {
+  const s = ladderStrategy({ mode: 'TREND' });
+  s.trendDirection = 'LONG';
+  s.finalTpPrice = 105;
+  let acted = false;
+  s._fillLeg = async () => { acted = true; };
+  s._flattenAtAnchor = async () => { acted = true; };
+  s.lastProcessedPrice = 101.6;
+  await s.handleRealtimePrice(100.4); // back inside, but not to the anchor
+  assert.equal(acted, false);
+  assert.equal(s.ladderMode, 'TREND', 'mode holds until the anchor or Final TP');
+});
+
+test('TREND: reaching the anchor flattens and returns to RANGE', async () => {
+  const s = ladderStrategy({ mode: 'TREND' });
+  s.trendDirection = 'LONG';
+  s.ladderLines.filter(l => l.direction === 'LONG').forEach(l => { l.state = 'POSITION_OPEN'; });
+  let flattened = false;
+  s._flattenAtAnchor = async () => { flattened = true; s.ladderMode = 'RANGE'; };
+  s.lastProcessedPrice = 100.4;
+  await s.handleRealtimePrice(99.95);
+  assert.equal(flattened, true);
+  assert.equal(s.ladderMode, 'RANGE');
+});
+
+test('RANGE never checks Final TP', async () => {
+  const s = ladderStrategy();
+  s.finalTpPrice = 100.2; // would fire if RANGE checked it
+  let stopped = false;
+  s.stop = async () => { stopped = true; };
+  s._fillLeg = async (leg) => { leg.state = 'POSITION_OPEN'; };
+  s.lastProcessedPrice = 100;
+  await s.handleRealtimePrice(100.35);
+  assert.equal(stopped, false, 'Final TP is a TREND-only exit');
+});
+
+test('TREND: Final TP hit stops the cycle', async () => {
+  const s = ladderStrategy({ mode: 'TREND' });
+  s.trendDirection = 'LONG';
+  s.finalTpPrice = 101;
+  let reason = null;
+  s.stop = async (opts) => { reason = opts.reason; };
+  s.lastProcessedPrice = 100.9;
+  await s.handleRealtimePrice(101.05);
+  assert.equal(reason, 'final_tp');
+});
+
+test('the empty-ladder gate anchors on the first tick', async () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.anchor = null;
+  await s.handleRealtimePrice(250);
+  assert.equal(s.anchor, 250);
+  assert.equal(s.ladderLines.length, 10);
+  assert.equal(s.ladderMode, 'RANGE');
+});
+
+test('_flattenAtAnchor no-ops when there is nothing open and the ladder is all-EMPTY', async () => {
+  const s = ladderStrategy();
+  let closeCalled = false;
+  s._closeConsolidated = async () => { closeCalled = true; };
+  let sizingCalled = false;
+  s._computeLadderBaseSize = () => { sizingCalled = true; return s._ladderBaseSize; };
+  await s._flattenAtAnchor();
+  assert.equal(closeCalled, false, 'no close order for a position that does not exist');
+  assert.equal(sizingCalled, false, 'no re-sizing/rebuild churn on a no-op oscillation');
+});
