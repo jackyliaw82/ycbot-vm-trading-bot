@@ -203,3 +203,77 @@ test('_closeConsolidated: nothing open returns false quietly, no order, no warni
   assert.equal(orderCalled, false);
   assert.equal(logs.length, 0, 'the normal no-op path stays quiet');
 });
+
+// ——— Task 8: dynamic sizing, harvest, Final TP ———————————————————————
+
+test('_computeLadderBaseSize: the formula floors at initialSize', () => {
+  const s = ladderStrategy({ base: 10000 });
+  s.currentInitialSize = 10000;
+  s.cycleAccumulatedLoss = 0;
+  s.recoveryFactor = 0.20;
+  s.recoveryDistance = 0.005;
+  s.lastWalletSnapshot = { totalMarginBalance: 1e9 }; // margin cap out of the way
+  assert.equal(s._computeLadderBaseSize(), 10000, 'no loss => no growth, never below initial');
+});
+
+test('_computeLadderBaseSize: a 50 USDT loss grows a 10k base to 12k', () => {
+  const s = ladderStrategy({ base: 10000 });
+  s.currentInitialSize = 10000;
+  s.cycleAccumulatedLoss = 50;
+  s.recoveryFactor = 0.20;
+  s.recoveryDistance = 0.005;
+  s.lastWalletSnapshot = { totalMarginBalance: 1e9 };
+  s._computeAccLoss = () => 50;
+  // 50 * 0.20 / 0.005 = 2000 additional
+  assert.equal(s._computeLadderBaseSize(), 12000);
+  assert.equal(s._legNotional !== undefined, true);
+});
+
+test('_computeLadderBaseSize: a full gauge freezes escalation', () => {
+  const s = ladderStrategy({ base: 10000 });
+  s.currentInitialSize = 10000;
+  s.initialCapital = 10000;
+  s.harvestLossThreshold = 0.30;
+  s.cycleAccumulatedLoss = 5000; // gauge full
+  s._computeAccLoss = () => 5000;
+  s._lastLadderSize = 12000;
+  s._harvestRestartPending = false;
+  assert.equal(s._computeLadderBaseSize(), 12000, 'reuses the last size instead of growing');
+});
+
+test('_recomputeFinalTpPrice: no AI cost term', () => {
+  const s = ladderStrategy({ mode: 'TREND' });
+  s.activePosition = { quantity: 100, avgEntry: 100.9, entryPrice: 100.9, notional: 10090 };
+  s.currentSide = 'LONG';
+  s.cycleAccumulatedLoss = 89;
+  s.desiredProfitUSDT = 100;
+  s._recomputeFinalTpPrice();
+  // needed = 89 + 100 + 10090*0.0008 = 197.072 ; tp = 100.9 + 197.072/100
+  assert.ok(Math.abs(s.finalTpPrice - 102.87072) < 1e-6, `got ${s.finalTpPrice}`);
+});
+
+test('_recomputeFinalTpPrice: null with no position', () => {
+  const s = ladderStrategy();
+  s.activePosition = null;
+  s._recomputeFinalTpPrice();
+  assert.equal(s.finalTpPrice, null);
+});
+
+test('harvestNow refuses when nothing is open', async () => {
+  const s = ladderStrategy();
+  await assert.rejects(() => s.harvestNow(), /nothing open/i);
+});
+
+test('harvest re-anchors to the CURRENT price, unlike the anchor flatten', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
+  s.activePosition = { quantity: 10, avgEntry: 100.3, entryPrice: 100.3, notional: 1003 };
+  s.currentPrice = 103;
+  s._closeConsolidated = async () => { s.activePosition = null; };
+  s._computeAccLoss = () => 0;
+  s.lastWalletSnapshot = { totalMarginBalance: 1e9 };
+  await s._harvestToFlat('manual_harvest');
+  assert.equal(s.anchor, 103, 'the harvest re-anchors; the anchor flatten does not');
+  assert.equal(s.ladderMode, 'RANGE');
+  assert.ok(s.ladderLines.every(l => l.state === 'EMPTY'));
+});

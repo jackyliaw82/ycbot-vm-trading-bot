@@ -129,7 +129,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.trendDirection = null;         // origin breakout direction ('LONG'|'SHORT')
 
     // ---- Phase 3: harvest-gauge cap ----
-    this._lastTrendSize = null;         // last dynamic TREND size (for gauge-full freeze)
+    this._lastLadderSize = null;        // last dynamic ladder base size (for gauge-full freeze)
     this._harvestRestartPending = false;// next TREND sizes fresh after a harvest-to-flat
     this._manualHarvestRequested = false; // latch: harvestNow() sets this; honored on the next free tick (transient, not persisted)
   }
@@ -425,12 +425,12 @@ class AnchorLadderStrategy extends TradingBase {
     this.cycleAccumulatedLoss = this._computeAccLoss();
     // Gauge-full escalation freeze: once the gauge is full, stop GROWING live exposure —
     // reuse the last size. EXCEPTION: a harvest restart (flat -> fresh) always re-sizes.
-    if (this._isGaugeFull() && !this._harvestRestartPending && this._lastTrendSize != null) {
-      return this._lastTrendSize;
+    if (this._isGaugeFull() && !this._harvestRestartPending && this._lastLadderSize != null) {
+      return this._lastLadderSize;
     }
     const proposed = this._computeFormulaSize();
     const sized = this._applyMarginHeadroomCap(proposed);
-    this._lastTrendSize = sized;
+    this._lastLadderSize = sized;
     this._harvestRestartPending = false; // consumed: the fresh post-harvest size is now applied
     return sized;
   }
@@ -533,40 +533,43 @@ class AnchorLadderStrategy extends TradingBase {
     await this.saveState();
   }
 
-  // De-risk to flat (hedge-safe) and re-anchor RANGE. accLoss is NOT reset (real carried loss);
-  // the gauge only empties if the realized PnL reduces cycleAccumulatedLoss on its own.
+  /**
+   * Manual harvest — flatten, RE-ANCHOR to the current price, dynamic-size,
+   * redistribute. Identical to the anchor flatten except for the re-anchor:
+   * the anchor flatten fires AT the anchor (so the geometry is already right),
+   * while a harvest fires wherever price happens to be. accLoss is NOT reset
+   * (real carried loss); the gauge only empties if realized PnL reduces
+   * cycleAccumulatedLoss on its own.
+   *
+   * Manual only. There is no automatic harvest.
+   */
   async _harvestToFlat(reason) {
     if (this._tradingSeqInProgress) {
-      await this.addLog(`Harvest (${reason}) skipped — a trading sequence is already in progress; retry.`);
+      await this.addLog(`Harvest (${reason}) skipped — a trading sequence is in progress; retry.`);
       return;
     }
     this._tradingSeqInProgress = true;
     try {
-      await this.addLog(`===== HARVEST (${reason}) — flatten to flat + re-anchor =====`);
-      if (this.ladderLines.some(l => l.state === 'POSITION_OPEN')) {
-        try { await this._flattenGrid(); } catch (e) { await this.addLog(`ERROR harvest grid flatten: ${e.message}`); }
-      }
+      await this.addLog(`===== HARVEST (${reason}) — flatten + re-anchor =====`);
       if (this.activePosition && this.activePosition.quantity > 0) {
-        try { await this._closeConsolidated('harvest'); } catch (e) { await this.addLog(`ERROR harvest consolidated close: ${e.message}`); }
+        try { await this._closeConsolidated('harvest'); }
+        catch (e) { await this.addLog(`ERROR harvest close: ${e.message}`); }
       }
       this.harvestCount = (this.harvestCount || 0) + 1;
       this.finalTpPrice = null;
-      // Ladder-base carry-forward: size the fresh post-harvest ladder from the LAST
-      // consolidated (TREND) position notional — the recovery-grown exposure —
-      // instead of the base initial size. Falls back to initialSize if no consolidated
-      // position happened this cycle. Kept SEPARATE from currentInitialSize (the
-      // dynamic-sizing base) so it never feeds back into trend sizing → no compounding.
-      // The consolidated notional is itself margin-capped, so no extra cap is needed.
-      // Levels per side are fixed (LADDER_LEVELS_PER_SIDE) — no re-derivation needed.
-      this._ladderBaseSize = (this._lastConsolidatedNotional > 0) ? this._lastConsolidatedNotional : this.currentInitialSize;
-      await this.addLog(`Ladder base carried to ${this._formatNotional(this._ladderBaseSize)} USDT (last consolidated notional).`);
-      // Re-anchor: clear the ladder so the next tick's empty-ladder gate rebuilds it around current price.
-      this.ladderLines = [];
-      this.vwapLong = null; this.vwapShort = null;
-      this.trendDirection = null;
-      this.ladderMode = 'RANGE';
-      this._harvestRestartPending = true; // next TREND entry re-sizes fresh (freeze exception)
-      await this._writeStrategyFlow('HARVEST', { reason, gridMode: 'RANGE' });
+      this._harvestRestartPending = true; // the fresh post-harvest size always re-sizes (freeze exception)
+
+      this.cycleAccumulatedLoss = this._computeAccLoss();
+      this._ladderBaseSize = this._computeLadderBaseSize();
+      await this.addLog(
+        `Post-harvest base ${this._formatNotional(this._ladderBaseSize)} USDT → ` +
+        `leg ${this._formatNotional(this._legNotional())} USDT (accLoss ${this._formatNotional(this.cycleAccumulatedLoss)}).`,
+      );
+
+      // Re-anchor on the live price — THE difference from the anchor flatten.
+      await this.initializeLadder(this.currentPrice);
+
+      await this._writeStrategyFlow('HARVEST', { reason, anchor: this.anchor, baseSize: this._ladderBaseSize }).catch(() => {});
       await this.saveState();
     } finally {
       this._tradingSeqInProgress = false;
@@ -649,7 +652,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.trendDirection = snapshot.trendDirection ?? null;
 
     // ---- Phase 3: harvest-gauge cap state ----
-    this._lastTrendSize = snapshot._lastTrendSize ?? null;
+    this._lastLadderSize = snapshot._lastLadderSize ?? snapshot._lastTrendSize ?? null;
     this._harvestRestartPending = !!snapshot._harvestRestartPending;
 
     // Restore cycle state
@@ -1205,7 +1208,7 @@ class AnchorLadderStrategy extends TradingBase {
    * keeps "1.5%" meaning exactly what it meant at cycle start.
    *
    * desiredProfitUSDT feeds _recomputeFinalTpPrice() (Final TP = entry ±
-   * (accLoss + desiredProfit + aiCost + fee)/qty), so the change re-derives the
+   * (accLoss + desiredProfit + fee)/qty), so the change re-derives the
    * Final TP immediately. No state-machine transition — like adjustLevels, the
    * cycle just continues with the new target. saveState persists it.
    */
@@ -1243,15 +1246,10 @@ class AnchorLadderStrategy extends TradingBase {
   // ——— Position actions ——————————————————————————————————————————————
 
   /**
-   * Manual, user-driven harvest. Flattens whatever is open ON DEMAND — grid
-   * legs and/or a consolidated TREND/UNWIND position — regardless of
-   * cycleAccumulatedLoss vs the auto harvest-gate threshold, and regardless
-   * of per-leg profit (the dual grid can have simultaneous LONG+SHORT legs,
-   * so there's no single "the position" to profit-gate). This is the backend
-   * for the Active Position card's "Harvest now" control.
+   * Manual, user-driven harvest. Flattens whatever is open ON DEMAND —
+   * regardless of cycleAccumulatedLoss vs the auto harvest-gate threshold.
+   * This is the backend for the Active Position card's "Harvest now" control.
    *
-   * Delegates to `_harvestToFlat` (hedge-safe: `_flattenGrid` + `_closeConsolidated`,
-   * never reduceOnly, never the one-way `_executeHarvest`/HARVEST_CLOSE path).
    * `_harvestToFlat` self-guards on `_tradingSeqInProgress` and SKIPS if a
    * trading sequence is momentarily in flight, so this sets a latch instead
    * of firing directly — `handleRealtimePrice` honors it on the next free
@@ -1261,15 +1259,10 @@ class AnchorLadderStrategy extends TradingBase {
    * route maps it to a 409).
    */
   async harvestNow() {
-    if (!this.isRunning) {
-      throw new Error('Strategy is not running.');
-    }
-    const hasGrid = this.ladderLines.some(l => l.state === 'POSITION_OPEN');
-    const hasConsolidated = !!(this.activePosition && this.activePosition.quantity > 0);
-    if (!hasGrid && !hasConsolidated) {
-      throw new Error('Nothing open to harvest.');
-    }
-    this._manualHarvestRequested = true; // honored on the next free tick (see handleRealtimePrice)
+    if (!this.isRunning) throw new Error('Strategy is not running.');
+    const open = !!(this.activePosition && this.activePosition.quantity > 0);
+    if (!open) throw new Error('Nothing open to harvest.');
+    this._manualHarvestRequested = true; // honored on the next free tick
     return { harvesting: true, queued: true, mode: this.ladderMode, price: this.currentPrice };
   }
 
@@ -1343,7 +1336,7 @@ class AnchorLadderStrategy extends TradingBase {
     const projectedFreePct = ((wallet - projectedUsed) / wallet) * 100;
     if (projectedFreePct < MARGIN_HEADROOM_FLOOR_PCT) {
       const floor = this.currentInitialSize || 0;
-      void this.addLog(`[REVERSAL] margin-headroom cap: proposed=${proposedSize} projectedFree=${projectedFreePct.toFixed(2)}% < ${MARGIN_HEADROOM_FLOOR_PCT}% → capped to ${floor}`);
+      void this.addLog(`[LADDER] margin-headroom cap: proposed=${proposedSize} projectedFree=${projectedFreePct.toFixed(2)}% < ${MARGIN_HEADROOM_FLOOR_PCT}% → capped to ${floor}`);
       return floor;
     }
     return proposedSize;
@@ -1353,10 +1346,9 @@ class AnchorLadderStrategy extends TradingBase {
 
   /**
    * Final TP price — solves for price where unrealized PnL on the current
-   * position covers accumulated_loss + desired_profit + ai_consult_cost +
-   * estimated_closing_fee.
+   * position covers accumulated_loss + desired_profit + estimated_closing_fee.
    *
-   *   needed = accLoss + desiredProfit + aiCost + estimatedClosingFee
+   *   needed = accLoss + desiredProfit + estimatedClosingFee
    *   LONG:  qty × (price - entryAvg) ≥ needed
    *          price ≥ entryAvg + needed / qty
    *   SHORT: qty × (entryAvg - price) ≥ needed
@@ -1379,9 +1371,9 @@ class AnchorLadderStrategy extends TradingBase {
     const qty = this.activePosition.quantity;
     const entry = this.activePosition.entryPrice || this.activePosition.avgEntry;
     const notional = this.activePosition.notional || (entry * qty) || 0;
+    // needed = accLoss + desiredProfit + estimatedClosingFee
+    // (the AI-cost term is gone — there is no AI.)
     const estimatedClosingFee = notional * FEE_RATE;
-    // No AI cost term any more — the strategy is fully mechanical, so the old
-    // `+ aiCost` addend is permanently zero and has been dropped.
     const needed = (this.cycleAccumulatedLoss || 0)
       + (this.desiredProfitUSDT || 0)
       + estimatedClosingFee;
@@ -1891,7 +1883,7 @@ class AnchorLadderStrategy extends TradingBase {
       maxPositionSizeUSDT: this.maxPositionSizeUSDT,
       recoveryFactorDecay: this.recoveryFactorDecay,
       recoveryDistanceAutoWiden: this.recoveryDistanceAutoWiden,
-      _lastTrendSize: this._lastTrendSize,
+      _lastLadderSize: this._lastLadderSize,
       _harvestRestartPending: this._harvestRestartPending,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
@@ -2078,7 +2070,7 @@ class AnchorLadderStrategy extends TradingBase {
         // ---- TREND state ----
         trendDirection: this.trendDirection,
         // ---- Phase 3: harvest-gauge cap state ----
-        _lastTrendSize: this._lastTrendSize,
+        _lastLadderSize: this._lastLadderSize,
         _harvestRestartPending: this._harvestRestartPending,
         config: {
           recoveryFactor: this.recoveryFactor,
