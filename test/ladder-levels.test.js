@@ -1,0 +1,56 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, MIN_INITIAL_SIZE_USDT } from '../ladder-levels.js';
+
+test('constants are the spec values', () => {
+  assert.equal(LADDER_STEP_PCT, 0.003);
+  assert.equal(LADDER_LEVELS_PER_SIDE, 5);
+  assert.equal(MIN_INITIAL_SIZE_USDT, 50);
+});
+
+test('buildLadder: LONG above the anchor, SHORT below — the inversion', () => {
+  const legs = buildLadder(100, 0.003, 5);
+  assert.equal(legs.length, 10);
+  for (const leg of legs) {
+    if (leg.direction === 'LONG') assert.ok(leg.price > 100, `LONG leg at ${leg.price} must be ABOVE the anchor`);
+    if (leg.direction === 'SHORT') assert.ok(leg.price < 100, `SHORT leg at ${leg.price} must be BELOW the anchor`);
+  }
+});
+
+test('buildLadder: level prices are anchor +/- k * stepPct * anchor', () => {
+  const legs = buildLadder(100, 0.003, 5);
+  const L = (k) => legs.find(l => l.direction === 'LONG' && l.levelIndex === k);
+  const S = (k) => legs.find(l => l.direction === 'SHORT' && l.levelIndex === k);
+  assert.ok(Math.abs(L(1).price - 100.3) < 1e-9);
+  assert.ok(Math.abs(L(5).price - 101.5) < 1e-9); // outermost = anchor + 1.5%
+  assert.ok(Math.abs(S(1).price - 99.7) < 1e-9);
+  assert.ok(Math.abs(S(5).price - 98.5) < 1e-9);  // outermost = anchor - 1.5%
+});
+
+test('buildLadder: every leg starts EMPTY with no fill data', () => {
+  for (const leg of buildLadder(4321.5, 0.003, 5)) {
+    assert.equal(leg.state, 'EMPTY');
+    assert.equal(leg.quantity, null);
+    assert.equal(leg.fillPrice, null);
+  }
+});
+
+test('buildLadder: no leg sits on the anchor', () => {
+  // k starts at 1, so the anchor is never a level. The anchor is the FLATTEN
+  // price — a leg there would open and close on the same tick.
+  assert.ok(buildLadder(100, 0.003, 5).every(l => l.price !== 100));
+});
+
+test('buildLadder: the ladder is symmetric about the anchor', () => {
+  const legs = buildLadder(68000, 0.003, 5);
+  for (let k = 1; k <= 5; k++) {
+    const up = legs.find(l => l.direction === 'LONG' && l.levelIndex === k).price;
+    const dn = legs.find(l => l.direction === 'SHORT' && l.levelIndex === k).price;
+    assert.ok(Math.abs((up - 68000) - (68000 - dn)) < 1e-6, `level ${k} is asymmetric`);
+  }
+});
+
+test('buildLadder: rejects a non-positive anchor', () => {
+  assert.throws(() => buildLadder(0, 0.003, 5), /anchor/i);
+  assert.throws(() => buildLadder(NaN, 0.003, 5), /anchor/i);
+});
