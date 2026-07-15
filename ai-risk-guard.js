@@ -8,7 +8,7 @@
  * retry (no fallback plan generated here).
  */
 
-const FEE_RATE = 0.0008; // 0.08% per side
+import { FEE_RATE } from './fees.js';
 
 class AiRiskGuard {
   constructor(config = {}) {
