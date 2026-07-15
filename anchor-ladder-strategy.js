@@ -56,12 +56,10 @@ class AnchorLadderStrategy extends TradingBase {
   constructor(gcfProxyUrl, profileId, sharedVmProxyGcfUrl) {
     super(gcfProxyUrl, profileId, sharedVmProxyGcfUrl);
 
-    // Reversal-specific state
+    // Cycle / position state
     this.strategyType = 'anchorLadder';
     this.currentSide = null;                // 'LONG' | 'SHORT' | null
     this.activePosition = null;            // { quantity, entryPrice, notional, unrealizedPnl }
-    this.bullLevel = null;
-    this.bearLevel = null;
     this.finalTpPrice = null;
     this.cycleAccumulatedLoss = 0;
     this.reversalCount = 0;
@@ -129,13 +127,13 @@ class AnchorLadderStrategy extends TradingBase {
   // ——— Lifecycle ——————————————————————————————————————————————————————
 
   /**
-   * Start the strategy. Forces one-way position mode, instantiates AI
-   * modules, subscribes to WS streams, requests first PLAN.
+   * Start the strategy. Forces one-way position mode, subscribes to WS
+   * streams, and builds the initial ladder on the first price tick.
    */
   async start(config = {}) {
     // strategyId is set by app.js before calling start() (non-blocking pattern).
     if (!this.strategyId) {
-      this.strategyId = `ai_dual_${this.profileId}_${Date.now()}`;
+      this.strategyId = `anchor_ladder_${this.profileId}_${Date.now()}`;
     }
     this.initFirestoreCollections(this.strategyId);
 
@@ -224,7 +222,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.ladderLines = [];
 
     // WebSocket setup — listen key first, then user-data + realtime price.
-    // No liquidation WS: reversal's AI consult / sizing math never reads
+    // No liquidation WS: the ladder's geometry / sizing math never reads
     // liquidation data. One less stream to keep alive.
     await this._retryListenKeyRequest(false);
     this.connectUserDataStream();
@@ -594,8 +592,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.initFirestoreCollections(this.strategyId);
 
     // C4 proxy URL validation. Without these the strategy cannot reach
-    // Binance OR the Anthropic key fetcher; abort cleanly and mark the
-    // doc with a recoverable error.
+    // Binance; abort cleanly and mark the doc with a recoverable error.
     if (!this.gcfProxyUrl || !this.sharedVmProxyGcfUrl) {
       const msg = `[RECOVERY] Cannot resume ${this.strategyId}: missing proxy URLs in snapshot (saved before C4 fix)`;
       console.error(msg);
@@ -635,8 +632,6 @@ class AnchorLadderStrategy extends TradingBase {
     // Restore cycle state
     this.currentSide = snapshot.currentSide || null;
     this.activePosition = snapshot.currentPosition || null;
-    this.bullLevel = snapshot.bullLevel || null;
-    this.bearLevel = snapshot.bearLevel || null;
     this.finalTpPrice = snapshot.finalTpPrice || null;
     this.cycleAccumulatedLoss = snapshot.cycleAccumulatedLoss || 0;
     this.reversalCount = snapshot.reversalCount || 0;
@@ -693,7 +688,7 @@ class AnchorLadderStrategy extends TradingBase {
 
     // WS lifecycle — listen-key request FIRST (avoids stale-key races),
     // then user-data stream, then realtime price feed, then refresh
-    // interval + health monitor. No liquidation WS: reversal's AI consult
+    // interval + health monitor. No liquidation WS: the ladder's geometry
     // and sizing math never read liquidation data.
     await this._retryListenKeyRequest(false);
     this.connectUserDataStream();
@@ -729,7 +724,7 @@ class AnchorLadderStrategy extends TradingBase {
     // automatically. Best-effort; swallow errors — the
     // automatic 30-min L3 will catch anything we miss here.
     this._reconcileRecentTrades().catch((err) => {
-      console.error(`[REVERSAL] L3 reconcile on resume failed: ${err.message}`);
+      console.error(`[LADDER] L3 reconcile on resume failed: ${err.message}`);
     });
 
     // Reconcile position from Binance (source of truth).
@@ -767,7 +762,7 @@ class AnchorLadderStrategy extends TradingBase {
    * auto-stop (v4.0.1 consolidation). "One method to rule them all":
    * position close (when
    * requested), final funding flush, WS cleanup, platform fee
-   * deduction, AI usage log, completion notification, saveState, and
+   * deduction, completion notification, saveState, and
    * the onStopComplete hook that unregisters from app.js's
    * `activeStrategies` map.
    *
@@ -787,7 +782,7 @@ class AnchorLadderStrategy extends TradingBase {
     const { flatten = false, reason = 'manual' } = options;
 
     // Concurrency + idempotency guard. stop() is reachable from
-    // /ai-reversal/stop AND from _handleFinalTpHit; both could fire in
+    // /anchor-ladder/stop AND from _handleFinalTpHit; both could fire in
     // quick succession. The `!isRunning` check catches the concurrent
     // race (first call sets isRunning=false synchronously before any
     // await, so the second microtask-queued call bails). The
@@ -815,31 +810,33 @@ class AnchorLadderStrategy extends TradingBase {
     const exitPrice = this.currentPrice;
 
     if (flatten) {
-      // Grid-aware flatten. In hedge/RANGE the position is held as open grid
-      // legs (positionSide LONG/SHORT, never reduceOnly), which the reversal
-      // HARVEST_CLOSE path (positionSide:'BOTH' + reduceOnly) can't close — it
-      // would orphan the legs. BOTH a stray grid leg AND a consolidated
-      // (TREND/UNWIND) hedge position can be open at once (e.g. a grid leg
-      // failed to flatten on TREND entry), so close EACH that has open state;
-      // the reversal (single-sided) fallback runs ONLY if neither did.
+      // Flatten the net one-way position. `_flattenGrid` closes via
+      // `_closeConsolidated` (ONE reduceOnly market order — one-way mode
+      // nets every filled leg into a single `activePosition`; there is no
+      // per-leg close) AND resets every ladder leg's bookkeeping to EMPTY.
+      // `_enterTrend` never touches leg state, so legs stay marked
+      // POSITION_OPEN straight through a TREND transition — this branch
+      // fires whenever anything is open, TREND included, and always wins.
       let closedSomething = false;
       if (this.ladderLines.some(l => l.state === 'POSITION_OPEN')) {
         try {
           await this._flattenGrid();
         } catch (err) {
-          await this.addLog(`[DUAL] stop: grid flatten failed: ${err.message}`);
+          await this.addLog(`[LADDER] stop: grid flatten failed: ${err.message}`);
         }
         closedSomething = true;
       }
-      if (this.activePosition && this.activePosition.quantity > 0 && (this.ladderMode === 'TREND' || this.ladderMode === 'UNWIND')) {
-        // Consolidated (TREND/UNWIND) hedge position — single positionSide-encoded
-        // position, not grid legs. Close it directly rather than falling through
-        // to the reversal HARVEST_CLOSE path (positionSide:'BOTH' + reduceOnly),
-        // which hedge mode rejects.
+      if (this.activePosition && this.activePosition.quantity > 0 && this.ladderMode === 'TREND') {
+        // Defensive fallback for a TREND-consolidated position with no
+        // ladder leg marked POSITION_OPEN. Currently unreachable — the
+        // branch above always wins per the comment there — but kept in
+        // case that invariant ever changes; closes directly via
+        // `_closeConsolidated` rather than resetting leg bookkeeping that
+        // isn't there to reset.
         try {
           await this._closeConsolidated('stop');
         } catch (err) {
-          await this.addLog(`[DUAL] stop: consolidated close failed: ${err.message}`);
+          await this.addLog(`[LADDER] stop: consolidated close failed: ${err.message}`);
         }
         closedSomething = true;
       }
@@ -852,27 +849,27 @@ class AnchorLadderStrategy extends TradingBase {
         try {
           await this._refreshCurrentPosition();
         } catch (err) {
-          await this.addLog(`[REVERSAL] stop: pre-flatten position refresh failed: ${err.message}`);
+          await this.addLog(`[LADDER] stop: pre-flatten position refresh failed: ${err.message}`);
         }
 
         if (this.activePosition && this.activePosition.quantity > 0) {
           const closeReason = reason === 'final_tp' ? 'final_tp' : 'user-stop';
           try {
-            await this.addLog(`[REVERSAL] stop: flattening ${this.currentSide} ${this.activePosition.quantity} (${closeReason})`);
+            await this.addLog(`[LADDER] stop: flattening ${this.currentSide} ${this.activePosition.quantity} (${closeReason})`);
             await this._closeConsolidated(closeReason);
             // Verify the close actually flattened — if Binance still reports a
             // residual position, log a warning so it's surfaced in the log feed.
             await this._refreshCurrentPosition();
             if (this.activePosition && this.activePosition.quantity > 0) {
-              await this.addLog(`[REVERSAL] WARNING: stop+flatten left residual ${this.currentSide} ${this.activePosition.quantity} on Binance — close it manually`);
+              await this.addLog(`[LADDER] WARNING: stop+flatten left residual ${this.currentSide} ${this.activePosition.quantity} on Binance — close it manually`);
             } else {
-              await this.addLog('[REVERSAL] stop: position confirmed flat');
+              await this.addLog('[LADDER] stop: position confirmed flat');
             }
           } catch (err) {
-            await this.addLog(`[REVERSAL] stop: flatten failed: ${err.message}`);
+            await this.addLog(`[LADDER] stop: flatten failed: ${err.message}`);
           }
         } else {
-          await this.addLog('[REVERSAL] stop: no open position on Binance — nothing to flatten');
+          await this.addLog('[LADDER] stop: no open position on Binance — nothing to flatten');
         }
       }
 
@@ -883,7 +880,7 @@ class AnchorLadderStrategy extends TradingBase {
         try {
           await this._postExecuteBookkeeping('FINAL_TP_HIT', { exitPrice });
         } catch (bkErr) {
-          console.error(`[REVERSAL] FINAL_TP_HIT bookkeeping failed: ${bkErr.message}`);
+          console.error(`[LADDER] FINAL_TP_HIT bookkeeping failed: ${bkErr.message}`);
         }
       }
     }
@@ -898,14 +895,14 @@ class AnchorLadderStrategy extends TradingBase {
     try {
       await this._pollFundingIncome();
     } catch (err) {
-      console.error(`[REVERSAL] final funding poll failed: ${err.message}`);
+      console.error(`[LADDER] final funding poll failed: ${err.message}`);
     }
 
     // Release the user-data listen key + drop both WS streams.
     try {
       if (typeof this.cleanupWebSockets === 'function') this.cleanupWebSockets();
     } catch (err) {
-      console.error(`[REVERSAL] cleanupWebSockets failed: ${err.message}`);
+      console.error(`[LADDER] cleanupWebSockets failed: ${err.message}`);
     }
 
     this.executionState = 'TERMINATED';
@@ -926,7 +923,7 @@ class AnchorLadderStrategy extends TradingBase {
       try {
         await this.deductPlatformFee(netPnL);
       } catch (feeErr) {
-        console.error(`[REVERSAL] platform fee error: ${feeErr.message}`);
+        console.error(`[LADDER] platform fee error: ${feeErr.message}`);
       }
     }
 
@@ -949,8 +946,8 @@ class AnchorLadderStrategy extends TradingBase {
     await this._recordHeroProfit(netPnL);
 
     await this.addLog(reason === 'final_tp'
-      ? '[REVERSAL] Final TP — cycle complete, strategy terminated.'
-      : '[REVERSAL] stop: terminated');
+      ? '[LADDER] Final TP — cycle complete, strategy terminated.'
+      : '[LADDER] stop: terminated');
 
     // Completion notification. Helper signature is
     // (userId, strategyData); the FCM token lookup relies on the
@@ -973,7 +970,7 @@ class AnchorLadderStrategy extends TradingBase {
           fundingFees: this.accumulatedFundingFees || 0,
         });
       } catch (notifyErr) {
-        console.error(`[REVERSAL] notify error: ${notifyErr.message}`);
+        console.error(`[LADDER] notify error: ${notifyErr.message}`);
       }
     }
 
@@ -981,7 +978,7 @@ class AnchorLadderStrategy extends TradingBase {
     // `activeStrategies.delete(strategyId)`. Without this, the next start
     // attempt for this profile is rejected with "already running".
     try { this.onStopComplete?.(); } catch (e) {
-      console.error('[REVERSAL] onStopComplete hook failed:', e.message);
+      console.error('[LADDER] onStopComplete hook failed:', e.message);
     }
   }
 
@@ -1029,16 +1026,16 @@ class AnchorLadderStrategy extends TradingBase {
         try {
           await this.deleteSubcollection(ref, name);
         } catch (subErr) {
-          console.error(`[REVERSAL] no-trade cleanup: ${name} delete failed: ${subErr.message}`);
+          console.error(`[LADDER] no-trade cleanup: ${name} delete failed: ${subErr.message}`);
         }
       }
       await strategyRef.delete();
-      console.log(`[REVERSAL] no-trade cycle ${this.strategyId} — strategy doc deleted (not persisted as completed).`);
+      console.log(`[LADDER] no-trade cycle ${this.strategyId} — strategy doc deleted (not persisted as completed).`);
     } catch (err) {
-      console.error(`[REVERSAL] no-trade doc delete failed for ${this.strategyId}: ${err.message} — falling back to saveState()`);
+      console.error(`[LADDER] no-trade doc delete failed for ${this.strategyId}: ${err.message} — falling back to saveState()`);
       this.willBeDeleted = false;
       try { await this.saveState(); } catch (saveErr) {
-        console.error(`[REVERSAL] fallback saveState also failed: ${saveErr.message}`);
+        console.error(`[LADDER] fallback saveState also failed: ${saveErr.message}`);
       }
     }
   }
@@ -1070,7 +1067,7 @@ class AnchorLadderStrategy extends TradingBase {
         tx.set(strategyRef, { heroCounted: true }, { merge: true });
       });
     } catch (err) {
-      console.error(`[REVERSAL] hero-profit record failed: ${err.message}`);
+      console.error(`[LADDER] hero-profit record failed: ${err.message}`);
     }
   }
 
@@ -1098,10 +1095,10 @@ class AnchorLadderStrategy extends TradingBase {
     // Cheap (multiplication + sign branch); needed so getStatus() and the
     // 30s heartbeat surface a live figure to the frontend.
     //
-    // MUST stay above the mode dispatch below: every RANGE/TREND/UNWIND branch
-    // returns, so anything after them never runs. Parked here (as in
-    // ai-reversal-strategy.js) this covers TREND/UNWIND, where the consolidated
-    // position lives; RANGE clears activePosition outright a few lines down.
+    // MUST stay above the mode dispatch below: every RANGE/TREND branch
+    // returns, so anything after them never runs. Parked here this covers
+    // TREND, where the consolidated position lives; RANGE clears
+    // activePosition when it flattens, a few lines down.
     if (this.activePosition) this._updateUnrealizedPnL(price);
 
     // ---- Ladder gate: anchor on the first tick (and after a harvest). ----
@@ -1186,8 +1183,8 @@ class AnchorLadderStrategy extends TradingBase {
    *
    * desiredProfitUSDT feeds _recomputeFinalTpPrice() (Final TP = entry ±
    * (accLoss + desiredProfit + fee)/qty), so the change re-derives the
-   * Final TP immediately. No state-machine transition — like adjustLevels, the
-   * cycle just continues with the new target. saveState persists it.
+   * Final TP immediately. No state-machine transition — the cycle just
+   * continues with the new target. saveState persists it.
    */
   async adjustProfitTarget({ desiredProfitPercent } = {}) {
     if (!this.isRunning) {
@@ -1208,7 +1205,7 @@ class AnchorLadderStrategy extends TradingBase {
     await this.saveState();
 
     await this.addLog(
-      `[REVERSAL] manual profit-target adjust: ${pct}% → ${this._formatNotional(newUSDT)} USDT ` +
+      `[LADDER] manual profit-target adjust: ${pct}% → ${this._formatNotional(newUSDT)} USDT ` +
       `(was ${this._formatNotional(before)} USDT, initialCapital ${this._formatNotional(this.initialCapital)})`,
     );
 
@@ -1253,7 +1250,6 @@ class AnchorLadderStrategy extends TradingBase {
    *
    *   - Final funding flush
    *   - Platform fee deduction on net positive PnL
-   *   - AI usage summary log
    *   - onStopComplete() hook → removes the entry from app.js's
    *     `activeStrategies` map. Without this hook the next start
    *     attempt for this profile is rejected with "already running"
@@ -1266,12 +1262,12 @@ class AnchorLadderStrategy extends TradingBase {
     if (this.executionState === 'EXECUTING' || this.executionState === 'TERMINATED') return;
     this.executionState = 'EXECUTING';
     try {
-      await this.addLog(`[REVERSAL] Final TP hit at ${this.currentPrice} — closing cycle`);
+      await this.addLog(`[LADDER] Final TP hit at ${this.currentPrice} — closing cycle`);
       await this.stop({ flatten: true, reason: 'final_tp' });
     } catch (err) {
-      await this.addLog(`[REVERSAL] _handleFinalTpHit error: ${err.message}`);
+      await this.addLog(`[LADDER] _handleFinalTpHit error: ${err.message}`);
       // If stop() never reached TERMINATED (e.g. threw very early), release
-      // the lock so a future tick or a /ai-reversal/stop request can try
+      // the lock so a future tick or a /anchor-ladder/stop request can try
       // again. If stop() succeeded, executionState is already TERMINATED.
       if (this.executionState !== 'TERMINATED') this.executionState = 'IDLE';
     }
@@ -1286,7 +1282,7 @@ class AnchorLadderStrategy extends TradingBase {
    *   New size        = Initial size + Additional size
    *
    * Reads `cycleAccumulatedLoss` from current accumulators (Binance-truth).
-   * Caller (_performReversal) is responsible for refreshing accumulators
+   * Caller (_computeLadderBaseSize) is responsible for refreshing accumulators
    * via WS confirmation before invoking — no forward projection.
    */
   _computeFormulaSize() {
@@ -1395,9 +1391,11 @@ class AnchorLadderStrategy extends TradingBase {
   // ——— Trade fill reconciliation ——————————————————————————————————————
 
   /**
-   * Post-execute bookkeeping hook. Called by each strategy action helper
-   * (_openInitialPosition / _performReversal / _executeHarvest /
-   * _handleFinalTpHit) AFTER `executor.executeAction()` resolves.
+   * Post-execute bookkeeping hook. Called after a leg fill (_fillLeg) and
+   * after the FINAL_TP_HIT close in stop(), once the order/close resolves
+   * on Binance. (_flattenAtAnchor / _harvestToFlat / _enterTrend do their
+   * own inline bookkeeping — accLoss recompute + saveState + strategyFlow —
+   * since they don't go through a single order/fill path.)
    *
    * IMPORTANT: TradingBase already updates `accumulatedTradingFees` and
    * `accumulatedRealizedPnL` automatically when ORDER_TRADE_UPDATE events
@@ -1456,7 +1454,7 @@ class AnchorLadderStrategy extends TradingBase {
       // TRUE LIVE state snapshot so the frontend can re-sync without waiting.
       this._pushHeartbeatNow();
     } catch (err) {
-      console.error(`[REVERSAL] _postExecuteBookkeeping error: ${err.message}`);
+      console.error(`[LADDER] _postExecuteBookkeeping error: ${err.message}`);
     }
   }
 
@@ -1529,7 +1527,7 @@ class AnchorLadderStrategy extends TradingBase {
         });
       } catch (_) { /* push is best-effort; REST poll catches stragglers */ }
     } catch (err) {
-      console.error(`[REVERSAL] _writeStrategyFlow failed: ${err.message}`);
+      console.error(`[LADDER] _writeStrategyFlow failed: ${err.message}`);
     }
   }
 
@@ -1604,7 +1602,7 @@ class AnchorLadderStrategy extends TradingBase {
       this._pushHeartbeatNow();
       return { added, count: incomes.length };
     } catch (err) {
-      console.error(`[REVERSAL] funding poll error: ${err.message}`);
+      console.error(`[LADDER] funding poll error: ${err.message}`);
       return { added: 0, count: 0, error: err.message };
     }
   }
@@ -1685,14 +1683,14 @@ class AnchorLadderStrategy extends TradingBase {
 
       if (expectNonEmpty && !hasPosition) {
         for (let attempt = 1; attempt <= 5; attempt++) {
-          console.log(`[REVERSAL] _refreshCurrentPosition: REST returned empty post-trade; retry ${attempt}/5 after 300ms`);
+          console.log(`[LADDER] _refreshCurrentPosition: REST returned empty post-trade; retry ${attempt}/5 after 300ms`);
           await new Promise((r) => setTimeout(r, 300));
           await this.detectCurrentPosition(true);
           side = this.currentPosition;
           qty = this.currentPositionQuantity;
           entryPrice = this.positionEntryPrice;
           if ((side === 'LONG' || side === 'SHORT') && qty && qty > 0 && Number.isFinite(entryPrice) && entryPrice > 0) {
-            console.log(`[REVERSAL] _refreshCurrentPosition: REST resolved non-empty on attempt ${attempt}/5`);
+            console.log(`[LADDER] _refreshCurrentPosition: REST resolved non-empty on attempt ${attempt}/5`);
             break;
           }
         }
@@ -1718,7 +1716,7 @@ class AnchorLadderStrategy extends TradingBase {
       this.activePosition = null;
       this.currentSide = null;
     } catch (err) {
-      await this.addLog(`[REVERSAL] _refreshCurrentPosition error: ${err.message}`);
+      await this.addLog(`[LADDER] _refreshCurrentPosition error: ${err.message}`);
     }
   }
 
@@ -1767,8 +1765,8 @@ class AnchorLadderStrategy extends TradingBase {
 
   /**
    * Deducts the platform fee from the user's wallet on net positive PnL.
-   * Lives here rather than on TradingBase for the same reason
-   * _fetchDeepseekApiKey does; follow-up: refactor down to TradingBase.
+   * Strategy-specific (reads userId/firestore off `this`) rather than on
+   * TradingBase; follow-up: refactor down to TradingBase.
    * Called from stop() when netPnL > 0.
    */
   async deductPlatformFee(profitAmount) {
@@ -1817,7 +1815,7 @@ class AnchorLadderStrategy extends TradingBase {
     }
   }
 
-  // ——— Status snapshot (consumed by /ai-reversal/status) ——————————————
+  // ——— Status snapshot (consumed by /anchor-ladder/status) ——————————————
 
   getStatus() {
     // acc-loss is purely derived from the live (Binance-truth) accumulators, so
@@ -1833,8 +1831,6 @@ class AnchorLadderStrategy extends TradingBase {
       subState: this.subState,
       currentSide: this.currentSide,
       currentPosition: this.activePosition,
-      bullLevel: this.bullLevel,
-      bearLevel: this.bearLevel,
       finalTpPrice: this.finalTpPrice,
       cycleAccumulatedLoss: this.cycleAccumulatedLoss,
       reversalCount: this.reversalCount,
@@ -1892,16 +1888,15 @@ class AnchorLadderStrategy extends TradingBase {
    * Slim TRUE LIVE snapshot for WS heartbeat broadcasts. Excludes:
    *   - Static config (leverage / priceType / recovery params / etc.) — loaded
    *     once by frontend's initial REST fetch of getStatus().
-   *   - Fields covered by other event pushes (currentPrice via price_tick;
-   *     bullLevel/bearLevel/activePlan via plan_update / flow_event).
-   *   - AI-consult cache (volumeProfile / cvd / orderbookDepth / volatility)
-   *     which only changes on consults — pushed via plan_update.context.
+   *   - Fields covered by other event pushes (currentPrice via price_tick).
+   *   - Volume/volatility snapshot cache (volumeProfile24h / cvd /
+   *     orderbookDepth / volatility) — refreshed on its own interval, not
+   *     worth a heartbeat push every time.
    *   - Derivable fields (cycleDuration = Date.now() - cycleStartTime).
    * Ladder/mode fields (mode, anchor/ladderLines/etc., trendDirection,
-   * finalTpPrice, ...) ARE included here — unlike reversal, a live ladder
-   * session needs them on every heartbeat because RANGE/TREND transitions
-   * and anchor-flatten rebuilds happen mid-cycle, not just at plan
-   * boundaries, and the frontend merges this payload directly into `status`
+   * finalTpPrice, ...) ARE included here because RANGE/TREND transitions
+   * and anchor-flatten rebuilds happen mid-cycle, and the frontend merges
+   * this payload directly into `status`
    * (setStatus(prev => ({...prev, ...payload}))) so a value missing here
    * would only ever reach the frontend via the next full REST getStatus().
    * Fires on the 30s safety-net interval AND immediately after every
@@ -1928,8 +1923,8 @@ class AnchorLadderStrategy extends TradingBase {
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
 
-      // Ladder state — see docstring: included here (unlike reversal's
-      // heartbeat) because mode/ladder transitions happen mid-cycle.
+      // Ladder state — see docstring: included here on every heartbeat
+      // because mode/ladder transitions happen mid-cycle.
       mode: this.ladderMode,         // the frontend reads status.mode, not ladderMode
       anchor: this.anchor,
       ladderLines: this.ladderLines,
@@ -1943,8 +1938,8 @@ class AnchorLadderStrategy extends TradingBase {
 
   /**
    * Immediate heartbeat broadcast — called from every bookkeeping path that
-   * mutates TRUE LIVE state (trade fills via _postExecuteBookkeeping; AI
-   * consults via _savePlanToFirestore caller; harvest-price set/clear).
+   * mutates TRUE LIVE state (trade fills via _postExecuteBookkeeping; ladder
+   * rebuilds / mode transitions; harvest set/clear).
    * Combined with the 30s safety-net interval in app.js, this means frontend
    * sees state mutations at sub-second latency without waiting for the next
    * tick. Best-effort — wrapped in try/catch so a broadcast hiccup never
@@ -1992,8 +1987,6 @@ class AnchorLadderStrategy extends TradingBase {
         stopReason: this.stopReason ?? null,
         currentSide: this.currentSide,
         currentPosition: this.activePosition,
-        bullLevel: this.bullLevel,
-        bearLevel: this.bearLevel,
         finalTpPrice: this.finalTpPrice,
         cycleAccumulatedLoss: this.cycleAccumulatedLoss,
         reversalCount: this.reversalCount,
@@ -2053,7 +2046,7 @@ class AnchorLadderStrategy extends TradingBase {
       };
       await this.firestore.collection('strategies').doc(this.strategyId).set(doc, { merge: true });
     } catch (err) {
-      await this.addLog(`[REVERSAL] saveState error: ${err.message}`);
+      await this.addLog(`[LADDER] saveState error: ${err.message}`);
     }
   }
 

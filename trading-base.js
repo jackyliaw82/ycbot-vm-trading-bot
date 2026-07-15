@@ -332,7 +332,7 @@ class TradingBase {
       // changed from this fill. Without this push, frontend would see
       // stale accumulators until the next 30s safety-net heartbeat.
       // Hook is optional — strategies that implement _pushHeartbeatNow
-      // (AiReversalStrategy) opt in; others no-op.
+      // (AnchorLadderStrategy) opt in; others no-op.
       if (typeof this._pushHeartbeatNow === 'function') {
         try { this._pushHeartbeatNow(); } catch (_) { /* non-fatal */ }
       }
@@ -1126,8 +1126,8 @@ class TradingBase {
         // notional check so sub-minNotional residue can still be closed.
         // ONE-WAY mode only (Binance rejects reduceOnly in HEDGE mode;
         // hedge closes use positionSide=LONG/SHORT which encodes direction).
-        // Reversal close paths (_executeHarvestClose, _executeReverse close
-        // leg) pass reduceOnly=true.
+        // The ladder's close paths (_closeConsolidated, used by every
+        // flatten/harvest/Final-TP close) pass reduceOnly=true.
         if (options.reduceOnly) orderParams.reduceOnly = 'true';
         const result = await this.makeProxyRequest('/fapi/v1/order', 'POST', orderParams, true, 'futures');
 
@@ -2034,7 +2034,13 @@ class TradingBase {
 
   // ─── WebSocket: Liquidation stream ─────────────────────────────────────────
   // Replaces deprecated GET /fapi/v1/allForceOrders REST endpoint.
-  // Aggregates forceOrder events into a 15m rolling buffer consumed by ai-market-context.
+  // Aggregates forceOrder events into a 15m rolling buffer. ORPHANED as of the
+  // anchor-ladder migration — its only consumer (ai-market-context.js) was
+  // deleted along with the rest of the AI stack, and no strategy calls
+  // connectLiquidationWebSocket() to start this stream. Left in place
+  // (never connects, so it costs nothing at runtime) for a future strategy
+  // that wants liquidation-cascade data; getLiquidationSnapshot() below is
+  // its read side.
 
   connectLiquidationWebSocket() {
     if (this.liquidationReconnectTimeout) clearTimeout(this.liquidationReconnectTimeout);
@@ -2146,12 +2152,13 @@ class TradingBase {
   }
 
   // Returns { longLiqVolume15m, shortLiqVolume15m, liqDominance, cascadeActive } or null.
-  // ai-market-context adds isAbnormal on top using its own threshold.
+  // Unconsumed today (see the ORPHANED note on connectLiquidationWebSocket above) —
+  // a future caller would add its own isAbnormal-style threshold on top.
   getLiquidationSnapshot() {
     // Never connected yet — no data at all
     if (!this._liqWsLastConnectedAt) return null;
 
-    // Disconnected and stale beyond our comfort window → don't let AI trust an empty/old buffer
+    // Disconnected and stale beyond our comfort window → don't let a caller trust an empty/old buffer
     if (!this.liquidationWsConnected && (Date.now() - this._liqWsLastConnectedAt > 5 * 60 * 1000)) {
       return null;
     }

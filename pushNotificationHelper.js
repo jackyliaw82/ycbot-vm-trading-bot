@@ -136,8 +136,7 @@ export async function sendPushNotification(userId, notificationData) {
   // Critical, terminal alerts bypass the rate limiter entirely. These fire at
   // most once per cycle (strategy stopped by the circuit breaker, or cycle
   // completed at Final TP) and the user MUST see them — a burst of frequent
-  // reversal pings must never be able to drain the bucket and starve one out.
-  // Only high-frequency types (reversal, etc.) stay rate-limited.
+  // high-frequency pings must never be able to drain the bucket and starve one out.
   const notifType = notificationData?.data?.type;
   const isCriticalAlert = notifType === 'capital_protection' || notifType === 'final_tp';
 
@@ -465,48 +464,3 @@ export async function sendStrategyCompletionNotification(userId, strategyData) {
   return await sendPushNotification(userId, notificationData);
 }
 
-export async function sendCapitalProtectionNotification(userId, protectionData) {
-  // Validate and provide defaults for protectionData
-  const lossAmount = typeof protectionData?.lossAmount === 'number' ? protectionData.lossAmount : 0;
-  const lossPercentage = typeof protectionData?.lossPercentage === 'number' ? protectionData.lossPercentage : 0;
-  const symbol = protectionData?.symbol || 'Unknown';
-
-  const notificationData = {
-    title: `⚠️ Capital Protection - ${symbol}`,
-    body: `Circuit breaker triggered!\nLoss: $${Math.abs(lossAmount).toFixed(2)} (${lossPercentage.toFixed(2)}%)\nStrategy stopped automatically.`,
-    data: {
-      type: 'capital_protection',
-      strategyId: protectionData?.strategyId || '',
-      symbol: symbol,
-      lossAmount: lossAmount.toString(),
-      lossPercentage: lossPercentage.toString(),
-    },
-  };
-
-  return await sendPushNotification(userId, notificationData);
-}
-
-export async function sendReversalNotification(userId, reversalData) {
-  // Validate and provide defaults for reversalData
-  const currentPrice = typeof reversalData?.currentPrice === 'number' ? reversalData.currentPrice : 0;
-  const reversalCount = typeof reversalData?.reversalCount === 'number' ? reversalData.reversalCount : 0;
-  const symbol = reversalData?.symbol || 'Unknown';
-  const oldPosition = reversalData?.oldPosition || 'NONE';
-  const newPosition = reversalData?.newPosition || 'NONE';
-
-  const notificationData = {
-    title: `🔄 Reversal #${reversalCount} - ${symbol}`,
-    body: `Position reversed: ${oldPosition} → ${newPosition}\nPrice: $${currentPrice.toFixed(2)}\nTotal reversals: ${reversalCount}`,
-    data: {
-      type: 'reversal',
-      strategyId: reversalData?.strategyId || '',
-      symbol: symbol,
-      oldPosition: oldPosition,
-      newPosition: newPosition,
-      reversalCount: reversalCount.toString(),
-      currentPrice: currentPrice.toString(),
-    },
-  };
-
-  return await sendPushNotification(userId, notificationData);
-}

@@ -225,8 +225,10 @@ test('_computeLadderBaseSize: a 50 USDT loss grows a 10k base to 12k', () => {
   s.lastWalletSnapshot = { totalMarginBalance: 1e9 };
   s._computeAccLoss = () => 50;
   // 50 * 0.20 / 0.005 = 2000 additional
-  assert.equal(s._computeLadderBaseSize(), 12000);
-  assert.equal(s._legNotional !== undefined, true);
+  const sized = s._computeLadderBaseSize();
+  assert.equal(sized, 12000);
+  s._ladderBaseSize = sized;
+  assert.equal(s._legNotional(), 2400, 'the grown base splits evenly across 5 legs');
 });
 
 test('_computeLadderBaseSize: a full gauge freezes escalation', () => {

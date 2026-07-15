@@ -1,11 +1,12 @@
 /**
- * Server-side billing gate for AI Reversal strategy START.
+ * Server-side billing gate for the strategy START endpoint (currently
+ * AnchorLadderStrategy's `/anchor-ladder/start`).
  *
  * This is a fail-closed mirror of the read-only checks in backend-service's
  * `/billing/preflight`. The React frontend calls preflight (which ALSO lazily
  * charges the 30 USD machine subscription) before it ever calls the VM bot —
- * but that gate is only *enforced* client-side: the VM's `/ai-reversal/start`
- * handler historically trusted whatever reached it, so a caller that bypassed
+ * but that gate is only *enforced* client-side: the VM's start handler
+ * historically trusted whatever reached it, so a caller that bypassed
  * the frontend (a direct request with their own valid token) could start a
  * strategy with a lapsed subscription and/or an empty Reload Balance.
  *

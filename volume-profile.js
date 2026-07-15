@@ -183,8 +183,9 @@ export function computeVolumeProfile(candles, binCount = VP_BIN_COUNT_24H) {
 
 /**
  * VolumeProfile — 24h VPVR for the chart histogram overlay, keyed by symbol.
- * `strategy` supplies makeProxyRequest — the same duck-typing AiMarketContext
- * used; this class does not invent a new transport.
+ * `strategy` supplies makeProxyRequest — the same duck-typed proxy transport
+ * every strategy already has from TradingBase; this class does not invent a
+ * new transport.
  */
 export class VolumeProfile {
   constructor(strategy) {
