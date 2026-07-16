@@ -874,7 +874,10 @@ class TradingBase {
     }
   }
 
-  async _calculateAdjustedQuantity(symbol, positionSizeUSDT, calculationPrice = null, actionType = 'ADD') {
+  // NOTE: the old `actionType` parameter is gone with L5b (see below). Nothing
+  // passed it — AnchorLadder's _legQuantity() wrapper always relied on the
+  // default — so its removal is not a call-site change.
+  async _calculateAdjustedQuantity(symbol, positionSizeUSDT, calculationPrice = null) {
     let priceUsedForCalculation;
 
     if (calculationPrice !== null && calculationPrice > 0) {
@@ -889,23 +892,21 @@ class TradingBase {
 
     const { minQty, maxQty, stepSize, precision, minNotional } = await this._getExchangeInfo(symbol);
 
-    // L5b: dynamic mid-run volatility-aware scaling for ADD actions only.
-    // CUT actions (de-risking) bypass scaling — closing risk should not be
-    // impeded by elevated volatility. Compares current ATR% to the start
-    // baseline; scales DOWN proportionally when current is significantly
-    // higher. Floored at VOL_SIZING_FLOOR so we don't shrink below
-    // executable size.
-    const isAdd = actionType === 'ADD' || actionType === 'ADD_LONG' || actionType === 'ADD_SHORT';
-    const startAtr = this._atrPctAtStart;
-    const curAtr = this._lastVolatility?.atrPercent;
-    if (isAdd && startAtr && curAtr && curAtr > startAtr * 1.5) {
-      const VOL_SIZING_FLOOR = 0.4;
-      const rawFactor = startAtr / curAtr;
-      const factor = Math.max(VOL_SIZING_FLOOR, Math.min(1, rawFactor));
-      const oldSize = positionSizeUSDT;
-      positionSizeUSDT = positionSizeUSDT * factor;
-      this.addLog(`[L5b] ATR ${startAtr.toFixed(2)}% → ${curAtr.toFixed(2)}% (>1.5×); scaling ADD ${oldSize.toFixed(2)} → ${positionSizeUSDT.toFixed(2)} USDT (×${factor.toFixed(2)})`).catch(() => {});
-    }
+    // The reversal-era "L5b" volatility-aware ADD scaling lived here and was
+    // REMOVED 2026-07-16. It read `this._atrPctAtStart`, which was never
+    // assigned anywhere in the repo, so it could never fire — but it was a
+    // live-money landmine, not merely dead:
+    //   - its `isAdd` test defaulted to true (actionType defaulted to 'ADD'
+    //     and AnchorLadder's _legQuantity() never passed one), so EVERY ladder
+    //     leg fill entered the branch;
+    //   - restoring the Volume Analytics producers populated `_lastVolatility`,
+    //     leaving `_atrPctAtStart` as the ONLY thing keeping it dormant.
+    // One natural-looking assignment ("record ATR at cycle start") would have
+    // silently shrunk every leg fill by up to 60% (its floor was 0.4). The
+    // ladder's economics depend on each leg carrying its designated notional —
+    // the dynamic sizing formula and the harvest gauge are calibrated on it —
+    // so silent per-leg scaling would corrupt them with no error anywhere.
+    // Do not reintroduce volatility scaling without re-deriving that maths.
 
     let rawQuantity = positionSizeUSDT / priceUsedForCalculation;
     // Floor (not ceil) to avoid overshooting the intended sizeUSDT — overshoot

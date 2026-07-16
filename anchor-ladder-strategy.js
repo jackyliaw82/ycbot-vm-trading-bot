@@ -341,9 +341,13 @@ class AnchorLadderStrategy extends TradingBase {
   /**
    * Notional -> quantity conversion (tick/step rounding, minNotional floor).
    * Thin wrapper around TradingBase._calculateAdjustedQuantity — the same
-   * conversion the old hedge-mode _openGridLeg used (default actionType
-   * 'ADD', since a leg fill is additive to the net one-way position and
-   * should still get the L5b ATR down-scaling that ADD actions receive).
+   * conversion the old hedge-mode _openGridLeg used.
+   *
+   * Every leg must carry its FULL designated notional (initialSize divided
+   * evenly across the levels). The sizing formula and the harvest gauge are
+   * calibrated on that, so nothing may scale a leg down behind their backs —
+   * which is why the reversal-era L5b ATR scaling was removed from the base
+   * class rather than left dormant. See the note at its old site.
    */
   async _quantityFor(symbol, notionalUSDT, price) {
     return this._calculateAdjustedQuantity(symbol, notionalUSDT, price);
