@@ -368,32 +368,58 @@ class AnchorLadderStrategy extends TradingBase {
    * `_closeConsolidated` and rebuilds the ladder from scratch.)
    */
   // Return value reflects whether a position was ACTUALLY closed, never
-  // merely whether legs were marked open. Legs can be marked POSITION_OPEN
-  // while `activePosition` is empty for two very different reasons:
+  // merely whether legs were marked open. There are THREE states here, not
+  // the two this doc used to enumerate:
   //   1. Genuine state drift (missed WS update) AND the last Binance refresh
   //      SUCCEEDED and confirmed flat — safe to reset the ledger; nothing is
   //      actually open.
-  //   2. The last Binance refresh FAILED — state is UNKNOWN, not flat. Legs
-  //      marked POSITION_OPEN could be a real live position. Wiping them
-  //      here would silently discard it with no close ever attempted.
+  //   2. `activePosition` empty + the last Binance refresh FAILED — state is
+  //      UNKNOWN, not flat. Legs marked POSITION_OPEN could be a real live
+  //      position. Wiping them would silently discard it, no close attempted.
+  //   3. `activePosition` STALE NON-NULL + the last refresh FAILED — the case
+  //      originally missed. `activePosition` is whatever it was BEFORE the
+  //      failure, so its quantity can sit UNDER what Binance really holds (a
+  //      leg fill's own refresh 503'd: memory says 4 legs, Binance holds 5).
+  //      The old `if (hadPosition)` branch closed that stale qty and then
+  //      wiped every leg — a silent PARTIAL close that orphans the remainder
+  //      on Binance and destroys the only bookkeeping pointing at it.
+  //
   // `this._lastPositionRefreshFailed` (set by _refreshCurrentPosition)
-  // distinguishes the two; only case 1 resets the bookkeeping.
+  // distinguishes them. TOMBSTONE — do NOT collapse this back into a bare
+  // `if (hadPosition) close()`: the flag must be consulted BEFORE any close
+  // decision, not just before the empty-activePosition wipe. Only a
+  // Binance-verified state may close or reset the ledger (see
+  // `_flattenAtAnchor`'s Fix A, which this mirrors).
   async _flattenGrid(reason = 'FLATTEN') {
-    const openLegs = this.ladderLines.filter(l => l.state === 'POSITION_OPEN');
-    const hadPosition = !!(this.activePosition && this.activePosition.quantity > 0);
+    let openLegs = this.ladderLines.filter(l => l.state === 'POSITION_OPEN');
+    let hadPosition = !!(this.activePosition && this.activePosition.quantity > 0);
     if (!openLegs.length && !hadPosition) return false;
+
+    if (this._lastPositionRefreshFailed) {
+      await this.addLog(
+        `[LADDER] _flattenGrid: last position refresh failed for ${this.symbol} — re-verifying with Binance ` +
+        `before closing (in-memory qty may be stale).`
+      );
+      await this._refreshCurrentPosition();
+      if (this._lastPositionRefreshFailed) {
+        const qty = openLegs.reduce((sum, l) => sum + (l.quantity || 0), 0);
+        await this.addLog(
+          `[LADDER] WARNING: _flattenGrid: Binance position refresh still failing for ${this.symbol} — ` +
+          `${openLegs.length} ladder leg(s) marked open (last-known qty ${qty}) but current Binance state is ` +
+          `UNKNOWN. NOT closing a possibly-stale quantity and NOT wiping legs — will retry on the next ` +
+          `stop/reconcile.`
+        );
+        return false;
+      }
+      // Refresh succeeded — re-derive off the now-verified state.
+      openLegs = this.ladderLines.filter(l => l.state === 'POSITION_OPEN');
+      hadPosition = !!(this.activePosition && this.activePosition.quantity > 0);
+      if (!openLegs.length && !hadPosition) return false;
+    }
 
     if (hadPosition) {
       await this.addLog(`Flattening ladder: closing net position (${openLegs.length} leg(s) recorded open).`);
       await this._closeConsolidated(reason);
-    } else if (openLegs.length && this._lastPositionRefreshFailed) {
-      const qty = openLegs.reduce((sum, l) => sum + (l.quantity || 0), 0);
-      await this.addLog(
-        `[LADDER] WARNING: _flattenGrid: Binance position refresh failed — ${this.symbol} has ${openLegs.length} ` +
-        `ladder leg(s) marked open (qty ${qty}) but current Binance state is UNKNOWN. NOT wiping legs and no close ` +
-        `attempted this pass — will retry on the next stop/reconcile.`
-      );
-      return false;
     }
 
     for (const leg of this.ladderLines) {
@@ -1094,7 +1120,14 @@ class AnchorLadderStrategy extends TradingBase {
           await this.addLog(`[LADDER] stop: grid flatten failed: ${err.message}`);
         }
       }
-      if (!closedSomething && this.activePosition && this.activePosition.quantity > 0 && this.ladderMode === 'TREND') {
+      // TOMBSTONE: both fallback branches below are `_lastPositionRefreshFailed`
+      // readers too — they close `this.activePosition`'s quantity directly.
+      // Without the flag check they simply re-introduce the stale partial
+      // close that `_flattenGrid` just refused to make (it returns false on
+      // unknown state, which leaves `!closedSomething` true and hands the
+      // stale qty straight to these branches). Do NOT drop the check.
+      if (!closedSomething && !this._lastPositionRefreshFailed
+          && this.activePosition && this.activePosition.quantity > 0 && this.ladderMode === 'TREND') {
         // Fallback for a TREND-consolidated position with no ladder leg left
         // marked POSITION_OPEN. Reachable — not merely defensive — when
         // branch 1's close throws before `_flattenGrid` resets leg state
@@ -1107,7 +1140,8 @@ class AnchorLadderStrategy extends TradingBase {
           await this.addLog(`[LADDER] stop: consolidated close failed: ${err.message}`);
         }
       }
-      if (!closedSomething && this.activePosition && this.activePosition.quantity > 0) {
+      if (!closedSomething && !this._lastPositionRefreshFailed
+          && this.activePosition && this.activePosition.quantity > 0) {
         const closeReason = reason === 'final_tp' ? 'final_tp' : 'user-stop';
         try {
           await this.addLog(`[LADDER] stop: flattening ${this.currentSide} ${this.activePosition.quantity} (${closeReason})`);
@@ -1118,13 +1152,16 @@ class AnchorLadderStrategy extends TradingBase {
         }
       } else if (!closedSomething) {
         // Do NOT claim "nothing to flatten" when the position state is
-        // actually UNKNOWN (refresh failed) and ladderLines still shows
-        // open legs — _flattenGrid already logged a WARNING for that case;
-        // repeating "nothing to flatten" here would contradict it and read
-        // as false reassurance.
-        const stateUnknownWithOpenLegs = this._lastPositionRefreshFailed
-          && this.ladderLines.some(l => l.state === 'POSITION_OPEN');
-        if (!stateUnknownWithOpenLegs) {
+        // actually UNKNOWN (refresh failed) — _flattenGrid already logged a
+        // WARNING for that case; repeating "nothing to flatten" here would
+        // contradict it and read as false reassurance. "Unknown" covers a
+        // stale NON-NULL activePosition as well as open legs: with the
+        // fallback branches above now gated on the flag, an unknown state
+        // reaches this else with its stale position still in memory.
+        const stateUnknown = this._lastPositionRefreshFailed
+          && (this.ladderLines.some(l => l.state === 'POSITION_OPEN')
+              || !!(this.activePosition && this.activePosition.quantity > 0));
+        if (!stateUnknown) {
           await this.addLog('[LADDER] stop: no open position on Binance — nothing to flatten');
         }
       }
@@ -1139,23 +1176,36 @@ class AnchorLadderStrategy extends TradingBase {
       } catch (err) {
         await this.addLog(`[LADDER] stop: post-flatten position refresh failed: ${err.message}`);
       }
-      if (this.activePosition && this.activePosition.quantity > 0) {
+      // TOMBSTONE — the flag check MUST come first. This block used to lead
+      // with `activePosition` and then `else if (closedSomething) ->
+      // "confirmed flat"`, so a stop whose refresh never succeeded reported
+      // "position confirmed flat" purely because a close had been ATTEMPTED:
+      // `_closeConsolidated` nulls `activePosition` unconditionally, the
+      // refresh above then fails and leaves it null, and null was read as
+      // flat. The FINAL-STATE-UNKNOWN arm below was unreachable in exactly
+      // the case it existed for, because it sat last AND keyed on legs that
+      // `_flattenGrid` had already wiped. The user must NEVER be told
+      // "confirmed flat" when the position state is unknown — an unverified
+      // stop is the last moment anyone is watching.
+      if (this._lastPositionRefreshFailed) {
+        // Never terminate silently: state is still UNKNOWN after the
+        // post-flatten refresh. Report whatever bookkeeping survives —
+        // deliberately-untouched legs and/or the last-known position — as
+        // the loudest signal we can give before the strategy terminates.
+        const openLegs = this.ladderLines.filter(l => l.state === 'POSITION_OPEN');
+        const legQty = openLegs.reduce((sum, l) => sum + (l.quantity || 0), 0);
+        const lastKnown = this.activePosition && this.activePosition.quantity > 0
+          ? `last-known position ${this.currentSide} ${this.activePosition.quantity}`
+          : 'no position in memory (which is NOT proof of flat — the refresh failed)';
+        await this.addLog(
+          `[LADDER] WARNING: stop: FINAL STATE UNKNOWN for ${this.symbol} — Binance could not be reached to confirm ` +
+          `flat${closedSomething ? ' after a close was attempted' : ''}. ${openLegs.length} ladder leg(s) (qty ` +
+          `${legQty}) remain marked open; ${lastKnown}. Verify manually on Binance.`
+        );
+      } else if (this.activePosition && this.activePosition.quantity > 0) {
         await this.addLog(`[LADDER] WARNING: stop+flatten left residual ${this.currentSide} ${this.activePosition.quantity} ${this.symbol} on Binance — close it manually`);
       } else if (closedSomething) {
         await this.addLog('[LADDER] stop: position confirmed flat');
-      } else if (this._lastPositionRefreshFailed && this.ladderLines.some(l => l.state === 'POSITION_OPEN')) {
-        // Never terminate silently: state is still UNKNOWN after both
-        // refresh attempts and ladderLines still shows open legs that were
-        // deliberately left untouched — this is the loudest signal we can
-        // give before the strategy terminates.
-        const qty = this.ladderLines
-          .filter(l => l.state === 'POSITION_OPEN')
-          .reduce((sum, l) => sum + (l.quantity || 0), 0);
-        await this.addLog(
-          `[LADDER] WARNING: stop: FINAL STATE UNKNOWN for ${this.symbol} — Binance could not be reached to confirm ` +
-          `flat, and ${this.ladderLines.filter(l => l.state === 'POSITION_OPEN').length} ladder leg(s) (qty ${qty}) ` +
-          `remain marked open. Verify manually on Binance.`
-        );
       }
 
       // Final TP: write the strategyFlow audit record + metricsSample so
