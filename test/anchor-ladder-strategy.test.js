@@ -166,6 +166,72 @@ test('_flattenAtAnchor no-ops when there is nothing open and the ladder is all-E
   assert.equal(sizingCalled, false, 'no re-sizing/rebuild churn on a no-op oscillation');
 });
 
+// ——— Task 13: flattenCount ——————————————————————————————————————————————
+
+// A strategy sitting on an open position at the anchor, ready to flatten.
+function flattenReady() {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 1, notional: 1000, entryPrice: 100 };
+  s.currentSide = 'LONG';
+  s.ladderLines[0].state = 'POSITION_OPEN';
+  s._closeConsolidated = async () => true;
+  s._computeLadderBaseSize = async () => s._ladderBaseSize;
+  s._computeAccLoss = () => 0;
+  return s;
+}
+
+test('_flattenAtAnchor increments flattenCount on every committed flatten', async () => {
+  const s = flattenReady();
+  assert.equal(s.flattenCount, 0, 'a fresh cycle starts at zero');
+
+  await s._flattenAtAnchor();
+  assert.equal(s.flattenCount, 1);
+
+  // Re-arm and flatten again — the count accumulates across a cycle.
+  s.activePosition = { quantity: 1, notional: 1000, entryPrice: 100 };
+  s.currentSide = 'LONG';
+  s.ladderLines[0].state = 'POSITION_OPEN';
+  await s._flattenAtAnchor();
+  assert.equal(s.flattenCount, 2);
+});
+
+test('_flattenAtAnchor counts a legs-open-but-flat reset, matching the ANCHOR_FLATTEN trail', async () => {
+  // No position, but a leg is still marked open: this path skips the close yet
+  // still re-sizes, rebuilds and writes ANCHOR_FLATTEN — so it must count.
+  const s = flattenReady();
+  s.activePosition = null;
+  s.currentSide = null;
+  let flows = 0;
+  s._writeStrategyFlow = async (t) => { if (t === 'ANCHOR_FLATTEN') flows += 1; };
+  await s._flattenAtAnchor();
+  assert.equal(s.flattenCount, 1);
+  assert.equal(flows, 1, 'flattenCount must track ANCHOR_FLATTEN one-for-one');
+});
+
+test('_flattenAtAnchor does NOT count a no-op oscillation', async () => {
+  const s = ladderStrategy();   // nothing open, every leg EMPTY
+  await s._flattenAtAnchor();
+  assert.equal(s.flattenCount, 0, 'an early return is not a flatten');
+});
+
+test('_flattenAtAnchor does NOT count an aborted flatten when Binance is unverifiable', async () => {
+  const s = flattenReady();
+  s._lastPositionRefreshFailed = true;
+  s._refreshCurrentPosition = async () => {};   // still failing — flag stays set
+  let closeCalled = false;
+  s._closeConsolidated = async () => { closeCalled = true; return true; };
+  await s._flattenAtAnchor();
+  assert.equal(closeCalled, false, 'must not close on an unknown Binance state');
+  assert.equal(s.flattenCount, 0, 'an aborted flatten is not a flatten');
+});
+
+test('_hasNoTradingActivity: a flatten alone marks the cycle as having traded', () => {
+  const s = ladderStrategy();
+  assert.equal(s._hasNoTradingActivity(), true, 'an untouched cycle is no-trade');
+  s.flattenCount = 1;
+  assert.equal(s._hasNoTradingActivity(), false, 'a flatten is trading activity');
+});
+
 // ——— _closeConsolidated: currentSide state-drift guard ——————————————————
 
 test('_closeConsolidated: currentSide missing is repopulated by a refresh from Binance before closing', async () => {
@@ -418,6 +484,24 @@ test('a ladder round-trips through saveState/resume', async () => {
   assert.equal(dst._ladderBaseSize, 12000);
 });
 
+test('flattenCount survives a save/restore round-trip', async () => {
+  const src = ladderStrategy();
+  src.flattenCount = 7;
+  let doc = null;
+  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
+  await AnchorLadderStrategy.prototype.saveState.call(src);
+  assert.equal(doc.flattenCount, 7, 'saveState must persist it');
+
+  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
+  cleanupResumeTimers(dst);
+
+  // Without this the count silently resets to 0 on every VM restart, and
+  // _hasNoTradingActivity would then delete a real cycle's doc as "no-trade".
+  assert.equal(dst.flattenCount, 7, 'resume must restore it');
+});
+
 test('getStatus reports the ladder shape the frontend needs', () => {
   const s = ladderStrategy({ anchor: 100 });
   s.ladderMode = 'RANGE';
@@ -439,6 +523,21 @@ test('getHeartbeatPayload reports the same ladder shape as getStatus', () => {
   assert.equal(hb.trendDirection, 'SHORT');
   assert.equal(hb.ladderLines.length, 10);
   assert.equal(hb.strategyType, 'anchorLadder');
+});
+
+test('getStatus and the heartbeat both emit flattenCount for the Flattens tile', () => {
+  // The frontend types itself off this payload: a field the backend never
+  // emits is a silent `undefined` at runtime with no type error.
+  const s = ladderStrategy({ anchor: 100 });
+  s.flattenCount = 3;
+  assert.equal(s.getStatus().flattenCount, 3);
+  assert.equal(s.getHeartbeatPayload().flattenCount, 3);
+});
+
+test('reversalCount is gone from the emitted payloads', () => {
+  const s = ladderStrategy({ anchor: 100 });
+  assert.equal('reversalCount' in s.getStatus(), false, 'the ladder has no reversal concept');
+  assert.equal('reversalCount' in s.getHeartbeatPayload(), false);
 });
 
 test('saveState writes the ANCHOR_LADDER type tags for boot recovery', async () => {

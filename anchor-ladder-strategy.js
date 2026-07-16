@@ -74,7 +74,7 @@ class AnchorLadderStrategy extends TradingBase {
     this._trendFinalTpArmed = false;
     this.finalTpPrice = null;
     this.cycleAccumulatedLoss = 0;
-    this.reversalCount = 0;
+    this.flattenCount = 0;
     this.harvestCount = 0;
     this.initialCapital = 0;
     this.currentInitialSize = 0;         // base for DYNAMIC trend sizing (original config size; never overwritten → no compounding)
@@ -572,14 +572,22 @@ class AnchorLadderStrategy extends TradingBase {
     this._trendFinalTpArmed = false;
     this.finalTpPrice = null;
 
+    // Both abort paths above have returned, so the flatten is committed and is
+    // counted here rather than on entry. Counts every reset that reaches this
+    // point — including the legs-open-but-no-position case, which still
+    // re-sizes and rebuilds — so the tile matches the ANCHOR_FLATTEN
+    // strategyFlow trail one-for-one. Persisted by the saveState() below.
+    this.flattenCount = (this.flattenCount || 0) + 1;
+
     await this.addLog(
-      `===== ANCHOR FLATTEN @ ${this._formatPrice(this.anchor)} ===== ` +
+      `===== ANCHOR FLATTEN #${this.flattenCount} @ ${this._formatPrice(this.anchor)} ===== ` +
       `accLoss ${this._formatNotional(this.cycleAccumulatedLoss)} USDT | ` +
       `base ${this._formatNotional(prevBase)} → ${this._formatNotional(this._ladderBaseSize)} USDT | ` +
       `leg ${this._formatNotional(this._legNotional())} USDT | ladder reset`,
     );
     await this._writeStrategyFlow('ANCHOR_FLATTEN', {
       anchor: this.anchor, accLoss: this.cycleAccumulatedLoss, baseSize: this._ladderBaseSize,
+      flattenCount: this.flattenCount,
     }).catch(() => {});
     await this.saveState();
   }
@@ -811,7 +819,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.activePosition = snapshot.currentPosition || null;
     this.finalTpPrice = snapshot.finalTpPrice || null;
     this.cycleAccumulatedLoss = snapshot.cycleAccumulatedLoss || 0;
-    this.reversalCount = snapshot.reversalCount || 0;
+    this.flattenCount = snapshot.flattenCount || 0;
     this.harvestCount = snapshot.harvestCount || 0;
     this.initialCapital = snapshot.initialCapital || 0;
     this.initialWalletBalance = snapshot.initialWalletBalance || null;
@@ -921,7 +929,7 @@ class AnchorLadderStrategy extends TradingBase {
     // (Final TP is a derived value; never persisted).
     this._recomputeFinalTpPrice();
 
-    await this.addLog(`[RECOVERY] subState=${this.subState} side=${this.currentSide || 'NONE'} reversals=${this.reversalCount} harvests=${this.harvestCount} accLoss=${this.cycleAccumulatedLoss.toFixed(4)} USDT`);
+    await this.addLog(`[RECOVERY] subState=${this.subState} side=${this.currentSide || 'NONE'} flattens=${this.flattenCount} harvests=${this.harvestCount} accLoss=${this.cycleAccumulatedLoss.toFixed(4)} USDT`);
 
     await this.saveState();
 
@@ -1178,7 +1186,7 @@ class AnchorLadderStrategy extends TradingBase {
           symbol: this.symbol,
           netPnL,
           profitPercentage: this.initialCapital ? (netPnL / this.initialCapital) * 100 : 0,
-          tradeCount: this.tradeCount || (this.reversalCount + this.harvestCount + (reason === 'final_tp' ? 1 : 0)),
+          tradeCount: this.tradeCount || (this.flattenCount + this.harvestCount + (reason === 'final_tp' ? 1 : 0)),
           timeTaken: elapsed,
           realizedPnL: this.accumulatedRealizedPnL || 0,
           tradingFees: this.accumulatedTradingFees || 0,
@@ -1199,17 +1207,18 @@ class AnchorLadderStrategy extends TradingBase {
 
   /**
    * True when this cycle never filled a position: no trading fees (every fill
-   * incurs a taker commission), no realized PnL, no funding, and no reversals
-   * or harvests. All of these are persisted by saveState() and restored by
-   * resume(), so the check is crash-safe across a VM restart. Conservative by
-   * design — any real trading activity leaves a non-zero accumulatedTradingFees,
-   * so a strategy that actually traded can never be misclassified as no-trade.
+   * incurs a taker commission), no realized PnL, no funding, and no anchor
+   * flattens or harvests. All of these are persisted by saveState() and
+   * restored by resume(), so the check is crash-safe across a VM restart.
+   * Conservative by design — any real trading activity leaves a non-zero
+   * accumulatedTradingFees, so a strategy that actually traded can never be
+   * misclassified as no-trade.
    */
   _hasNoTradingActivity() {
     return (this.accumulatedTradingFees || 0) === 0
       && (this.accumulatedRealizedPnL || 0) === 0
       && (this.accumulatedFundingFees || 0) === 0
-      && (this.reversalCount || 0) === 0
+      && (this.flattenCount || 0) === 0
       && (this.harvestCount || 0) === 0;
   }
 
@@ -1643,7 +1652,7 @@ class AnchorLadderStrategy extends TradingBase {
           `(side=${this.currentSide ?? 'FLAT'}, ` +
           `entry=${this.activePosition?.entryPrice ?? this.activePosition?.avgEntry ?? 'n/a'}, ` +
           `qty=${this.activePosition?.quantity ?? 'n/a'}, ` +
-          `reversals=${this.reversalCount}, harvests=${this.harvestCount}, ` +
+          `flattens=${this.flattenCount}, harvests=${this.harvestCount}, ` +
           `accLoss=${this.cycleAccumulatedLoss.toFixed(4)})`
         );
       }
@@ -1651,7 +1660,7 @@ class AnchorLadderStrategy extends TradingBase {
       this._writeMetricsSample().catch(() => {});
       this._writeStrategyFlow(actionType, extra).catch(() => {});
       // Immediate heartbeat — currentPosition / currentSide / cycleAccumLoss /
-      // reversalCount / harvestCount / accumulated*PnL just changed. Without
+      // flattenCount / harvestCount / accumulated*PnL just changed. Without
       // this push, frontend would see stale state for up to 30s (next safety-
       // net interval). _writeStrategyFlow above also fires its own flow_event
       // push with a slim per-event payload; this heartbeat carries the full
@@ -1711,7 +1720,7 @@ class AnchorLadderStrategy extends TradingBase {
           notional: this.activePosition.notional,
         } : null,
         cycleAccumulatedLoss: this.cycleAccumulatedLoss,
-        reversalCount: this.reversalCount,
+        flattenCount: this.flattenCount,
         harvestCount: this.harvestCount,
         finalTpPrice: this.finalTpPrice,
         ...extra,
@@ -1741,7 +1750,7 @@ class AnchorLadderStrategy extends TradingBase {
       t: Date.now(),
       accumulatedLoss: this.cycleAccumulatedLoss,
       currentSize: this.activePosition?.notional || 0,
-      reversalCount: this.reversalCount,
+      flattenCount: this.flattenCount,
       harvestCount: this.harvestCount,
       side: this.currentSide || null,
     };
@@ -2066,7 +2075,7 @@ class AnchorLadderStrategy extends TradingBase {
       currentPosition: this.activePosition,
       finalTpPrice: this.finalTpPrice,
       cycleAccumulatedLoss: this.cycleAccumulatedLoss,
-      reversalCount: this.reversalCount,
+      flattenCount: this.flattenCount,
       harvestCount: this.harvestCount,
       initialCapital: this.initialCapital,
       currentInitialSize: this.currentInitialSize,
@@ -2147,7 +2156,7 @@ class AnchorLadderStrategy extends TradingBase {
       currentPosition: this.activePosition,
       finalTpPrice: this.finalTpPrice,
       cycleAccumulatedLoss: this.cycleAccumulatedLoss,
-      reversalCount: this.reversalCount,
+      flattenCount: this.flattenCount,
       harvestCount: this.harvestCount,
       initialCapital: this.initialCapital,
       harvestLossThreshold: this.harvestLossThreshold,
@@ -2221,7 +2230,7 @@ class AnchorLadderStrategy extends TradingBase {
         currentPosition: this.activePosition,
         finalTpPrice: this.finalTpPrice,
         cycleAccumulatedLoss: this.cycleAccumulatedLoss,
-        reversalCount: this.reversalCount,
+        flattenCount: this.flattenCount,
         harvestCount: this.harvestCount,
         initialCapital: this.initialCapital,
         initialWalletBalance: this.initialWalletBalance,
