@@ -12,6 +12,13 @@ const MARGIN_HEADROOM_FLOOR_PCT = 30;              // free margin floor for sizi
 const HARVEST_LOSS_THRESHOLD_PCT = 0.30;           // 30% of initial capital — gate for HARVEST eligibility
 const DEFAULT_RECOVERY_FACTOR = 0.20;
 const DEFAULT_RECOVERY_DISTANCE = 0.005;           // 0.5%
+// Backoff between `_reconcileTrendInvariant`'s Final-TP arming retries.
+// The retry costs a Binance REST round trip AND a Firestore log write, and it
+// is driven from `handleRealtimePrice` — i.e. every price tick, several per
+// second. Unarmed TREND is fully exposed with no exit target, so we want the
+// arm ASAP; Binance REST throttling on this VM's IP is a known live failure
+// mode, so we cannot hammer it per tick. 15s is the compromise.
+const TREND_ARM_RETRY_INTERVAL_MS = 15_000;
 
 function formatDuration(ms) {
   if (!ms || ms < 0) return 'N/A';
@@ -66,6 +73,11 @@ class AnchorLadderStrategy extends TradingBase {
     // once a fetch succeeds. stop()'s flatten path and _flattenGrid() read
     // this to avoid treating a failed refresh as a confirmed-flat position.
     this._lastPositionRefreshFailed = false;
+    // Backoff clock for `_reconcileTrendInvariant`'s Final-TP arming retry.
+    // In-memory only and deliberately NOT persisted: a restart should always
+    // get one immediate attempt at re-arming rather than inheriting a stale
+    // interval from the process that died.
+    this._trendArmRetryLastTs = null;
     // NOTE: `_trendFinalTpArmed` is deliberately NOT initialised here — it is
     // a DERIVED getter (see its definition above `_enterTrend`), not stored
     // state. It used to be a plain field, which is precisely why it could
@@ -766,6 +778,19 @@ class AnchorLadderStrategy extends TradingBase {
     // retrying until Binance answers rather than leaving the cycle stuck
     // fully exposed with no exit target for the rest of the cycle.
     if (this.ladderMode === 'TREND' && !this._trendFinalTpArmed) {
+      // Backoff. This runs from `handleRealtimePrice` — every price tick,
+      // several per second — and each attempt costs a Binance REST round trip
+      // plus a Firestore log write. Previously the bug below capped the retry
+      // at exactly one attempt by accident (it marked itself armed and never
+      // came back); now that the retry actually persists until it succeeds, it
+      // needs a real rate limit rather than that accidental one.
+      const now = Date.now();
+      if (this._trendArmRetryLastTs != null
+          && (now - this._trendArmRetryLastTs) < TREND_ARM_RETRY_INTERVAL_MS) {
+        return false;
+      }
+      this._trendArmRetryLastTs = now;
+
       await this.addLog(
         `[LADDER] TREND Final-TP invariant reconcile: TREND ${this.trendDirection} active for ${this.symbol} but ` +
         `Final TP is still unarmed — retrying position refresh.`
@@ -779,6 +804,38 @@ class AnchorLadderStrategy extends TradingBase {
         return false;
       }
       this._recomputeFinalTpPrice();
+
+      // TOMBSTONE — do NOT collapse this back into an unconditional
+      // `armed = true` / "armed at ..." log. This is a reconciler for an
+      // invariant, and it used to mark the invariant ACHIEVED without ever
+      // checking that it was: a successful refresh that resolves to FLAT (or
+      // to an unresolvable side) derives NO target, so it logged the nonsense
+      // "Final TP armed at N/A", reported success, and — back when the flag
+      // was stored — short-circuited its own retry forever.
+      //
+      // Reachable, not theoretical: a process death inside `_flattenAtAnchor`
+      // between `_closeConsolidated()` and `saveState()` — a window that
+      // contains `_computeLadderBaseSize()` -> `getTotalMarginBalance()`, a
+      // real 100-500ms round trip — persists TREND + every leg POSITION_OPEN
+      // while Binance is already flat. The refresh then succeeds and honestly
+      // answers "flat", and this branch called that an arm.
+      //
+      // A reconciler may only report the state it actually reached.
+      if (!this._trendFinalTpArmed) {
+        await this.addLog(
+          `[LADDER] WARNING: TREND Final-TP invariant reconcile: refresh SUCCEEDED for ${this.symbol} but no Final TP ` +
+          `could be derived (position ${this.activePosition && this.activePosition.quantity > 0
+            ? `qty ${this.activePosition.quantity}, side ${this.currentSide || 'UNRESOLVED'}`
+            : 'FLAT on Binance'}` +
+          `) — TREND ${this.trendDirection} with no position to exit is a contradiction; Final TP stays unarmed and ` +
+          `this will retry. Check whether an anchor flatten died before it could persist.`
+        );
+        return false;
+      }
+
+      // Armed: clear the backoff so a LATER disarm retries immediately rather
+      // than waiting out an interval left over from this recovery.
+      this._trendArmRetryLastTs = null;
       await this.addLog(
         `[LADDER] TREND Final-TP invariant reconcile: Final TP armed at ${this._formatPrice(this.finalTpPrice)}.`
       );

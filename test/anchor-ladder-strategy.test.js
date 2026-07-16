@@ -998,6 +998,104 @@ test('FIX B: _reconcileTrendInvariant keeps retrying (does not crash or wedge) w
   assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud WARNING, never a silent no-op');
 });
 
+// ——— I2: a reconciler may only report the state it actually reached ————————
+//
+// `_reconcileTrendInvariant` armed Final TP and then marked the invariant
+// ACHIEVED without checking that it was. A refresh that SUCCEEDS and honestly
+// answers "flat" derives no target — so it logged "Final TP armed at N/A",
+// returned success, and (while the armed flag was still stored state)
+// short-circuited its own retry forever.
+//
+// Reachable via a process death inside `_flattenAtAnchor` between
+// `_closeConsolidated()` and `saveState()` — a window containing a real
+// 100-500ms `getTotalMarginBalance()` round trip — which persists
+// TREND + every leg POSITION_OPEN while Binance is already flat.
+
+// The persisted contradiction that window leaves behind.
+function trendButFlatOnBinance() {
+  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  s.trendDirection = 'LONG';
+  s.ladderLines.filter(l => l.direction === 'LONG').forEach((l) => {
+    l.state = 'POSITION_OPEN'; l.quantity = 20; l.fillPrice = l.price;
+  });
+  s.finalTpPrice = null;
+  s.desiredProfitUSDT = 100;
+  // The refresh SUCCEEDS — Binance simply says flat (the close committed
+  // before the crash). This is the case the old code called an "arm".
+  s._refreshCurrentPosition = async () => {
+    s._lastPositionRefreshFailed = false;
+    s.activePosition = null;
+    s.currentSide = null;
+  };
+  return s;
+}
+
+test('I2: reconcile does NOT claim an arm when a successful refresh resolves to FLAT', async () => {
+  const s = trendButFlatOnBinance();
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+
+  const healed = await s._reconcileTrendInvariant();
+
+  assert.equal(healed, false, 'must NOT report success it did not achieve');
+  assert.equal(s.finalTpPrice, null, 'no target was derived');
+  assert.equal(s._trendFinalTpArmed, false, 'and so it is not armed');
+  assert.equal(
+    logs.some((m) => m.includes('armed at') && m.includes('N/A')), false,
+    'must never log the nonsense "Final TP armed at N/A"',
+  );
+  assert.ok(
+    logs.some((m) => m.includes('WARNING') && m.includes('FLAT')),
+    'the TREND-but-flat contradiction is reported loudly, naming what it found',
+  );
+});
+
+test('I2: the arming retry is not short-circuited — it retries on a later tick and self-heals', async () => {
+  const s = trendButFlatOnBinance();
+  s.addLog = async () => {};
+
+  const first = await s._reconcileTrendInvariant();
+  assert.equal(first, false);
+  assert.equal(s._trendFinalTpArmed, false);
+
+  // A later tick, past the backoff: the position reappears (or was there all
+  // along and Binance finally reports it). The reconcile MUST still be live.
+  s._trendArmRetryLastTs = Date.now() - 60_000;
+  s.cycleAccumulatedLoss = 89;
+  s._refreshCurrentPosition = async () => {
+    s._lastPositionRefreshFailed = false;
+    s.currentSide = 'LONG';
+    s.activePosition = { quantity: 100, entryPrice: 100.4, avgEntry: 100.4, notional: 10040, unrealizedPnl: 0 };
+  };
+
+  const second = await s._reconcileTrendInvariant();
+
+  assert.equal(second, true, 'the retry was never short-circuited, so it can still self-heal');
+  assert.ok(s.finalTpPrice != null, 'Final TP armed once a real position was verified');
+  assert.equal(s._trendFinalTpArmed, true);
+});
+
+test('I2: the unarmed retry is rate-limited — it does not hit Binance on every tick', async () => {
+  const s = trendButFlatOnBinance();
+  s.addLog = async () => {};
+  let refreshCalls = 0;
+  s._refreshCurrentPosition = async () => {
+    refreshCalls++;
+    s._lastPositionRefreshFailed = false;
+    s.activePosition = null;
+    s.currentSide = null;
+  };
+
+  // 50 ticks in the same instant — the tick loop's real cadence.
+  for (let i = 0; i < 50; i++) await s._reconcileTrendInvariant();
+
+  assert.equal(refreshCalls, 1, 'a permanently-unarmed TREND must not hammer Binance REST once per price tick');
+
+  s._trendArmRetryLastTs = Date.now() - 60_000; // interval elapsed
+  await s._reconcileTrendInvariant();
+  assert.equal(refreshCalls, 2, 'but it DOES retry once the backoff interval passes — never gives up');
+});
+
 // ——— I1: finalTpPrice may only ever be derived from VERIFIED position data ——
 //
 // `_trendFinalTpArmed` used to be a stored field shadowing `finalTpPrice`, and
