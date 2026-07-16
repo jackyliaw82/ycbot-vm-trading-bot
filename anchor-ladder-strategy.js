@@ -66,12 +66,10 @@ class AnchorLadderStrategy extends TradingBase {
     // once a fetch succeeds. stop()'s flatten path and _flattenGrid() read
     // this to avoid treating a failed refresh as a confirmed-flat position.
     this._lastPositionRefreshFailed = false;
-    // Set by _enterTrend(): true once Final TP has been armed from a
-    // VERIFIED (successfully refreshed) position at the RANGE→TREND
-    // transition. False while TREND is active but the arming refresh
-    // failed — signals `_reconcileTrendInvariant` (every tick + resume) to
-    // keep retrying rather than leaving the cycle permanently unarmed.
-    this._trendFinalTpArmed = false;
+    // NOTE: `_trendFinalTpArmed` is deliberately NOT initialised here — it is
+    // a DERIVED getter (see its definition above `_enterTrend`), not stored
+    // state. It used to be a plain field, which is precisely why it could
+    // drift out of step with `finalTpPrice`. Do not reintroduce the field.
     this.finalTpPrice = null;
     this.cycleAccumulatedLoss = 0;
     this.flattenCount = 0;
@@ -283,7 +281,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.ladderLines = buildLadder(currentPrice, this.stepPct, this.levelsPerSide);
     this.ladderMode = 'RANGE';
     this.trendDirection = null;
-    this._trendFinalTpArmed = false;
+    // Nulling finalTpPrice IS the disarm — `_trendFinalTpArmed` derives from it.
     this.finalTpPrice = null;
     this.lastProcessedPrice = currentPrice;
 
@@ -602,7 +600,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.ladderLines = buildLadder(this.anchor, this.stepPct, this.levelsPerSide);
     this.ladderMode = 'RANGE';
     this.trendDirection = null;
-    this._trendFinalTpArmed = false;
+    // Nulling finalTpPrice IS the disarm — `_trendFinalTpArmed` derives from it.
     this.finalTpPrice = null;
 
     // Both abort paths above have returned, so the flatten is committed and is
@@ -626,6 +624,50 @@ class AnchorLadderStrategy extends TradingBase {
   }
 
   /**
+   * "Is TREND's Final TP armed?" — DERIVED, never stored.
+   *
+   * The invariant this encodes has always been: *not armed MUST mean
+   * `finalTpPrice` is null* — never silently keep a stale guess. It used to
+   * be a plain boolean field set alongside `finalTpPrice`, i.e. a SHADOW of
+   * a value that is itself already state. Two copies of one fact drift, and
+   * every drift here fails OPEN, because the TREND exit gate
+   * (`if (this.finalTpPrice && ...)`) trusts ANY non-null value and never
+   * consults this flag:
+   *
+   *   - The field was never persisted by `saveState` while `finalTpPrice`
+   *     IS persisted and restored, so every TREND resume booted with
+   *     armed=false + a non-null restored target and raised a FALSE
+   *     "still unarmed" alarm.
+   *   - `_pollFundingIncome` (8-hourly), `adjustProfitTarget` (the user's
+   *     profit pencil) and `resume` all call `_recomputeFinalTpPrice()`
+   *     without touching the flag, so they could resurrect the exact
+   *     unverified target `_enterTrend` had deliberately refused — with
+   *     armed still false — and the exit gate would fire on it.
+   *
+   * Deriving it makes those states unrepresentable rather than merely
+   * unlikely: the arm IS the non-null value. `_recomputeFinalTpPrice` is the
+   * single writer and refuses to derive from unverified data, so
+   * "armed" reduces to "TREND holds a target derived from a Binance-verified
+   * position". Nothing to persist, nothing to restore, nothing to desync.
+   *
+   * TOMBSTONE — do NOT turn this back into an assignable field "for
+   * clarity". The setter below deliberately THROWS: in this codebase a
+   * silent fail-open is the dominant failure mode, so an assignment must
+   * fail loudly at the offending line rather than quietly desync the exit
+   * gate. Disarm by nulling `finalTpPrice`; arm by recomputing it.
+   */
+  get _trendFinalTpArmed() {
+    return this.ladderMode === 'TREND' && this.finalTpPrice != null;
+  }
+
+  set _trendFinalTpArmed(_v) {
+    throw new Error(
+      '_trendFinalTpArmed is derived from (ladderMode === TREND && finalTpPrice != null) and cannot be assigned. ' +
+      'To disarm, set finalTpPrice = null. To arm, call _recomputeFinalTpPrice() against a verified position.',
+    );
+  }
+
+  /**
    * Fully scaled -> TREND. Passive from here: the position is KEPT EXACTLY AS-IS.
    *
    * Deliberately does NOT flatten and re-open (which is what the old
@@ -636,7 +678,11 @@ class AnchorLadderStrategy extends TradingBase {
   async _enterTrend(direction) {
     this.ladderMode = 'TREND';
     this.trendDirection = direction;
-    this._trendFinalTpArmed = false;
+    // Disarm before arming: `_trendFinalTpArmed` derives from finalTpPrice, so
+    // nulling it here means a failed arm below cannot leave the pre-TREND
+    // value standing (that value was derived off the not-yet-reconciled
+    // position and is exactly the "stale guess" the invariant forbids).
+    this.finalTpPrice = null;
     await this._refreshCurrentPosition(true);
     if (this._lastPositionRefreshFailed) {
       // One retry before giving up: a single 503 right at the TREND
@@ -648,22 +694,24 @@ class AnchorLadderStrategy extends TradingBase {
       await this._refreshCurrentPosition(true);
     }
     if (this._lastPositionRefreshFailed) {
-      // Explicitly null out finalTpPrice rather than leaving whatever this
-      // leg's own `_postExecuteBookkeeping` recompute set it to a moment
-      // earlier — that value was ALSO derived off the same not-yet-fully-
-      // reconciled position (it predates this leg's confirmed fill) and the
-      // TREND exit check (`if (this.finalTpPrice && ...)`) doesn't know
-      // about `_trendFinalTpArmed` — it trusts any non-null value. "Not
-      // armed" must mean null, not "silently keep the last stale guess".
-      this.finalTpPrice = null;
+      // finalTpPrice is already null (disarmed above) and MUST stay that way:
+      // the TREND exit check (`if (this.finalTpPrice && ...)`) trusts any
+      // non-null value, so "not armed" must mean null, not "silently keep the
+      // last stale guess". Nothing is recomputed on this branch — and even if
+      // it were, `_recomputeFinalTpPrice` refuses to derive from a position
+      // whose refresh just failed.
       await this.addLog(
         `[LADDER] WARNING: _enterTrend: Binance position refresh failed (twice) while arming TREND ${direction} ` +
         `for ${this.symbol} — Final TP NOT armed from unverified data. Position remains fully exposed with NO ` +
         `exit target until _reconcileTrendInvariant self-heals it on a later tick/resume.`
       );
     } else {
-      this._recomputeFinalTpPrice(); // armed HERE and only here — RANGE never checks it
-      this._trendFinalTpArmed = true;
+      // Armed HERE and only here on the happy path — RANGE never checks it.
+      // The arm is the write itself: if the recompute cannot resolve a target
+      // (flat / unresolved side), finalTpPrice stays null and
+      // `_trendFinalTpArmed` stays false, so `_reconcileTrendInvariant`
+      // retries on the next tick rather than the cycle believing it is armed.
+      this._recomputeFinalTpPrice();
     }
 
     const avg = averageOpenEntry(this.ladderLines, direction);
@@ -731,7 +779,6 @@ class AnchorLadderStrategy extends TradingBase {
         return false;
       }
       this._recomputeFinalTpPrice();
-      this._trendFinalTpArmed = true;
       await this.addLog(
         `[LADDER] TREND Final-TP invariant reconcile: Final TP armed at ${this._formatPrice(this.finalTpPrice)}.`
       );
@@ -1673,6 +1720,30 @@ class AnchorLadderStrategy extends TradingBase {
    * never arms.
    */
   _recomputeFinalTpPrice() {
+    // SINGLE CHOKE POINT — the only writer of finalTpPrice that derives a
+    // target, and therefore the right place to enforce "a target may only be
+    // derived from Binance-VERIFIED position data".
+    //
+    // TOMBSTONE — do NOT drop this guard and re-guard the call sites instead.
+    // This method has four callers, three of which (`_pollFundingIncome`,
+    // `adjustProfitTarget`, `resume`) fire on schedules and user actions that
+    // have nothing to do with arming, and every one of them used to be
+    // unguarded. When the last refresh failed, `activePosition` is whatever it
+    // was BEFORE the failure (a stale qty/entry), so a target derived from it
+    // is a guess — and because the TREND exit gate is `if (this.finalTpPrice
+    // && ...)`, that guess would be ACTED ON: an 8-hourly funding settlement
+    // or the user nudging the profit-target pencil would silently resurrect
+    // the exact unverified target `_enterTrend` had refused to arm, and close
+    // the cycle at it. Refusing here means every caller — including any future
+    // one — inherits the invariant instead of having to remember it.
+    //
+    // Nulling (rather than leaving the previous value) is the point: it keeps
+    // "unverified" and "unarmed" the same state, so `_reconcileTrendInvariant`
+    // sees an unarmed TREND and retries each tick until Binance answers.
+    if (this._lastPositionRefreshFailed) {
+      this.finalTpPrice = null;
+      return;
+    }
     if (!this.activePosition || !this.activePosition.quantity || this.activePosition.quantity <= 0) {
       this.finalTpPrice = null;
       return;

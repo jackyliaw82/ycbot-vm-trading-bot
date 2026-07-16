@@ -23,13 +23,14 @@ function ladderStrategy({ mode = 'RANGE', anchor = 100, base = 1000 } = {}) {
   s.initialCapital = base;
   s.activePosition = null;
   s.finalTpPrice = null;
-  // A synthetic `mode: 'TREND'` strategy represents a cycle that already
-  // went through a real (successful) _enterTrend() — mark Final TP as
-  // already armed so `_reconcileTrendInvariant`'s self-heal (Fix B) doesn't
-  // treat these fixtures as "arming failed" and clobber a manually-set
-  // finalTpPrice. Tests that specifically exercise the arming-failure /
-  // self-heal path override this back to false themselves.
-  s._trendFinalTpArmed = mode === 'TREND';
+  // NOTE: there is deliberately no `_trendFinalTpArmed` seed here any more.
+  // It is now DERIVED (ladderMode === 'TREND' && finalTpPrice != null), and
+  // assigning it throws by design. This fixture used to seed it to
+  // `mode === 'TREND'`, which was a trap: it defaulted every TREND fixture to
+  // "armed" independently of finalTpPrice, so a test could assert against the
+  // seed rather than the code. A TREND fixture that sets a finalTpPrice is now
+  // armed by construction; one that leaves it null genuinely IS unarmed and
+  // SHOULD be self-healed by `_reconcileTrendInvariant`.
   s._tradingSeqInProgress = false;
   s._manualHarvestRequested = false;
   s.addLog = async () => {};
@@ -956,8 +957,7 @@ test('FIX B: _enterTrend arms Final TP normally when the refresh succeeds on the
 test('FIX B: _reconcileTrendInvariant self-heals Final TP once the refresh recovers — not permanently stuck unarmed', async () => {
   const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
   s.trendDirection = 'LONG';
-  s._trendFinalTpArmed = false; // arming failed at the original TREND transition
-  s.finalTpPrice = null;
+  s.finalTpPrice = null; // arming failed at the original TREND transition => derived unarmed
   s.currentSide = 'LONG';
   s.cycleAccumulatedLoss = 89;
   s.desiredProfitUSDT = 100;
@@ -983,8 +983,7 @@ test('FIX B: _reconcileTrendInvariant self-heals Final TP once the refresh recov
 test('FIX B: _reconcileTrendInvariant keeps retrying (does not crash or wedge) while the refresh keeps failing', async () => {
   const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
   s.trendDirection = 'LONG';
-  s._trendFinalTpArmed = false;
-  s.finalTpPrice = null;
+  s.finalTpPrice = null; // derived unarmed
   s.currentSide = 'LONG';
 
   s._refreshCurrentPosition = async () => { s._lastPositionRefreshFailed = true; };
@@ -997,6 +996,99 @@ test('FIX B: _reconcileTrendInvariant keeps retrying (does not crash or wedge) w
   assert.equal(s._trendFinalTpArmed, false, 'still not armed — nothing to self-heal from yet');
   assert.equal(s.finalTpPrice, null);
   assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud WARNING, never a silent no-op');
+});
+
+// ——— I1: finalTpPrice may only ever be derived from VERIFIED position data ——
+//
+// `_trendFinalTpArmed` used to be a stored field shadowing `finalTpPrice`, and
+// `_recomputeFinalTpPrice` wrote a target from whatever `activePosition` held
+// — including a STALE one left behind by a failed refresh. The TREND exit gate
+// is `if (this.finalTpPrice && ...)`: it trusts ANY non-null value and never
+// consults the flag. So the 8-hourly funding poll, the user's profit-target
+// pencil, or resume could each resurrect the exact unverified target
+// `_enterTrend` had deliberately refused — with armed still false — and the
+// bot would close the cycle at it.
+
+// The shared setup: TREND, arming refused (finalTpPrice null), but a STALE
+// non-null activePosition still in memory from before the refresh failed.
+function unarmedTrendWithStalePosition() {
+  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  s.trendDirection = 'LONG';
+  s.currentSide = 'LONG';
+  s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024, unrealizedPnl: 0 };
+  s._lastPositionRefreshFailed = true; // state is UNKNOWN — the position above is a stale guess
+  s.finalTpPrice = null;               // _enterTrend refused to arm from it
+  s.cycleAccumulatedLoss = 89;
+  s.desiredProfitUSDT = 100;
+  return s;
+}
+
+test('I1: _recomputeFinalTpPrice refuses to derive a target from an unverified position', () => {
+  const s = unarmedTrendWithStalePosition();
+  s._recomputeFinalTpPrice();
+  assert.equal(s.finalTpPrice, null, 'no target may be derived while the last refresh failed');
+  assert.equal(s._trendFinalTpArmed, false, 'and therefore TREND is not armed');
+});
+
+test('I1: a funding settlement cannot resurrect the target _enterTrend refused to arm', async () => {
+  const s = unarmedTrendWithStalePosition();
+  s._lastFundingPollTs = 1;
+  // KNOWN TRAP: _computeAccLoss recomputes cycleAccumulatedLoss from the
+  // accumulators, silently defeating a directly-seeded value. Stub it.
+  s._computeAccLoss = () => 89;
+  s.makeProxyRequest = async () => ([{ income: '-0.5', time: 2 }]);
+  s._pushHeartbeatNow = () => {};
+
+  const res = await s._pollFundingIncome();
+
+  assert.equal(res.count > 0 || s.accumulatedFundingFees === -0.5, true, 'the poll really ran (guard against a vacuous pass)');
+  assert.equal(
+    s.finalTpPrice, null,
+    'the 8-hourly funding poll must not re-arm an unverified target behind the guard\'s back',
+  );
+  assert.equal(s._trendFinalTpArmed, false, 'still unarmed — so the reconcile keeps retrying');
+});
+
+test('I1: adjustProfitTarget cannot resurrect the target _enterTrend refused to arm', async () => {
+  const s = unarmedTrendWithStalePosition();
+
+  await s.adjustProfitTarget({ desiredProfitPercent: 2 });
+
+  assert.equal(s.desiredProfitUSDT, 20, 'the profit target itself still updates');
+  assert.equal(
+    s.finalTpPrice, null,
+    'touching the profit pencil must not silently re-arm an unverified target',
+  );
+  assert.equal(s._trendFinalTpArmed, false);
+});
+
+test('I1: _trendFinalTpArmed is derived, not stored — it cannot drift from finalTpPrice', () => {
+  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  s.finalTpPrice = null;
+  assert.equal(s._trendFinalTpArmed, false, 'null target => unarmed, always');
+  s.finalTpPrice = 104.08;
+  assert.equal(s._trendFinalTpArmed, true, 'non-null target => armed, always');
+  // The invariant is enforced structurally: a silent desync is impossible
+  // because the flag cannot be written at all.
+  assert.throws(
+    () => { s._trendFinalTpArmed = false; },
+    /derived/,
+    'assigning the derived flag must fail loudly rather than desync the exit gate',
+  );
+});
+
+test('I1: nothing persists _trendFinalTpArmed — a TREND resume derives it from the restored target', () => {
+  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  s.finalTpPrice = 104.08;
+  s.activePosition = { quantity: 100, entryPrice: 100.4, avgEntry: 100.4, notional: 10040, unrealizedPnl: 0 };
+  // saveState's doc is the contract with resume(); armed must not appear in it
+  // (it is derived), while finalTpPrice — which it derives FROM — must.
+  const doc = s.getStatus();
+  assert.equal('_trendFinalTpArmed' in doc, false, 'derived state is never persisted');
+  assert.equal(doc.finalTpPrice, 104.08, 'the value it derives from is what persists');
+  // A TREND snapshot restored with a live target is armed on arrival — no
+  // false "still unarmed" alarm, which is what the unpersisted field caused.
+  assert.equal(s._trendFinalTpArmed, true);
 });
 
 // ——— Boot recovery must survive a transient position-API failure ————————
