@@ -60,6 +60,11 @@ class AnchorLadderStrategy extends TradingBase {
     this.strategyType = 'anchorLadder';
     this.currentSide = null;                // 'LONG' | 'SHORT' | null
     this.activePosition = null;            // { quantity, entryPrice, notional, unrealizedPnl }
+    // Set by _refreshCurrentPosition(): true when the LAST Binance position
+    // fetch failed (state is UNKNOWN — never wiped to flat on failure), false
+    // once a fetch succeeds. stop()'s flatten path and _flattenGrid() read
+    // this to avoid treating a failed refresh as a confirmed-flat position.
+    this._lastPositionRefreshFailed = false;
     this.finalTpPrice = null;
     this.cycleAccumulatedLoss = 0;
     this.reversalCount = 0;
@@ -149,7 +154,6 @@ class AnchorLadderStrategy extends TradingBase {
     this.desiredProfitUSDT = config.desiredProfitUSDT || 0;
     this.currentInitialSize = config.initialSize || 0;
     this._ladderBaseSize = this.currentInitialSize; // initial ladder uses the initial size; a harvest later carries the last consolidated notional
-    this.maxPositionSizeUSDT = config.maxPositionSizeUSDT || (this.currentInitialSize * 10);
 
     // Fixed geometry — not user knobs. The 0.3% step clears the round-trip fee
     // floor (max(0.0025, FEE_RATE*3) = 0.25%) with headroom.
@@ -174,8 +178,7 @@ class AnchorLadderStrategy extends TradingBase {
     // readability: identity/sizing | recovery knobs | advanced toggles.
     await this.addLog(
       `Config: symbol=${this.symbol}, initialSize=${this.currentInitialSize} USDT, ` +
-      `leverage=${this.leverage}x, maxPos=${this.maxPositionSizeUSDT} USDT, ` +
-      `priceType=${this.priceType} ` +
+      `leverage=${this.leverage}x, priceType=${this.priceType} ` +
       `| recoveryFactor=${(this.recoveryFactor * 100).toFixed(0)}%, ` +
       `recoveryDistance=${(this.recoveryDistance * 100).toFixed(2)}%, ` +
       `harvestLossThreshold=${(this.harvestLossThreshold * 100).toFixed(0)}%, ` +
@@ -351,10 +354,15 @@ class AnchorLadderStrategy extends TradingBase {
    */
   // Return value reflects whether a position was ACTUALLY closed, never
   // merely whether legs were marked open. Legs can be marked POSITION_OPEN
-  // while `activePosition` is empty (state drift — a missed WS update, a
-  // transient API error) in which case this resets the bookkeeping but
-  // places no order and returns false, so the caller does not mistake
-  // ledger cleanup for a real close.
+  // while `activePosition` is empty for two very different reasons:
+  //   1. Genuine state drift (missed WS update) AND the last Binance refresh
+  //      SUCCEEDED and confirmed flat — safe to reset the ledger; nothing is
+  //      actually open.
+  //   2. The last Binance refresh FAILED — state is UNKNOWN, not flat. Legs
+  //      marked POSITION_OPEN could be a real live position. Wiping them
+  //      here would silently discard it with no close ever attempted.
+  // `this._lastPositionRefreshFailed` (set by _refreshCurrentPosition)
+  // distinguishes the two; only case 1 resets the bookkeeping.
   async _flattenGrid(reason = 'FLATTEN') {
     const openLegs = this.ladderLines.filter(l => l.state === 'POSITION_OPEN');
     const hadPosition = !!(this.activePosition && this.activePosition.quantity > 0);
@@ -363,6 +371,14 @@ class AnchorLadderStrategy extends TradingBase {
     if (hadPosition) {
       await this.addLog(`Flattening ladder: closing net position (${openLegs.length} leg(s) recorded open).`);
       await this._closeConsolidated(reason);
+    } else if (openLegs.length && this._lastPositionRefreshFailed) {
+      const qty = openLegs.reduce((sum, l) => sum + (l.quantity || 0), 0);
+      await this.addLog(
+        `[LADDER] WARNING: _flattenGrid: Binance position refresh failed — ${this.symbol} has ${openLegs.length} ` +
+        `ladder leg(s) marked open (qty ${qty}) but current Binance state is UNKNOWN. NOT wiping legs and no close ` +
+        `attempted this pass — will retry on the next stop/reconcile.`
+      );
+      return false;
     }
 
     for (const leg of this.ladderLines) {
@@ -419,8 +435,15 @@ class AnchorLadderStrategy extends TradingBase {
    * entry sizing — same recovery-formula + margin-headroom-cap + gauge-full
    * freeze, repurposed: the ladder re-bases at every flatten instead of
    * sizing a one-off consolidated TREND entry).
+   *
+   * Async: fetches the LIVE margin balance for the headroom cap rather than
+   * trusting a cached snapshot. Called only from `_flattenAtAnchor` /
+   * `_harvestToFlat` — both async, both at flatten points, a handful of
+   * times per cycle, never in a hot loop — so the extra round trip is cheap
+   * and buys a correct-during-drawdown headroom figure instead of a frozen
+   * cycle-start one.
    */
-  _computeLadderBaseSize() {
+  async _computeLadderBaseSize() {
     this.cycleAccumulatedLoss = this._computeAccLoss();
     // Gauge-full escalation freeze: once the gauge is full, stop GROWING live exposure —
     // reuse the last size. EXCEPTION: a harvest restart (flat -> fresh) always re-sizes.
@@ -428,7 +451,20 @@ class AnchorLadderStrategy extends TradingBase {
       return this._lastLadderSize;
     }
     const proposed = this._computeFormulaSize();
-    const sized = this._applyMarginHeadroomCap(proposed);
+    let walletBalance;
+    try {
+      walletBalance = await this.getTotalMarginBalance();
+    } catch (err) {
+      // FAIL CLOSED: an unknown margin balance must never read as "plenty of
+      // headroom". Cap to the safe floor (currentInitialSize) rather than
+      // falling back to a stale/guessed figure.
+      await this.addLog(`[LADDER] margin-headroom cap: getTotalMarginBalance() failed (${err.message}) — capping to currentInitialSize (fail-closed).`);
+      const floor = this.currentInitialSize || 0;
+      this._lastLadderSize = floor;
+      this._harvestRestartPending = false;
+      return floor;
+    }
+    const sized = this._applyMarginHeadroomCap(proposed, walletBalance);
     this._lastLadderSize = sized;
     this._harvestRestartPending = false; // consumed: the fresh post-harvest size is now applied
     return sized;
@@ -488,7 +524,7 @@ class AnchorLadderStrategy extends TradingBase {
 
     const prevBase = this._ladderBaseSize;
     this.cycleAccumulatedLoss = this._computeAccLoss();
-    this._ladderBaseSize = this._computeLadderBaseSize();
+    this._ladderBaseSize = await this._computeLadderBaseSize();
 
     this.ladderLines = buildLadder(this.anchor, this.stepPct, this.levelsPerSide);
     this.ladderMode = 'RANGE';
@@ -593,7 +629,7 @@ class AnchorLadderStrategy extends TradingBase {
       this._harvestRestartPending = true; // the fresh post-harvest size always re-sizes (freeze exception)
 
       this.cycleAccumulatedLoss = this._computeAccLoss();
-      this._ladderBaseSize = this._computeLadderBaseSize();
+      this._ladderBaseSize = await this._computeLadderBaseSize();
       await this.addLog(
         `Post-harvest base ${this._formatNotional(this._ladderBaseSize)} USDT → ` +
         `leg ${this._formatNotional(this._legNotional())} USDT (accLoss ${this._formatNotional(this.cycleAccumulatedLoss)}).`,
@@ -652,7 +688,6 @@ class AnchorLadderStrategy extends TradingBase {
     // Restore config
     this.symbol = snapshot.symbol;
     this.leverage = snapshot.leverage || DEFAULT_LEVERAGE;
-    this.maxPositionSizeUSDT = snapshot.maxPositionSizeUSDT || 0;
     this.priceType = snapshot.priceType || 'MARK';
     this.recoveryFactor = snapshot.config?.recoveryFactor ?? DEFAULT_RECOVERY_FACTOR;
     this.recoveryDistance = snapshot.config?.recoveryDistance ?? DEFAULT_RECOVERY_DISTANCE;
@@ -914,7 +949,16 @@ class AnchorLadderStrategy extends TradingBase {
           await this.addLog(`[LADDER] stop: flatten failed: ${err.message}`);
         }
       } else if (!closedSomething) {
-        await this.addLog('[LADDER] stop: no open position on Binance — nothing to flatten');
+        // Do NOT claim "nothing to flatten" when the position state is
+        // actually UNKNOWN (refresh failed) and ladderLines still shows
+        // open legs — _flattenGrid already logged a WARNING for that case;
+        // repeating "nothing to flatten" here would contradict it and read
+        // as false reassurance.
+        const stateUnknownWithOpenLegs = this._lastPositionRefreshFailed
+          && this.ladderLines.some(l => l.state === 'POSITION_OPEN');
+        if (!stateUnknownWithOpenLegs) {
+          await this.addLog('[LADDER] stop: no open position on Binance — nothing to flatten');
+        }
       }
 
       // Residual verification — ALWAYS runs, regardless of which branch (if
@@ -931,6 +975,19 @@ class AnchorLadderStrategy extends TradingBase {
         await this.addLog(`[LADDER] WARNING: stop+flatten left residual ${this.currentSide} ${this.activePosition.quantity} ${this.symbol} on Binance — close it manually`);
       } else if (closedSomething) {
         await this.addLog('[LADDER] stop: position confirmed flat');
+      } else if (this._lastPositionRefreshFailed && this.ladderLines.some(l => l.state === 'POSITION_OPEN')) {
+        // Never terminate silently: state is still UNKNOWN after both
+        // refresh attempts and ladderLines still shows open legs that were
+        // deliberately left untouched — this is the loudest signal we can
+        // give before the strategy terminates.
+        const qty = this.ladderLines
+          .filter(l => l.state === 'POSITION_OPEN')
+          .reduce((sum, l) => sum + (l.quantity || 0), 0);
+        await this.addLog(
+          `[LADDER] WARNING: stop: FINAL STATE UNKNOWN for ${this.symbol} — Binance could not be reached to confirm ` +
+          `flat, and ${this.ladderLines.filter(l => l.state === 'POSITION_OPEN').length} ladder leg(s) (qty ${qty}) ` +
+          `remain marked open. Verify manually on Binance.`
+        );
       }
 
       // Final TP: write the strategyFlow audit record + metricsSample so
@@ -1332,9 +1389,13 @@ class AnchorLadderStrategy extends TradingBase {
    * Margin-headroom projection — simulate 2 more reversals at current
    * trajectory; if projected freeMargin% < MARGIN_HEADROOM_FLOOR_PCT, cap
    * the proposed new size back to currentInitialSize.
+   *
+   * `wallet` MUST be the live totalMarginBalance (see `_computeLadderBaseSize`,
+   * the sole caller) — never a cached snapshot. A cached figure over-estimates
+   * headroom exactly during drawdown, when the cap matters most.
    */
-  _applyMarginHeadroomCap(proposedSize) {
-    const wallet = this.lastWalletSnapshot?.totalMarginBalance || this.initialCapital || 0;
+  _applyMarginHeadroomCap(proposedSize, wallet) {
+    wallet = wallet || 0;
     if (wallet <= 0) return proposedSize;
     const proposedNotional = proposedSize;
     const usedMargin = (this.activePosition?.notional || 0) / Math.max(1, this.leverage);
@@ -1731,6 +1792,11 @@ class AnchorLadderStrategy extends TradingBase {
         }
       }
 
+      // Reached only when detectCurrentPosition() above did NOT throw —
+      // Binance was actually queried, so the result (position or genuinely
+      // empty) is authoritative.
+      this._lastPositionRefreshFailed = false;
+
       if ((side === 'LONG' || side === 'SHORT') && qty && qty > 0 && Number.isFinite(entryPrice) && entryPrice > 0) {
         const notional = qty * entryPrice;
         this.activePosition = {
@@ -1747,11 +1813,21 @@ class AnchorLadderStrategy extends TradingBase {
         return;
       }
 
-      // No position (or REST kept returning empty after retries).
+      // No position (or REST kept returning empty after retries) — the
+      // fetch SUCCEEDED and confirmed flat, so it's safe to reflect that.
       this.activePosition = null;
       this.currentSide = null;
     } catch (err) {
-      await this.addLog(`[LADDER] _refreshCurrentPosition error: ${err.message}`);
+      // detectCurrentPosition() throws on an API failure and — critically —
+      // never wipes currentPosition/positionEntryPrice/etc on the way there,
+      // so `this.activePosition` here is still whatever it was BEFORE this
+      // call (stale, not flat). Leave it untouched: swallow the error (many
+      // callers of _refreshCurrentPosition assume it never throws — e.g.
+      // _postExecuteBookkeeping's saveState/heartbeat tail must still run)
+      // but flag the failure so state-sensitive callers like stop()'s
+      // flatten path can tell "confirmed flat" apart from "unknown".
+      this._lastPositionRefreshFailed = true;
+      await this.addLog(`[LADDER] _refreshCurrentPosition error: ${err.message} — position state UNKNOWN, NOT treated as flat.`);
     }
   }
 
@@ -1895,7 +1971,6 @@ class AnchorLadderStrategy extends TradingBase {
       recoveryFactor: this.recoveryFactor,
       recoveryDistance: this.recoveryDistance,
       harvestLossThreshold: this.harvestLossThreshold,
-      maxPositionSizeUSDT: this.maxPositionSizeUSDT,
       _lastLadderSize: this._lastLadderSize,
       _harvestRestartPending: this._harvestRestartPending,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
@@ -2048,7 +2123,6 @@ class AnchorLadderStrategy extends TradingBase {
         strategyStartTime: this.strategyStartTime || null,
         strategyEndTime: this.strategyEndTime || null,
         leverage: this.leverage,
-        maxPositionSizeUSDT: this.maxPositionSizeUSDT,
         // Strategy settings surfaced at top-level so the Historical tab's
         // summary card can render them without descending into config.
         // (HistoricalDataTab reads d.desiredProfitUSDT / d.positionSizeUSDT /

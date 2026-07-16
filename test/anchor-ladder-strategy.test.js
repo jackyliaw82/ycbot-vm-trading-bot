@@ -206,32 +206,32 @@ test('_closeConsolidated: nothing open returns false quietly, no order, no warni
 
 // ——— Task 8: dynamic sizing, harvest, Final TP ———————————————————————
 
-test('_computeLadderBaseSize: the formula floors at initialSize', () => {
+test('_computeLadderBaseSize: the formula floors at initialSize', async () => {
   const s = ladderStrategy({ base: 10000 });
   s.currentInitialSize = 10000;
   s.cycleAccumulatedLoss = 0;
   s.recoveryFactor = 0.20;
   s.recoveryDistance = 0.005;
-  s.lastWalletSnapshot = { totalMarginBalance: 1e9 }; // margin cap out of the way
-  assert.equal(s._computeLadderBaseSize(), 10000, 'no loss => no growth, never below initial');
+  s.getTotalMarginBalance = async () => 1e9; // margin cap out of the way
+  assert.equal(await s._computeLadderBaseSize(), 10000, 'no loss => no growth, never below initial');
 });
 
-test('_computeLadderBaseSize: a 50 USDT loss grows a 10k base to 12k', () => {
+test('_computeLadderBaseSize: a 50 USDT loss grows a 10k base to 12k', async () => {
   const s = ladderStrategy({ base: 10000 });
   s.currentInitialSize = 10000;
   s.cycleAccumulatedLoss = 50;
   s.recoveryFactor = 0.20;
   s.recoveryDistance = 0.005;
-  s.lastWalletSnapshot = { totalMarginBalance: 1e9 };
+  s.getTotalMarginBalance = async () => 1e9;
   s._computeAccLoss = () => 50;
   // 50 * 0.20 / 0.005 = 2000 additional
-  const sized = s._computeLadderBaseSize();
+  const sized = await s._computeLadderBaseSize();
   assert.equal(sized, 12000);
   s._ladderBaseSize = sized;
   assert.equal(s._legNotional(), 2400, 'the grown base splits evenly across 5 legs');
 });
 
-test('_computeLadderBaseSize: a full gauge freezes escalation', () => {
+test('_computeLadderBaseSize: a full gauge freezes escalation', async () => {
   const s = ladderStrategy({ base: 10000 });
   s.currentInitialSize = 10000;
   s.initialCapital = 10000;
@@ -240,7 +240,37 @@ test('_computeLadderBaseSize: a full gauge freezes escalation', () => {
   s._computeAccLoss = () => 5000;
   s._lastLadderSize = 12000;
   s._harvestRestartPending = false;
-  assert.equal(s._computeLadderBaseSize(), 12000, 'reuses the last size instead of growing');
+  // Gauge-full freeze returns _lastLadderSize before ever touching the
+  // wallet, so no getTotalMarginBalance stub is needed here.
+  assert.equal(await s._computeLadderBaseSize(), 12000, 'reuses the last size instead of growing');
+});
+
+test('_computeLadderBaseSize: uses the LIVE margin balance, not a stale one — a small live balance makes the cap bite', async () => {
+  const s = ladderStrategy({ base: 10000 });
+  s.currentInitialSize = 10000;
+  s.initialCapital = 1e9; // frozen cycle-start balance is huge (would NOT trigger the cap)
+  s.cycleAccumulatedLoss = 50;
+  s.recoveryFactor = 0.20;
+  s.recoveryDistance = 0.005;
+  s.leverage = 10;
+  s.activePosition = null;
+  s.getTotalMarginBalance = async () => 100; // live balance during drawdown is tiny
+  const sized = await s._computeLadderBaseSize();
+  assert.equal(sized, s.currentInitialSize, 'the live-balance headroom cap bites and floors to currentInitialSize');
+});
+
+test('_computeLadderBaseSize: getTotalMarginBalance() throwing fails CLOSED — capped to currentInitialSize, never left uncapped', async () => {
+  const s = ladderStrategy({ base: 10000 });
+  s.currentInitialSize = 10000;
+  s.cycleAccumulatedLoss = 50;
+  s.recoveryFactor = 0.20;
+  s.recoveryDistance = 0.005;
+  s.getTotalMarginBalance = async () => { throw new Error('-1001 API error'); };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+  const sized = await s._computeLadderBaseSize();
+  assert.equal(sized, s.currentInitialSize, 'an unknown wallet balance must never read as headroom — cap to the safe floor');
+  assert.ok(logs.some((m) => m.includes('fail-closed') || m.includes('failed')), 'the fail-closed cap is logged');
 });
 
 test('_recomputeFinalTpPrice: no AI cost term', () => {
@@ -273,7 +303,7 @@ test('harvest re-anchors to the CURRENT price, unlike the anchor flatten', async
   s.currentPrice = 103;
   s._closeConsolidated = async () => { s.activePosition = null; };
   s._computeAccLoss = () => 0;
-  s.lastWalletSnapshot = { totalMarginBalance: 1e9 };
+  s.getTotalMarginBalance = async () => 1e9;
   await s._harvestToFlat('manual_harvest');
   assert.equal(s.anchor, 103, 'the harvest re-anchors; the anchor flatten does not');
   assert.equal(s.ladderMode, 'RANGE');
@@ -584,4 +614,84 @@ test('Fix 2 regression: filling the outermost leg via the REAL _fillLeg path (no
   assert.equal(s.ladderMode, 'TREND');
   assert.equal(s.trendDirection, 'LONG');
   assert.ok(s.finalTpPrice != null, 'Final TP armed via the real _enterTrend -> _recomputeFinalTpPrice path (no regression from the invariant check)');
+});
+
+// ——— FIX 1 (maxPositionSizeUSDT removal): a dead knob must not resurface ——
+
+test('Fix 1: getStatus() no longer emits maxPositionSizeUSDT', () => {
+  const s = ladderStrategy({ anchor: 100 });
+  const st = s.getStatus();
+  assert.equal('maxPositionSizeUSDT' in st, false, 'the dead knob must not resurface in the status payload');
+});
+
+test('Fix 1: saveState() no longer persists maxPositionSizeUSDT', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  let written = null;
+  s.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { written = d; } }) }) };
+  await AnchorLadderStrategy.prototype.saveState.call(s);
+  assert.equal('maxPositionSizeUSDT' in written, false, 'the dead knob must not resurface in the persisted snapshot');
+});
+
+// ——— FIX 2: getCurrentPositions() throws instead of swallowing to [] —————
+// (proven-by-probe bug: a transient API error was indistinguishable from a
+// genuinely flat account, so detectCurrentPosition() wiped real position
+// state on a 5xx.)
+
+test('Fix 2: getCurrentPositions() throws when the API call fails, instead of swallowing to []', async () => {
+  const s = ladderStrategy();
+  s.makeProxyRequest = async () => { throw new Error('-1001 Internal error'); };
+  await assert.rejects(() => s.getCurrentPositions(), /-1001/);
+});
+
+test('Fix 2: a position refresh failure does NOT wipe activePosition / currentPosition — stale beats falsely flat', async () => {
+  const s = ladderStrategy();
+  delete s._refreshCurrentPosition; // use the REAL implementation, not the test-helper no-op stub
+  // Seed "last known" state as if a real position had already been confirmed.
+  s.activePosition = { quantity: 2.5, entryPrice: 100, avgEntry: 100, notional: 250, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.currentPosition = 'LONG';
+  s.currentPositionQuantity = 2.5;
+  s.positionEntryPrice = 100;
+  s.getCurrentPositions = async () => { throw new Error('-1001 Internal error'); }; // the underlying REST call fails
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s._refreshCurrentPosition();
+
+  assert.deepEqual(s.activePosition, { quantity: 2.5, entryPrice: 100, avgEntry: 100, notional: 250, unrealizedPnl: 0 }, 'activePosition must stay exactly as it was — never wiped on a fetch failure');
+  assert.equal(s.currentSide, 'LONG', 'currentSide must stay stale, not nulled');
+  assert.equal(s._lastPositionRefreshFailed, true, 'the failure must be signalled, not silently absorbed');
+  assert.ok(logs.some((m) => m.includes('UNKNOWN')), 'the failure is logged as unknown state, never as flat');
+});
+
+test('Fix 2: stop({flatten:true}) with legs POSITION_OPEN and the position API failing logs a WARNING, does NOT wipe the legs, and does not claim flat', async () => {
+  const s = stubStopTail(ladderStrategy());
+  delete s._refreshCurrentPosition; // use the REAL implementation
+
+  const openLeg = s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1);
+  openLeg.state = 'POSITION_OPEN';
+  openLeg.quantity = 1.4;
+  // No last-known position in memory AND Binance cannot be reached — the
+  // exact "no known state while ladderLines has POSITION_OPEN legs" scenario.
+  s.activePosition = null;
+  s.currentSide = null;
+  s.getCurrentPositions = async () => { throw new Error('-1001 Internal error'); };
+
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+  let orderCalled = false;
+  s.placeMarketOrder = async () => { orderCalled = true; return {}; };
+
+  await s.stop({ flatten: true });
+
+  assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud WARNING is logged instead of a silent termination');
+  assert.ok(
+    logs.some((m) => m.includes('WARNING') && m.includes('1.4')),
+    'the WARNING names the stranded quantity',
+  );
+  assert.equal(openLeg.state, 'POSITION_OPEN', 'the leg must NOT be wiped to EMPTY when the state is unknown');
+  assert.equal(orderCalled, false, 'no close was attempted against a phantom/unknown position');
+  assert.ok(!logs.some((m) => m.includes('confirmed flat')), 'must never claim confirmed-flat when the state is unknown');
+  assert.ok(!logs.some((m) => m.includes('nothing to flatten')), 'must never claim nothing-to-flatten when the state is unknown');
+  assert.equal(s.executionState, 'TERMINATED', 'stop() still completes termination — it never hangs open');
 });

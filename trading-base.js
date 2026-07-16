@@ -984,6 +984,11 @@ class TradingBase {
 
   // ─── Position detection ────────────────────────────────────────────────────
 
+  // Throws on API error rather than returning [] — mirrors getWalletBalance()'s
+  // established convention. A swallowed [] here is indistinguishable from a
+  // genuinely flat account to detectCurrentPosition() (sole caller), which
+  // would otherwise wipe real position state on a transient 5xx. A real,
+  // empty-position result still legitimately returns [].
   async getCurrentPositions() {
     try {
       const accountInfo = await this.makeProxyRequest('/fapi/v2/account', 'GET', {}, true, 'futures');
@@ -992,7 +997,7 @@ class TradingBase {
       );
     } catch (error) {
       console.error(`Failed to get current positions: ${error.message}`);
-      return [];
+      throw error;
     }
   }
 
@@ -1103,7 +1108,15 @@ class TradingBase {
         this.lastPositionEntryPrice = parseFloat(p.entryPrice);
       }
     } catch (error) {
+      // A fetch failure (getCurrentPositions() now throws instead of
+      // returning []) must NOT read as "flat". Every state mutation above
+      // sits inside the try, so on a throw none of it ran — currentPosition
+      // / positionEntryPrice / positionSize / *Quantity are left exactly as
+      // they were (stale, never wiped to NONE/null). Rethrow so callers can
+      // distinguish "confirmed flat" from "unknown — the fetch failed",
+      // mirroring getWalletBalance()'s throw-on-error convention.
       console.error(`Failed to detect current position for ${this.symbol}: ${error.message}`);
+      throw error;
     }
   }
 
@@ -2408,6 +2421,22 @@ class TradingBase {
       return totalWalletBalance;
     } catch (error) {
       console.error(`Failed to get wallet balance: ${error.message}`);
+      throw error;
+    }
+  }
+
+  // totalMarginBalance = totalWalletBalance + unrealized PnL. During drawdown
+  // marginBalance < walletBalance, so a headroom check MUST read this figure,
+  // not getWalletBalance()'s realized-only totalWalletBalance — using the
+  // wallet balance there would over-estimate free margin exactly when it
+  // matters most. Same throw-on-error shape as getWalletBalance(): an unknown
+  // margin balance must never be silently treated as "plenty of headroom".
+  async getTotalMarginBalance() {
+    try {
+      const accountInfo = await this.makeProxyRequest('/fapi/v2/account', 'GET', {}, true, 'futures');
+      return parseFloat(accountInfo.totalMarginBalance);
+    } catch (error) {
+      console.error(`Failed to get total margin balance: ${error.message}`);
       throw error;
     }
   }
