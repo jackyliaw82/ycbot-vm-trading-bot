@@ -215,17 +215,6 @@ test('_flattenAtAnchor does NOT count a no-op oscillation', async () => {
   assert.equal(s.flattenCount, 0, 'an early return is not a flatten');
 });
 
-test('_flattenAtAnchor does NOT count an aborted flatten when Binance is unverifiable', async () => {
-  const s = flattenReady();
-  s._lastPositionRefreshFailed = true;
-  s._refreshCurrentPosition = async () => {};   // still failing — flag stays set
-  let closeCalled = false;
-  s._closeConsolidated = async () => { closeCalled = true; return true; };
-  await s._flattenAtAnchor();
-  assert.equal(closeCalled, false, 'must not close on an unknown Binance state');
-  assert.equal(s.flattenCount, 0, 'an aborted flatten is not a flatten');
-});
-
 test('_hasNoTradingActivity: a flatten alone marks the cycle as having traded', () => {
   const s = ladderStrategy();
   assert.equal(s._hasNoTradingActivity(), true, 'an untouched cycle is no-trade');
@@ -262,65 +251,6 @@ test('_closeConsolidated: currentSide still missing after refresh logs a WARNING
   assert.equal(result, false, 'never guess the side — refuse to close');
   assert.equal(orderCalled, false, 'no order placed');
   assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud warning was logged, not a silent no-op');
-});
-
-// ——— ITEM 3: the close primitive's safety must not live only in its callers —
-//
-// `_closeConsolidated` closes `activePosition.quantity`, which is only
-// trustworthy if the last refresh SUCCEEDED. Every caller guards it; the
-// primitive itself did not. That is the shape that produced C1 and C3 — a new
-// caller must re-derive the contract, and the one that forgets fails SILENTLY.
-
-test('ITEM 3: _closeConsolidated self-refuses on UNKNOWN state — a caller that forgets to guard cannot silently orphan a position', async () => {
-  const s = ladderStrategy();
-  s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024 };
-  s.currentSide = 'LONG';
-  s._lastPositionRefreshFailed = true; // stale qty: Binance may hold more than 80
-  let ordered = null;
-  s.placeMarketOrder = async (...a) => { ordered = a; return { orderId: 1 }; };
-  // Stub the fill-confirm: without it the REVERTED-fix run stalls on the real
-  // 3s WS timeout before failing. A slow failure is still a failure, but a
-  // hang is not — keep the negative path fast and unambiguous.
-  s._waitForOrderFillConfirmation = async () => {};
-  const logs = [];
-  s.addLog = async (m) => { logs.push(m); };
-
-  // An unguarded caller — exactly what a future one would look like.
-  const result = await s._closeConsolidated('some_new_caller');
-
-  assert.equal(result, false, 'refuses rather than closing an unverified quantity');
-  assert.equal(ordered, null, 'no reduceOnly order for a quantity that may be under what Binance holds');
-  assert.equal(s.activePosition.quantity, 80, 'the position is left intact for the caller to re-verify');
-  assert.ok(logs.some((m) => m.includes('WARNING')), 'refusal is loud, never silent');
-});
-
-test('ITEM 3: the self-guard introduces NO double-verification — it consults, it does not re-verify', async () => {
-  // C1/C3's pinned design: the CALLER re-verifies once, then closes. If the
-  // primitive re-refreshed instead of merely refusing, _flattenAtAnchor would
-  // verify twice and pay a second round trip. Consulting is not verifying.
-  const s = ladderStrategy({ anchor: 100 });
-  const legs = s.ladderLines.filter(l => l.direction === 'LONG');
-  legs.slice(0, 4).forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 20; });
-  s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024 };
-  s.currentSide = 'LONG';
-  s._lastPositionRefreshFailed = true; // caller will re-verify once
-
-  let refreshCalls = 0;
-  s._refreshCurrentPosition = async () => {
-    refreshCalls++;
-    s._lastPositionRefreshFailed = false; // the caller's single re-verification succeeds
-    s.activePosition = { quantity: 100, entryPrice: 100.4, avgEntry: 100.4, notional: 10040 };
-  };
-  let closedQty = null;
-  s.placeMarketOrder = async (_sym, _side, qty) => { closedQty = qty; return { orderId: 1 }; };
-  s._waitForOrderFillConfirmation = async () => {};
-  s.getTotalMarginBalance = async () => 1e9;
-  s._computeAccLoss = () => 0;
-
-  await s._flattenAtAnchor();
-
-  assert.equal(refreshCalls, 1, 'exactly ONE verification total — the caller re-verifies, the primitive only consults');
-  assert.equal(closedQty, 100, 'and the close still proceeds with the REFRESHED quantity (C1/C3 pins intact)');
 });
 
 test('_closeConsolidated: nothing open returns false quietly, no order, no warning', async () => {
@@ -865,107 +795,48 @@ test('Fix 2: a position refresh failure does NOT wipe activePosition / currentPo
   assert.ok(logs.some((m) => m.includes('UNKNOWN')), 'the failure is logged as unknown state, never as flat');
 });
 
-test('Fix 2: stop({flatten:true}) with legs POSITION_OPEN and the position API failing logs a WARNING, does NOT wipe the legs, and does not claim flat', async () => {
+test('stop({flatten:true}) closes the legs when the position API is down and memory has no position at all', async () => {
+  // The scenario the old "refuse to close on unknown state" guard mishandled:
+  // legs say 1.4 is open, `activePosition`/`currentSide` are both null (their
+  // only writer is the REST refresh, which is failing), and Binance cannot be
+  // reached. The guard closed NOTHING and left the position stranded. The legs
+  // know both the size and the side, so the close proceeds on their word.
   const s = stubStopTail(ladderStrategy());
   delete s._refreshCurrentPosition; // use the REAL implementation
 
   const openLeg = s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1);
   openLeg.state = 'POSITION_OPEN';
   openLeg.quantity = 1.4;
-  // No last-known position in memory AND Binance cannot be reached — the
-  // exact "no known state while ladderLines has POSITION_OPEN legs" scenario.
   s.activePosition = null;
   s.currentSide = null;
   s.getCurrentPositions = async () => { throw new Error('-1001 Internal error'); };
 
   const logs = [];
   s.addLog = async (msg) => { logs.push(msg); };
-  let orderCalled = false;
-  s.placeMarketOrder = async () => { orderCalled = true; return {}; };
+  let orderArgs = null;
+  s.placeMarketOrder = async (symbol, side, qty, price, opts) => { orderArgs = { side, qty, opts }; return {}; };
 
   await s.stop({ flatten: true });
 
-  assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud WARNING is logged instead of a silent termination');
-  assert.ok(
-    logs.some((m) => m.includes('WARNING') && m.includes('1.4')),
-    'the WARNING names the stranded quantity',
+  assert.deepEqual(
+    orderArgs, { side: 'SELL', qty: 1.4, opts: { reduceOnly: true } },
+    'the leg qty AND the leg direction drive the close — neither needs the dead position API',
   );
-  assert.equal(openLeg.state, 'POSITION_OPEN', 'the leg must NOT be wiped to EMPTY when the state is unknown');
-  assert.equal(orderCalled, false, 'no close was attempted against a phantom/unknown position');
   assert.ok(!logs.some((m) => m.includes('confirmed flat')), 'must never claim confirmed-flat when the state is unknown');
   assert.ok(!logs.some((m) => m.includes('nothing to flatten')), 'must never claim nothing-to-flatten when the state is unknown');
+  assert.ok(
+    logs.some((m) => m.includes('WARNING') && m.includes('FINAL STATE UNKNOWN')),
+    'the residual verification still cannot confirm flat, and says so loudly',
+  );
   assert.equal(s.executionState, 'TERMINATED', 'stop() still completes termination — it never hangs open');
 });
 
-// ——— Adversarial re-review fixes (Fix A / Fix B) —————————————————————————
-//
-// FIX A: `_flattenAtAnchor` never consulted `_lastPositionRefreshFailed` —
-// closing a STALE `activePosition.quantity` (a fill's own refresh 503'd,
-// leaving in-memory qty under Binance's real held qty) orphaned the residual
-// on Binance and then wiped every leg to EMPTY, converting "wipe on unknown"
-// into "silent partial-close on unknown".
+// ——— Adversarial re-review fix (Fix B) ———————————————————————————————————
 //
 // FIX B: `_enterTrend` armed Final TP off `_recomputeFinalTpPrice()`
 // regardless of whether its own arming refresh succeeded, baking a wrong
 // exit price for the rest of the cycle (Final TP is armed HERE AND ONLY
 // HERE — no later leg fills occur in TREND to correct it).
-
-test('FIX A: _flattenAtAnchor with a failed position refresh does NOT close a stale quantity and does NOT reset the ladder', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  const openLeg = s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1);
-  openLeg.state = 'POSITION_OPEN';
-  openLeg.quantity = 80; // stale in-memory qty; Binance may actually hold more
-  s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024, unrealizedPnl: 0 };
-  s.currentSide = 'LONG';
-  s._lastPositionRefreshFailed = true; // set by a prior failed refresh (e.g. the fill's own refresh 503'd)
-
-  let refreshCalls = 0;
-  s._refreshCurrentPosition = async () => {
-    refreshCalls++;
-    s._lastPositionRefreshFailed = true; // the re-verification attempt fails too — state stays UNKNOWN
-  };
-  let closeCalled = false;
-  s._closeConsolidated = async () => { closeCalled = true; return true; };
-
-  const logs = [];
-  s.addLog = async (msg) => { logs.push(msg); };
-
-  await s._flattenAtAnchor();
-
-  assert.equal(refreshCalls, 1, 're-verifies with Binance before deciding whether to close');
-  assert.equal(closeCalled, false, 'must NOT close a quantity it knows is unverified');
-  assert.equal(openLeg.state, 'POSITION_OPEN', 'the ladder must NOT be reset to EMPTY over an unreconciled position');
-  assert.equal(s.ladderMode, 'RANGE', 'ladderMode is untouched (the reset never ran)');
-  assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud WARNING is logged instead of a silent stale close');
-  assert.ok(logs.some((m) => m.includes('WARNING') && m.includes('BTCUSDT')), 'the WARNING names the symbol');
-});
-
-test('FIX A: _flattenAtAnchor re-verifies and proceeds with the CORRECT quantity once the retry succeeds', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  const legs = s.ladderLines.filter(l => l.direction === 'LONG');
-  legs.slice(0, 4).forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 20; });
-  s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024, unrealizedPnl: 0 }; // stale — only 4 legs' worth
-  s.currentSide = 'LONG';
-  s._lastPositionRefreshFailed = true;
-
-  s._refreshCurrentPosition = async () => {
-    // the retry succeeds and reveals the REAL, larger quantity (the 5th
-    // leg's own fill's refresh had failed earlier and was never corrected).
-    s._lastPositionRefreshFailed = false;
-    s.activePosition = { quantity: 100, entryPrice: 100.4, avgEntry: 100.4, notional: 10040, unrealizedPnl: 0 };
-  };
-
-  let closedQty = null;
-  s._closeConsolidated = async () => { closedQty = s.activePosition.quantity; s.activePosition = null; s.currentSide = null; return true; };
-  s.getTotalMarginBalance = async () => 1e9;
-  s._computeAccLoss = () => 0;
-
-  await s._flattenAtAnchor();
-
-  assert.equal(closedQty, 100, 'the flatten must close the REFRESHED (correct) quantity, not the stale 80');
-  assert.equal(s.ladderMode, 'RANGE');
-  assert.ok(s.ladderLines.every(l => l.state === 'EMPTY'), 'the ladder resets once the close is against verified state');
-});
 
 test('FIX B: _enterTrend does NOT arm Final TP when the arming refresh fails (twice) — clears the stale value and logs loudly', async () => {
   const s = ladderStrategy({ anchor: 100 });
@@ -1405,121 +1276,31 @@ test('start() RESOLVES when the position API 503s — no bare detectCurrentPosit
   assert.equal(s._lastPositionRefreshFailed, true, 'flagged UNKNOWN, not flat');
 });
 
-// ——— C1: _harvestToFlat is the THIRD `_lastPositionRefreshFailed` reader ————
+// ——— The close is sized from the WS-true legs, and stop() must never lie ———
 //
-// REGRESSION PIN. `_harvestToFlat` closed `activePosition.quantity` without
-// ever consulting the flag. Binance really holds 5 legs' worth; a leg fill's
-// own refresh 503'd, so in-memory `activePosition` is stale at 4 legs and the
-// flag is true. A manual harvest closed 4 and ORPHANED the 5th on Binance —
-// then `initializeLadder` wiped every leg to EMPTY and RE-ANCHORED, leaving
-// the orphan invisible (legs EMPTY, activePosition null) and netting against a
-// geometry it was never part of, with the sizing formula and harvest gauge
-// calibrated on notionals that no longer exist. Not one log line.
+// THE PIN FOR THE ROOT CAUSE. Every open books its filled qty from the
+// user-data WS (`_fillLeg` -> `_resolveFill` -> `leg.quantity`), so the five
+// open legs below are a WS-true record of 100. `activePosition.quantity` is
+// written ONLY by `_refreshCurrentPosition` (REST), and here that call 503s,
+// so it is stuck at the stale 80 it held before the failure.
 //
-// Stubbed at the NETWORK boundary so the real
-// getCurrentPositions -> detectCurrentPosition -> _refreshCurrentPosition
-// chain runs: `ladderStrategy()`'s `_refreshCurrentPosition` no-op stub is
-// exactly why this was invisible to a green suite, so it is deleted here to
-// expose the real prototype method.
-function harvestFixtureWithFailingRefresh() {
-  const s = ladderStrategy({ anchor: 100, base: 1000 });
-  // 5 legs are really open on Binance; memory only ever booked 4 (the 5th
-  // leg's own post-fill refresh 503'd and was never corrected).
-  const longLegs = s.ladderLines.filter(l => l.direction === 'LONG');
-  longLegs.forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 20; l.fillPrice = l.price; });
-  s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024, unrealizedPnl: 0 };
-  s.currentSide = 'LONG';
-  s.currentPrice = 103;
-  s._lastPositionRefreshFailed = true;
-  delete s._refreshCurrentPosition; // expose the REAL method (helper stubs it to a no-op)
-  const proxyCalls = [];
-  s.makeProxyRequest = async (endpoint) => {
-    proxyCalls.push(endpoint);
-    const err = new Error('Binance proxy error: 503 Service Unavailable');
-    err.status = 503;
-    throw err;
-  };
-  return { s, proxyCalls };
-}
-
-test('C1: _harvestToFlat with a failed position refresh does NOT close a stale quantity, does NOT re-anchor, and warns loudly', async () => {
-  const { s, proxyCalls } = harvestFixtureWithFailingRefresh();
-  let closeCalled = false;
-  s._closeConsolidated = async () => { closeCalled = true; return true; };
-  s.getTotalMarginBalance = async () => 1e9;
-  s._computeAccLoss = () => 0; // _computeLadderBaseSize overwrites cycleAccumulatedLoss from the accumulators
-  const logs = [];
-  s.addLog = async (msg) => { logs.push(msg); };
-
-  await s._harvestToFlat('manual_harvest');
-
-  assert.equal(closeCalled, false, 'must NOT close a quantity it knows is unverified');
-  assert.equal(s.anchor, 100, 'must NOT re-anchor over an unreconciled position — the orphan would net against a new geometry');
-  assert.ok(
-    proxyCalls.includes('/fapi/v2/account'),
-    'the real getCurrentPositions -> detectCurrentPosition chain must actually have run (else this test proves nothing)',
-  );
-  assert.ok(
-    s.ladderLines.filter(l => l.state === 'POSITION_OPEN').length === 5,
-    'the legs must stay marked open — wiping them to EMPTY is what makes the orphan invisible',
-  );
-  assert.equal(s.harvestCount, 0, 'an aborted harvest is not counted');
-  assert.equal(s._tradingSeqInProgress, false, 'the sequence latch is released on the abort path');
-  assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud WARNING is logged instead of a silent stale close');
-  assert.ok(logs.some((m) => m.includes('WARNING') && m.includes('BTCUSDT')), 'the WARNING names the symbol');
-});
-
-test('C1: _harvestToFlat re-verifies and harvests the CORRECT quantity once the retry succeeds', async () => {
-  const s = ladderStrategy({ anchor: 100, base: 1000 });
-  s.ladderLines.filter(l => l.direction === 'LONG').forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 20; });
-  s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024, unrealizedPnl: 0 }; // stale — only 4 legs' worth
-  s.currentSide = 'LONG';
-  s.currentPrice = 103;
-  s._lastPositionRefreshFailed = true;
-
-  s._refreshCurrentPosition = async () => {
-    // the retry succeeds and reveals the REAL, larger quantity
-    s._lastPositionRefreshFailed = false;
-    s.activePosition = { quantity: 100, entryPrice: 100.4, avgEntry: 100.4, notional: 10040, unrealizedPnl: 0 };
-  };
-  let closedQty = null;
-  s._closeConsolidated = async () => { closedQty = s.activePosition.quantity; s.activePosition = null; s.currentSide = null; return true; };
-  s.getTotalMarginBalance = async () => 1e9;
-  s._computeAccLoss = () => 0;
-
-  await s._harvestToFlat('manual_harvest');
-
-  assert.equal(closedQty, 100, 'the harvest must close the REFRESHED (correct) quantity, not the stale 80');
-  assert.equal(s.anchor, 103, 'the re-anchor proceeds once the close is against verified state');
-  assert.equal(s.harvestCount, 1);
-  assert.ok(s.ladderLines.every(l => l.state === 'EMPTY'), 'the ladder resets once the close is against verified state');
-});
-
-// ——— C3: stop({flatten:true}) must not partial-close, and must never lie ———
-//
-// REGRESSION PIN — TWO distinct defects, both proven by the same scenario.
-//
-// `_flattenGrid`'s doc enumerated two cases and missed the third: a STALE
-// NON-NULL `activePosition` + a failed refresh. Binance really holds 5 legs'
-// worth, a leg fill's own refresh 503'd so memory says 4, and the flag is
-// true. `stop({flatten:true})` closed the stale 4 and ORPHANED the 5th, wiped
-// every leg, and then printed "position confirmed flat" — no residual
-// warning, no FINAL STATE UNKNOWN. That guard was unreachable because it sat
-// behind `else if (closedSomething)` AND keyed on legs `_flattenGrid` had
-// just wiped.
-//
-// Defect 2 is independent of defect 1: `_closeConsolidated` nulls
-// `activePosition` unconditionally, so ANY attempted close followed by a
-// failing refresh left null (read as flat) + closedSomething true ->
-// "confirmed flat" while the true state was unknown.
+// Closing 80 of the 100 that Binance actually holds ORPHANS the remaining 20.
+// That single mistake produced three rounds of bugs — first the orphan, then
+// a "refuse to close on unknown state" guard bolted onto every close path
+// (which orphans WORSE: it closes nothing at all and wipes the legs), then
+// the terminal-path Critical. The close now sizes from the legs, which need
+// no network call and therefore cannot go unknown.
 //
 // Stubbed at the NETWORK boundary so the real getCurrentPositions ->
-// detectCurrentPosition -> _refreshCurrentPosition chain runs.
+// detectCurrentPosition -> _refreshCurrentPosition chain genuinely runs and
+// genuinely fails: `ladderStrategy()`'s no-op `_refreshCurrentPosition` stub
+// is exactly why this class of bug was invisible to a green suite.
 function stopFixtureWithFailingRefresh() {
   const s = ladderStrategy({ anchor: 100, base: 1000 });
   const longLegs = s.ladderLines.filter(l => l.direction === 'LONG');
   longLegs.forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 20; l.fillPrice = l.price; });
-  // Memory booked 4 legs; Binance holds all 5. The flag says so.
+  // The legs (WS) know 5 x 20 = 100. activePosition (REST) is stale at 80 —
+  // the 5th leg's own post-fill refresh 503'd and was never corrected.
   s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024, unrealizedPnl: 0 };
   s.currentSide = 'LONG';
   s.executionState = 'RUNNING';
@@ -1543,10 +1324,14 @@ function stopFixtureWithFailingRefresh() {
   return { s, proxyCalls, logs };
 }
 
-test('C3: stop({flatten:true}) with a failed refresh does NOT close a stale quantity and does NOT wipe the legs', async () => {
-  const { s, proxyCalls, logs } = stopFixtureWithFailingRefresh();
-  let closeCalled = false;
-  s._closeConsolidated = async () => { closeCalled = true; return true; };
+test('the close is sized from the WS-true legs and is UNAFFECTED by a failing position REST call', async () => {
+  const { s, proxyCalls } = stopFixtureWithFailingRefresh();
+  let orderArgs = null;
+  s.placeMarketOrder = async (symbol, side, qty, price, opts) => {
+    orderArgs = { symbol, side, qty, price, opts };
+    return { orderId: 1 };
+  };
+  s._waitForOrderFillConfirmation = async () => {}; // keep the negative path fast; never hang on the real 3s WS timeout
 
   // stop() clears its own intervals, but a rejection before that point would
   // leave the 30-min listen-key interval live and HANG the runner instead of
@@ -1558,15 +1343,16 @@ test('C3: stop({flatten:true}) with a failed refresh does NOT close a stale quan
     clearInterval(s._volumeRefreshInterval);
   }
 
-  assert.equal(closeCalled, false, 'must NOT close a quantity it knows is unverified — closing 4 of 5 legs orphans the 5th');
+  assert.ok(orderArgs, 'the position API being down must not stop the close — the legs need no network call');
   assert.equal(
-    s.ladderLines.filter(l => l.state === 'POSITION_OPEN').length,
-    5,
-    'the legs must NOT be wiped — they are the only bookkeeping left pointing at the unreconciled position',
+    orderArgs.qty, 100,
+    'the close must be sized from the WS-true leg sum (100), NOT the stale REST activePosition (80) — closing 80 orphans 20',
   );
+  assert.equal(orderArgs.side, 'SELL', 'closing a LONG sells');
+  assert.deepEqual(orderArgs.opts, { reduceOnly: true }, 'one-way close: reduceOnly, never positionSide');
   assert.ok(
     proxyCalls.includes('/fapi/v2/account'),
-    'the real getCurrentPositions -> detectCurrentPosition chain must actually have run (else this test proves nothing)',
+    'the real getCurrentPositions -> detectCurrentPosition chain must actually have run and failed (else this test proves nothing)',
   );
 });
 
