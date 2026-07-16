@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AnchorLadderStrategy } from '../anchor-ladder-strategy.js';
 import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE } from '../ladder-levels.js';
+import { precisionFormatter } from '../precisionUtils.js';
 
 // A strategy with an anchored ladder and nothing open. All I/O stubbed, so a
 // tick exercises only the dispatch. Every later task's tests reuse this.
@@ -392,6 +393,36 @@ test('_recomputeFinalTpPrice: null with no position', () => {
 test('harvestNow refuses when nothing is open', async () => {
   const s = ladderStrategy();
   await assert.rejects(() => s.harvestNow(), /nothing open/i);
+});
+
+test('_closeQuantity rounds the summed leg qty to stepSize (guards Binance -1111)', () => {
+  // stepSize 0.01 → quantityPrecision 2, so 0.28×3 = 0.8400000000000001 must
+  // come back as 0.84, not the raw float (which Binance rejects on close).
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();
+  s.ladderLines
+    .filter((l) => l.direction === 'LONG')
+    .slice(0, 3)
+    .forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.28; });
+  s.activePosition = { quantity: 0.84, entryPrice: 100.6, avgEntry: 100.6, notional: 84.5, unrealizedPnl: 0 };
+
+  const rawSum = s.ladderLines
+    .filter((l) => l.state === 'POSITION_OPEN')
+    .reduce((a, l) => a + l.quantity, 0);
+  assert.notEqual(rawSum, 0.84, 'precondition: 0.28×3 carries an IEEE-754 artifact');
+
+  const qty = s._closeQuantity();
+  assert.equal(qty, 0.84, 'summed leg qty must round to the stepSize, not 0.8400000000000001');
+  assert.equal(qty.toFixed(2), '0.84');
+});
+
+test('placeMarketOrder rounds the quantity to stepSize before sending (order-layer -1111 guard)', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();
+  let sentQty = null;
+  s.makeProxyRequest = async (_path, _method, params) => { sentQty = params.quantity; return { orderId: 1, status: 'FILLED' }; };
+  await s.placeMarketOrder('BTCUSDT', 'SELL', 0.8400000000000001, undefined, { reduceOnly: true });
+  assert.equal(sentQty, 0.84, 'the order layer must floor the FP artifact even if the caller does not');
 });
 
 test('harvestNow refuses when a position is open but the gauge is NOT full', async () => {

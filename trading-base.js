@@ -1125,6 +1125,13 @@ class TradingBase {
 
   async placeMarketOrder(symbol, side, quantity, positionSide, options = {}) {
     if (quantity <= 0) throw new Error('Calculated quantity is zero or negative.');
+    // Round to the symbol's stepSize before sending — same as placeLimitOrder.
+    // Callers that SUM per-leg quantities can hand us float artifacts (e.g.
+    // 0.28×3 = 0.8400000000000001) that Binance rejects with -1111 "precision
+    // over maximum". roundQuantity floors on the stepSize, so this is the last
+    // line of defence regardless of what the caller passes.
+    const roundedQuantity = this.roundQuantity(quantity);
+    if (!(roundedQuantity > 0)) throw new Error(`Quantity ${quantity} rounds to zero at the symbol stepSize.`);
 
     return new Promise(async (resolve, reject) => {
       try {
@@ -1132,7 +1139,7 @@ class TradingBase {
           symbol,
           side,
           type: 'MARKET',
-          quantity,
+          quantity: roundedQuantity,
           newOrderRespType: 'FULL',
         };
         if (positionSide) orderParams.positionSide = positionSide;

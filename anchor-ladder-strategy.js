@@ -431,7 +431,14 @@ class AnchorLadderStrategy extends TradingBase {
     const legQty = this.ladderLines
       .filter((l) => l.state === 'POSITION_OPEN')
       .reduce((sum, l) => sum + (l.quantity || 0), 0);
-    return Math.max(legQty, restQty);
+    // Round to the symbol's stepSize before returning. Summing per-leg
+    // quantities — each already exchange-valid — produces float artifacts like
+    // 0.28 × 3 = 0.8400000000000001, which Binance rejects on the close order
+    // with -1111 "precision over maximum". roundQuantity FLOORS on the stepSize
+    // (never overshoots the real position → no -2018 insufficient-position) and
+    // cleans the FP noise; legQty and restQty describe the same position, so
+    // this is lossless for a genuine close.
+    return this.roundQuantity(Math.max(legQty, restQty));
   }
 
   /**
@@ -1000,13 +1007,11 @@ class AnchorLadderStrategy extends TradingBase {
 
     this._startWebSocketHealthMonitoring();
 
-    // Background volume snapshot refresh. Fire one immediate refresh in
-    // addition to the recurring schedule: the primitives (VP/CVD/orderbook/ATR)
-    // are null on every restart, so without this the chart's POC/HVN overlays
-    // and the Volume Analytics panel sit blank for the first 5 minutes of a
-    // resumed position.
+    // Background volume snapshot refresh. _scheduleVolumeRefresh() fires one
+    // immediate refresh itself, so the primitives (VP/CVD/orderbook/ATR) and
+    // the Volume Analytics panel populate within seconds of resume rather than
+    // sitting blank until the first 5-minute interval.
     this._scheduleVolumeRefresh();
-    this._refreshVolumeSnapshot().catch(() => {});
 
     // Preload _wsHandledOrderIds from Firestore trades subcollection BEFORE
     // L3 reconcile fires. The in-memory dedup map is empty on every restart;
@@ -2151,6 +2156,13 @@ class AnchorLadderStrategy extends TradingBase {
 
   _scheduleVolumeRefresh() {
     if (this._volumeRefreshInterval) clearInterval(this._volumeRefreshInterval);
+    // Fire ONE immediate refresh so the chart's POC/HVN overlays and the
+    // Volume Analytics panel populate within seconds of start/resume — the
+    // primitives (VP/CVD/orderbook/ATR) start null, so without this they sit
+    // blank until the first interval fires 5 minutes later. This lives here
+    // (not the callers) so EVERY startup path gets it: start() previously only
+    // scheduled, leaving a fresh strategy blank for 5 minutes.
+    this._refreshVolumeSnapshot().catch(() => {});
     // 5-minute cadence. Each fetcher caches internally (VP TTL 10min,
     // CVD ~5min, etc.) so this is cheap when nothing has expired and
     // keeps the chart fresh during long position holds.
