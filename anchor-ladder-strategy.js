@@ -4,6 +4,7 @@ import wsBroadcast from './ws-broadcast.js';
 import { FieldValue } from '@google-cloud/firestore';
 import { FEE_RATE } from './fees.js';
 import { VolumeProfile } from './volume-profile.js';
+import { MarketMetrics } from './market-metrics.js';
 import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, MIN_INITIAL_SIZE_USDT } from './ladder-levels.js';
 import { planLadderActions, averageOpenEntry } from './ladder-crossings.js';
 
@@ -104,10 +105,10 @@ class AnchorLadderStrategy extends TradingBase {
     // POC/VAH/VAL/HVN edges. The ladder itself reads nothing from it.
     this.volumeProfile = null;              // VolumeProfile instance (built in start()/resume())
     this._lastVolumeProfile24h = null;
-    // Legacy Volume Analytics cells. No producer remains (the AI market-context
-    // fetchers that populated them are gone), so these stay null and the panel
-    // renders "—". Left in the status payload rather than removed so the
-    // frontend contract is changed deliberately, not as a side effect here.
+    // Volume Analytics cells, fed by MarketMetrics off the same 5-min refresh.
+    // Display-only, exactly like the profile above: the ladder reads none of
+    // them. See market-metrics.js.
+    this.marketMetrics = null;              // MarketMetrics instance (built in start()/resume())
     this._lastCvd = null;
     this._lastOrderbookDepth = null;
     this._lastVolatility = null;
@@ -224,6 +225,7 @@ class AnchorLadderStrategy extends TradingBase {
     await this.addLog(`Wallet balance: ${this._formatNotional(this.initialWalletBalance)} USDT — using as initialCapital.`);
 
     this.volumeProfile = new VolumeProfile(this);
+    this.marketMetrics = new MarketMetrics(this);
 
     this.isRunning = true;
     this.cycleStartTime = Date.now();
@@ -247,10 +249,9 @@ class AnchorLadderStrategy extends TradingBase {
 
     this._startWebSocketHealthMonitoring();
 
-    // Background refresh of volume primitives (VP24h/VP7d/CVD/orderbook/ATR).
-    // Independent of AI consult cadence so the chart's POC/HVN/Final TP
-    // overlays + Volume Analytics panel stay populated during long
-    // position holds where no consult fires.
+    // Background refresh of the display-only volume primitives
+    // (VP24h/CVD/orderbook/ATR) that feed the chart's POC/HVN overlays and the
+    // Volume Analytics panel.
     this._scheduleVolumeRefresh();
 
     // Reconcile against Binance — pick up any pre-existing position (e.g., manual trade or VM restart).
@@ -859,6 +860,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.minNotional = minNotional;
 
     this.volumeProfile = new VolumeProfile(this);
+    this.marketMetrics = new MarketMetrics(this);
 
     this.isRunning = true;
 
@@ -876,13 +878,11 @@ class AnchorLadderStrategy extends TradingBase {
 
     this._startWebSocketHealthMonitoring();
 
-    // Background volume snapshot refresh. CRITICAL on resume: when a
-    // position is already held, resume() does NOT fire a fresh PLAN
-    // consult, so the volume primitives (VP/CVD/orderbook/ATR) would
-    // otherwise stay null until the next reversal/harvest — leaving the
-    // chart's POC/HVN/Final TP overlays + Volume Analytics panel blank.
-    // Fire one immediate refresh in addition to the recurring schedule
-    // so the user sees data within seconds, not 5 minutes.
+    // Background volume snapshot refresh. Fire one immediate refresh in
+    // addition to the recurring schedule: the primitives (VP/CVD/orderbook/ATR)
+    // are null on every restart, so without this the chart's POC/HVN overlays
+    // and the Volume Analytics panel sit blank for the first 5 minutes of a
+    // resumed position.
     this._scheduleVolumeRefresh();
     this._refreshVolumeSnapshot().catch(() => {});
 
@@ -1955,18 +1955,32 @@ class AnchorLadderStrategy extends TradingBase {
   }
 
   /**
-   * Refresh the 24h VP for the chart histogram. Chart-only — the ladder is
-   * anchored on live price and reads nothing from the profile. Best-effort:
+   * Refresh the 24h VP for the chart histogram, plus the Volume Analytics
+   * primitives (CVD / orderbook depth / ATR). Display-only — the ladder is
+   * anchored on live price and reads nothing from any of them. Best-effort:
    * a failure leaves the last snapshot in place rather than throwing into the
    * tick path.
+   *
+   * Each metric is caught independently: one dead endpoint must not blank the
+   * other three cells. Fetched in parallel — they are unrelated reads and the
+   * serial version would stack four round-trips onto the tick path's interval.
    */
   async _refreshVolumeSnapshot() {
-    try {
-      const vp = await this.volumeProfile.get24h(this.symbol);
-      if (vp) this._lastVolumeProfile24h = vp;
-    } catch (e) {
-      await this.addLog(`Volume profile refresh failed: ${e.message} (keeping the last snapshot).`);
-    }
+    const refresh = async (label, fetch, assign) => {
+      try {
+        const value = await fetch();
+        if (value) assign(value);
+      } catch (e) {
+        await this.addLog(`${label} refresh failed: ${e.message} (keeping the last snapshot).`);
+      }
+    };
+
+    await Promise.all([
+      refresh('Volume profile', () => this.volumeProfile.get24h(this.symbol), v => { this._lastVolumeProfile24h = v; }),
+      refresh('CVD', () => this.marketMetrics.getCvd(this.symbol), v => { this._lastCvd = v; }),
+      refresh('Orderbook depth', () => this.marketMetrics.getOrderbookDepth(this.symbol), v => { this._lastOrderbookDepth = v; }),
+      refresh('ATR', () => this.marketMetrics.getVolatility(this.symbol), v => { this._lastVolatility = v; }),
+    ]);
   }
 
   _scheduleVolumeRefresh() {
