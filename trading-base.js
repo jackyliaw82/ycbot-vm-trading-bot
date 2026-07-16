@@ -2014,7 +2014,7 @@ class TradingBase {
       if (!Array.isArray(rows)) return;
 
       const mapped = rows
-        .filter(r => r.symbol === this.symbol && (r.positionSide === 'LONG' || r.positionSide === 'SHORT'))
+        .filter(r => r.symbol === this.symbol && (r.positionSide === 'LONG' || r.positionSide === 'SHORT' || r.positionSide === 'BOTH'))
         .map(r => ({
           s: r.symbol,
           pa: r.positionAmt,

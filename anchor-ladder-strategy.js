@@ -68,9 +68,12 @@ class AnchorLadderStrategy extends TradingBase {
     this.currentInitialSize = 0;         // base for DYNAMIC trend sizing (original config size; never overwritten → no compounding)
     this._ladderBaseSize = 0;            // base the LADDER is sized from: initial size, then the dynamically re-sized base after an anchor flatten / harvest
     this.cycleStartTime = null;
-    // Execution lock. KEPT (not AI state): stop() and _handleFinalTpHit use the
-    // EXECUTING/TERMINATED values as the re-entry guard around termination.
-    // The AI-only 'PLANNING' value is no longer produced by anything.
+    // Execution lock. KEPT (not AI state): stop() uses the TERMINATED value
+    // as the re-entry guard around termination. EXECUTING is not currently
+    // produced by anything (its sole producer, the dead _handleFinalTpHit,
+    // was removed) but the value is left in the enum for a future re-entry
+    // guard around stop() itself. The AI-only 'PLANNING' value is no longer
+    // produced by anything.
     this.executionState = 'IDLE';           // IDLE | EXECUTING | TERMINATED
     this.subState = 'INITIAL';              // INITIAL | WAITING | LONG_HELD | SHORT_HELD | HARVESTING | EXITED
     // How the cycle ended — set in stop() to 'final_tp' or 'manual' and persisted
@@ -346,6 +349,12 @@ class AnchorLadderStrategy extends TradingBase {
    * (`_flattenAtAnchor` does NOT call this — it closes directly via
    * `_closeConsolidated` and rebuilds the ladder from scratch.)
    */
+  // Return value reflects whether a position was ACTUALLY closed, never
+  // merely whether legs were marked open. Legs can be marked POSITION_OPEN
+  // while `activePosition` is empty (state drift — a missed WS update, a
+  // transient API error) in which case this resets the bookkeeping but
+  // places no order and returns false, so the caller does not mistake
+  // ledger cleanup for a real close.
   async _flattenGrid(reason = 'FLATTEN') {
     const openLegs = this.ladderLines.filter(l => l.state === 'POSITION_OPEN');
     const hadPosition = !!(this.activePosition && this.activePosition.quantity > 0);
@@ -363,7 +372,7 @@ class AnchorLadderStrategy extends TradingBase {
     }
 
     await this.saveState();
-    return true;
+    return hadPosition;
   }
 
   // Close the full net one-way position to flat. reduceOnly is REQUIRED (not
@@ -521,6 +530,40 @@ class AnchorLadderStrategy extends TradingBase {
       direction, avgEntry: avg, finalTpPrice: this.finalTpPrice,
     }).catch(() => {});
     await this.saveState();
+  }
+
+  /**
+   * Derive the RANGE→TREND invariant instead of chasing the fill event.
+   *
+   * `handleRealtimePrice`'s normal path already calls `_enterTrend` the
+   * instant the outermost leg fills — but `_fillLeg` persists that leg's
+   * POSITION_OPEN state (via `_postExecuteBookkeeping` -> `saveState`)
+   * BEFORE that call runs. A process death in that ~0.5-2s window (a PM2
+   * restart or VM redeploy, both routine here) persists "RANGE + fully
+   * scaled" with no way back: `resume()` only re-arms Final TP when the
+   * snapshot already says TREND, and every leg being open means the tick
+   * loop's `plan.fills` is empty forever, so the event that drives
+   * `_enterTrend` can never fire again. The ladder then sits fully exposed
+   * with NO exit target — the anchor flatten becomes the only remaining
+   * exit, which turns a winning move into a guaranteed loss.
+   *
+   * Called from `resume()` and from the top of every tick (before the
+   * TREND/RANGE dispatch) so the invariant self-heals on the very next
+   * opportunity regardless of when the crash happened. Idempotent: a no-op
+   * once `ladderMode` is already 'TREND'.
+   */
+  async _reconcileTrendInvariant() {
+    if (this.ladderMode !== 'RANGE') return false;
+    const outermost = this.ladderLines.find(
+      (l) => l.levelIndex === this.levelsPerSide && l.state === 'POSITION_OPEN',
+    );
+    if (!outermost) return false;
+    await this.addLog(
+      `[LADDER] RANGE→TREND invariant reconcile: outermost ${outermost.direction} leg already ` +
+      `POSITION_OPEN with ladderMode still RANGE — arming TREND now (resume or a missed tick).`,
+    );
+    await this._enterTrend(outermost.direction);
+    return true;
   }
 
   /**
@@ -749,9 +792,14 @@ class AnchorLadderStrategy extends TradingBase {
 
     await this.saveState();
 
-    // Mode-aware resume: RANGE rebuilds nothing (first tick / existing legs drive it);
-    // TREND re-arms Final TP from the restored consolidated position.
-    if (this.ladderMode === 'TREND' && this.activePosition && this.currentSide) {
+    // Mode-aware resume: RANGE re-derives the TREND invariant here (not just
+    // on the next tick) so a process death between `_fillLeg(L5)` persisting
+    // and `_enterTrend` running can never strand the cycle in RANGE fully-
+    // scaled with no exit target — see `_reconcileTrendInvariant`. TREND
+    // (already armed on the snapshot) re-arms Final TP from the restored
+    // consolidated position.
+    const reconciledToTrend = await this._reconcileTrendInvariant();
+    if (!reconciledToTrend && this.ladderMode === 'TREND' && this.activePosition && this.currentSide) {
       this._recomputeFinalTpPrice();
       await this.addLog(`Resumed in TREND ${this.currentSide}; Final TP ${this.finalTpPrice ? this._formatPrice(this.finalTpPrice) : 'n/a'}.`);
     }
@@ -781,9 +829,10 @@ class AnchorLadderStrategy extends TradingBase {
   async stop(options = {}) {
     const { flatten = false, reason = 'manual' } = options;
 
-    // Concurrency + idempotency guard. stop() is reachable from
-    // /anchor-ladder/stop AND from _handleFinalTpHit; both could fire in
-    // quick succession. The `!isRunning` check catches the concurrent
+    // Concurrency + idempotency guard. stop() is reachable from both the
+    // /anchor-ladder/stop route AND the tick loop's Final TP check in
+    // handleRealtimePrice; both could fire in quick succession. The
+    // `!isRunning` check catches the concurrent
     // race (first call sets isRunning=false synchronously before any
     // await, so the second microtask-queued call bails). The
     // TERMINATED check catches a stop attempt AFTER a previous stop
@@ -810,67 +859,78 @@ class AnchorLadderStrategy extends TradingBase {
     const exitPrice = this.currentPrice;
 
     if (flatten) {
-      // Flatten the net one-way position. `_flattenGrid` closes via
-      // `_closeConsolidated` (ONE reduceOnly market order — one-way mode
-      // nets every filled leg into a single `activePosition`; there is no
-      // per-leg close) AND resets every ladder leg's bookkeeping to EMPTY.
-      // `_enterTrend` never touches leg state, so legs stay marked
-      // POSITION_OPEN straight through a TREND transition — this branch
-      // fires whenever anything is open, TREND included, and always wins.
+      // Flatten the net one-way position. `_flattenGrid` / `_closeConsolidated`
+      // place ONE reduceOnly market order — one-way mode nets every filled leg
+      // into a single `activePosition`; there is no per-leg close. `_enterTrend`
+      // never touches leg state, so legs stay marked POSITION_OPEN straight
+      // through a TREND transition — branch 1 below fires whenever anything is
+      // open, TREND included, and usually wins.
+      //
+      // Source-of-truth refresh FIRST, before any branch decides what (if
+      // anything) is open. In-memory `activePosition` can be null while
+      // Binance still holds a position (a transient API error makes
+      // `getCurrentPositions()` return [] indistinguishable from flat, a
+      // missed WS update, a partial restart) — nothing below may conclude
+      // "there is nothing to close" from memory alone.
+      try {
+        await this._refreshCurrentPosition();
+      } catch (err) {
+        await this.addLog(`[LADDER] stop: pre-flatten position refresh failed: ${err.message}`);
+      }
+
+      // closedSomething reflects an ACTUAL close, never a leg marking —
+      // `_flattenGrid` now returns whether it closed a real position (see its
+      // own doc). It only gates which fallback branch attempts a close; the
+      // residual verification below ALWAYS runs afterwards regardless of
+      // its value.
       let closedSomething = false;
       if (this.ladderLines.some(l => l.state === 'POSITION_OPEN')) {
         try {
-          await this._flattenGrid();
+          closedSomething = await this._flattenGrid();
         } catch (err) {
           await this.addLog(`[LADDER] stop: grid flatten failed: ${err.message}`);
         }
-        closedSomething = true;
       }
-      if (this.activePosition && this.activePosition.quantity > 0 && this.ladderMode === 'TREND') {
-        // Defensive fallback for a TREND-consolidated position with no
-        // ladder leg marked POSITION_OPEN. Currently unreachable — the
-        // branch above always wins per the comment there — but kept in
-        // case that invariant ever changes; closes directly via
-        // `_closeConsolidated` rather than resetting leg bookkeeping that
-        // isn't there to reset.
+      if (!closedSomething && this.activePosition && this.activePosition.quantity > 0 && this.ladderMode === 'TREND') {
+        // Fallback for a TREND-consolidated position with no ladder leg left
+        // marked POSITION_OPEN. Reachable — not merely defensive — when
+        // branch 1's close throws before `_flattenGrid` resets leg state
+        // (proven live: legs stay POSITION_OPEN through TREND, so branch 1
+        // fires and throws, then this branch retries the close directly).
         try {
           await this._closeConsolidated('stop');
+          closedSomething = true;
         } catch (err) {
           await this.addLog(`[LADDER] stop: consolidated close failed: ${err.message}`);
         }
-        closedSomething = true;
       }
-      if (!closedSomething) {
-        // Source-of-truth refresh BEFORE the flatten check. activePosition can be
-        // null in-memory while Binance still holds an open position (state lost
-        // across a partial restart, missed WS update, etc.) — without this
-        // refresh the close silently no-ops and the user is left with an open
-        // position. stop() always closes.
+      if (!closedSomething && this.activePosition && this.activePosition.quantity > 0) {
+        const closeReason = reason === 'final_tp' ? 'final_tp' : 'user-stop';
         try {
-          await this._refreshCurrentPosition();
+          await this.addLog(`[LADDER] stop: flattening ${this.currentSide} ${this.activePosition.quantity} (${closeReason})`);
+          await this._closeConsolidated(closeReason);
+          closedSomething = true;
         } catch (err) {
-          await this.addLog(`[LADDER] stop: pre-flatten position refresh failed: ${err.message}`);
+          await this.addLog(`[LADDER] stop: flatten failed: ${err.message}`);
         }
+      } else if (!closedSomething) {
+        await this.addLog('[LADDER] stop: no open position on Binance — nothing to flatten');
+      }
 
-        if (this.activePosition && this.activePosition.quantity > 0) {
-          const closeReason = reason === 'final_tp' ? 'final_tp' : 'user-stop';
-          try {
-            await this.addLog(`[LADDER] stop: flattening ${this.currentSide} ${this.activePosition.quantity} (${closeReason})`);
-            await this._closeConsolidated(closeReason);
-            // Verify the close actually flattened — if Binance still reports a
-            // residual position, log a warning so it's surfaced in the log feed.
-            await this._refreshCurrentPosition();
-            if (this.activePosition && this.activePosition.quantity > 0) {
-              await this.addLog(`[LADDER] WARNING: stop+flatten left residual ${this.currentSide} ${this.activePosition.quantity} on Binance — close it manually`);
-            } else {
-              await this.addLog('[LADDER] stop: position confirmed flat');
-            }
-          } catch (err) {
-            await this.addLog(`[LADDER] stop: flatten failed: ${err.message}`);
-          }
-        } else {
-          await this.addLog('[LADDER] stop: no open position on Binance — nothing to flatten');
-        }
+      // Residual verification — ALWAYS runs, regardless of which branch (if
+      // any) closed something above: a close call can throw, partially
+      // fill, or race a fill event, so Binance is the only source of truth
+      // for whether the position is actually flat. Never terminate silently
+      // with a position still open.
+      try {
+        await this._refreshCurrentPosition();
+      } catch (err) {
+        await this.addLog(`[LADDER] stop: post-flatten position refresh failed: ${err.message}`);
+      }
+      if (this.activePosition && this.activePosition.quantity > 0) {
+        await this.addLog(`[LADDER] WARNING: stop+flatten left residual ${this.currentSide} ${this.activePosition.quantity} ${this.symbol} on Binance — close it manually`);
+      } else if (closedSomething) {
+        await this.addLog('[LADDER] stop: position confirmed flat');
       }
 
       // Final TP: write the strategyFlow audit record + metricsSample so
@@ -1118,6 +1178,14 @@ class AnchorLadderStrategy extends TradingBase {
       return;
     }
 
+    // ---- Derive the RANGE→TREND invariant BEFORE dispatching on mode. ----
+    // Fully scaled (outermost leg POSITION_OPEN) always implies TREND — a
+    // no-op once already TREND, and a self-heal on the first tick after a
+    // resume that stalled in RANGE fully-scaled (see _reconcileTrendInvariant).
+    // Runs first so a transition here is picked up by the TREND branch on
+    // this SAME tick rather than waiting one more.
+    await this._reconcileTrendInvariant();
+
     // ---- TREND: passive. Two exits, and only two. ----
     if (this.ladderMode === 'TREND') {
       // 1) Final TP -> close + STOP. The cycle ends.
@@ -1238,39 +1306,6 @@ class AnchorLadderStrategy extends TradingBase {
     if (!open) throw new Error('Nothing open to harvest.');
     this._manualHarvestRequested = true; // honored on the next free tick
     return { harvesting: true, queued: true, mode: this.ladderMode, price: this.currentPrice };
-  }
-
-  /**
-   * Final TP detection handler — invoked from handleRealtimePrice when
-   * price crosses finalTpPrice. v4.0.1: reduced to a thin re-entry guard
-   * around stop({flatten:true, reason:'final_tp'}). The unified stop()
-   * method does everything that used to live here (HARVEST_CLOSE, the
-   * residual check, FINAL_TP_HIT bookkeeping, WS cleanup, notification,
-   * saveState) PLUS the parity gaps that were missing before:
-   *
-   *   - Final funding flush
-   *   - Platform fee deduction on net positive PnL
-   *   - onStopComplete() hook → removes the entry from app.js's
-   *     `activeStrategies` map. Without this hook the next start
-   *     attempt for this profile is rejected with "already running"
-   *     until the VM restarts. This was the user-reported bug.
-   */
-  async _handleFinalTpHit() {
-    // Re-entry guard: two ticks could pass the `isRunning` check in
-    // handleRealtimePrice before stop() flips isRunning to false. The
-    // executionState lock prevents the second call from double-stopping.
-    if (this.executionState === 'EXECUTING' || this.executionState === 'TERMINATED') return;
-    this.executionState = 'EXECUTING';
-    try {
-      await this.addLog(`[LADDER] Final TP hit at ${this.currentPrice} — closing cycle`);
-      await this.stop({ flatten: true, reason: 'final_tp' });
-    } catch (err) {
-      await this.addLog(`[LADDER] _handleFinalTpHit error: ${err.message}`);
-      // If stop() never reached TERMINATED (e.g. threw very early), release
-      // the lock so a future tick or a /anchor-ladder/stop request can try
-      // again. If stop() succeeded, executionState is already TERMINATED.
-      if (this.executionState !== 'TERMINATED') this.executionState = 'IDLE';
-    }
   }
 
   // ——— Dynamic sizing ————————————————————————————————————————————————

@@ -407,3 +407,181 @@ test('_recomputeFinalTpPrice keys off trendDirection, not just currentSide (resu
   assert.ok(s.finalTpPrice != null, 'Final TP must arm from trendDirection even when currentSide has not resolved yet');
   assert.ok(Math.abs(s.finalTpPrice - 102.87072) < 1e-6, `got ${s.finalTpPrice}`);
 });
+
+// ——— Final-review fixes ——————————————————————————————————————————————
+//
+// FIX 1: stop({flatten:true}) previously set `closedSomething = true` merely
+// because ladder legs were MARKED POSITION_OPEN — not because anything was
+// actually closed — which gated off the ONLY residual verification in the
+// whole stop path. These tests pin the corrected shape: a source-of-truth
+// refresh runs BEFORE deciding there is nothing to close, `closedSomething`
+// reflects an ACTUAL close, and the residual verification ALWAYS runs
+// afterwards regardless of which branch (if any) closed something.
+//
+// stop() does a lot of tail bookkeeping unrelated to the flatten logic under
+// test (platform fee, hero-profit, no-trade-doc cleanup, WS teardown) —
+// stub it all to a no-op so these tests exercise only the flatten +
+// residual-verification path.
+function stubStopTail(s) {
+  s._pollFundingIncome = async () => {};
+  s.cleanupWebSockets = () => {};
+  s.deductPlatformFee = async () => {};
+  s._recordHeroProfit = async () => {};
+  s._deleteNoTradeStrategyDoc = async () => {};
+  return s;
+}
+
+test('Fix 1(a): legs POSITION_OPEN + activePosition null in-memory, Binance still reports a position -> stop({flatten:true}) closes it and runs the residual check', async () => {
+  const s = stubStopTail(ladderStrategy());
+  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
+  s.activePosition = null; // in-memory drift: legs say open, position says flat
+  s.currentSide = null;
+
+  let refreshCalls = 0;
+  s._refreshCurrentPosition = async () => {
+    refreshCalls++;
+    if (refreshCalls === 1) {
+      // Binance — the source of truth — still reports the position memory lost.
+      s.activePosition = { quantity: 1.2 };
+      s.currentSide = 'LONG';
+    } else {
+      // The close succeeded; Binance now confirms flat.
+      s.activePosition = null;
+      s.currentSide = null;
+    }
+  };
+  let orderArgs = null;
+  s.placeMarketOrder = async (symbol, side, qty, price, opts) => { orderArgs = { side, qty, opts }; return {}; };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s.stop({ flatten: true });
+
+  assert.ok(orderArgs, 'a close order was placed against the Binance-confirmed position, not skipped as a phantom leg');
+  assert.equal(orderArgs.side, 'SELL', 'closing a LONG sells');
+  assert.deepEqual(orderArgs.opts, { reduceOnly: true });
+  assert.ok(refreshCalls >= 2, 'the residual verification ran (a post-close refresh happened)');
+  assert.ok(logs.some((m) => m.includes('confirmed flat')), 'residual verification confirmed flat and said so');
+  assert.ok(!logs.some((m) => m.includes('WARNING')), 'no residual was left, so no warning was logged');
+});
+
+test('Fix 1(b): the close order throws -> stop() still runs the residual verification and logs a WARNING', async () => {
+  const s = stubStopTail(ladderStrategy());
+  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
+  s.activePosition = { quantity: 0.8 };
+  s.currentSide = 'LONG';
+
+  let refreshCalls = 0;
+  // Leaves activePosition/currentSide untouched — Binance genuinely still
+  // shows the position open because every close attempt below throws.
+  s._refreshCurrentPosition = async () => { refreshCalls++; };
+  s.placeMarketOrder = async () => { throw new Error('-1001 Internal error'); };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s.stop({ flatten: true });
+
+  assert.ok(refreshCalls >= 2, 'the residual verification refresh ran despite every close attempt throwing');
+  assert.ok(
+    logs.some((m) => m.includes('WARNING') && m.includes('manually')),
+    'a loud warning names the residual instead of a silent termination',
+  );
+  assert.equal(s.executionState, 'TERMINATED', 'stop() still completes termination — it never hangs open on a throw');
+});
+
+test('Fix 1: the normal path (legs open, position known, close succeeds) now runs the residual verification (it previously did not)', async () => {
+  const s = stubStopTail(ladderStrategy());
+  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
+  s.activePosition = { quantity: 0.5 };
+  s.currentSide = 'LONG';
+
+  let refreshCalls = 0;
+  s._refreshCurrentPosition = async () => {
+    refreshCalls++;
+    if (refreshCalls >= 2) { s.activePosition = null; s.currentSide = null; } // the close succeeded
+  };
+  let orderArgs = null;
+  s.placeMarketOrder = async (symbol, side, qty, price, opts) => { orderArgs = { side, qty, opts }; return {}; };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s.stop({ flatten: true });
+
+  assert.ok(orderArgs, 'the close order was placed');
+  assert.ok(refreshCalls >= 2, 'the residual verification ran on the normal branch-1 path, not only the previously-broken fallback branch');
+  assert.ok(logs.some((m) => m.includes('confirmed flat')), 'the residual check found flat and logged it');
+});
+
+test('reduceOnly invariant (live-money): the close order carries reduceOnly:true and no positionSide', async () => {
+  const s = stubStopTail(ladderStrategy());
+  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
+  s.activePosition = { quantity: 0.7 };
+  s.currentSide = 'LONG';
+  s._refreshCurrentPosition = async () => {}; // leaves state as-is; irrelevant to this assertion
+  let orderArgs = null;
+  s.placeMarketOrder = async (symbol, side, qty, price, opts) => { orderArgs = { symbol, side, qty, price, opts }; return {}; };
+  s.addLog = async () => {};
+
+  await s.stop({ flatten: true });
+
+  assert.ok(orderArgs, 'a close order was placed');
+  assert.equal(orderArgs.opts.reduceOnly, true, 'one-way mode closes MUST be reduceOnly');
+  assert.equal(orderArgs.opts.positionSide, undefined, 'one-way mode MUST NOT send positionSide — that is a hedge-mode concept');
+});
+
+// ——— FIX 2: the RANGE→TREND invariant is derived, not chased —————————————
+
+test('Fix 2: resume() self-heals a snapshot stuck in RANGE fully-scaled — arms TREND + Final TP', async () => {
+  const src = ladderStrategy({ anchor: 100, base: 12000 });
+  src.ladderMode = 'RANGE'; // the bug: process died between _fillLeg(L5) persisting and _enterTrend running
+  src.ladderLines.filter(l => l.direction === 'LONG').forEach((l, i) => {
+    Object.assign(l, { state: 'POSITION_OPEN', quantity: 10 + i, fillPrice: 100.3 + i * 0.3 });
+  });
+  src.activePosition = { quantity: 50, entryPrice: 100.9, avgEntry: 100.9, notional: 5045 };
+  src.currentSide = 'LONG';
+  src.cycleAccumulatedLoss = 89;
+  src.desiredProfitUSDT = 100;
+  src.lastProcessedPrice = 101.5;
+
+  let doc = null;
+  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
+  await AnchorLadderStrategy.prototype.saveState.call(src);
+
+  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  // detectCurrentPosition/_refreshCurrentPosition are stubbed no-ops by
+  // stubResumeIO, so the restored snapshot fields (activePosition,
+  // currentSide) stand in for "Binance still confirms this position" —
+  // exactly what _enterTrend's internal refresh would find live.
+  // resume() reconciling to TREND now reaches _enterTrend -> _writeStrategyFlow,
+  // which stubResumeIO doesn't cover (no prior resume() path ever hit it) —
+  // stub it here too so the test stays network-free.
+  dst._writeStrategyFlow = async () => {};
+  await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
+  cleanupResumeTimers(dst);
+
+  assert.equal(dst.ladderMode, 'TREND', 'the invariant self-heals on resume, not just on the next tick');
+  assert.equal(dst.trendDirection, 'LONG');
+  assert.ok(dst.finalTpPrice != null, 'Final TP is armed — never silently left null');
+});
+
+test('Fix 2 regression: filling the outermost leg via the REAL _fillLeg path (not a stub) still transitions to TREND with Final TP armed', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 40, entryPrice: 100.9, avgEntry: 100.9, notional: 4036 };
+  s.currentSide = 'LONG';
+  s.cycleAccumulatedLoss = 0;
+  s.desiredProfitUSDT = 50;
+  s.placeMarketOrder = async () => ({}); // no orderId -> _resolveFill falls back to requested qty/level price
+  s._quantityFor = async (symbol, notional, price) => notional / price; // skip the real exchange-info/network sizing call
+  s.lastProcessedPrice = 100;
+
+  await s.handleRealtimePrice(101.6); // past L5 at 101.5
+
+  assert.ok(
+    s.ladderLines.filter((l) => l.direction === 'LONG').every((l) => l.state === 'POSITION_OPEN'),
+    'every LONG leg actually filled through the real _fillLeg path',
+  );
+  assert.equal(s.ladderMode, 'TREND');
+  assert.equal(s.trendDirection, 'LONG');
+  assert.ok(s.finalTpPrice != null, 'Final TP armed via the real _enterTrend -> _recomputeFinalTpPrice path (no regression from the invariant check)');
+});
