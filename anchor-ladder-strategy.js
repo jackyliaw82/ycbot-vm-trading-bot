@@ -1589,13 +1589,18 @@ class AnchorLadderStrategy extends TradingBase {
    * of firing directly — `handleRealtimePrice` honors it on the next free
    * tick, guaranteeing the harvest actually runs (no silent no-op).
    *
-   * Refuses only when there is nothing open. Throws on ineligibility (the
-   * route maps it to a 409).
+   * Two gates, mirroring the frontend: a position must be OPEN, and the loss
+   * gauge must be FULL (cycleAccumulatedLoss >= harvestLossThreshold ×
+   * initialCapital). `force` is a TEMPORARY test bypass of the gauge gate — the
+   * panel's test button sends it so the flow can be exercised without waiting
+   * for an 8% drawdown. Remove `force` once harvest is verified in the field.
+   * Throws on ineligibility (the route maps it to a 409).
    */
-  async harvestNow() {
+  async harvestNow({ force = false } = {}) {
     if (!this.isRunning) throw new Error('Strategy is not running.');
     const open = !!(this.activePosition && this.activePosition.quantity > 0);
     if (!open) throw new Error('Nothing open to harvest.');
+    if (!force && !this._isGaugeFull()) throw new Error('Harvest gauge is not full yet.');
     this._manualHarvestRequested = true; // honored on the next free tick
     return { harvesting: true, queued: true, mode: this.ladderMode, price: this.currentPrice };
   }

@@ -394,6 +394,33 @@ test('harvestNow refuses when nothing is open', async () => {
   await assert.rejects(() => s.harvestNow(), /nothing open/i);
 });
 
+test('harvestNow refuses when a position is open but the gauge is NOT full', async () => {
+  const s = ladderStrategy();                        // initialCapital 1000, 8% threshold => full at 80
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  s.cycleAccumulatedLoss = 40;                        // below the 80 gate
+  await assert.rejects(() => s.harvestNow(), /gauge is not full/i);
+  assert.equal(s._manualHarvestRequested, false, 'no latch set when the gauge gate refuses');
+});
+
+test('harvestNow queues when a position is open AND the gauge is full', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  s.cycleAccumulatedLoss = 100;                       // >= 80 => gauge full
+  const res = await s.harvestNow();
+  assert.equal(res.queued, true);
+  assert.equal(s._manualHarvestRequested, true, 'latch set once eligible');
+});
+
+test('harvestNow({ force: true }) bypasses the gauge gate (temporary test path)', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  s.cycleAccumulatedLoss = 0;                         // gauge empty
+  await assert.rejects(() => s.harvestNow(), /gauge is not full/i);   // sanity: refused without force
+  const res = await s.harvestNow({ force: true });
+  assert.equal(res.queued, true);
+  assert.equal(s._manualHarvestRequested, true, 'force bypasses the gauge gate');
+});
+
 test('harvest re-anchors to the CURRENT price, unlike the anchor flatten', async () => {
   const s = ladderStrategy({ anchor: 100 });
   s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
