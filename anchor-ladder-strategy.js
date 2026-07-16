@@ -734,6 +734,46 @@ class AnchorLadderStrategy extends TradingBase {
     this._tradingSeqInProgress = true;
     try {
       await this.addLog(`===== HARVEST (${reason}) — flatten + re-anchor =====`);
+
+      // TOMBSTONE — do NOT remove this guard (it mirrors _flattenAtAnchor's).
+      // This is the THIRD `_lastPositionRefreshFailed` reader. If the last
+      // refresh failed, `this.activePosition` is whatever it was BEFORE that
+      // failure — possibly a STALE quantity (a leg fill's own refresh 503'd,
+      // so it still reflects 4/5 legs while Binance already holds all 5).
+      // Closing that stale qty places a reduceOnly order for less than what
+      // is actually open and ORPHANS the remainder on Binance.
+      //
+      // Strictly worse here than at the anchor flatten: the harvest
+      // RE-ANCHORS (initializeLadder below wipes every leg to EMPTY and moves
+      // the anchor to the live price), so the orphan is left netting against
+      // a geometry it was never part of, and both the dynamic sizing formula
+      // and the harvest gauge go on to be calibrated on notionals that no
+      // longer exist — with the legs EMPTY and activePosition null, nothing
+      // is left pointing at it. Re-verify with Binance (the source of truth)
+      // before committing to a close; if it is still unverifiable, abort
+      // LOUDLY: do NOT close, do NOT re-anchor, do NOT reset the ladder.
+      // The harvest is manual, so the user can simply retry once the API
+      // recovers; the latch has already been consumed, which is correct —
+      // a failed harvest must not silently re-fire on the next tick.
+      if (this._lastPositionRefreshFailed) {
+        await this.addLog(
+          `[LADDER] _harvestToFlat: last position refresh failed for ${this.symbol} — re-verifying with Binance ` +
+          `before closing (in-memory qty may be stale).`
+        );
+        await this._refreshCurrentPosition();
+        if (this._lastPositionRefreshFailed) {
+          const openLegsNow = this.ladderLines.filter(l => l.state === 'POSITION_OPEN');
+          const qty = openLegsNow.reduce((sum, l) => sum + (l.quantity || 0), 0);
+          await this.addLog(
+            `[LADDER] WARNING: _harvestToFlat: Binance position refresh still failing for ${this.symbol} — ` +
+            `${openLegsNow.length} ladder leg(s) marked open (last-known qty ${qty}) but current Binance state is ` +
+            `UNKNOWN. NOT closing a possibly-stale quantity and NOT re-anchoring — harvest ABORTED, retry it once ` +
+            `the position API recovers.`
+          );
+          return;
+        }
+      }
+
       if (this.activePosition && this.activePosition.quantity > 0) {
         try { await this._closeConsolidated('harvest'); }
         catch (e) { await this.addLog(`ERROR harvest close: ${e.message}`); }

@@ -1155,3 +1155,93 @@ test('start() RESOLVES when the position API 503s — no bare detectCurrentPosit
   assert.equal(s.isRunning, true);
   assert.equal(s._lastPositionRefreshFailed, true, 'flagged UNKNOWN, not flat');
 });
+
+// ——— C1: _harvestToFlat is the THIRD `_lastPositionRefreshFailed` reader ————
+//
+// REGRESSION PIN. `_harvestToFlat` closed `activePosition.quantity` without
+// ever consulting the flag. Binance really holds 5 legs' worth; a leg fill's
+// own refresh 503'd, so in-memory `activePosition` is stale at 4 legs and the
+// flag is true. A manual harvest closed 4 and ORPHANED the 5th on Binance —
+// then `initializeLadder` wiped every leg to EMPTY and RE-ANCHORED, leaving
+// the orphan invisible (legs EMPTY, activePosition null) and netting against a
+// geometry it was never part of, with the sizing formula and harvest gauge
+// calibrated on notionals that no longer exist. Not one log line.
+//
+// Stubbed at the NETWORK boundary so the real
+// getCurrentPositions -> detectCurrentPosition -> _refreshCurrentPosition
+// chain runs: `ladderStrategy()`'s `_refreshCurrentPosition` no-op stub is
+// exactly why this was invisible to a green suite, so it is deleted here to
+// expose the real prototype method.
+function harvestFixtureWithFailingRefresh() {
+  const s = ladderStrategy({ anchor: 100, base: 1000 });
+  // 5 legs are really open on Binance; memory only ever booked 4 (the 5th
+  // leg's own post-fill refresh 503'd and was never corrected).
+  const longLegs = s.ladderLines.filter(l => l.direction === 'LONG');
+  longLegs.forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 20; l.fillPrice = l.price; });
+  s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.currentPrice = 103;
+  s._lastPositionRefreshFailed = true;
+  delete s._refreshCurrentPosition; // expose the REAL method (helper stubs it to a no-op)
+  const proxyCalls = [];
+  s.makeProxyRequest = async (endpoint) => {
+    proxyCalls.push(endpoint);
+    const err = new Error('Binance proxy error: 503 Service Unavailable');
+    err.status = 503;
+    throw err;
+  };
+  return { s, proxyCalls };
+}
+
+test('C1: _harvestToFlat with a failed position refresh does NOT close a stale quantity, does NOT re-anchor, and warns loudly', async () => {
+  const { s, proxyCalls } = harvestFixtureWithFailingRefresh();
+  let closeCalled = false;
+  s._closeConsolidated = async () => { closeCalled = true; return true; };
+  s.getTotalMarginBalance = async () => 1e9;
+  s._computeAccLoss = () => 0; // _computeLadderBaseSize overwrites cycleAccumulatedLoss from the accumulators
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s._harvestToFlat('manual_harvest');
+
+  assert.equal(closeCalled, false, 'must NOT close a quantity it knows is unverified');
+  assert.equal(s.anchor, 100, 'must NOT re-anchor over an unreconciled position — the orphan would net against a new geometry');
+  assert.ok(
+    proxyCalls.includes('/fapi/v2/account'),
+    'the real getCurrentPositions -> detectCurrentPosition chain must actually have run (else this test proves nothing)',
+  );
+  assert.ok(
+    s.ladderLines.filter(l => l.state === 'POSITION_OPEN').length === 5,
+    'the legs must stay marked open — wiping them to EMPTY is what makes the orphan invisible',
+  );
+  assert.equal(s.harvestCount, 0, 'an aborted harvest is not counted');
+  assert.equal(s._tradingSeqInProgress, false, 'the sequence latch is released on the abort path');
+  assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud WARNING is logged instead of a silent stale close');
+  assert.ok(logs.some((m) => m.includes('WARNING') && m.includes('BTCUSDT')), 'the WARNING names the symbol');
+});
+
+test('C1: _harvestToFlat re-verifies and harvests the CORRECT quantity once the retry succeeds', async () => {
+  const s = ladderStrategy({ anchor: 100, base: 1000 });
+  s.ladderLines.filter(l => l.direction === 'LONG').forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 20; });
+  s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024, unrealizedPnl: 0 }; // stale — only 4 legs' worth
+  s.currentSide = 'LONG';
+  s.currentPrice = 103;
+  s._lastPositionRefreshFailed = true;
+
+  s._refreshCurrentPosition = async () => {
+    // the retry succeeds and reveals the REAL, larger quantity
+    s._lastPositionRefreshFailed = false;
+    s.activePosition = { quantity: 100, entryPrice: 100.4, avgEntry: 100.4, notional: 10040, unrealizedPnl: 0 };
+  };
+  let closedQty = null;
+  s._closeConsolidated = async () => { closedQty = s.activePosition.quantity; s.activePosition = null; s.currentSide = null; return true; };
+  s.getTotalMarginBalance = async () => 1e9;
+  s._computeAccLoss = () => 0;
+
+  await s._harvestToFlat('manual_harvest');
+
+  assert.equal(closedQty, 100, 'the harvest must close the REFRESHED (correct) quantity, not the stale 80');
+  assert.equal(s.anchor, 103, 'the re-anchor proceeds once the close is against verified state');
+  assert.equal(s.harvestCount, 1);
+  assert.ok(s.ladderLines.every(l => l.state === 'EMPTY'), 'the ladder resets once the close is against verified state');
+});
