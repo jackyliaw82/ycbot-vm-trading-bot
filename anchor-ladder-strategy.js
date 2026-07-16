@@ -442,11 +442,52 @@ class AnchorLadderStrategy extends TradingBase {
     return hadPosition;
   }
 
-  // Close the full net one-way position to flat. reduceOnly is REQUIRED (not
-  // positionSide, which is a hedge-mode concept) — without it a sub-minNotional
-  // close is rejected by Binance with -4164 "insufficient position".
+  /**
+   * Close the full net one-way position to flat. reduceOnly is REQUIRED (not
+   * positionSide, which is a hedge-mode concept) — without it a sub-minNotional
+   * close is rejected by Binance with -4164 "insufficient position".
+   *
+   * ⚠️ CONTRACT — this is the SINGLE close primitive for the whole strategy.
+   * It closes `this.activePosition.quantity`. That quantity is only
+   * trustworthy if the last Binance refresh SUCCEEDED: after a failed refresh
+   * `activePosition` is whatever it was BEFORE the failure, so its quantity
+   * can sit UNDER what Binance really holds (a leg fill's own refresh 503'd:
+   * memory says 4 legs, Binance holds 5). Closing that stale qty places a
+   * reduceOnly order for less than what is open and ORPHANS the remainder —
+   * a silent partial close. This is the exact defect behind C1 and C3.
+   *
+   * Every caller therefore re-verifies with Binance and refuses on UNKNOWN
+   * state BEFORE calling. Current guarded callers, all of which retry the
+   * refresh once and bail loudly if it still fails:
+   *   - `_flattenGrid`        (its own `_lastPositionRefreshFailed` branch)
+   *   - `_flattenAtAnchor`    (Fix A)
+   *   - `_harvestToFlat`      (C1 — strictly worse there: it re-anchors)
+   *   - `stop({flatten:true})` (C3 — both fallback branches gate on the flag)
+   *
+   * The guard below makes that contract SELF-ENFORCING rather than merely
+   * documented. It is a no-op for all four callers above (each has already
+   * established the flag is false, so it never fires and costs nothing), and
+   * it deliberately REFUSES rather than re-refreshing: consulting is not
+   * verifying, so `_flattenAtAnchor` still re-verifies exactly once and no
+   * second round trip is introduced anywhere. It exists for the NEXT caller —
+   * the safety of this primitive must not keep living only in its callers,
+   * where each new one has to re-derive it and the one that forgets fails
+   * SILENTLY.
+   *
+   * TOMBSTONE — do NOT remove this guard on the grounds that "the callers
+   * already check". That is precisely the property that made C1/C3 possible.
+   */
   async _closeConsolidated(reason) {
     if (!this.activePosition || !(this.activePosition.quantity > 0)) return false;
+    if (this._lastPositionRefreshFailed) {
+      await this.addLog(
+        `[LADDER] WARNING: _closeConsolidated (${reason}): refusing to close ${this.symbol} — the last Binance ` +
+        `position refresh FAILED, so the in-memory quantity (${this.activePosition.quantity}) is UNVERIFIED and ` +
+        `may be under what Binance actually holds; closing it would orphan the remainder. The caller must ` +
+        `re-verify before closing (see this method's contract).`
+      );
+      return false;
+    }
     if (!this.currentSide) {
       // currentSide missing while activePosition is populated is state drift
       // (missed WS update, partial restart, a snapshot written without it).

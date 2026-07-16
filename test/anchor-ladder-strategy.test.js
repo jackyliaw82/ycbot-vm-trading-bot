@@ -264,6 +264,65 @@ test('_closeConsolidated: currentSide still missing after refresh logs a WARNING
   assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud warning was logged, not a silent no-op');
 });
 
+// ——— ITEM 3: the close primitive's safety must not live only in its callers —
+//
+// `_closeConsolidated` closes `activePosition.quantity`, which is only
+// trustworthy if the last refresh SUCCEEDED. Every caller guards it; the
+// primitive itself did not. That is the shape that produced C1 and C3 — a new
+// caller must re-derive the contract, and the one that forgets fails SILENTLY.
+
+test('ITEM 3: _closeConsolidated self-refuses on UNKNOWN state — a caller that forgets to guard cannot silently orphan a position', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024 };
+  s.currentSide = 'LONG';
+  s._lastPositionRefreshFailed = true; // stale qty: Binance may hold more than 80
+  let ordered = null;
+  s.placeMarketOrder = async (...a) => { ordered = a; return { orderId: 1 }; };
+  // Stub the fill-confirm: without it the REVERTED-fix run stalls on the real
+  // 3s WS timeout before failing. A slow failure is still a failure, but a
+  // hang is not — keep the negative path fast and unambiguous.
+  s._waitForOrderFillConfirmation = async () => {};
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+
+  // An unguarded caller — exactly what a future one would look like.
+  const result = await s._closeConsolidated('some_new_caller');
+
+  assert.equal(result, false, 'refuses rather than closing an unverified quantity');
+  assert.equal(ordered, null, 'no reduceOnly order for a quantity that may be under what Binance holds');
+  assert.equal(s.activePosition.quantity, 80, 'the position is left intact for the caller to re-verify');
+  assert.ok(logs.some((m) => m.includes('WARNING')), 'refusal is loud, never silent');
+});
+
+test('ITEM 3: the self-guard introduces NO double-verification — it consults, it does not re-verify', async () => {
+  // C1/C3's pinned design: the CALLER re-verifies once, then closes. If the
+  // primitive re-refreshed instead of merely refusing, _flattenAtAnchor would
+  // verify twice and pay a second round trip. Consulting is not verifying.
+  const s = ladderStrategy({ anchor: 100 });
+  const legs = s.ladderLines.filter(l => l.direction === 'LONG');
+  legs.slice(0, 4).forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 20; });
+  s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024 };
+  s.currentSide = 'LONG';
+  s._lastPositionRefreshFailed = true; // caller will re-verify once
+
+  let refreshCalls = 0;
+  s._refreshCurrentPosition = async () => {
+    refreshCalls++;
+    s._lastPositionRefreshFailed = false; // the caller's single re-verification succeeds
+    s.activePosition = { quantity: 100, entryPrice: 100.4, avgEntry: 100.4, notional: 10040 };
+  };
+  let closedQty = null;
+  s.placeMarketOrder = async (_sym, _side, qty) => { closedQty = qty; return { orderId: 1 }; };
+  s._waitForOrderFillConfirmation = async () => {};
+  s.getTotalMarginBalance = async () => 1e9;
+  s._computeAccLoss = () => 0;
+
+  await s._flattenAtAnchor();
+
+  assert.equal(refreshCalls, 1, 'exactly ONE verification total — the caller re-verifies, the primitive only consults');
+  assert.equal(closedQty, 100, 'and the close still proceeds with the REFRESHED quantity (C1/C3 pins intact)');
+});
+
 test('_closeConsolidated: nothing open returns false quietly, no order, no warning', async () => {
   const s = ladderStrategy();
   s.activePosition = null;
