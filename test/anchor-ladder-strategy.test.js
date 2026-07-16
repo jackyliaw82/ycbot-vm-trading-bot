@@ -23,6 +23,13 @@ function ladderStrategy({ mode = 'RANGE', anchor = 100, base = 1000 } = {}) {
   s.initialCapital = base;
   s.activePosition = null;
   s.finalTpPrice = null;
+  // A synthetic `mode: 'TREND'` strategy represents a cycle that already
+  // went through a real (successful) _enterTrend() — mark Final TP as
+  // already armed so `_reconcileTrendInvariant`'s self-heal (Fix B) doesn't
+  // treat these fixtures as "arming failed" and clobber a manually-set
+  // finalTpPrice. Tests that specifically exercise the arming-failure /
+  // self-heal path override this back to false themselves.
+  s._trendFinalTpArmed = mode === 'TREND';
   s._tradingSeqInProgress = false;
   s._manualHarvestRequested = false;
   s.addLog = async () => {};
@@ -254,9 +261,20 @@ test('_computeLadderBaseSize: uses the LIVE margin balance, not a stale one — 
   s.recoveryDistance = 0.005;
   s.leverage = 10;
   s.activePosition = null;
+  // FIX D: `_computeLadderBaseSize`'s first line overwrites
+  // `cycleAccumulatedLoss` with `_computeAccLoss()`'s return. Without
+  // stubbing it, the real `_computeAccLoss` (accumulators are all 0 in this
+  // fixture) resets accLoss to 0, the formula floors at currentInitialSize
+  // (10000) BEFORE the margin-headroom cap is ever consulted, and the
+  // assertion below passed trivially — it would still pass with
+  // `_applyMarginHeadroomCap` deleted entirely. Stubbing this makes the
+  // formula actually propose 12000 so the cap has something to bite.
+  s._computeAccLoss = () => 50;
   s.getTotalMarginBalance = async () => 100; // live balance during drawdown is tiny
+  const uncapped = s._computeFormulaSize();
+  assert.equal(uncapped, 12000, 'sanity: the formula (before any cap) proposes 12000 for this accLoss');
   const sized = await s._computeLadderBaseSize();
-  assert.equal(sized, s.currentInitialSize, 'the live-balance headroom cap bites and floors to currentInitialSize');
+  assert.equal(sized, s.currentInitialSize, 'the live-balance headroom cap bites and floors to currentInitialSize (10000), not the uncapped 12000');
 });
 
 test('_computeLadderBaseSize: getTotalMarginBalance() throwing fails CLOSED — capped to currentInitialSize, never left uncapped', async () => {
@@ -271,6 +289,30 @@ test('_computeLadderBaseSize: getTotalMarginBalance() throwing fails CLOSED — 
   const sized = await s._computeLadderBaseSize();
   assert.equal(sized, s.currentInitialSize, 'an unknown wallet balance must never read as headroom — cap to the safe floor');
   assert.ok(logs.some((m) => m.includes('fail-closed') || m.includes('failed')), 'the fail-closed cap is logged');
+});
+
+test('FIX C: getTotalMarginBalance() resolving to NaN (a 200 with a missing/malformed field, no throw) still fails CLOSED — capped, never uncapped', async () => {
+  const s = ladderStrategy({ base: 10000 });
+  s.currentInitialSize = 10000;
+  s.cycleAccumulatedLoss = 50;
+  s.recoveryFactor = 0.20;
+  s.recoveryDistance = 0.005;
+  s._computeAccLoss = () => 50; // formula would otherwise propose 12000 uncapped
+  s.getTotalMarginBalance = async () => NaN; // does NOT throw — the exact gap this fix closes
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+  const sized = await s._computeLadderBaseSize();
+  assert.equal(sized, s.currentInitialSize, 'a NaN wallet balance must never read as infinite headroom — cap to the safe floor, not the uncapped 12000');
+  assert.ok(logs.some((m) => m.includes('fail-closed') || m.includes('invalid') || m.includes('unknown')), 'the fail-closed cap is logged');
+});
+
+test('FIX C: _applyMarginHeadroomCap directly — a non-finite wallet caps to currentInitialSize instead of returning proposedSize uncapped', () => {
+  const s = ladderStrategy({ base: 10000 });
+  s.currentInitialSize = 10000;
+  s.addLog = async () => {};
+  assert.equal(s._applyMarginHeadroomCap(12000, NaN), 10000, 'NaN wallet must fail closed');
+  assert.equal(s._applyMarginHeadroomCap(12000, undefined), 10000, 'undefined wallet must fail closed');
+  assert.equal(s._applyMarginHeadroomCap(12000, 0), 10000, 'zero wallet must fail closed too (previously fell through to uncapped)');
 });
 
 test('_recomputeFinalTpPrice: no AI cost term', () => {
@@ -694,4 +736,166 @@ test('Fix 2: stop({flatten:true}) with legs POSITION_OPEN and the position API f
   assert.ok(!logs.some((m) => m.includes('confirmed flat')), 'must never claim confirmed-flat when the state is unknown');
   assert.ok(!logs.some((m) => m.includes('nothing to flatten')), 'must never claim nothing-to-flatten when the state is unknown');
   assert.equal(s.executionState, 'TERMINATED', 'stop() still completes termination — it never hangs open');
+});
+
+// ——— Adversarial re-review fixes (Fix A / Fix B) —————————————————————————
+//
+// FIX A: `_flattenAtAnchor` never consulted `_lastPositionRefreshFailed` —
+// closing a STALE `activePosition.quantity` (a fill's own refresh 503'd,
+// leaving in-memory qty under Binance's real held qty) orphaned the residual
+// on Binance and then wiped every leg to EMPTY, converting "wipe on unknown"
+// into "silent partial-close on unknown".
+//
+// FIX B: `_enterTrend` armed Final TP off `_recomputeFinalTpPrice()`
+// regardless of whether its own arming refresh succeeded, baking a wrong
+// exit price for the rest of the cycle (Final TP is armed HERE AND ONLY
+// HERE — no later leg fills occur in TREND to correct it).
+
+test('FIX A: _flattenAtAnchor with a failed position refresh does NOT close a stale quantity and does NOT reset the ladder', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  const openLeg = s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1);
+  openLeg.state = 'POSITION_OPEN';
+  openLeg.quantity = 80; // stale in-memory qty; Binance may actually hold more
+  s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s._lastPositionRefreshFailed = true; // set by a prior failed refresh (e.g. the fill's own refresh 503'd)
+
+  let refreshCalls = 0;
+  s._refreshCurrentPosition = async () => {
+    refreshCalls++;
+    s._lastPositionRefreshFailed = true; // the re-verification attempt fails too — state stays UNKNOWN
+  };
+  let closeCalled = false;
+  s._closeConsolidated = async () => { closeCalled = true; return true; };
+
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s._flattenAtAnchor();
+
+  assert.equal(refreshCalls, 1, 're-verifies with Binance before deciding whether to close');
+  assert.equal(closeCalled, false, 'must NOT close a quantity it knows is unverified');
+  assert.equal(openLeg.state, 'POSITION_OPEN', 'the ladder must NOT be reset to EMPTY over an unreconciled position');
+  assert.equal(s.ladderMode, 'RANGE', 'ladderMode is untouched (the reset never ran)');
+  assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud WARNING is logged instead of a silent stale close');
+  assert.ok(logs.some((m) => m.includes('WARNING') && m.includes('BTCUSDT')), 'the WARNING names the symbol');
+});
+
+test('FIX A: _flattenAtAnchor re-verifies and proceeds with the CORRECT quantity once the retry succeeds', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  const legs = s.ladderLines.filter(l => l.direction === 'LONG');
+  legs.slice(0, 4).forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 20; });
+  s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024, unrealizedPnl: 0 }; // stale — only 4 legs' worth
+  s.currentSide = 'LONG';
+  s._lastPositionRefreshFailed = true;
+
+  s._refreshCurrentPosition = async () => {
+    // the retry succeeds and reveals the REAL, larger quantity (the 5th
+    // leg's own fill's refresh had failed earlier and was never corrected).
+    s._lastPositionRefreshFailed = false;
+    s.activePosition = { quantity: 100, entryPrice: 100.4, avgEntry: 100.4, notional: 10040, unrealizedPnl: 0 };
+  };
+
+  let closedQty = null;
+  s._closeConsolidated = async () => { closedQty = s.activePosition.quantity; s.activePosition = null; s.currentSide = null; return true; };
+  s.getTotalMarginBalance = async () => 1e9;
+  s._computeAccLoss = () => 0;
+
+  await s._flattenAtAnchor();
+
+  assert.equal(closedQty, 100, 'the flatten must close the REFRESHED (correct) quantity, not the stale 80');
+  assert.equal(s.ladderMode, 'RANGE');
+  assert.ok(s.ladderLines.every(l => l.state === 'EMPTY'), 'the ladder resets once the close is against verified state');
+});
+
+test('FIX B: _enterTrend does NOT arm Final TP when the arming refresh fails (twice) — clears the stale value and logs loudly', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.ladderLines.filter(l => l.direction === 'LONG').forEach(l => { l.state = 'POSITION_OPEN'; l.quantity = 20; l.fillPrice = l.price; });
+  s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024, unrealizedPnl: 0 }; // stale: only 4 legs' worth
+  s.currentSide = 'LONG';
+  s.finalTpPrice = 101.9305; // a stale value left by the outermost leg's own (also-stale) _postExecuteBookkeeping recompute
+  s.cycleAccumulatedLoss = 89;
+  s.desiredProfitUSDT = 100;
+
+  let refreshCalls = 0;
+  s._refreshCurrentPosition = async () => {
+    refreshCalls++;
+    s._lastPositionRefreshFailed = true; // fails on the initial attempt AND the retry
+  };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s._enterTrend('LONG');
+
+  assert.equal(refreshCalls, 2, 'retries once before giving up');
+  assert.equal(s._trendFinalTpArmed, false, 'must not be marked armed');
+  assert.equal(s.finalTpPrice, null, 'must NOT arm from unverified data — the stale pre-existing value is cleared, not trusted');
+  assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud WARNING is logged instead of arming silently');
+});
+
+test('FIX B: _enterTrend arms Final TP normally when the refresh succeeds on the first try', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.ladderLines.filter(l => l.direction === 'LONG').forEach(l => { l.state = 'POSITION_OPEN'; l.quantity = 20; l.fillPrice = l.price; });
+  s.currentSide = 'LONG';
+  s.cycleAccumulatedLoss = 89;
+  s.desiredProfitUSDT = 100;
+
+  let refreshCalls = 0;
+  s._refreshCurrentPosition = async () => {
+    refreshCalls++;
+    s._lastPositionRefreshFailed = false;
+    s.activePosition = { quantity: 100, entryPrice: 100.4, avgEntry: 100.4, notional: 10040, unrealizedPnl: 0 };
+  };
+
+  await s._enterTrend('LONG');
+
+  assert.equal(refreshCalls, 1, 'no retry needed when the first refresh succeeds');
+  assert.equal(s._trendFinalTpArmed, true);
+  assert.ok(s.finalTpPrice != null, 'Final TP is armed from the verified position');
+});
+
+test('FIX B: _reconcileTrendInvariant self-heals Final TP once the refresh recovers — not permanently stuck unarmed', async () => {
+  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  s.trendDirection = 'LONG';
+  s._trendFinalTpArmed = false; // arming failed at the original TREND transition
+  s.finalTpPrice = null;
+  s.currentSide = 'LONG';
+  s.cycleAccumulatedLoss = 89;
+  s.desiredProfitUSDT = 100;
+
+  let refreshCalls = 0;
+  s._refreshCurrentPosition = async () => {
+    refreshCalls++;
+    s._lastPositionRefreshFailed = false; // the retry now succeeds
+    s.activePosition = { quantity: 100, entryPrice: 100.4, avgEntry: 100.4, notional: 10040, unrealizedPnl: 0 };
+  };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  const healed = await s._reconcileTrendInvariant();
+
+  assert.equal(refreshCalls, 1);
+  assert.equal(healed, true);
+  assert.equal(s._trendFinalTpArmed, true, 'now marked armed');
+  assert.ok(s.finalTpPrice != null, 'Final TP is now armed from the freshly verified position');
+  assert.ok(logs.some((m) => m.includes('armed')), 'the successful self-heal is logged');
+});
+
+test('FIX B: _reconcileTrendInvariant keeps retrying (does not crash or wedge) while the refresh keeps failing', async () => {
+  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  s.trendDirection = 'LONG';
+  s._trendFinalTpArmed = false;
+  s.finalTpPrice = null;
+  s.currentSide = 'LONG';
+
+  s._refreshCurrentPosition = async () => { s._lastPositionRefreshFailed = true; };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  const healed = await s._reconcileTrendInvariant();
+
+  assert.equal(healed, false);
+  assert.equal(s._trendFinalTpArmed, false, 'still not armed — nothing to self-heal from yet');
+  assert.equal(s.finalTpPrice, null);
+  assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud WARNING, never a silent no-op');
 });

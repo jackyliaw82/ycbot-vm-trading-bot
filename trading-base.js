@@ -2434,7 +2434,15 @@ class TradingBase {
   async getTotalMarginBalance() {
     try {
       const accountInfo = await this.makeProxyRequest('/fapi/v2/account', 'GET', {}, true, 'futures');
-      return parseFloat(accountInfo.totalMarginBalance);
+      const totalMarginBalance = parseFloat(accountInfo.totalMarginBalance);
+      // A 200 response with an absent/malformed totalMarginBalance field
+      // parses to NaN WITHOUT throwing — that must not silently propagate
+      // to a caller doing a fail-closed headroom check. Throw so it lands
+      // in the same "unknown balance" bucket as a hard API failure.
+      if (!Number.isFinite(totalMarginBalance)) {
+        throw new Error(`totalMarginBalance is non-finite in account response (got ${JSON.stringify(accountInfo?.totalMarginBalance)})`);
+      }
+      return totalMarginBalance;
     } catch (error) {
       console.error(`Failed to get total margin balance: ${error.message}`);
       throw error;

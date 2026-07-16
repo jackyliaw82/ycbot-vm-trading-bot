@@ -65,6 +65,12 @@ class AnchorLadderStrategy extends TradingBase {
     // once a fetch succeeds. stop()'s flatten path and _flattenGrid() read
     // this to avoid treating a failed refresh as a confirmed-flat position.
     this._lastPositionRefreshFailed = false;
+    // Set by _enterTrend(): true once Final TP has been armed from a
+    // VERIFIED (successfully refreshed) position at the RANGE→TREND
+    // transition. False while TREND is active but the arming refresh
+    // failed — signals `_reconcileTrendInvariant` (every tick + resume) to
+    // keep retrying rather than leaving the cycle permanently unarmed.
+    this._trendFinalTpArmed = false;
     this.finalTpPrice = null;
     this.cycleAccumulatedLoss = 0;
     this.reversalCount = 0;
@@ -273,6 +279,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.ladderLines = buildLadder(currentPrice, this.stepPct, this.levelsPerSide);
     this.ladderMode = 'RANGE';
     this.trendDirection = null;
+    this._trendFinalTpArmed = false;
     this.finalTpPrice = null;
     this.lastProcessedPrice = currentPrice;
 
@@ -514,9 +521,41 @@ class AnchorLadderStrategy extends TradingBase {
    * log + strategyFlow audit trail on every oscillation.
    */
   async _flattenAtAnchor() {
-    const hadPosition = !!(this.activePosition && this.activePosition.quantity > 0);
+    let hadPosition = !!(this.activePosition && this.activePosition.quantity > 0);
     const hasOpenLegs = this.ladderLines.some(l => l.state === 'POSITION_OPEN');
     if (!hadPosition && !hasOpenLegs) return;
+
+    // The last Binance refresh may have failed (_lastPositionRefreshFailed),
+    // in which case `this.activePosition` is whatever it was BEFORE that
+    // failure — possibly a STALE quantity (e.g. a leg fill's own refresh
+    // 503'd, so activePosition still reflects 4/5 legs while Binance already
+    // holds all 5). Closing that stale quantity would place a reduceOnly
+    // order for less than what's actually open, orphan the remainder on
+    // Binance, and then wipe every leg to EMPTY below — converting "wipe on
+    // unknown" into "silent partial-close on unknown", the exact class this
+    // flag exists to prevent. Re-verify with Binance before committing to a
+    // close; if it's still unverifiable, do NOT close and do NOT reset the
+    // ladder — leave the legs marked so the state stays inspectable.
+    if (this._lastPositionRefreshFailed) {
+      await this.addLog(
+        `[LADDER] _flattenAtAnchor: last position refresh failed for ${this.symbol} — re-verifying with Binance ` +
+        `before closing (in-memory qty may be stale).`
+      );
+      await this._refreshCurrentPosition();
+      if (this._lastPositionRefreshFailed) {
+        const openLegsNow = this.ladderLines.filter(l => l.state === 'POSITION_OPEN');
+        const qty = openLegsNow.reduce((sum, l) => sum + (l.quantity || 0), 0);
+        await this.addLog(
+          `[LADDER] WARNING: _flattenAtAnchor: Binance position refresh still failing for ${this.symbol} — ` +
+          `${openLegsNow.length} ladder leg(s) marked open (last-known qty ${qty}) but current Binance state is ` +
+          `UNKNOWN. NOT closing a possibly-stale quantity and NOT resetting the ladder — will retry on the next ` +
+          `anchor crossing.`
+        );
+        return;
+      }
+      // Refresh succeeded — re-derive off the now-verified state before deciding whether to close.
+      hadPosition = !!(this.activePosition && this.activePosition.quantity > 0);
+    }
 
     if (hadPosition) {
       await this._closeConsolidated('anchor_flatten');
@@ -529,6 +568,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.ladderLines = buildLadder(this.anchor, this.stepPct, this.levelsPerSide);
     this.ladderMode = 'RANGE';
     this.trendDirection = null;
+    this._trendFinalTpArmed = false;
     this.finalTpPrice = null;
 
     await this.addLog(
@@ -554,16 +594,43 @@ class AnchorLadderStrategy extends TradingBase {
   async _enterTrend(direction) {
     this.ladderMode = 'TREND';
     this.trendDirection = direction;
+    this._trendFinalTpArmed = false;
     await this._refreshCurrentPosition(true);
-    this._recomputeFinalTpPrice(); // armed HERE and only here — RANGE never checks it
+    if (this._lastPositionRefreshFailed) {
+      // One retry before giving up: a single 503 right at the TREND
+      // transition must not bake a wrong exit price for the whole cycle —
+      // Final TP is armed HERE AND ONLY HERE; in TREND no further leg fills
+      // occur, so `_postExecuteBookkeeping` never runs again to correct it,
+      // and the funding-poll recompute just re-derives from the same stale
+      // `activePosition`.
+      await this._refreshCurrentPosition(true);
+    }
+    if (this._lastPositionRefreshFailed) {
+      // Explicitly null out finalTpPrice rather than leaving whatever this
+      // leg's own `_postExecuteBookkeeping` recompute set it to a moment
+      // earlier — that value was ALSO derived off the same not-yet-fully-
+      // reconciled position (it predates this leg's confirmed fill) and the
+      // TREND exit check (`if (this.finalTpPrice && ...)`) doesn't know
+      // about `_trendFinalTpArmed` — it trusts any non-null value. "Not
+      // armed" must mean null, not "silently keep the last stale guess".
+      this.finalTpPrice = null;
+      await this.addLog(
+        `[LADDER] WARNING: _enterTrend: Binance position refresh failed (twice) while arming TREND ${direction} ` +
+        `for ${this.symbol} — Final TP NOT armed from unverified data. Position remains fully exposed with NO ` +
+        `exit target until _reconcileTrendInvariant self-heals it on a later tick/resume.`
+      );
+    } else {
+      this._recomputeFinalTpPrice(); // armed HERE and only here — RANGE never checks it
+      this._trendFinalTpArmed = true;
+    }
 
     const avg = averageOpenEntry(this.ladderLines, direction);
     await this.addLog(
       `===== TREND ${direction} (fully scaled @ ${this._formatPrice(this.currentPrice)}) ===== ` +
-      `avg entry ${this._formatPrice(avg)} | Final TP ${this._formatPrice(this.finalTpPrice)}`,
+      `avg entry ${this._formatPrice(avg)} | Final TP ${this.finalTpPrice != null ? this._formatPrice(this.finalTpPrice) : 'UNARMED — see WARNING above'}`,
     );
     await this._writeStrategyFlow('TREND_ENTER', {
-      direction, avgEntry: avg, finalTpPrice: this.finalTpPrice,
+      direction, avgEntry: avg, finalTpPrice: this.finalTpPrice, armed: this._trendFinalTpArmed,
     }).catch(() => {});
     await this.saveState();
   }
@@ -589,17 +656,48 @@ class AnchorLadderStrategy extends TradingBase {
    * once `ladderMode` is already 'TREND'.
    */
   async _reconcileTrendInvariant() {
-    if (this.ladderMode !== 'RANGE') return false;
-    const outermost = this.ladderLines.find(
-      (l) => l.levelIndex === this.levelsPerSide && l.state === 'POSITION_OPEN',
-    );
-    if (!outermost) return false;
-    await this.addLog(
-      `[LADDER] RANGE→TREND invariant reconcile: outermost ${outermost.direction} leg already ` +
-      `POSITION_OPEN with ladderMode still RANGE — arming TREND now (resume or a missed tick).`,
-    );
-    await this._enterTrend(outermost.direction);
-    return true;
+    if (this.ladderMode === 'RANGE') {
+      const outermost = this.ladderLines.find(
+        (l) => l.levelIndex === this.levelsPerSide && l.state === 'POSITION_OPEN',
+      );
+      if (!outermost) return false;
+      await this.addLog(
+        `[LADDER] RANGE→TREND invariant reconcile: outermost ${outermost.direction} leg already ` +
+        `POSITION_OPEN with ladderMode still RANGE — arming TREND now (resume or a missed tick).`,
+      );
+      await this._enterTrend(outermost.direction);
+      return true;
+    }
+
+    // Self-heal for Fix B: `_enterTrend` already ran (ladderMode is TREND)
+    // but its arming refresh failed (twice) and left Final TP unarmed. No
+    // further leg fills happen in TREND, so nothing else will ever retry
+    // this — this reconcile runs on every tick and on resume, so it keeps
+    // retrying until Binance answers rather than leaving the cycle stuck
+    // fully exposed with no exit target for the rest of the cycle.
+    if (this.ladderMode === 'TREND' && !this._trendFinalTpArmed) {
+      await this.addLog(
+        `[LADDER] TREND Final-TP invariant reconcile: TREND ${this.trendDirection} active for ${this.symbol} but ` +
+        `Final TP is still unarmed — retrying position refresh.`
+      );
+      await this._refreshCurrentPosition(true);
+      if (this._lastPositionRefreshFailed) {
+        await this.addLog(
+          `[LADDER] WARNING: TREND Final-TP invariant reconcile: refresh failed again for ${this.symbol} — ` +
+          `Final TP still unarmed, will retry next tick.`
+        );
+        return false;
+      }
+      this._recomputeFinalTpPrice();
+      this._trendFinalTpArmed = true;
+      await this.addLog(
+        `[LADDER] TREND Final-TP invariant reconcile: Final TP armed at ${this._formatPrice(this.finalTpPrice)}.`
+      );
+      await this.saveState();
+      return true;
+    }
+
+    return false;
   }
 
   /**
@@ -1395,8 +1493,18 @@ class AnchorLadderStrategy extends TradingBase {
    * headroom exactly during drawdown, when the cap matters most.
    */
   _applyMarginHeadroomCap(proposedSize, wallet) {
-    wallet = wallet || 0;
-    if (wallet <= 0) return proposedSize;
+    // Fail CLOSED on an unknown wallet balance. The `getTotalMarginBalance()`
+    // call site already throws (caught by `_computeLadderBaseSize`) on a
+    // hard API failure, but a 200 response with a missing/malformed field
+    // parses to NaN WITHOUT throwing — belt-and-braces here too. An unknown
+    // balance must NEVER read as "infinite headroom" (the previous
+    // `wallet <= 0 -> return proposedSize` fell through to exactly that for
+    // NaN, since `NaN <= 0` is false).
+    if (!Number.isFinite(wallet) || wallet <= 0) {
+      const floor = this.currentInitialSize || 0;
+      void this.addLog(`[LADDER] margin-headroom cap: wallet balance invalid/unknown (${wallet}) — capping to ${floor} (fail-closed).`);
+      return floor;
+    }
     const proposedNotional = proposedSize;
     const usedMargin = (this.activePosition?.notional || 0) / Math.max(1, this.leverage);
     const proposedMarginUse = proposedNotional / Math.max(1, this.leverage);
