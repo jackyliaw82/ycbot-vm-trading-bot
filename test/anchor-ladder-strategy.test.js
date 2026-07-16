@@ -998,3 +998,160 @@ test('FIX B: _reconcileTrendInvariant keeps retrying (does not crash or wedge) w
   assert.equal(s.finalTpPrice, null);
   assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud WARNING, never a silent no-op');
 });
+
+// ——— Boot recovery must survive a transient position-API failure ————————
+//
+// REGRESSION PIN. resume() and start() each used to carry a BARE
+// `await this.detectCurrentPosition(true)` immediately above their
+// `await this._refreshCurrentPosition()` call. Once getCurrentPositions() was
+// changed to THROW on an API error (so "flat" and "unknown" stop being the
+// same value), that bare, unguarded call made ONE transient 503 during boot
+// throw straight out of resume() into app.js's recovery `.catch()`, which does
+// `isRunning=false` + `activeStrategies.delete()` + a `recovery_failed` write.
+// Boot recovery queries `where('isRunning','==',true)`, so the strategy was
+// NEVER picked up again: a live leveraged position left open on Binance with
+// no ladder, no Final TP and — by design — no stop-loss, while the UI read
+// "stopped". Permanent, never retried.
+//
+// These tests stub at the NETWORK boundary (makeProxyRequest) so the real
+// getCurrentPositions -> detectCurrentPosition -> _refreshCurrentPosition
+// chain executes. They deliberately do NOT use ladderStrategy(), whose
+// `_refreshCurrentPosition` no-op stub is exactly why this bug was invisible
+// to a fully green suite.
+
+const API_503 = () => {
+  const err = new Error('Binance proxy error: 503 Service Unavailable');
+  err.status = 503;
+  return err;
+};
+
+// Neutralise every heavy resume()/start() internal EXCEPT the position chain
+// under test (detectCurrentPosition / _refreshCurrentPosition), which must run
+// for real. Returns the proxy-call log.
+function stubBootInternals(s) {
+  const proxyCalls = [];
+  s.initFirestoreCollections = () => {};
+  s.addLog = async () => {};
+  s.saveState = async () => {};
+  s._writeStrategyFlow = async () => {};
+  s.setLeverage = async () => {};
+  s.setPositionMode = async () => {};
+  s._getExchangeInfo = async () => {};
+  s.exchangeInfoCache = { BTCUSDT: { minNotional: 5 } };
+  s._retryListenKeyRequest = async () => {};
+  s.connectUserDataStream = () => {};
+  s.connectRealtimeWebSocket = () => {};
+  s._startWebSocketHealthMonitoring = () => {};
+  s._scheduleVolumeRefresh = () => {};
+  s._refreshVolumeSnapshot = async () => {};
+  s._preloadWsHandledOrderIdsFromFirestore = async () => {};
+  s._reconcileRecentTrades = async () => {};
+  s._pollFundingIncome = async () => {};
+  s._scheduleNextFundingPoll = () => {};
+  s._scheduledListenKeyRefresh = () => {};
+  // THE network boundary. /fapi/v2/account is what getCurrentPositions() hits.
+  s.makeProxyRequest = async (endpoint) => {
+    proxyCalls.push(endpoint);
+    throw API_503();
+  };
+  return proxyCalls;
+}
+
+function bootSnapshot() {
+  return {
+    strategyId: 'anchor_ladder_boot_test',
+    profileId: 'test-profile',
+    userId: 'test-user',
+    gcfProxyUrl: 'http://proxy.invalid',
+    sharedVmProxyGcfUrl: 'http://vm.invalid',
+    symbol: 'BTCUSDT',
+    leverage: 10,
+    ladderMode: 'RANGE',
+    anchor: 100,
+    ladderLines: buildLadder(100, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE).map((l) =>
+      (l.direction === 'LONG' && l.levelIndex === 1)
+        ? { ...l, state: 'POSITION_OPEN', quantity: 2 }
+        : l,
+    ),
+    lastProcessedPrice: 100.35,
+    currentSide: 'LONG',
+    // A REAL live leveraged position — this is what the bug abandoned.
+    currentPosition: { quantity: 2, entryPrice: 100.3, avgEntry: 100.3, notional: 200.6, unrealizedPnl: 0 },
+    cycleAccumulatedLoss: 12.5,
+    initialCapital: 1000,
+    currentInitialSize: 1000,
+    ladderBaseSize: 1000,
+    cycleStartTime: Date.now() - 60_000,
+    subState: 'LONG_HELD',
+    config: { initialSize: 1000, desiredProfitUSDT: 50 },
+  };
+}
+
+test('resume() RESOLVES when the position API 503s — a transient boot failure must never abandon a live position', async () => {
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
+  const proxyCalls = stubBootInternals(s);
+  const snapshot = bootSnapshot();
+
+  // The pre-fix bare `await this.detectCurrentPosition(true)` rethrows here and
+  // rejects resume(), which is what app.js's recovery .catch() turned into a
+  // permanent isRunning=false. The finally is mandatory: resume() arms a 30-min
+  // listen-key interval BEFORE this point, so a rejection that skipped the
+  // clearInterval would hang the test runner instead of failing it.
+  try {
+    await assert.doesNotReject(
+      () => s.resume(snapshot),
+      'resume() must swallow a transient position-API failure — a rejection here is what app.js turns into a permanent, never-retried stop',
+    );
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+
+  assert.ok(
+    proxyCalls.includes('/fapi/v2/account'),
+    'the real getCurrentPositions -> detectCurrentPosition chain must actually have run (else this test proves nothing)',
+  );
+
+  // 1. What app.js's recovery .catch() would have destroyed.
+  assert.equal(s.isRunning, true, 'the strategy stays LIVE so the per-tick retry can recover it');
+  assert.notEqual(s.criticalError, 'recovery_failed', 'the doc is never marked recovery_failed by a transient 503');
+
+  // 2. The machinery the bare call defeated actually engaged.
+  assert.equal(
+    s._lastPositionRefreshFailed,
+    true,
+    'the failure is flagged — position state reads as UNKNOWN, never as flat',
+  );
+
+  // 3. The restored position is NOT wiped to flat/null by the failure.
+  assert.ok(s.activePosition, 'the restored live position survives the failed refresh');
+  assert.equal(s.activePosition.quantity, 2);
+  assert.equal(s.activePosition.entryPrice, 100.3);
+  assert.equal(s.currentSide, 'LONG', 'side is preserved, not cleared');
+  assert.equal(
+    s.ladderLines.filter((l) => l.state === 'POSITION_OPEN').length,
+    1,
+    'the open leg is still marked open — nothing is silently discarded',
+  );
+});
+
+test('start() RESOLVES when the position API 503s — no bare detectCurrentPosition escapes start() either', async () => {
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
+  const proxyCalls = stubBootInternals(s);
+  // getWalletBalance also throws on API error, but it is deliberately unguarded
+  // in start() (user-initiated: the error is surfaced to the UI). Stub it so the
+  // 503 under test reaches the position chain, not the balance fetch.
+  s.getWalletBalance = async () => 1000;
+
+  try {
+    await assert.doesNotReject(
+      () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, leverage: 10 }),
+      'start() must not reject on a transient position-API failure',
+    );
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+
+  assert.ok(proxyCalls.includes('/fapi/v2/account'), 'the real position chain ran');
+  assert.equal(s.isRunning, true);
+  assert.equal(s._lastPositionRefreshFailed, true, 'flagged UNKNOWN, not flat');
+});
