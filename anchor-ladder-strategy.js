@@ -255,7 +255,10 @@ class AnchorLadderStrategy extends TradingBase {
     this._scheduleVolumeRefresh();
 
     // Reconcile against Binance — pick up any pre-existing position (e.g., manual trade or VM restart).
-    await this.detectCurrentPosition(true);
+    // _refreshCurrentPosition() calls detectCurrentPosition(true) itself, inside
+    // a try that sets _lastPositionRefreshFailed. Do NOT add a bare
+    // detectCurrentPosition() call here: it now THROWS on an API error, and an
+    // unguarded throw escapes start() (see the note in resume()).
     await this._refreshCurrentPosition();
 
     // Funding poll baseline + scheduler. Anchor at strategy start so the
@@ -916,7 +919,22 @@ class AnchorLadderStrategy extends TradingBase {
     });
 
     // Reconcile position from Binance (source of truth).
-    await this.detectCurrentPosition(true);
+    //
+    // ⚠️ Do NOT reinstate a bare `await this.detectCurrentPosition(true)` here.
+    // It used to sit on this line and was a CRITICAL bug: detectCurrentPosition()
+    // THROWS on an API error (so that "flat" and "unknown" stop being the same
+    // value), and an unguarded throw escapes resume() into app.js's recovery
+    // .catch(), which sets isRunning:false. Boot recovery queries
+    // where('isRunning','==',true) — so ONE transient 503 during a redeploy
+    // permanently abandoned a live position: still open on Binance, no ladder,
+    // no Final TP, and no stop-loss by design. Never retried, because the doc
+    // had already been marked stopped.
+    //
+    // _refreshCurrentPosition() makes the identical detectCurrentPosition(true)
+    // call inside a try that sets _lastPositionRefreshFailed, which every
+    // consequential reader consults and which _reconcileTrendInvariant retries
+    // on each tick. The bare call was pure redundancy that defeated exactly the
+    // machinery built for this case.
     await this._refreshCurrentPosition();
 
     // Catch up on any funding settlements during downtime, then schedule
