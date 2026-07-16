@@ -9,7 +9,7 @@ import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, MIN_INITIAL_SIZE_
 import { planLadderActions, averageOpenEntry } from './ladder-crossings.js';
 
 const MARGIN_HEADROOM_FLOOR_PCT = 30;              // free margin floor for sizing safety
-const HARVEST_LOSS_THRESHOLD_PCT = 0.30;           // 30% of initial capital — gate for HARVEST eligibility
+const HARVEST_LOSS_THRESHOLD_PCT = 0.08;           // 8% of initial capital — gate for HARVEST eligibility
 const DEFAULT_RECOVERY_FACTOR = 0.20;
 const DEFAULT_RECOVERY_DISTANCE = 0.005;           // 0.5%
 // Backoff between `_reconcileTrendInvariant`'s Final-TP arming retries.
