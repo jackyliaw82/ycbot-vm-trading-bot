@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AnchorLadderStrategy } from '../anchor-ladder-strategy.js';
-import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE } from '../ladder-levels.js';
+import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, LADDER_STEP_PCT_MAX, LADDER_LEVELS_MAX } from '../ladder-levels.js';
 import { precisionFormatter } from '../precisionUtils.js';
 
 // A strategy with an anchored ladder and nothing open. All I/O stubbed, so a
@@ -55,6 +55,86 @@ test('start() rejects an initial size below the 50 USDT minimum', async () => {
     /50/,
     'the gate must name the minimum',
   );
+});
+
+// ——— Configurable geometry: the VM is the authority on the bounds ———
+
+function geoStrategy() {
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  s.addLog = async () => {};
+  return s;
+}
+
+// NOTE on matchers below: /step/i and /whole number between 3 and 10/ are
+// deliberately specific to the BOUNDS error, not just "step"/"level". A bare
+// /step/i also matches Binance's stepSize wording, and a bare /level/i also
+// matches the min-size error ("for a 2-level ladder") — with initialSize 1000
+// these tests clear the size gate today, but a future initialSize change
+// could let them pass off the WRONG gate while the bounds check silently
+// broke. Pin to the bounds message's own wording so that can't happen.
+test('start() rejects a ladder step below the 0.3% fee floor', async () => {
+  await assert.rejects(
+    () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderStepPct: 0.002 }),
+    /Ladder step .* must be between 0\.3% and 2\.0%/,
+    'the gate must name the step',
+  );
+});
+
+test('start() rejects a ladder step above the 2% ceiling', async () => {
+  await assert.rejects(
+    () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderStepPct: 0.03 }),
+    /Ladder step .* must be between 0\.3% and 2\.0%/,
+  );
+});
+
+test('start() rejects a level count outside 3-10', async () => {
+  await assert.rejects(
+    () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderLevelsPerSide: 2 }),
+    /whole number between 3 and 10/,
+  );
+  await assert.rejects(
+    () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderLevelsPerSide: 11 }),
+    /whole number between 3 and 10/,
+  );
+});
+
+test('start() rejects a non-integer level count', async () => {
+  await assert.rejects(
+    () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderLevelsPerSide: 5.5 }),
+    /whole number between 3 and 10/,
+  );
+});
+
+test('start() scales the minimum initial size with the chosen level count', async () => {
+  // 8 levels needs 8 * 10 = 80 USDT. 79 must be refused even though it clears
+  // the old flat 50.
+  await assert.rejects(
+    () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 79, ladderLevelsPerSide: 8 }),
+    /80/,
+    'the gate must name the scaled minimum',
+  );
+});
+
+// REGRESSION PIN. The start-time minNotional gate used to divide by the CONSTANT
+// (LADDER_LEVELS_PER_SIDE) while _legNotional() divides by the FIELD
+// (this.levelsPerSide). With the constant it validates a 5-rung ladder against an
+// N-rung runtime, and for N > 5 it is TOO PERMISSIVE. Here: 10 levels, 100 USDT,
+// minNotional 15. The buggy gate checks 100/5 = 20 >= 15 and PASSES; the real legs
+// are 100/10 = 10, below the exchange minimum. It must reject.
+test('start() sizes the minNotional gate from the CHOSEN level count, not the default', async () => {
+  const s = geoStrategy();
+  stubBootInternals(s);
+  s.exchangeInfoCache = { BTCUSDT: { minNotional: 15 } };
+  s.getWalletBalance = async () => 1000;
+  try {
+    await assert.rejects(
+      () => s.start({ symbol: 'BTCUSDT', initialSize: 100, ladderLevelsPerSide: 10, leverage: 10 }),
+      /minimum notional/i,
+      'legs are 100/10 = 10 USDT, under the 15 USDT minNotional — must refuse',
+    );
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
 });
 
 // ——— Task 7: tick dispatch ——————————————————————————————————————————
@@ -1487,4 +1567,66 @@ test('C3: stop({flatten:true}) still reports "confirmed flat" when the refresh a
   assert.ok(logs.some((m) => m.includes('position confirmed flat')), 'a genuinely verified flat is still reported as such');
   assert.ok(!logs.some((m) => m.includes('FINAL STATE UNKNOWN')), 'no cry-wolf on the verified path');
   assert.ok(s.ladderLines.every(l => l.state === 'EMPTY'), 'the ladder resets once the close is against verified state');
+});
+
+// ——— Geometry persistence: resume must rebuild the SAME ladder ———
+
+test('saveState persists the ladder geometry', async () => {
+  const s = ladderStrategy();
+  s.stepPct = 0.005;
+  s.levelsPerSide = 8;
+  let saved = null;
+  // saveState writes via this.firestore.collection('strategies').doc(id).set(doc, {merge:true})
+  s.firestore = { collection: () => ({ doc: () => ({ set: async (doc) => { saved = doc; } }) }) };
+  s.addLog = async () => {};
+  // ladderStrategy() stubs saveState for the OTHER tests in this file (so a
+  // trading-sequence test doesn't need a firestore double); this test is
+  // specifically about persistence, so it calls the real prototype method
+  // (same pattern as the existing save/restore round-trip tests above).
+  await AnchorLadderStrategy.prototype.saveState.call(s);
+  assert.ok(saved, 'saveState wrote a doc');
+  assert.equal(saved.stepPct, 0.005, 'stepPct must round-trip');
+  assert.equal(saved.levelsPerSide, 8, 'levelsPerSide must round-trip');
+});
+
+test('resume restores non-default geometry from the snapshot', () => {
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  s._applySnapshotGeometry({ stepPct: 0.005, levelsPerSide: 8 });
+  assert.equal(s.stepPct, 0.005, 'a cycle started at 0.5% must resume at 0.5%');
+  assert.equal(s.levelsPerSide, 8, 'a cycle started at 8 levels must resume at 8');
+});
+
+test('resume falls back to the defaults for a legacy snapshot without geometry', () => {
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  s._applySnapshotGeometry({});
+  assert.equal(s.stepPct, LADDER_STEP_PCT, 'pre-change docs default to 0.3%');
+  assert.equal(s.levelsPerSide, LADDER_LEVELS_PER_SIDE, 'pre-change docs default to 5');
+});
+
+test('resume THROWS on a present-but-invalid geometry instead of silently defaulting (out-of-bounds step)', () => {
+  // A corrupted/out-of-bounds snapshot value is NOT the same as an absent one.
+  // Silently coercing it to the default would read "unknown" as "safe" and
+  // rebuild a ladder that does not match whatever is actually on the exchange
+  // for this cycle — exactly the silent-fail-open shape this codebase forbids.
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  assert.throws(
+    () => s._applySnapshotGeometry({ stepPct: LADDER_STEP_PCT_MAX + 1, levelsPerSide: 5 }),
+    /step/i,
+  );
+});
+
+test('resume THROWS on a present-but-invalid geometry instead of silently defaulting (out-of-bounds levels)', () => {
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  assert.throws(
+    () => s._applySnapshotGeometry({ stepPct: LADDER_STEP_PCT, levelsPerSide: LADDER_LEVELS_MAX + 1 }),
+    /level/i,
+  );
+});
+
+test('resume THROWS on a non-numeric (e.g. stringified) geometry value rather than coercing it', () => {
+  // resolveLadderGeometry is strict, not coercing (a numeric string is not a
+  // number); _applySnapshotGeometry must inherit that, not re-introduce
+  // Number(...) coercion via its own ad hoc checks.
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  assert.throws(() => s._applySnapshotGeometry({ stepPct: '0.005', levelsPerSide: 8 }));
 });

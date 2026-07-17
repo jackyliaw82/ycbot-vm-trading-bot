@@ -1,6 +1,10 @@
 import express from 'express';
 import cors from 'cors';
 import { AnchorLadderStrategy } from './anchor-ladder-strategy.js';
+import {
+  minInitialSizeUSDT,
+  resolveLadderGeometry,
+} from './ladder-levels.js';
 
 // TradFi-Perps symbols are gated by Binance behind a separate trading agreement
 // (error -4411 fires for unsigned accounts). The reversal strategy's symbol
@@ -1353,15 +1357,25 @@ app.post('/anchor-ladder/start', async (req, res) => {
       });
     }
 
-    // Defence in depth — AnchorLadderStrategy.start() gates on
-    // MIN_INITIAL_SIZE_USDT (50 USDT, ladder-levels.js) too, but that check
-    // fires deep inside the non-blocking start() promise after the 200
-    // response has already gone out. Reject here up front so an
-    // under-minimum request never even mints a strategyId or touches the
-    // billing gate.
-    if (!(Number(config.initialSize) >= 50)) {
+    // Defence in depth — AnchorLadderStrategy.start() gates on the geometry
+    // bounds (ladder-levels.js resolveLadderGeometry) too, but those checks
+    // fire deep inside the non-blocking start() promise after the 200
+    // response has already gone out. Reject here up front, via the SAME
+    // validator start() uses, so an out-of-bounds request never even mints a
+    // strategyId or touches the billing gate, AND so this gate can never
+    // silently re-diverge from start()'s (it did once, within a single task —
+    // see resolveLadderGeometry's docstring in ladder-levels.js).
+    const geometry = resolveLadderGeometry({
+      ladderStepPct: config.ladderStepPct,
+      ladderLevelsPerSide: config.ladderLevelsPerSide,
+    });
+    if (!geometry.ok) {
+      return res.status(400).json({ error: geometry.error, code: geometry.code });
+    }
+    const minSize = minInitialSizeUSDT(geometry.levelsPerSide);
+    if (!(Number(config.initialSize) >= minSize)) {
       return res.status(400).json({
-        error: `Initial size (${config.initialSize} USDT) is below the 50 USDT minimum for a 5-level ladder.`,
+        error: `Initial size (${config.initialSize} USDT) is below the ${minSize} USDT minimum for a ${geometry.levelsPerSide}-level ladder.`,
         code: 'INITIAL_SIZE_TOO_LOW',
       });
     }

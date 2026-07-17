@@ -5,7 +5,13 @@ import { FieldValue } from '@google-cloud/firestore';
 import { FEE_RATE } from './fees.js';
 import { VolumeProfile } from './volume-profile.js';
 import { MarketMetrics } from './market-metrics.js';
-import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, MIN_INITIAL_SIZE_USDT } from './ladder-levels.js';
+import {
+  buildLadder,
+  LADDER_STEP_PCT,
+  LADDER_LEVELS_PER_SIDE,
+  minInitialSizeUSDT,
+  resolveLadderGeometry,
+} from './ladder-levels.js';
 import { planLadderActions, averageOpenEntry } from './ladder-crossings.js';
 
 const MARGIN_HEADROOM_FLOOR_PCT = 30;              // free margin floor for sizing safety
@@ -138,8 +144,8 @@ class AnchorLadderStrategy extends TradingBase {
     this.anchor = null;
     this.ladderLines = [];              // [{levelIndex, direction, price, state, quantity}]
     this.lastProcessedPrice = null;     // last tick price the ladder crossing logic saw
-    this.stepPct = LADDER_STEP_PCT;     // fixed geometry, not a user knob (see ladder-levels.js)
-    this.levelsPerSide = LADDER_LEVELS_PER_SIDE;
+    this.stepPct = LADDER_STEP_PCT;     // DEFAULT geometry; start() overrides from config within bounds (see ladder-levels.js resolveLadderGeometry)
+    this.levelsPerSide = LADDER_LEVELS_PER_SIDE; // DEFAULT; same override in start()
     this._tradingSeqInProgress = false; // ladder crossing reentrancy guard
 
     // ---- TREND state ----
@@ -173,19 +179,33 @@ class AnchorLadderStrategy extends TradingBase {
     this.currentInitialSize = config.initialSize || 0;
     this._ladderBaseSize = this.currentInitialSize; // initial ladder uses the initial size; a harvest later carries the last consolidated notional
 
-    // Fixed geometry — not user knobs. The 0.3% step clears the round-trip fee
-    // floor (max(0.0025, FEE_RATE*3) = 0.25%) with headroom.
-    this.stepPct = LADDER_STEP_PCT;
-    this.levelsPerSide = LADDER_LEVELS_PER_SIDE;
-
     if (!this.symbol) throw new Error('AnchorLadderStrategy.start: missing symbol');
+    // Ladder geometry. DEFAULTS preserve the original fixed geometry; both are
+    // user-configurable within bounds enforced HERE via resolveLadderGeometry
+    // (ladder-levels.js) — the SAME validator the /anchor-ladder/start route
+    // uses, so the two gates can never drift again. The UI is a convenience —
+    // the VM is the authority, so an old frontend or a direct API call cannot
+    // deploy a structurally lossy or unreachable ladder. Rejected BEFORE any
+    // network call, like the size gate below.
+    const geometry = resolveLadderGeometry({
+      ladderStepPct: config.ladderStepPct,
+      ladderLevelsPerSide: config.ladderLevelsPerSide,
+    });
+    if (!geometry.ok) {
+      await this.addLog(`ERROR: [VALIDATION_ERROR] ${geometry.error}`);
+      throw new Error(geometry.error);
+    }
+    this.stepPct = geometry.stepPct;
+    this.levelsPerSide = geometry.levelsPerSide;
+
     // Gate on the trivially-known minimum BEFORE any network call — no point
     // burning a setLeverage/setPositionMode/exchangeInfo round trip on an
     // input that's rejected regardless. (The tighter per-symbol minNotional
     // check, which needs exchangeInfoCache, runs further down after
     // _getExchangeInfo.)
-    if (!(this.currentInitialSize >= MIN_INITIAL_SIZE_USDT)) {
-      const msg = `Initial size (${this.currentInitialSize} USDT) is below the ${MIN_INITIAL_SIZE_USDT} USDT minimum for a ${LADDER_LEVELS_PER_SIDE}-level ladder.`;
+    const minSize = minInitialSizeUSDT(this.levelsPerSide);
+    if (!(this.currentInitialSize >= minSize)) {
+      const msg = `Initial size (${this.currentInitialSize} USDT) is below the ${minSize} USDT minimum for a ${this.levelsPerSide}-level ladder.`;
       await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
       throw new Error(msg);
     }
@@ -196,7 +216,8 @@ class AnchorLadderStrategy extends TradingBase {
     // readability: identity/sizing | recovery knobs | advanced toggles.
     await this.addLog(
       `Config: symbol=${this.symbol}, initialSize=${this.currentInitialSize} USDT, ` +
-      `leverage=${this.leverage}x, priceType=${this.priceType} ` +
+      `leverage=${this.leverage}x, priceType=${this.priceType}, ` +
+      `ladderStep=${(this.stepPct * 100).toFixed(2)}%, ladderLevels=${this.levelsPerSide}/side ` +
       `| recoveryFactor=${(this.recoveryFactor * 100).toFixed(0)}%, ` +
       `recoveryDistance=${(this.recoveryDistance * 100).toFixed(2)}%, ` +
       `harvestLossThreshold=${(this.harvestLossThreshold * 100).toFixed(0)}%, ` +
@@ -224,7 +245,10 @@ class AnchorLadderStrategy extends TradingBase {
 
     const minNotional = this.exchangeInfoCache[this.symbol]?.minNotional || 5;
     this.minNotional = minNotional;
-    const legNotional = this.currentInitialSize / LADDER_LEVELS_PER_SIDE;
+    // Divide by the FIELD, not the constant — `_legNotional()` (the runtime
+    // sizing path) already does, and the two must agree or this gate validates a
+    // 5-rung ladder against an N-rung runtime (too permissive for N > 5).
+    const legNotional = this.currentInitialSize / this.levelsPerSide;
     if (legNotional < minNotional) {
       const msg = `Each ladder leg would be ${legNotional.toFixed(2)} USDT, below this symbol's ${minNotional} USDT minimum notional.`;
       await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
@@ -879,6 +903,44 @@ class AnchorLadderStrategy extends TradingBase {
   }
 
   /**
+   * Restore ladder geometry from a persisted snapshot.
+   *
+   * This MUST come from the snapshot, not the constants. A cycle started at 8
+   * levels that resumed at 5 would rebuild a DIFFERENT ladder beneath its own
+   * filled legs — orphaning inventory and confusing _reconcileTrendInvariant,
+   * which derives TREND from "fully scaled". Snapshots written before geometry
+   * was configurable carry neither field; those legitimately default.
+   *
+   * Validation is delegated to resolveLadderGeometry — the SAME single
+   * definition of "valid geometry" that start() and the HTTP route use (see
+   * its docstring in ladder-levels.js). Its `?? DEFAULT` fallback covers the
+   * genuinely-absent (null/undefined) case, i.e. a legacy pre-geometry
+   * snapshot. A field that is PRESENT but fails the bounds/type check (e.g.
+   * corrupted Firestore data, a hand-edited doc, 0, NaN, a numeric string) is
+   * NOT the same as absent — silently coercing it to the default would read
+   * "unknown" as "safe" and rebuild a ladder that may not match whatever is
+   * actually open on the exchange for this cycle. That is exactly the
+   * silent-fail-open shape this codebase forbids (see CLAUDE.md), so this
+   * throws instead: resume() has no surrounding try/catch around this call,
+   * so the throw rejects the resume() promise, and app.js's
+   * recoverActiveStrategies() already treats a rejected resume() as a hard
+   * recovery failure — isRunning:false + criticalError persisted, strategy
+   * NOT added to activeStrategies — rather than silently running with the
+   * wrong ladder.
+   */
+  _applySnapshotGeometry(snapshot = {}) {
+    const geometry = resolveLadderGeometry({
+      ladderStepPct: snapshot.stepPct,
+      ladderLevelsPerSide: snapshot.levelsPerSide,
+    });
+    if (!geometry.ok) {
+      throw new Error(`AnchorLadderStrategy.resume: invalid persisted geometry — ${geometry.error}`);
+    }
+    this.stepPct = geometry.stepPct;
+    this.levelsPerSide = geometry.levelsPerSide;
+  }
+
+  /**
    * Resume a strategy from a Firestore snapshot. Called by app.js boot-scan
    * (recoverActiveStrategies) when a `type: 'ANCHOR_LADDER'` doc has
    * `isRunning: true` but no in-memory instance exists (i.e. PM2 restart
@@ -936,8 +998,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.lastProcessedPrice = snapshot.lastProcessedPrice ?? null;
     this._ladderBaseSize = snapshot.ladderBaseSize || this.currentInitialSize; // grown ladder base survives restarts (else ladder shrinks to initial)
     this._lastLadderSize = snapshot._lastLadderSize ?? null;
-    this.stepPct = LADDER_STEP_PCT;           // fixed, never from the snapshot
-    this.levelsPerSide = LADDER_LEVELS_PER_SIDE;
+    this._applySnapshotGeometry(snapshot);
 
     // Restore cycle state
     this.currentSide = snapshot.currentSide || null;
@@ -2443,6 +2504,10 @@ class AnchorLadderStrategy extends TradingBase {
         lastProcessedPrice: this.lastProcessedPrice,
         ladderBaseSize: this._ladderBaseSize,
         _lastLadderSize: this._lastLadderSize,
+        // Geometry is per-cycle config, not a constant — resume MUST rebuild the
+        // ladder this cycle actually started with (see _applySnapshotGeometry).
+        stepPct: this.stepPct,
+        levelsPerSide: this.levelsPerSide,
         config: {
           recoveryFactor: this.recoveryFactor,
           recoveryDistance: this.recoveryDistance,
