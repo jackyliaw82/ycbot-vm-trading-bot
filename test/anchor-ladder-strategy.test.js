@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AnchorLadderStrategy } from '../anchor-ladder-strategy.js';
-import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE } from '../ladder-levels.js';
+import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, LADDER_STEP_PCT_MAX, LADDER_LEVELS_MAX } from '../ladder-levels.js';
 import { precisionFormatter } from '../precisionUtils.js';
 
 // A strategy with an anchored ladder and nothing open. All I/O stubbed, so a
@@ -1567,4 +1567,66 @@ test('C3: stop({flatten:true}) still reports "confirmed flat" when the refresh a
   assert.ok(logs.some((m) => m.includes('position confirmed flat')), 'a genuinely verified flat is still reported as such');
   assert.ok(!logs.some((m) => m.includes('FINAL STATE UNKNOWN')), 'no cry-wolf on the verified path');
   assert.ok(s.ladderLines.every(l => l.state === 'EMPTY'), 'the ladder resets once the close is against verified state');
+});
+
+// ——— Geometry persistence: resume must rebuild the SAME ladder ———
+
+test('saveState persists the ladder geometry', async () => {
+  const s = ladderStrategy();
+  s.stepPct = 0.005;
+  s.levelsPerSide = 8;
+  let saved = null;
+  // saveState writes via this.firestore.collection('strategies').doc(id).set(doc, {merge:true})
+  s.firestore = { collection: () => ({ doc: () => ({ set: async (doc) => { saved = doc; } }) }) };
+  s.addLog = async () => {};
+  // ladderStrategy() stubs saveState for the OTHER tests in this file (so a
+  // trading-sequence test doesn't need a firestore double); this test is
+  // specifically about persistence, so it calls the real prototype method
+  // (same pattern as the existing save/restore round-trip tests above).
+  await AnchorLadderStrategy.prototype.saveState.call(s);
+  assert.ok(saved, 'saveState wrote a doc');
+  assert.equal(saved.stepPct, 0.005, 'stepPct must round-trip');
+  assert.equal(saved.levelsPerSide, 8, 'levelsPerSide must round-trip');
+});
+
+test('resume restores non-default geometry from the snapshot', () => {
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  s._applySnapshotGeometry({ stepPct: 0.005, levelsPerSide: 8 });
+  assert.equal(s.stepPct, 0.005, 'a cycle started at 0.5% must resume at 0.5%');
+  assert.equal(s.levelsPerSide, 8, 'a cycle started at 8 levels must resume at 8');
+});
+
+test('resume falls back to the defaults for a legacy snapshot without geometry', () => {
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  s._applySnapshotGeometry({});
+  assert.equal(s.stepPct, LADDER_STEP_PCT, 'pre-change docs default to 0.3%');
+  assert.equal(s.levelsPerSide, LADDER_LEVELS_PER_SIDE, 'pre-change docs default to 5');
+});
+
+test('resume THROWS on a present-but-invalid geometry instead of silently defaulting (out-of-bounds step)', () => {
+  // A corrupted/out-of-bounds snapshot value is NOT the same as an absent one.
+  // Silently coercing it to the default would read "unknown" as "safe" and
+  // rebuild a ladder that does not match whatever is actually on the exchange
+  // for this cycle — exactly the silent-fail-open shape this codebase forbids.
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  assert.throws(
+    () => s._applySnapshotGeometry({ stepPct: LADDER_STEP_PCT_MAX + 1, levelsPerSide: 5 }),
+    /step/i,
+  );
+});
+
+test('resume THROWS on a present-but-invalid geometry instead of silently defaulting (out-of-bounds levels)', () => {
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  assert.throws(
+    () => s._applySnapshotGeometry({ stepPct: LADDER_STEP_PCT, levelsPerSide: LADDER_LEVELS_MAX + 1 }),
+    /level/i,
+  );
+});
+
+test('resume THROWS on a non-numeric (e.g. stringified) geometry value rather than coercing it', () => {
+  // resolveLadderGeometry is strict, not coercing (a numeric string is not a
+  // number); _applySnapshotGeometry must inherit that, not re-introduce
+  // Number(...) coercion via its own ad hoc checks.
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  assert.throws(() => s._applySnapshotGeometry({ stepPct: '0.005', levelsPerSide: 8 }));
 });

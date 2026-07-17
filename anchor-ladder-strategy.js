@@ -903,6 +903,44 @@ class AnchorLadderStrategy extends TradingBase {
   }
 
   /**
+   * Restore ladder geometry from a persisted snapshot.
+   *
+   * This MUST come from the snapshot, not the constants. A cycle started at 8
+   * levels that resumed at 5 would rebuild a DIFFERENT ladder beneath its own
+   * filled legs — orphaning inventory and confusing _reconcileTrendInvariant,
+   * which derives TREND from "fully scaled". Snapshots written before geometry
+   * was configurable carry neither field; those legitimately default.
+   *
+   * Validation is delegated to resolveLadderGeometry — the SAME single
+   * definition of "valid geometry" that start() and the HTTP route use (see
+   * its docstring in ladder-levels.js). Its `?? DEFAULT` fallback covers the
+   * genuinely-absent (null/undefined) case, i.e. a legacy pre-geometry
+   * snapshot. A field that is PRESENT but fails the bounds/type check (e.g.
+   * corrupted Firestore data, a hand-edited doc, 0, NaN, a numeric string) is
+   * NOT the same as absent — silently coercing it to the default would read
+   * "unknown" as "safe" and rebuild a ladder that may not match whatever is
+   * actually open on the exchange for this cycle. That is exactly the
+   * silent-fail-open shape this codebase forbids (see CLAUDE.md), so this
+   * throws instead: resume() has no surrounding try/catch around this call,
+   * so the throw rejects the resume() promise, and app.js's
+   * recoverActiveStrategies() already treats a rejected resume() as a hard
+   * recovery failure — isRunning:false + criticalError persisted, strategy
+   * NOT added to activeStrategies — rather than silently running with the
+   * wrong ladder.
+   */
+  _applySnapshotGeometry(snapshot = {}) {
+    const geometry = resolveLadderGeometry({
+      ladderStepPct: snapshot.stepPct,
+      ladderLevelsPerSide: snapshot.levelsPerSide,
+    });
+    if (!geometry.ok) {
+      throw new Error(`AnchorLadderStrategy.resume: invalid persisted geometry — ${geometry.error}`);
+    }
+    this.stepPct = geometry.stepPct;
+    this.levelsPerSide = geometry.levelsPerSide;
+  }
+
+  /**
    * Resume a strategy from a Firestore snapshot. Called by app.js boot-scan
    * (recoverActiveStrategies) when a `type: 'ANCHOR_LADDER'` doc has
    * `isRunning: true` but no in-memory instance exists (i.e. PM2 restart
@@ -960,8 +998,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.lastProcessedPrice = snapshot.lastProcessedPrice ?? null;
     this._ladderBaseSize = snapshot.ladderBaseSize || this.currentInitialSize; // grown ladder base survives restarts (else ladder shrinks to initial)
     this._lastLadderSize = snapshot._lastLadderSize ?? null;
-    this.stepPct = LADDER_STEP_PCT;           // fixed, never from the snapshot
-    this.levelsPerSide = LADDER_LEVELS_PER_SIDE;
+    this._applySnapshotGeometry(snapshot);
 
     // Restore cycle state
     this.currentSide = snapshot.currentSide || null;
@@ -2467,6 +2504,10 @@ class AnchorLadderStrategy extends TradingBase {
         lastProcessedPrice: this.lastProcessedPrice,
         ladderBaseSize: this._ladderBaseSize,
         _lastLadderSize: this._lastLadderSize,
+        // Geometry is per-cycle config, not a constant — resume MUST rebuild the
+        // ladder this cycle actually started with (see _applySnapshotGeometry).
+        stepPct: this.stepPct,
+        levelsPerSide: this.levelsPerSide,
         config: {
           recoveryFactor: this.recoveryFactor,
           recoveryDistance: this.recoveryDistance,
