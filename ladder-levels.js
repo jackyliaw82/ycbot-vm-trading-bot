@@ -54,3 +54,53 @@ export function buildLadder(anchor, stepPct = LADDER_STEP_PCT, levelsPerSide = L
   }
   return legs;
 }
+
+/**
+ * The SINGLE definition of valid ladder geometry. Both the HTTP route
+ * (app.js, which must answer synchronously) and start() (which runs after the
+ * 200 has gone out) validate through this — two copies of this rule drifted
+ * within one task of existing, and an input the route accepts but start()
+ * rejects is a 200 followed by an invisible async failure. See CLAUDE.md's
+ * "silent fail-open" section: never let an input the route accepted read as
+ * valid to one gate and invalid to the other.
+ *
+ * STRICT, not coercing: a numeric string is NOT a number. `Number(...)`
+ * coercion is exactly what let the route accept "0.005"/"8"/[8] while
+ * start()'s `Number.isFinite`/`Number.isInteger` checks reject them — do not
+ * reintroduce it here or at either call site.
+ *
+ * The `?? DEFAULT` fallback applies ONLY to null/undefined (field genuinely
+ * absent). 0, NaN, '', false, [8], etc. are NOT absent — they fall through to
+ * validation and are REJECTED, never silently defaulted. Unknown input must
+ * read as invalid, never as safe.
+ *
+ * Pure: no I/O, throws nothing, always returns a result object.
+ *
+ * @param {{ladderStepPct?: unknown, ladderLevelsPerSide?: unknown}} [input]
+ * @returns {{ok: true, stepPct: number, levelsPerSide: number} | {ok: false, code: string, error: string}}
+ */
+export function resolveLadderGeometry({ ladderStepPct, ladderLevelsPerSide } = {}) {
+  const stepPct = ladderStepPct ?? LADDER_STEP_PCT;
+  const levelsPerSide = ladderLevelsPerSide ?? LADDER_LEVELS_PER_SIDE;
+
+  if (!Number.isFinite(stepPct) || stepPct < LADDER_STEP_PCT_MIN || stepPct > LADDER_STEP_PCT_MAX) {
+    return {
+      ok: false,
+      code: 'LADDER_STEP_OUT_OF_BOUNDS',
+      error:
+        `Ladder step (${(stepPct * 100).toFixed(2)}%) must be between ` +
+        `${(LADDER_STEP_PCT_MIN * 100).toFixed(1)}% and ${(LADDER_STEP_PCT_MAX * 100).toFixed(1)}%. ` +
+        `Below ${(LADDER_STEP_PCT_MIN * 100).toFixed(1)}% every anchor-flatten round trip loses to fees.`,
+    };
+  }
+  if (!Number.isInteger(levelsPerSide) || levelsPerSide < LADDER_LEVELS_MIN || levelsPerSide > LADDER_LEVELS_MAX) {
+    return {
+      ok: false,
+      code: 'LADDER_LEVELS_OUT_OF_BOUNDS',
+      error:
+        `Ladder levels per side (${levelsPerSide}) must be a whole number between ` +
+        `${LADDER_LEVELS_MIN} and ${LADDER_LEVELS_MAX}.`,
+    };
+  }
+  return { ok: true, stepPct, levelsPerSide };
+}

@@ -3,9 +3,7 @@ import cors from 'cors';
 import { AnchorLadderStrategy } from './anchor-ladder-strategy.js';
 import {
   minInitialSizeUSDT,
-  LADDER_LEVELS_PER_SIDE,
-  LADDER_STEP_PCT_MIN, LADDER_STEP_PCT_MAX,
-  LADDER_LEVELS_MIN, LADDER_LEVELS_MAX,
+  resolveLadderGeometry,
 } from './ladder-levels.js';
 
 // TradFi-Perps symbols are gated by Binance behind a separate trading agreement
@@ -1360,35 +1358,24 @@ app.post('/anchor-ladder/start', async (req, res) => {
     }
 
     // Defence in depth — AnchorLadderStrategy.start() gates on the geometry
-    // bounds and minInitialSizeUSDT (ladder-levels.js) too, but those checks
+    // bounds (ladder-levels.js resolveLadderGeometry) too, but those checks
     // fire deep inside the non-blocking start() promise after the 200
-    // response has already gone out. Reject here up front so an out-of-bounds
-    // request never even mints a strategyId or touches the billing gate.
-    // Bounds first (mirrors start()'s order): the minimum-size gate below
-    // depends on a validated level count.
-    const requestedLevels = config.ladderLevelsPerSide ?? LADDER_LEVELS_PER_SIDE;
-    if (config.ladderStepPct != null) {
-      const step = Number(config.ladderStepPct);
-      if (!Number.isFinite(step) || step < LADDER_STEP_PCT_MIN || step > LADDER_STEP_PCT_MAX) {
-        return res.status(400).json({
-          error: `Ladder step (${config.ladderStepPct}) must be between ${LADDER_STEP_PCT_MIN} and ${LADDER_STEP_PCT_MAX}.`,
-          code: 'LADDER_STEP_OUT_OF_BOUNDS',
-        });
-      }
+    // response has already gone out. Reject here up front, via the SAME
+    // validator start() uses, so an out-of-bounds request never even mints a
+    // strategyId or touches the billing gate, AND so this gate can never
+    // silently re-diverge from start()'s (it did once, within a single task —
+    // see resolveLadderGeometry's docstring in ladder-levels.js).
+    const geometry = resolveLadderGeometry({
+      ladderStepPct: config.ladderStepPct,
+      ladderLevelsPerSide: config.ladderLevelsPerSide,
+    });
+    if (!geometry.ok) {
+      return res.status(400).json({ error: geometry.error, code: geometry.code });
     }
-    if (config.ladderLevelsPerSide != null) {
-      const levels = Number(config.ladderLevelsPerSide);
-      if (!Number.isInteger(levels) || levels < LADDER_LEVELS_MIN || levels > LADDER_LEVELS_MAX) {
-        return res.status(400).json({
-          error: `Ladder levels per side (${config.ladderLevelsPerSide}) must be a whole number between ${LADDER_LEVELS_MIN} and ${LADDER_LEVELS_MAX}.`,
-          code: 'LADDER_LEVELS_OUT_OF_BOUNDS',
-        });
-      }
-    }
-    const minSize = minInitialSizeUSDT(requestedLevels);
+    const minSize = minInitialSizeUSDT(geometry.levelsPerSide);
     if (!(Number(config.initialSize) >= minSize)) {
       return res.status(400).json({
-        error: `Initial size (${config.initialSize} USDT) is below the ${minSize} USDT minimum for a ${requestedLevels}-level ladder.`,
+        error: `Initial size (${config.initialSize} USDT) is below the ${minSize} USDT minimum for a ${geometry.levelsPerSide}-level ladder.`,
         code: 'INITIAL_SIZE_TOO_LOW',
       });
     }

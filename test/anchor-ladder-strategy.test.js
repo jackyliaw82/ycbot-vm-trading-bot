@@ -65,10 +65,17 @@ function geoStrategy() {
   return s;
 }
 
+// NOTE on matchers below: /step/i and /whole number between 3 and 10/ are
+// deliberately specific to the BOUNDS error, not just "step"/"level". A bare
+// /step/i also matches Binance's stepSize wording, and a bare /level/i also
+// matches the min-size error ("for a 2-level ladder") — with initialSize 1000
+// these tests clear the size gate today, but a future initialSize change
+// could let them pass off the WRONG gate while the bounds check silently
+// broke. Pin to the bounds message's own wording so that can't happen.
 test('start() rejects a ladder step below the 0.3% fee floor', async () => {
   await assert.rejects(
     () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderStepPct: 0.002 }),
-    /step/i,
+    /Ladder step .* must be between 0\.3% and 2\.0%/,
     'the gate must name the step',
   );
 });
@@ -76,25 +83,25 @@ test('start() rejects a ladder step below the 0.3% fee floor', async () => {
 test('start() rejects a ladder step above the 2% ceiling', async () => {
   await assert.rejects(
     () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderStepPct: 0.03 }),
-    /step/i,
+    /Ladder step .* must be between 0\.3% and 2\.0%/,
   );
 });
 
 test('start() rejects a level count outside 3-10', async () => {
   await assert.rejects(
     () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderLevelsPerSide: 2 }),
-    /level/i,
+    /whole number between 3 and 10/,
   );
   await assert.rejects(
     () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderLevelsPerSide: 11 }),
-    /level/i,
+    /whole number between 3 and 10/,
   );
 });
 
 test('start() rejects a non-integer level count', async () => {
   await assert.rejects(
     () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderLevelsPerSide: 5.5 }),
-    /level/i,
+    /whole number between 3 and 10/,
   );
 });
 

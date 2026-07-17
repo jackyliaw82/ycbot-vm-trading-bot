@@ -7,9 +7,10 @@ import { VolumeProfile } from './volume-profile.js';
 import { MarketMetrics } from './market-metrics.js';
 import {
   buildLadder,
-  LADDER_STEP_PCT, LADDER_STEP_PCT_MIN, LADDER_STEP_PCT_MAX,
-  LADDER_LEVELS_PER_SIDE, LADDER_LEVELS_MIN, LADDER_LEVELS_MAX,
+  LADDER_STEP_PCT,
+  LADDER_LEVELS_PER_SIDE,
   minInitialSizeUSDT,
+  resolveLadderGeometry,
 } from './ladder-levels.js';
 import { planLadderActions, averageOpenEntry } from './ladder-crossings.js';
 
@@ -143,8 +144,8 @@ class AnchorLadderStrategy extends TradingBase {
     this.anchor = null;
     this.ladderLines = [];              // [{levelIndex, direction, price, state, quantity}]
     this.lastProcessedPrice = null;     // last tick price the ladder crossing logic saw
-    this.stepPct = LADDER_STEP_PCT;     // fixed geometry, not a user knob (see ladder-levels.js)
-    this.levelsPerSide = LADDER_LEVELS_PER_SIDE;
+    this.stepPct = LADDER_STEP_PCT;     // DEFAULT geometry; start() overrides from config within bounds (see ladder-levels.js resolveLadderGeometry)
+    this.levelsPerSide = LADDER_LEVELS_PER_SIDE; // DEFAULT; same override in start()
     this._tradingSeqInProgress = false; // ladder crossing reentrancy guard
 
     // ---- TREND state ----
@@ -178,30 +179,25 @@ class AnchorLadderStrategy extends TradingBase {
     this.currentInitialSize = config.initialSize || 0;
     this._ladderBaseSize = this.currentInitialSize; // initial ladder uses the initial size; a harvest later carries the last consolidated notional
 
-    // Ladder geometry. DEFAULTS preserve the original fixed geometry; both are
-    // user-configurable within bounds enforced HERE. The UI is a convenience —
-    // the VM is the authority, so an old frontend or a direct API call cannot
-    // deploy a structurally lossy or unreachable ladder.
-    this.stepPct = config.ladderStepPct ?? LADDER_STEP_PCT;
-    this.levelsPerSide = config.ladderLevelsPerSide ?? LADDER_LEVELS_PER_SIDE;
-
     if (!this.symbol) throw new Error('AnchorLadderStrategy.start: missing symbol');
-    // Geometry bounds. Rejected BEFORE any network call, like the size gate below.
-    if (!Number.isFinite(this.stepPct) || this.stepPct < LADDER_STEP_PCT_MIN || this.stepPct > LADDER_STEP_PCT_MAX) {
-      const msg =
-        `Ladder step (${(this.stepPct * 100).toFixed(2)}%) must be between ` +
-        `${(LADDER_STEP_PCT_MIN * 100).toFixed(1)}% and ${(LADDER_STEP_PCT_MAX * 100).toFixed(1)}%. ` +
-        `Below ${(LADDER_STEP_PCT_MIN * 100).toFixed(1)}% every anchor-flatten round trip loses to fees.`;
-      await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
-      throw new Error(msg);
+    // Ladder geometry. DEFAULTS preserve the original fixed geometry; both are
+    // user-configurable within bounds enforced HERE via resolveLadderGeometry
+    // (ladder-levels.js) — the SAME validator the /anchor-ladder/start route
+    // uses, so the two gates can never drift again. The UI is a convenience —
+    // the VM is the authority, so an old frontend or a direct API call cannot
+    // deploy a structurally lossy or unreachable ladder. Rejected BEFORE any
+    // network call, like the size gate below.
+    const geometry = resolveLadderGeometry({
+      ladderStepPct: config.ladderStepPct,
+      ladderLevelsPerSide: config.ladderLevelsPerSide,
+    });
+    if (!geometry.ok) {
+      await this.addLog(`ERROR: [VALIDATION_ERROR] ${geometry.error}`);
+      throw new Error(geometry.error);
     }
-    if (!Number.isInteger(this.levelsPerSide) || this.levelsPerSide < LADDER_LEVELS_MIN || this.levelsPerSide > LADDER_LEVELS_MAX) {
-      const msg =
-        `Ladder levels per side (${this.levelsPerSide}) must be a whole number between ` +
-        `${LADDER_LEVELS_MIN} and ${LADDER_LEVELS_MAX}.`;
-      await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
-      throw new Error(msg);
-    }
+    this.stepPct = geometry.stepPct;
+    this.levelsPerSide = geometry.levelsPerSide;
+
     // Gate on the trivially-known minimum BEFORE any network call — no point
     // burning a setLeverage/setPositionMode/exchangeInfo round trip on an
     // input that's rejected regardless. (The tighter per-symbol minNotional
