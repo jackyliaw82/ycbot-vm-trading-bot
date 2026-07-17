@@ -5,7 +5,7 @@ import { FieldValue } from '@google-cloud/firestore';
 import { FEE_RATE } from './fees.js';
 import { VolumeProfile } from './volume-profile.js';
 import { MarketMetrics } from './market-metrics.js';
-import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, MIN_INITIAL_SIZE_USDT } from './ladder-levels.js';
+import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, minInitialSizeUSDT } from './ladder-levels.js';
 import { planLadderActions, averageOpenEntry } from './ladder-crossings.js';
 
 const MARGIN_HEADROOM_FLOOR_PCT = 30;              // free margin floor for sizing safety
@@ -184,8 +184,9 @@ class AnchorLadderStrategy extends TradingBase {
     // input that's rejected regardless. (The tighter per-symbol minNotional
     // check, which needs exchangeInfoCache, runs further down after
     // _getExchangeInfo.)
-    if (!(this.currentInitialSize >= MIN_INITIAL_SIZE_USDT)) {
-      const msg = `Initial size (${this.currentInitialSize} USDT) is below the ${MIN_INITIAL_SIZE_USDT} USDT minimum for a ${LADDER_LEVELS_PER_SIDE}-level ladder.`;
+    const minSize = minInitialSizeUSDT(this.levelsPerSide);
+    if (!(this.currentInitialSize >= minSize)) {
+      const msg = `Initial size (${this.currentInitialSize} USDT) is below the ${minSize} USDT minimum for a ${this.levelsPerSide}-level ladder.`;
       await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
       throw new Error(msg);
     }

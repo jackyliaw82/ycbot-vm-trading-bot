@@ -1,11 +1,30 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, MIN_INITIAL_SIZE_USDT } from '../ladder-levels.js';
+import {
+  buildLadder,
+  LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE,
+  LADDER_STEP_PCT_MIN, LADDER_STEP_PCT_MAX,
+  LADDER_LEVELS_MIN, LADDER_LEVELS_MAX,
+  MIN_LEG_USDT, minInitialSizeUSDT,
+} from '../ladder-levels.js';
 
-test('constants are the spec values', () => {
+test('defaults are the spec values', () => {
   assert.equal(LADDER_STEP_PCT, 0.003);
   assert.equal(LADDER_LEVELS_PER_SIDE, 5);
-  assert.equal(MIN_INITIAL_SIZE_USDT, 50);
+});
+
+test('geometry bounds are the spec values', () => {
+  assert.equal(LADDER_STEP_PCT_MIN, 0.003);
+  assert.equal(LADDER_STEP_PCT_MAX, 0.02);
+  assert.equal(LADDER_LEVELS_MIN, 3);
+  assert.equal(LADDER_LEVELS_MAX, 10);
+});
+
+test('minInitialSizeUSDT scales with the level count', () => {
+  assert.equal(MIN_LEG_USDT, 10);
+  assert.equal(minInitialSizeUSDT(5), 50);  // identical to the old flat minimum
+  assert.equal(minInitialSizeUSDT(3), 30);
+  assert.equal(minInitialSizeUSDT(10), 100);
 });
 
 test('buildLadder: LONG above the anchor, SHORT below — the inversion', () => {
@@ -53,4 +72,20 @@ test('buildLadder: the ladder is symmetric about the anchor', () => {
 test('buildLadder: rejects a non-positive anchor', () => {
   assert.throws(() => buildLadder(0, 0.003, 5), /anchor/i);
   assert.throws(() => buildLadder(NaN, 0.003, 5), /anchor/i);
+});
+
+test('buildLadder: honours non-default geometry', () => {
+  const legs = buildLadder(200, 0.005, 8);
+  assert.equal(legs.length, 16, '8 per side');
+  const longs = legs.filter(l => l.direction === 'LONG').map(l => l.price).sort((a, b) => a - b);
+  const shorts = legs.filter(l => l.direction === 'SHORT').map(l => l.price).sort((a, b) => b - a);
+  assert.equal(longs.length, 8);
+  assert.equal(shorts.length, 8);
+  assert.equal(longs[0], 201);    // 200 + 1 * 0.005 * 200
+  assert.equal(longs[7], 208);    // 200 + 8 * 0.005 * 200
+  assert.equal(shorts[0], 199);
+  assert.equal(shorts[7], 192);
+  // The inversion holds at any geometry: LONG above, SHORT below.
+  assert.ok(longs.every(p => p > 200));
+  assert.ok(shorts.every(p => p < 200));
 });
