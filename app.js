@@ -1505,23 +1505,23 @@ app.get('/anchor-ladder/status', (req, res) => {
   res.json({ strategies: ladderStrategies, count: Object.keys(ladderStrategies).length });
 });
 
-// Manual user-driven harvest. Gated like the frontend: a position must be open
-// AND the loss gauge must be full. `force` (temporary test flag) bypasses the
-// gauge gate so the flow can be exercised without an 8% drawdown. Closes the
-// open leg to flat at market (reduceOnly), then re-anchors the ladder. The
-// cycle CONTINUES — this does NOT stop the strategy. strategy.harvestNow()
-// validates eligibility synchronously and queues the close via the
-// manual-harvest latch honored on the next free tick, so the response is an
-// immediate eligibility verdict. Ineligibility throws → 409.
+// Manual user-driven re-anchor / harvest. Single gate: a position must be open
+// (the gauge no longer gates this). Closes the open leg to flat at market
+// (reduceOnly), then re-anchors the ladder on the live price. The frontend
+// labels it Harvest (unrealized >= 0) or Re-anchor (unrealized < 0), but both
+// call this identical action. The cycle CONTINUES — this does NOT stop the
+// strategy. strategy.harvestNow() validates eligibility synchronously and
+// queues the close via the manual-harvest latch honored on the next free tick,
+// so the response is an immediate eligibility verdict. Ineligibility throws → 409.
 app.post('/anchor-ladder/harvest-now', async (req, res) => {
   try {
-    const { strategyId, force } = req.body;
+    const { strategyId } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
     const strategy = activeStrategies.get(strategyId);
     if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
       return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
     }
-    const result = await strategy.harvestNow({ force: !!force });
+    const result = await strategy.harvestNow();
     res.json({ success: true, ...result });
   } catch (error) {
     res.status(409).json({ error: error.message });

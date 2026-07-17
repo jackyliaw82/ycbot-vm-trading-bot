@@ -295,18 +295,35 @@ test('_computeLadderBaseSize: a 50 USDT loss grows a 10k base to 12k', async () 
   assert.equal(s._legNotional(), 2400, 'the grown base splits evenly across 5 legs');
 });
 
-test('_computeLadderBaseSize: a full gauge freezes escalation', async () => {
+test('_computeLadderBaseSize: a full gauge freezes escalation (returns the locked _lastLadderSize)', async () => {
   const s = ladderStrategy({ base: 10000 });
   s.currentInitialSize = 10000;
   s.initialCapital = 10000;
   s.harvestLossThreshold = 0.30;
   s.cycleAccumulatedLoss = 5000; // gauge full
-  s._computeAccLoss = () => 5000;
-  s._lastLadderSize = 12000;
-  s._harvestRestartPending = false;
+  s._computeAccLoss = () => 5000; // TRAP: _computeLadderBaseSize overwrites accLoss on entry — stub it
+  s._lastLadderSize = 12000;      // sentinel: the last GROWN size
   // Gauge-full freeze returns _lastLadderSize before ever touching the
-  // wallet, so no getTotalMarginBalance stub is needed here.
-  assert.equal(await s._computeLadderBaseSize(), 12000, 'reuses the last size instead of growing');
+  // wallet, so no getTotalMarginBalance stub is needed here. This is the
+  // gauge's sole remaining job: a re-anchor/harvest at a full gauge keeps
+  // the locked grown size rather than re-sizing fresh.
+  assert.equal(await s._computeLadderBaseSize(), 12000, 'reuses the locked size instead of growing');
+});
+
+test('_computeLadderBaseSize: a NOT-full gauge re-sizes fresh, ignoring any locked _lastLadderSize sentinel', async () => {
+  const s = ladderStrategy({ base: 10000 });
+  s.currentInitialSize = 10000;
+  s.initialCapital = 10000;
+  s.harvestLossThreshold = 0.30;    // full at 3000
+  s.cycleAccumulatedLoss = 50;       // below the gate → NOT full
+  s._computeAccLoss = () => 50;      // TRAP: stub so the formula proposes a fresh 12000
+  s.recoveryFactor = 0.20;
+  s.recoveryDistance = 0.005;
+  s._lastLadderSize = 99999;         // stale sentinel that MUST NOT be returned
+  s.getTotalMarginBalance = async () => 1e9; // margin cap out of the way
+  const sized = await s._computeLadderBaseSize();
+  assert.equal(sized, 12000, 'gauge not full → fresh compute (50*0.20/0.005 = 2000 additional), not the 99999 sentinel');
+  assert.notEqual(sized, 99999, 'the stale locked size is ignored when the gauge is not full');
 });
 
 test('_computeLadderBaseSize: uses the LIVE margin balance, not a stale one — a small live balance makes the cap bite', async () => {
@@ -425,12 +442,14 @@ test('placeMarketOrder rounds the quantity to stepSize before sending (order-lay
   assert.equal(sentQty, 0.84, 'the order layer must floor the FP artifact even if the caller does not');
 });
 
-test('harvestNow refuses when a position is open but the gauge is NOT full', async () => {
+test('harvestNow queues when a position is open and the gauge is NOT full (gauge no longer gates)', async () => {
   const s = ladderStrategy();                        // initialCapital 1000, 8% threshold => full at 80
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
-  s.cycleAccumulatedLoss = 40;                        // below the 80 gate
-  await assert.rejects(() => s.harvestNow(), /gauge is not full/i);
-  assert.equal(s._manualHarvestRequested, false, 'no latch set when the gauge gate refuses');
+  s.cycleAccumulatedLoss = 40;                        // well below the 80 gate → gauge NOT full
+  assert.equal(s._isGaugeFull(), false, 'precondition: the gauge is genuinely not full');
+  const res = await s.harvestNow();
+  assert.equal(res.queued, true, 'queues regardless of gauge fullness — the gauge no longer gates the action');
+  assert.equal(s._manualHarvestRequested, true, 'latch set whenever a position is open');
 });
 
 test('harvestNow queues when a position is open AND the gauge is full', async () => {
@@ -440,16 +459,6 @@ test('harvestNow queues when a position is open AND the gauge is full', async ()
   const res = await s.harvestNow();
   assert.equal(res.queued, true);
   assert.equal(s._manualHarvestRequested, true, 'latch set once eligible');
-});
-
-test('harvestNow({ force: true }) bypasses the gauge gate (temporary test path)', async () => {
-  const s = ladderStrategy();
-  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
-  s.cycleAccumulatedLoss = 0;                         // gauge empty
-  await assert.rejects(() => s.harvestNow(), /gauge is not full/i);   // sanity: refused without force
-  const res = await s.harvestNow({ force: true });
-  assert.equal(res.queued, true);
-  assert.equal(s._manualHarvestRequested, true, 'force bypasses the gauge gate');
 });
 
 test('harvest re-anchors to the CURRENT price, unlike the anchor flatten', async () => {
@@ -597,10 +606,9 @@ test('saveState writes the ANCHOR_LADDER type tags for boot recovery', async () 
   assert.equal(written.strategyType, 'anchorLadder');
 });
 
-test('_lastLadderSize and _harvestRestartPending survive a save/resume round trip', async () => {
+test('_lastLadderSize survives a save/resume round trip', async () => {
   const src = ladderStrategy({ anchor: 100, base: 12000 });
   src._lastLadderSize = 15000;
-  src._harvestRestartPending = true;
 
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
@@ -612,7 +620,6 @@ test('_lastLadderSize and _harvestRestartPending survive a save/resume round tri
   cleanupResumeTimers(dst);
 
   assert.equal(dst._lastLadderSize, 15000, 'the martingale escalation freeze must survive a restart');
-  assert.equal(dst._harvestRestartPending, true);
 });
 
 test('_recomputeFinalTpPrice keys off trendDirection, not just currentSide (resume race)', () => {

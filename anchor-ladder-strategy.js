@@ -147,7 +147,6 @@ class AnchorLadderStrategy extends TradingBase {
 
     // ---- Phase 3: harvest-gauge cap ----
     this._lastLadderSize = null;        // last dynamic ladder base size (for gauge-full freeze)
-    this._harvestRestartPending = false;// next TREND sizes fresh after a harvest-to-flat
     this._manualHarvestRequested = false; // latch: harvestNow() sets this; honored on the next free tick (transient, not persisted)
   }
 
@@ -510,9 +509,11 @@ class AnchorLadderStrategy extends TradingBase {
    */
   async _computeLadderBaseSize() {
     this.cycleAccumulatedLoss = this._computeAccLoss();
-    // Gauge-full escalation freeze: once the gauge is full, stop GROWING live exposure —
-    // reuse the last size. EXCEPTION: a harvest restart (flat -> fresh) always re-sizes.
-    if (this._isGaugeFull() && !this._harvestRestartPending && this._lastLadderSize != null) {
+    // Gauge-full escalation freeze: once the gauge is full, stop GROWING live
+    // exposure — reuse the last (grown) size. This is the gauge's sole remaining
+    // job: a re-anchor/harvest at a full gauge keeps the locked size, at a
+    // not-full gauge re-sizes fresh.
+    if (this._isGaugeFull() && this._lastLadderSize != null) {
       return this._lastLadderSize;
     }
     const proposed = this._computeFormulaSize();
@@ -526,12 +527,10 @@ class AnchorLadderStrategy extends TradingBase {
       await this.addLog(`[LADDER] margin-headroom cap: getTotalMarginBalance() failed (${err.message}) — capping to currentInitialSize (fail-closed).`);
       const floor = this.currentInitialSize || 0;
       this._lastLadderSize = floor;
-      this._harvestRestartPending = false;
       return floor;
     }
     const sized = this._applyMarginHeadroomCap(proposed, walletBalance);
     this._lastLadderSize = sized;
-    this._harvestRestartPending = false; // consumed: the fresh post-harvest size is now applied
     return sized;
   }
 
@@ -845,7 +844,14 @@ class AnchorLadderStrategy extends TradingBase {
     }
     this._tradingSeqInProgress = true;
     try {
-      await this.addLog(`===== HARVEST (${reason}) — flatten + re-anchor =====`);
+      // Label the action by the sign of the position's unrealized PnL captured
+      // BEFORE the close (activePosition is nulled by `_closeConsolidated`).
+      // Same backend action either way; the label just distinguishes a
+      // profit-banking HARVEST from a strategic loss-taking RE-ANCHOR.
+      const closingPnl = (this.activePosition && Number.isFinite(this.activePosition.unrealizedPnl))
+        ? this.activePosition.unrealizedPnl : 0;
+      const kind = closingPnl >= 0 ? 'HARVEST' : 'RE-ANCHOR';
+      await this.addLog(`===== ${kind} (${reason}) — flatten + re-anchor =====`);
 
       // Self-gating and self-sizing (see `_closeQuantity`). This matters most
       // here of all the close paths: the harvest RE-ANCHORS, so anything left
@@ -854,19 +860,18 @@ class AnchorLadderStrategy extends TradingBase {
       catch (e) { await this.addLog(`ERROR harvest close: ${e.message}`); }
       this.harvestCount = (this.harvestCount || 0) + 1;
       this.finalTpPrice = null;
-      this._harvestRestartPending = true; // the fresh post-harvest size always re-sizes (freeze exception)
 
       this.cycleAccumulatedLoss = this._computeAccLoss();
       this._ladderBaseSize = await this._computeLadderBaseSize();
       await this.addLog(
-        `Post-harvest base ${this._formatNotional(this._ladderBaseSize)} USDT → ` +
+        `Post-${kind} base ${this._formatNotional(this._ladderBaseSize)} USDT → ` +
         `leg ${this._formatNotional(this._legNotional())} USDT (accLoss ${this._formatNotional(this.cycleAccumulatedLoss)}).`,
       );
 
       // Re-anchor on the live price — THE difference from the anchor flatten.
       await this.initializeLadder(this.currentPrice);
 
-      await this._writeStrategyFlow('HARVEST', { reason, anchor: this.anchor, baseSize: this._ladderBaseSize }).catch(() => {});
+      await this._writeStrategyFlow('HARVEST', { reason, kind, closingPnl, anchor: this.anchor, baseSize: this._ladderBaseSize }).catch(() => {});
       await this.saveState();
     } finally {
       this._tradingSeqInProgress = false;
@@ -931,7 +936,6 @@ class AnchorLadderStrategy extends TradingBase {
     this.lastProcessedPrice = snapshot.lastProcessedPrice ?? null;
     this._ladderBaseSize = snapshot.ladderBaseSize || this.currentInitialSize; // grown ladder base survives restarts (else ladder shrinks to initial)
     this._lastLadderSize = snapshot._lastLadderSize ?? null;
-    this._harvestRestartPending = !!snapshot._harvestRestartPending;
     this.stepPct = LADDER_STEP_PCT;           // fixed, never from the snapshot
     this.levelsPerSide = LADDER_LEVELS_PER_SIDE;
 
@@ -1594,18 +1598,17 @@ class AnchorLadderStrategy extends TradingBase {
    * of firing directly — `handleRealtimePrice` honors it on the next free
    * tick, guaranteeing the harvest actually runs (no silent no-op).
    *
-   * Two gates, mirroring the frontend: a position must be OPEN, and the loss
-   * gauge must be FULL (cycleAccumulatedLoss >= harvestLossThreshold ×
-   * initialCapital). `force` is a TEMPORARY test bypass of the gauge gate — the
-   * panel's test button sends it so the flow can be exercised without waiting
-   * for an 8% drawdown. Remove `force` once harvest is verified in the field.
-   * Throws on ineligibility (the route maps it to a 409).
+   * One gate: a position must be OPEN. The action is the same regardless of the
+   * gauge — the frontend labels it Harvest (unrealized >= 0) or Re-anchor
+   * (unrealized < 0), but both queue the identical flatten + re-anchor. The
+   * gauge no longer gates this; its only remaining job is locking dynamic
+   * sizing (see `_computeLadderBaseSize`). Throws on ineligibility (the route
+   * maps it to a 409).
    */
-  async harvestNow({ force = false } = {}) {
+  async harvestNow() {
     if (!this.isRunning) throw new Error('Strategy is not running.');
     const open = !!(this.activePosition && this.activePosition.quantity > 0);
-    if (!open) throw new Error('Nothing open to harvest.');
-    if (!force && !this._isGaugeFull()) throw new Error('Harvest gauge is not full yet.');
+    if (!open) throw new Error('Nothing open to close.');
     this._manualHarvestRequested = true; // honored on the next free tick
     return { harvesting: true, queued: true, mode: this.ladderMode, price: this.currentPrice };
   }
@@ -2272,7 +2275,6 @@ class AnchorLadderStrategy extends TradingBase {
       recoveryDistance: this.recoveryDistance,
       harvestLossThreshold: this.harvestLossThreshold,
       _lastLadderSize: this._lastLadderSize,
-      _harvestRestartPending: this._harvestRestartPending,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
@@ -2441,7 +2443,6 @@ class AnchorLadderStrategy extends TradingBase {
         lastProcessedPrice: this.lastProcessedPrice,
         ladderBaseSize: this._ladderBaseSize,
         _lastLadderSize: this._lastLadderSize,
-        _harvestRestartPending: this._harvestRestartPending,
         config: {
           recoveryFactor: this.recoveryFactor,
           recoveryDistance: this.recoveryDistance,
