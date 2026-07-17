@@ -1,6 +1,12 @@
 import express from 'express';
 import cors from 'cors';
 import { AnchorLadderStrategy } from './anchor-ladder-strategy.js';
+import {
+  minInitialSizeUSDT,
+  LADDER_LEVELS_PER_SIDE,
+  LADDER_STEP_PCT_MIN, LADDER_STEP_PCT_MAX,
+  LADDER_LEVELS_MIN, LADDER_LEVELS_MAX,
+} from './ladder-levels.js';
 
 // TradFi-Perps symbols are gated by Binance behind a separate trading agreement
 // (error -4411 fires for unsigned accounts). The reversal strategy's symbol
@@ -1353,15 +1359,36 @@ app.post('/anchor-ladder/start', async (req, res) => {
       });
     }
 
-    // Defence in depth — AnchorLadderStrategy.start() gates on
-    // MIN_INITIAL_SIZE_USDT (50 USDT, ladder-levels.js) too, but that check
-    // fires deep inside the non-blocking start() promise after the 200
-    // response has already gone out. Reject here up front so an
-    // under-minimum request never even mints a strategyId or touches the
-    // billing gate.
-    if (!(Number(config.initialSize) >= 50)) {
+    // Defence in depth — AnchorLadderStrategy.start() gates on the geometry
+    // bounds and minInitialSizeUSDT (ladder-levels.js) too, but those checks
+    // fire deep inside the non-blocking start() promise after the 200
+    // response has already gone out. Reject here up front so an out-of-bounds
+    // request never even mints a strategyId or touches the billing gate.
+    // Bounds first (mirrors start()'s order): the minimum-size gate below
+    // depends on a validated level count.
+    const requestedLevels = config.ladderLevelsPerSide ?? LADDER_LEVELS_PER_SIDE;
+    if (config.ladderStepPct != null) {
+      const step = Number(config.ladderStepPct);
+      if (!Number.isFinite(step) || step < LADDER_STEP_PCT_MIN || step > LADDER_STEP_PCT_MAX) {
+        return res.status(400).json({
+          error: `Ladder step (${config.ladderStepPct}) must be between ${LADDER_STEP_PCT_MIN} and ${LADDER_STEP_PCT_MAX}.`,
+          code: 'LADDER_STEP_OUT_OF_BOUNDS',
+        });
+      }
+    }
+    if (config.ladderLevelsPerSide != null) {
+      const levels = Number(config.ladderLevelsPerSide);
+      if (!Number.isInteger(levels) || levels < LADDER_LEVELS_MIN || levels > LADDER_LEVELS_MAX) {
+        return res.status(400).json({
+          error: `Ladder levels per side (${config.ladderLevelsPerSide}) must be a whole number between ${LADDER_LEVELS_MIN} and ${LADDER_LEVELS_MAX}.`,
+          code: 'LADDER_LEVELS_OUT_OF_BOUNDS',
+        });
+      }
+    }
+    const minSize = minInitialSizeUSDT(requestedLevels);
+    if (!(Number(config.initialSize) >= minSize)) {
       return res.status(400).json({
-        error: `Initial size (${config.initialSize} USDT) is below the 50 USDT minimum for a 5-level ladder.`,
+        error: `Initial size (${config.initialSize} USDT) is below the ${minSize} USDT minimum for a ${requestedLevels}-level ladder.`,
         code: 'INITIAL_SIZE_TOO_LOW',
       });
     }

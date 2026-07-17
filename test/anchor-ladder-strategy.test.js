@@ -57,6 +57,79 @@ test('start() rejects an initial size below the 50 USDT minimum', async () => {
   );
 });
 
+// ——— Configurable geometry: the VM is the authority on the bounds ———
+
+function geoStrategy() {
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  s.addLog = async () => {};
+  return s;
+}
+
+test('start() rejects a ladder step below the 0.3% fee floor', async () => {
+  await assert.rejects(
+    () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderStepPct: 0.002 }),
+    /step/i,
+    'the gate must name the step',
+  );
+});
+
+test('start() rejects a ladder step above the 2% ceiling', async () => {
+  await assert.rejects(
+    () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderStepPct: 0.03 }),
+    /step/i,
+  );
+});
+
+test('start() rejects a level count outside 3-10', async () => {
+  await assert.rejects(
+    () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderLevelsPerSide: 2 }),
+    /level/i,
+  );
+  await assert.rejects(
+    () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderLevelsPerSide: 11 }),
+    /level/i,
+  );
+});
+
+test('start() rejects a non-integer level count', async () => {
+  await assert.rejects(
+    () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 1000, ladderLevelsPerSide: 5.5 }),
+    /level/i,
+  );
+});
+
+test('start() scales the minimum initial size with the chosen level count', async () => {
+  // 8 levels needs 8 * 10 = 80 USDT. 79 must be refused even though it clears
+  // the old flat 50.
+  await assert.rejects(
+    () => geoStrategy().start({ symbol: 'BTCUSDT', initialSize: 79, ladderLevelsPerSide: 8 }),
+    /80/,
+    'the gate must name the scaled minimum',
+  );
+});
+
+// REGRESSION PIN. The start-time minNotional gate used to divide by the CONSTANT
+// (LADDER_LEVELS_PER_SIDE) while _legNotional() divides by the FIELD
+// (this.levelsPerSide). With the constant it validates a 5-rung ladder against an
+// N-rung runtime, and for N > 5 it is TOO PERMISSIVE. Here: 10 levels, 100 USDT,
+// minNotional 15. The buggy gate checks 100/5 = 20 >= 15 and PASSES; the real legs
+// are 100/10 = 10, below the exchange minimum. It must reject.
+test('start() sizes the minNotional gate from the CHOSEN level count, not the default', async () => {
+  const s = geoStrategy();
+  stubBootInternals(s);
+  s.exchangeInfoCache = { BTCUSDT: { minNotional: 15 } };
+  s.getWalletBalance = async () => 1000;
+  try {
+    await assert.rejects(
+      () => s.start({ symbol: 'BTCUSDT', initialSize: 100, ladderLevelsPerSide: 10, leverage: 10 }),
+      /minimum notional/i,
+      'legs are 100/10 = 10 USDT, under the 15 USDT minNotional — must refuse',
+    );
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+});
+
 // ——— Task 7: tick dispatch ——————————————————————————————————————————
 
 test('RANGE: crossing L1 fills it and opens LONG', async () => {

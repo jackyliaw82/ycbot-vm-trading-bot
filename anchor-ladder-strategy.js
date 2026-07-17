@@ -5,7 +5,12 @@ import { FieldValue } from '@google-cloud/firestore';
 import { FEE_RATE } from './fees.js';
 import { VolumeProfile } from './volume-profile.js';
 import { MarketMetrics } from './market-metrics.js';
-import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, minInitialSizeUSDT } from './ladder-levels.js';
+import {
+  buildLadder,
+  LADDER_STEP_PCT, LADDER_STEP_PCT_MIN, LADDER_STEP_PCT_MAX,
+  LADDER_LEVELS_PER_SIDE, LADDER_LEVELS_MIN, LADDER_LEVELS_MAX,
+  minInitialSizeUSDT,
+} from './ladder-levels.js';
 import { planLadderActions, averageOpenEntry } from './ladder-crossings.js';
 
 const MARGIN_HEADROOM_FLOOR_PCT = 30;              // free margin floor for sizing safety
@@ -173,12 +178,30 @@ class AnchorLadderStrategy extends TradingBase {
     this.currentInitialSize = config.initialSize || 0;
     this._ladderBaseSize = this.currentInitialSize; // initial ladder uses the initial size; a harvest later carries the last consolidated notional
 
-    // Fixed geometry — not user knobs. The 0.3% step clears the round-trip fee
-    // floor (max(0.0025, FEE_RATE*3) = 0.25%) with headroom.
-    this.stepPct = LADDER_STEP_PCT;
-    this.levelsPerSide = LADDER_LEVELS_PER_SIDE;
+    // Ladder geometry. DEFAULTS preserve the original fixed geometry; both are
+    // user-configurable within bounds enforced HERE. The UI is a convenience —
+    // the VM is the authority, so an old frontend or a direct API call cannot
+    // deploy a structurally lossy or unreachable ladder.
+    this.stepPct = config.ladderStepPct ?? LADDER_STEP_PCT;
+    this.levelsPerSide = config.ladderLevelsPerSide ?? LADDER_LEVELS_PER_SIDE;
 
     if (!this.symbol) throw new Error('AnchorLadderStrategy.start: missing symbol');
+    // Geometry bounds. Rejected BEFORE any network call, like the size gate below.
+    if (!Number.isFinite(this.stepPct) || this.stepPct < LADDER_STEP_PCT_MIN || this.stepPct > LADDER_STEP_PCT_MAX) {
+      const msg =
+        `Ladder step (${(this.stepPct * 100).toFixed(2)}%) must be between ` +
+        `${(LADDER_STEP_PCT_MIN * 100).toFixed(1)}% and ${(LADDER_STEP_PCT_MAX * 100).toFixed(1)}%. ` +
+        `Below ${(LADDER_STEP_PCT_MIN * 100).toFixed(1)}% every anchor-flatten round trip loses to fees.`;
+      await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
+      throw new Error(msg);
+    }
+    if (!Number.isInteger(this.levelsPerSide) || this.levelsPerSide < LADDER_LEVELS_MIN || this.levelsPerSide > LADDER_LEVELS_MAX) {
+      const msg =
+        `Ladder levels per side (${this.levelsPerSide}) must be a whole number between ` +
+        `${LADDER_LEVELS_MIN} and ${LADDER_LEVELS_MAX}.`;
+      await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
+      throw new Error(msg);
+    }
     // Gate on the trivially-known minimum BEFORE any network call — no point
     // burning a setLeverage/setPositionMode/exchangeInfo round trip on an
     // input that's rejected regardless. (The tighter per-symbol minNotional
@@ -197,7 +220,8 @@ class AnchorLadderStrategy extends TradingBase {
     // readability: identity/sizing | recovery knobs | advanced toggles.
     await this.addLog(
       `Config: symbol=${this.symbol}, initialSize=${this.currentInitialSize} USDT, ` +
-      `leverage=${this.leverage}x, priceType=${this.priceType} ` +
+      `leverage=${this.leverage}x, priceType=${this.priceType}, ` +
+      `ladderStep=${(this.stepPct * 100).toFixed(2)}%, ladderLevels=${this.levelsPerSide}/side ` +
       `| recoveryFactor=${(this.recoveryFactor * 100).toFixed(0)}%, ` +
       `recoveryDistance=${(this.recoveryDistance * 100).toFixed(2)}%, ` +
       `harvestLossThreshold=${(this.harvestLossThreshold * 100).toFixed(0)}%, ` +
@@ -225,7 +249,10 @@ class AnchorLadderStrategy extends TradingBase {
 
     const minNotional = this.exchangeInfoCache[this.symbol]?.minNotional || 5;
     this.minNotional = minNotional;
-    const legNotional = this.currentInitialSize / LADDER_LEVELS_PER_SIDE;
+    // Divide by the FIELD, not the constant — `_legNotional()` (the runtime
+    // sizing path) already does, and the two must agree or this gate validates a
+    // 5-rung ladder against an N-rung runtime (too permissive for N > 5).
+    const legNotional = this.currentInitialSize / this.levelsPerSide;
     if (legNotional < minNotional) {
       const msg = `Each ladder leg would be ${legNotional.toFixed(2)} USDT, below this symbol's ${minNotional} USDT minimum notional.`;
       await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
