@@ -954,7 +954,8 @@ class AnchorLadderStrategy extends TradingBase {
       // stays open on Binance while the bot's books read "flat, fresh ladder" and
       // nothing ever tries to close it again. Leave the ladder INTACT instead, so
       // the position stays tracked and the harvest can be retried. `_flattenAtAnchor`
-      // gets this right by not catching at all. Do NOT rethrow here:
+      // and `_flattenGrid` now carry this same guard — no close path may wipe its
+      // leg ledger on a close it could not verify. Do NOT rethrow here:
       // `handleRealtimePrice` awaits this without a catch, so a throw would escape
       // the WS tick handler.
       //
