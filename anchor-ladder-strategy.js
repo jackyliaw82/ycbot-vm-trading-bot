@@ -1704,8 +1704,20 @@ class AnchorLadderStrategy extends TradingBase {
    * gauge — the frontend labels it Harvest (unrealized >= 0) or Re-anchor
    * (unrealized < 0), but both queue the identical flatten + re-anchor. The
    * gauge no longer gates this; its only remaining job is locking dynamic
-   * sizing (see `_computeLadderBaseSize`). Throws on ineligibility (the route
-   * maps it to a 409).
+   * sizing (see `_computeLadderBaseSize`).
+   *
+   * `triggerPrice` is optional and selects between two modes:
+   *  - omitted/null → immediate harvest: latches for the next free tick (as
+   *    above), also clearing any previously-armed trigger.
+   *  - a number → arm a validated one-shot Trigger Price instead of harvesting
+   *    now; fires later off `handleRealtimePrice` when the market crosses it.
+   *
+   * Throws on ineligibility. Two error shapes, tagged so the route can tell
+   * them apart: state conflicts ('Strategy is not running.', 'Nothing open
+   * to close.') are untagged → the route maps them to 409; trigger-price
+   * validation failures (non-positive price, no live price yet, price too
+   * close to the current price) set `error.invalidInput = true` → the route
+   * maps those to 400.
    */
   async harvestNow(triggerPrice = null) {
     if (!this.isRunning) throw new Error('Strategy is not running.');
@@ -1725,17 +1737,20 @@ class AnchorLadderStrategy extends TradingBase {
     // With a price → arm a one-shot trigger. The VM is the authority on
     // validity (mirrors the ladder-geometry bounds philosophy): validate,
     // enforce the 0.1% gap, and round to the symbol's tick size here.
+    // These are client-INPUT errors (bad/too-close price), not state
+    // conflicts — tag them so the route can map to 400 instead of 409.
+    const invalidInput = (msg) => { const e = new Error(msg); e.invalidInput = true; return e; };
     const px = Number(triggerPrice);
     if (!Number.isFinite(px) || px <= 0) {
-      throw new Error('Trigger price must be a positive number.');
+      throw invalidInput('Trigger price must be a positive number.');
     }
     const ref = this.currentPrice;
     if (!Number.isFinite(ref) || ref <= 0) {
-      throw new Error('No live price yet — cannot arm a trigger.');
+      throw invalidInput('No live price yet — cannot arm a trigger.');
     }
     const rounded = this.roundPrice(px);
     if (Math.abs(rounded - ref) < ref * TRIGGER_MIN_GAP_PCT) {
-      throw new Error(`Trigger price must be at least 0.1% from the current price (${this._formatPrice(ref)}).`);
+      throw invalidInput(`Trigger price must be at least 0.1% from the current price (${this._formatPrice(ref)}).`);
     }
     this.harvestTriggerPrice = rounded;
     this.harvestTriggerAbove = rounded > ref;

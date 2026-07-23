@@ -1526,7 +1526,15 @@ app.get('/anchor-ladder/status', (req, res) => {
 // call this identical action. The cycle CONTINUES — this does NOT stop the
 // strategy. strategy.harvestNow() validates eligibility synchronously and
 // queues the close via the manual-harvest latch honored on the next free tick,
-// so the response is an immediate eligibility verdict. Ineligibility throws → 409.
+// so the response is an immediate eligibility verdict.
+//
+// triggerPrice omitted/null → immediate harvest (today's behavior); a number
+// → arm a one-shot trigger validated + rounded by the strategy. Two error
+// shapes: genuine state conflicts ('Strategy is not running.', 'Nothing open
+// to close.') → 409; trigger-price validation failures (bad price, no live
+// price yet, too close to the current price) are tagged by the strategy
+// (error.invalidInput) → 400. The strategy remains the sole authority on
+// trigger validity — this route does not duplicate that logic.
 app.post('/anchor-ladder/harvest-now', async (req, res) => {
   try {
     const { strategyId, triggerPrice } = req.body;
@@ -1535,12 +1543,10 @@ app.post('/anchor-ladder/harvest-now', async (req, res) => {
     if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
       return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
     }
-    // triggerPrice omitted/null → immediate harvest (today's behavior); a number
-    // → arm a one-shot trigger validated + rounded by the strategy.
     const result = await strategy.harvestNow(triggerPrice ?? null);
     res.json({ success: true, ...result });
   } catch (error) {
-    res.status(409).json({ error: error.message });
+    res.status(error.invalidInput ? 400 : 409).json({ error: error.message });
   }
 });
 

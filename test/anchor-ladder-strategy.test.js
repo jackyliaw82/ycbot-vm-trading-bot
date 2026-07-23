@@ -489,7 +489,11 @@ test('_recomputeFinalTpPrice: null with no position', () => {
 
 test('harvestNow refuses when nothing is open', async () => {
   const s = ladderStrategy();
-  await assert.rejects(() => s.harvestNow(), /nothing open/i);
+  await assert.rejects(() => s.harvestNow(), (err) => {
+    assert.match(err.message, /nothing open/i);
+    assert.notEqual(err.invalidInput, true, 'a state conflict must NOT be tagged invalidInput (route must map it to 409)');
+    return true;
+  });
 });
 
 test('_closeQuantity rounds the summed leg qty to stepSize (guards Binance -1111)', () => {
@@ -1644,6 +1648,17 @@ test('harvestNow(triggerPrice) arms an ABOVE trigger and rounds to tick size', a
   assert.equal(s._manualHarvestRequested, false, 'arming must NOT set the immediate latch');
 });
 
+test('harvestNow(triggerPrice) rejects arming with no live price yet', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  s.currentPrice = null;                            // no live price yet
+  await assert.rejects(() => s.harvestNow(101), (err) => {
+    assert.match(err.message, /no live price/i);
+    assert.equal(err.invalidInput, true, 'client-input validation errors must be tagged invalidInput (route maps to 400)');
+    return true;
+  });
+});
+
 test('harvestNow(triggerPrice) infers a BELOW trigger from the current price', async () => {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
   const s = ladderStrategy();
@@ -1657,14 +1672,22 @@ test('harvestNow(triggerPrice) rejects a level within the 0.1% gap', async () =>
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
   const s = ladderStrategy();                       // currentPrice 100 → band 99.9..100.1
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
-  await assert.rejects(() => s.harvestNow(100.05), /0\.1%|current price/i);
+  await assert.rejects(() => s.harvestNow(100.05), (err) => {
+    assert.match(err.message, /0\.1%|current price/i);
+    assert.equal(err.invalidInput, true, 'client-input validation errors must be tagged invalidInput (route maps to 400)');
+    return true;
+  });
   assert.equal(s.harvestTriggerPrice, null, 'a rejected arm leaves no trigger set');
 });
 
 test('harvestNow(triggerPrice) rejects a non-positive price', async () => {
   const s = ladderStrategy();
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
-  await assert.rejects(() => s.harvestNow(0), /positive/i);
+  await assert.rejects(() => s.harvestNow(0), (err) => {
+    assert.match(err.message, /positive/i);
+    assert.equal(err.invalidInput, true, 'client-input validation errors must be tagged invalidInput (route maps to 400)');
+    return true;
+  });
 });
 
 test('harvestNow() with no price latches immediately AND clears any armed trigger', async () => {
