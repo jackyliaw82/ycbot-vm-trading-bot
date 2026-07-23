@@ -880,13 +880,6 @@ class AnchorLadderStrategy extends TradingBase {
       // Self-gating and self-sizing (see `_closeQuantity`). This matters most
       // here of all the close paths: the harvest RE-ANCHORS, so anything left
       // behind would net against a geometry it was never part of.
-      //
-      // Inventory BEFORE the close. `_closeQuantity()` sums the WS-true open-leg
-      // ledger (floored by activePosition) and returns 0 ONLY when Binance was
-      // reachable and confirmed flat — so it distinguishes "nothing to close"
-      // from "something is open".
-      const hadInventory = this._closeQuantity() > 0;
-
       let closed = false;
       try { closed = await this._closeConsolidated('harvest'); }
       catch (e) { await this.addLog(`ERROR ${kind} close: ${e.message}`); }
@@ -901,7 +894,26 @@ class AnchorLadderStrategy extends TradingBase {
       // gets this right by not catching at all. Do NOT rethrow here:
       // `handleRealtimePrice` awaits this without a catch, so a throw would escape
       // the WS tick handler.
-      if (hadInventory && !closed) {
+      //
+      // `closed === true` only means the close order was PLACED without
+      // throwing — an unconfirmed fill is swallowed inside `_closeConsolidated`
+      // and is NOT covered by this guard (pre-existing, shared with
+      // `_flattenAtAnchor`).
+      //
+      // Check POST-close inventory, not a pre-close snapshot: in the `!closed`
+      // branch, `_closeConsolidated` never reaches its leg-clearing /
+      // `activePosition`-nulling code (that only runs after a confirmed close),
+      // so the ledger is untouched and `_closeQuantity()` still reads the true
+      // open inventory here. This also correctly stops aborting when
+      // `_closeConsolidated` internally refreshed and found the account
+      // genuinely flat (returns `false` with nothing actually open) — a
+      // pre-close snapshot would have aborted on that stale reading and
+      // blocked the re-anchor for no reason. (This check would NOT be valid
+      // after a SUCCESSFUL close: legs stay POSITION_OPEN until
+      // `initializeLadder` rebuilds them below, so `_closeQuantity()` would
+      // still read positive even though the close is fine — do not
+      // "simplify" this to run unconditionally.)
+      if (!closed && this._closeQuantity() > 0) {
         await this.addLog(
           `WARNING: ${kind} (${reason}) ABORTED — the close did not complete, so the ladder was left ` +
           `INTACT and the open position is still tracked. Retry the harvest, or close it manually on Binance.`,

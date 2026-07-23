@@ -580,8 +580,13 @@ test('_harvestToFlat: close throws with inventory open -> aborts, ladder left in
 
   assert.equal(s.harvestCount, 0, 'harvestCount must not increment on an aborted close');
   assert.equal(s.anchor, 100, 'anchor must stay put — no re-anchor on a failed close');
-  assert.ok(longLegs.every((l) => l.state === 'POSITION_OPEN'), 'legs must stay POSITION_OPEN — the only record of open inventory');
-  assert.ok(s._closeQuantity() > 0, 'the position must still be closable (ledger not wiped)');
+
+  // Read off the LIVE array, not the captured `longLegs` references: buildLadder
+  // allocates NEW leg objects and initializeLadder replaces `this.ladderLines`
+  // wholesale, so the captured objects would stay POSITION_OPEN even if the
+  // ladder WAS rebuilt underneath them — asserting on `longLegs` proves nothing.
+  assert.equal(s.ladderLines.filter((l) => l.state === 'POSITION_OPEN').length, 2,
+    'the open-leg ledger must survive — it is the only record of the live position');
   assert.equal(s._tradingSeqInProgress, false, 'the seq lock must still release on the abort path');
 });
 
@@ -614,6 +619,51 @@ test('_harvestToFlat: genuinely flat -> still re-anchors — the abort must not 
 
   assert.equal(s.harvestCount, 1, 'a no-op close must not be mistaken for a failed one');
   assert.equal(s.anchor, 105, 're-anchors normally when there was nothing to close');
+});
+
+test('_harvestToFlat: close returns false WITHOUT throwing (side unresolved) -> aborts, ladder left intact', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  // No legs are marked open, so _closeConsolidated's leg-direction fallback
+  // finds nothing; combined with currentSide null, the initial side lookup
+  // fails outright. Only `activePosition` carries the (drifted) inventory —
+  // exactly the "no legs behind it, no side in memory" case the code calls out.
+  s.currentSide = null;
+  s.activePosition = { quantity: 1, avgEntry: 100.3, entryPrice: 100.3, notional: 100.3, unrealizedPnl: 0 };
+  s.currentPrice = 110; // distinct from the anchor — must NOT be adopted
+  // `_refreshCurrentPosition` is stubbed to a no-op by the `ladderStrategy()`
+  // fixture — it leaves `currentSide` null while the inventory (activePosition)
+  // remains, so `_closeConsolidated`'s post-refresh side check ALSO fails and
+  // it logs the "side could not be resolved" warning and returns `false`
+  // WITHOUT throwing (as opposed to the earlier throw-based abort test above).
+
+  await s._harvestToFlat('manual_harvest');
+
+  assert.equal(s.harvestCount, 0, 'harvestCount must not increment on an aborted close');
+  assert.equal(s.anchor, 100, 'anchor must stay put — no re-anchor on an unresolved-side abort');
+  assert.ok(s.activePosition && s.activePosition.quantity > 0, 'the position must still be tracked, not silently dropped');
+  assert.equal(s._tradingSeqInProgress, false, 'the seq lock must still release on the abort path');
+});
+
+test('_harvestToFlat: _closeConsolidated refreshes mid-close and proves genuinely flat -> does NOT abort, re-anchors', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  // Stale PRE-close reading, same shape as the previous test: no legs marked
+  // open, currentSide null, so the initial side lookup fails and
+  // `_closeConsolidated` refreshes internally — but THIS time the refresh
+  // proves the account genuinely flat (the case Item 1's guard fix targets:
+  // a pre-close snapshot would read "had inventory" here and wrongly abort).
+  s.currentSide = null;
+  s.activePosition = { quantity: 1, avgEntry: 100.3, entryPrice: 100.3, notional: 100.3, unrealizedPnl: 0 };
+  s._refreshCurrentPosition = async () => {
+    s.activePosition = null; // REST confirms flat
+    s.currentSide = null;
+  };
+  s.currentPrice = 105;
+  s.getTotalMarginBalance = async () => 1e9;
+
+  await s._harvestToFlat('manual_harvest');
+
+  assert.equal(s.harvestCount, 1, 'a refresh-confirmed-flat close must not be mistaken for a failed one');
+  assert.equal(s.anchor, 105, 're-anchors on the live price — the abort must not fire on a stale pre-close reading');
 });
 
 // ——— Task 9: persistence, status, and resume ——————————————————————————
