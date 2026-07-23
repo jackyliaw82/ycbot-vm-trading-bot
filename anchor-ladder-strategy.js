@@ -1013,6 +1013,8 @@ class AnchorLadderStrategy extends TradingBase {
     this.currentSide = snapshot.currentSide || null;
     this.activePosition = snapshot.currentPosition || null;
     this.finalTpPrice = snapshot.finalTpPrice || null;
+    this.harvestTriggerPrice = snapshot.harvestTriggerPrice ?? null;
+    this.harvestTriggerAbove = snapshot.harvestTriggerAbove ?? null;
     this.cycleAccumulatedLoss = snapshot.cycleAccumulatedLoss || 0;
     this.flattenCount = snapshot.flattenCount || 0;
     this.harvestCount = snapshot.harvestCount || 0;
@@ -1319,6 +1321,10 @@ class AnchorLadderStrategy extends TradingBase {
     // `_refreshCurrentPosition` had real fields to work against.
     this.activePosition = null;
     this.currentSide = null;
+
+    // Any armed harvest trigger dies with the cycle (Final TP or manual Stop).
+    this.harvestTriggerPrice = null;
+    this.harvestTriggerAbove = null;
 
     // Final funding flush — capture any settlement that happened between
     // the last scheduled poll and stop. Non-critical: swallow errors.
@@ -2418,6 +2424,8 @@ class AnchorLadderStrategy extends TradingBase {
       recoveryDistance: this.recoveryDistance,
       harvestLossThreshold: this.harvestLossThreshold,
       _lastLadderSize: this._lastLadderSize,
+      harvestTriggerPrice: this.harvestTriggerPrice ?? null,
+      harvestTriggerAbove: this.harvestTriggerAbove ?? null,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
@@ -2488,6 +2496,8 @@ class AnchorLadderStrategy extends TradingBase {
       stepPct: this.stepPct,
       legNotional: this._legNotional(),
       ladderBaseSize: this._ladderBaseSize,
+      harvestTriggerPrice: this.harvestTriggerPrice ?? null,
+      harvestTriggerAbove: this.harvestTriggerAbove ?? null,
     };
   }
 
@@ -2586,6 +2596,10 @@ class AnchorLadderStrategy extends TradingBase {
         lastProcessedPrice: this.lastProcessedPrice,
         ladderBaseSize: this._ladderBaseSize,
         _lastLadderSize: this._lastLadderSize,
+        // Armed manual harvest/re-anchor trigger (one-shot price level). Persist
+        // so a VM restart / resume doesn't silently disarm it.
+        harvestTriggerPrice: this.harvestTriggerPrice ?? null,
+        harvestTriggerAbove: this.harvestTriggerAbove ?? null,
         // Geometry is per-cycle config, not a constant — resume MUST rebuild the
         // ladder this cycle actually started with (see _applySnapshotGeometry).
         stepPct: this.stepPct,

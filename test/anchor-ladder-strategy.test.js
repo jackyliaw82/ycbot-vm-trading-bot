@@ -1745,3 +1745,32 @@ test('the trigger fires BEFORE the anchor-flatten dispatch on the same tick', as
   assert.equal(harvested, true, 'trigger wins');
   assert.equal(flattened, false, 'anchor flatten did not run this tick');
 });
+
+// ——— Trigger price: persistence + status ———
+
+test('getStatus surfaces the armed trigger', () => {
+  const s = ladderStrategy();
+  s.harvestTriggerPrice = 105.5; s.harvestTriggerAbove = true;
+  const st = s.getStatus();
+  assert.equal(st.harvestTriggerPrice, 105.5);
+  assert.equal(st.harvestTriggerAbove, true);
+});
+
+test('getHeartbeatPayload surfaces the armed trigger', () => {
+  const s = ladderStrategy();
+  s.harvestTriggerPrice = 98; s.harvestTriggerAbove = false;
+  const hb = s.getHeartbeatPayload();
+  assert.equal(hb.harvestTriggerPrice, 98);
+  assert.equal(hb.harvestTriggerAbove, false);
+});
+
+test('saveState persists the armed trigger fields', async () => {
+  const s = ladderStrategy();
+  delete s.saveState;                        // restore the real prototype method (fixture stubs it)
+  let captured = null;
+  s.firestore = { collection: () => ({ doc: () => ({ set: async (doc) => { captured = doc; } }) }) };
+  s.harvestTriggerPrice = 105; s.harvestTriggerAbove = true;
+  await s.saveState();
+  assert.equal(captured.harvestTriggerPrice, 105);
+  assert.equal(captured.harvestTriggerAbove, true);
+});
