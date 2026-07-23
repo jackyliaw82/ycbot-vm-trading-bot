@@ -311,7 +311,10 @@ test('_closeConsolidated: currentSide missing is repopulated by a refresh from B
   s.currentSide = null;
   s._refreshCurrentPosition = async () => { s.currentSide = 'LONG'; };
   let orderArgs = null;
-  s.placeMarketOrder = async (symbol, side, qty) => { orderArgs = { symbol, side, qty }; return {}; };
+  s.placeMarketOrder = async (symbol, side, qty) => { orderArgs = { symbol, side, qty }; return { orderId: 1 }; };
+  // The close itself succeeds (WS confirms the fill) — this test is about the
+  // currentSide repopulation, not about fill verification tiering.
+  s._waitForOrderFillConfirmation = async () => true;
   const result = await s._closeConsolidated('test');
   assert.equal(result, true, 'the close fires once the refresh repopulates currentSide');
   assert.ok(orderArgs, 'an order was placed');
@@ -346,6 +349,155 @@ test('_closeConsolidated: nothing open returns false quietly, no order, no warni
   assert.equal(result, false);
   assert.equal(orderCalled, false);
   assert.equal(logs.length, 0, 'the normal no-op path stays quiet');
+});
+
+// ——— _closeConsolidated: tiered fill verification (WS -> REST ack -> REST position check) ———
+//
+// _waitForOrderFillConfirmation never REJECTS — it resolves true (WS
+// confirmed) or false (3s timeout) — so a close must not be treated as done
+// merely because the order was placed without throwing. These tests pin the
+// three-tier contract mirroring _resolveFill's tiering on the open path.
+
+test('_closeConsolidated: unverifiable close (WS times out, no REST ack, refresh still shows it open) returns false and leaves state intact', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.placeMarketOrder = async () => ({ orderId: 1 }); // no executedQty in the ack
+  s._waitForOrderFillConfirmation = async () => false; // WS timed out
+  s._refreshCurrentPosition = async () => {
+    // Binance still reports the position open — the close did not land.
+    s._lastPositionRefreshFailed = false;
+    s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+    s.currentSide = 'LONG';
+  };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  const result = await s._closeConsolidated('test');
+
+  assert.equal(result, false, 'an unverified close must never be reported as success');
+  assert.ok(s.activePosition && s.activePosition.quantity === 0.5, 'activePosition must stay intact, not dropped');
+  assert.equal(s.currentSide, 'LONG', 'currentSide must not be cleared on an unverified close');
+  assert.ok(
+    logs.some((m) => m.includes('WARNING') && m.includes('could NOT be verified')),
+    'a loud warning is logged instead of a silent drop',
+  );
+});
+
+test('_closeConsolidated: tier 2 — a full REST-ack executedQty verifies the close when WS times out', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.placeMarketOrder = async () => ({ orderId: 1, executedQty: '0.5' });
+  s._waitForOrderFillConfirmation = async () => false; // WS timed out
+  let refreshCalled = false;
+  s._refreshCurrentPosition = async () => { refreshCalled = true; };
+
+  const result = await s._closeConsolidated('test');
+
+  assert.equal(result, true, 'a full REST-ack fill verifies the close without needing tier 3');
+  assert.equal(refreshCalled, false, 'tier 2 succeeding must short-circuit before tier 3\'s REST refresh');
+  assert.equal(s.activePosition, null, 'position state is cleared once verified');
+  assert.equal(s.currentSide, null);
+});
+
+test('_closeConsolidated: tier 3 — a REST refresh confirming flat verifies the close when WS and the ack both miss', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.placeMarketOrder = async () => ({ orderId: 1 }); // no executedQty
+  s._waitForOrderFillConfirmation = async () => false; // WS timed out
+  s._refreshCurrentPosition = async () => {
+    s._lastPositionRefreshFailed = false;
+    s.activePosition = null; // Binance confirms flat
+    s.currentSide = null;
+  };
+
+  const result = await s._closeConsolidated('test');
+
+  assert.equal(result, true, 'a confirmed-flat REST refresh verifies the close');
+  assert.equal(s.activePosition, null);
+  assert.equal(s.currentSide, null);
+});
+
+test('_closeConsolidated: tier 3 — a FAILED refresh must NOT read as verified (unknown must never read as closed)', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.placeMarketOrder = async () => ({ orderId: 1 });
+  s._waitForOrderFillConfirmation = async () => false; // WS timed out
+  s._refreshCurrentPosition = async () => { s._lastPositionRefreshFailed = true; }; // Binance unreachable
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  const result = await s._closeConsolidated('test');
+
+  assert.equal(result, false, 'unknown state must never be treated as a verified close');
+  assert.ok(s.activePosition && s.activePosition.quantity === 0.5, 'activePosition must NOT be cleared on an unresolved refresh');
+  assert.equal(s.currentSide, 'LONG');
+  assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud warning is logged, never a silent drop');
+});
+
+// ——— _flattenAtAnchor / _flattenGrid: an unverified close must abort the leg-ledger rebuild ———
+//
+// buildLadder()/the EMPTY-reset loop wipe the POSITION_OPEN leg ledger — the
+// ONLY record of open inventory (_closeQuantity sizes every close from it).
+// Rebuilding after an unverified close would orphan a live position: it stays
+// open on Binance while the bot's own books read "flat, fresh ladder" and
+// nothing ever tries to close it again.
+
+test('_flattenAtAnchor: an unverified close aborts the rebuild — flattenCount unchanged, ladder left intact', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  const longLegs = s.ladderLines.filter(l => l.direction === 'LONG').slice(0, 2);
+  longLegs.forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
+  s.activePosition = { quantity: 1, entryPrice: 100.3, avgEntry: 100.3, notional: 100.3, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s._closeConsolidated = async () => false; // the close could not be verified
+  let sizingCalled = false;
+  s._computeLadderBaseSize = async () => { sizingCalled = true; return s._ladderBaseSize; };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s._flattenAtAnchor();
+
+  assert.equal(s.flattenCount, 0, 'an aborted flatten must not count as committed');
+  assert.equal(s.anchor, 100, 'the anchor must not move on an aborted flatten');
+  assert.equal(sizingCalled, false, 'no re-sizing churn when the close was never verified');
+  // Read off the LIVE array, not the captured `longLegs` references —
+  // buildLadder allocates NEW leg objects and _flattenAtAnchor replaces
+  // `this.ladderLines` wholesale, so the captured objects would stay
+  // POSITION_OPEN even if the ladder WAS rebuilt underneath them — asserting
+  // on `longLegs` would prove nothing.
+  assert.equal(
+    s.ladderLines.filter((l) => l.state === 'POSITION_OPEN').length, 2,
+    'the open-leg ledger must survive — it is the only record of the live position',
+  );
+  assert.ok(
+    logs.some((m) => m.includes('WARNING') && m.includes('ANCHOR FLATTEN aborted')),
+    'a loud warning is logged instead of a silent rebuild',
+  );
+});
+
+test('_flattenGrid: an unverified close keeps the leg ledger intact and returns false', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  const openLeg = s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1);
+  openLeg.state = 'POSITION_OPEN';
+  openLeg.quantity = 0.5;
+  s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s._closeConsolidated = async () => false; // unverified
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  const result = await s._flattenGrid('test');
+
+  assert.equal(result, false, 'an unverified flatten must report failure, not success');
+  assert.equal(openLeg.state, 'POSITION_OPEN', 'the leg ledger must survive an unverified close');
+  assert.equal(openLeg.quantity, 0.5);
+  assert.ok(
+    logs.some((m) => m.includes('WARNING') && m.includes('leg ledger left INTACT')),
+    'a loud warning is logged instead of a silent leg-wipe',
+  );
 });
 
 // ——— Task 8: dynamic sizing, harvest, Final TP ———————————————————————
@@ -599,7 +751,11 @@ test('_harvestToFlat: close succeeds -> harvestCount increments and re-anchors o
   s.currentSide = 'LONG';
   s.currentPrice = 110; // distinct from the anchor — the re-anchor target
   s.placeMarketOrder = async () => ({ orderId: 1, status: 'FILLED' });
-  s._waitForOrderFillConfirmation = async () => {}; // keep the success path fast
+  // The close succeeds (WS confirms the fill) — tier 1 of _closeConsolidated's
+  // verification. Was `async () => {}` (falsy/unverified), which under the
+  // tightened contract now reads as an UNVERIFIED close; express the intended
+  // success explicitly instead.
+  s._waitForOrderFillConfirmation = async () => true;
   s.getTotalMarginBalance = async () => 1e9;
 
   await s._harvestToFlat('manual_harvest');
