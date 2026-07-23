@@ -1756,6 +1756,40 @@ test('a trigger reached while FLAT disarms quietly without harvesting', async ()
   assert.equal(s.harvestTriggerPrice, null, 'disarmed');
 });
 
+test('a trigger reached while position state is UNKNOWN still harvests (never reads unknown as flat)', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();
+  // Legs are the WS-true ledger: a leg filled, but the REST refresh that would
+  // populate activePosition failed. That is UNKNOWN, not flat.
+  s.ladderLines.filter((l) => l.direction === 'LONG').slice(0, 2)
+    .forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
+  s.activePosition = null;
+  s._lastPositionRefreshFailed = true;
+  s.harvestTriggerPrice = 101; s.harvestTriggerAbove = true;
+  let fired = null;
+  s._harvestToFlat = async (r) => { fired = r; };
+  await s.handleRealtimePrice(101);
+  assert.equal(fired, 'price_trigger', 'unknown state must NOT disarm quietly');
+  assert.equal(s.harvestTriggerPrice, null);
+});
+
+test('an armed trigger NOT yet reached survives a real anchor flatten', async () => {
+  // Precondition: the tick must genuinely flatten (not merely "make one up") —
+  // stub _flattenAtAnchor and assert it fired, exactly like the plain
+  // "RANGE: crossing the anchor flattens" test above. Otherwise a tick that
+  // never flattens would pass this test while proving nothing.
+  const s = ladderStrategy();
+  let flattened = false;
+  s._flattenAtAnchor = async () => { flattened = true; };
+  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
+  s.lastProcessedPrice = 100.35;
+  s.harvestTriggerPrice = 105; s.harvestTriggerAbove = true;   // armed, nowhere near this tick
+  await s.handleRealtimePrice(99.9);                           // crosses back below the anchor
+  assert.equal(flattened, true, 'precondition: the anchor flatten actually ran');
+  assert.equal(s.harvestTriggerPrice, 105, 'the trigger must survive an anchor flatten untouched');
+  assert.equal(s.harvestTriggerAbove, true);
+});
+
 test('the trigger fires BEFORE the anchor-flatten dispatch on the same tick', async () => {
   const s = ladderStrategy();                // anchor 100
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: 2 };

@@ -1567,13 +1567,22 @@ class AnchorLadderStrategy extends TradingBase {
         : price <= this.harvestTriggerPrice;
       if (reached) {
         const level = this.harvestTriggerPrice;
-        const open = !!(this.activePosition && this.activePosition.quantity > 0);
+        // Decide openness from `_closeQuantity()`, NOT `activePosition` — see
+        // the TOMBSTONE above `_closeQuantity()`. `activePosition` is written
+        // only by `_refreshCurrentPosition` (REST) and holds stale/null on a
+        // failed refresh; reading that as "flat" silently disarms the trigger
+        // while a real position sits open on Binance. `_closeQuantity()`
+        // returns 0 only when Binance was reachable and reported flat — a
+        // genuine flat — and otherwise falls through to the WS-true leg
+        // ledger, so UNKNOWN state still harvests.
+        const open = this._closeQuantity() > 0;
         this.harvestTriggerPrice = null;
         this.harvestTriggerAbove = null;
         if (open) {
           await this._harvestToFlat('price_trigger');
         } else {
-          await this.addLog(`Trigger price ${this._formatPrice(level)} reached but the position is already flat — disarmed.`);
+          await this.addLog(`[LADDER] trigger price ${this._formatPrice(level)} reached but the position is already flat — disarmed.`);
+          this._pushHeartbeatNow?.();
           await this.saveState();
         }
         this.lastProcessedPrice = price;
