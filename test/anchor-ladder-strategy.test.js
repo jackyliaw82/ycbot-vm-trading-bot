@@ -1685,3 +1685,63 @@ test('cancelHarvestTrigger clears an armed trigger', async () => {
   assert.equal(s.harvestTriggerPrice, null);
   assert.equal(s.harvestTriggerAbove, null);
 });
+
+// ——— Trigger price: tick-loop firing ———
+
+test('an armed ABOVE trigger fires _harvestToFlat when price reaches the level', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: 5 };
+  s.harvestTriggerPrice = 101; s.harvestTriggerAbove = true;
+  let fired = null;
+  s._harvestToFlat = async (reason) => { fired = reason; };
+  await s.handleRealtimePrice(101);
+  assert.equal(fired, 'price_trigger');
+  assert.equal(s.harvestTriggerPrice, null, 'one-shot: cleared before acting');
+  assert.equal(s.harvestTriggerAbove, null);
+});
+
+test('an armed ABOVE trigger does NOT fire while price is below the level', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: 5 };
+  s.harvestTriggerPrice = 101; s.harvestTriggerAbove = true;
+  let fired = false;
+  s._harvestToFlat = async () => { fired = true; };
+  await s.handleRealtimePrice(100.5);
+  assert.equal(fired, false);
+  assert.equal(s.harvestTriggerPrice, 101, 'still armed');
+});
+
+test('an armed BELOW trigger fires when price gaps through the level', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: -3 };
+  s.harvestTriggerPrice = 99; s.harvestTriggerAbove = false;
+  let fired = null;
+  s._harvestToFlat = async (r) => { fired = r; };
+  await s.handleRealtimePrice(98);           // jumped past 99
+  assert.equal(fired, 'price_trigger');
+  assert.equal(s.harvestTriggerPrice, null);
+});
+
+test('a trigger reached while FLAT disarms quietly without harvesting', async () => {
+  const s = ladderStrategy();
+  s.activePosition = null;                   // flat
+  s.harvestTriggerPrice = 101; s.harvestTriggerAbove = true;
+  let fired = false;
+  s._harvestToFlat = async () => { fired = true; };
+  await s.handleRealtimePrice(101);
+  assert.equal(fired, false, 'nothing open → no harvest');
+  assert.equal(s.harvestTriggerPrice, null, 'disarmed');
+});
+
+test('the trigger fires BEFORE the anchor-flatten dispatch on the same tick', async () => {
+  const s = ladderStrategy();                // anchor 100
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: 2 };
+  s.lastProcessedPrice = 100.5;
+  s.harvestTriggerPrice = 100; s.harvestTriggerAbove = false;  // trigger AT the anchor
+  let harvested = false, flattened = false;
+  s._harvestToFlat = async () => { harvested = true; };
+  s._flattenAtAnchor = async () => { flattened = true; };
+  await s.handleRealtimePrice(100);          // crosses anchor AND hits trigger
+  assert.equal(harvested, true, 'trigger wins');
+  assert.equal(flattened, false, 'anchor flatten did not run this tick');
+});

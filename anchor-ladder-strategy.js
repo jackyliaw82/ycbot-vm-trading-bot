@@ -1549,6 +1549,32 @@ class AnchorLadderStrategy extends TradingBase {
       return;
     }
 
+    // Armed price trigger — fire the manual harvest/re-anchor at a user-set
+    // level. Placed here with the manual latch, BEFORE the RANGE/TREND
+    // dispatch, so it takes precedence over the normal ladder action on this
+    // tick (identical to the manual latch). One-shot: cleared BEFORE acting so
+    // a throw mid-harvest can never leave a re-firing loop. Threshold (not
+    // prev/current bracketing) so a gap-through and a resume-past-level fire.
+    if (this.harvestTriggerPrice != null) {
+      const reached = this.harvestTriggerAbove
+        ? price >= this.harvestTriggerPrice
+        : price <= this.harvestTriggerPrice;
+      if (reached) {
+        const level = this.harvestTriggerPrice;
+        const open = !!(this.activePosition && this.activePosition.quantity > 0);
+        this.harvestTriggerPrice = null;
+        this.harvestTriggerAbove = null;
+        if (open) {
+          await this._harvestToFlat('price_trigger');
+        } else {
+          await this.addLog(`Trigger price ${this._formatPrice(level)} reached but the position is already flat — disarmed.`);
+          await this.saveState();
+        }
+        this.lastProcessedPrice = price;
+        return;
+      }
+    }
+
     // ---- Derive the RANGE→TREND invariant BEFORE dispatching on mode. ----
     // Fully scaled (outermost leg POSITION_OPEN) always implies TREND — a
     // no-op once already TREND, and a self-heal on the first tick after a
