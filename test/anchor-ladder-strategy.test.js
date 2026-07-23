@@ -1630,3 +1630,58 @@ test('resume THROWS on a non-numeric (e.g. stringified) geometry value rather th
   const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   assert.throws(() => s._applySnapshotGeometry({ stepPct: '0.005', levelsPerSide: 8 }));
 });
+
+// ——— Trigger price: arm / cancel / validate ———
+
+test('harvestNow(triggerPrice) arms an ABOVE trigger and rounds to tick size', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();                       // currentPrice 100
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  const res = await s.harvestNow(101.239);          // ~1.2% above → rounds to 101.24
+  assert.equal(res.armed, true);
+  assert.equal(s.harvestTriggerPrice, 101.24);
+  assert.equal(s.harvestTriggerAbove, true);
+  assert.equal(s._manualHarvestRequested, false, 'arming must NOT set the immediate latch');
+});
+
+test('harvestNow(triggerPrice) infers a BELOW trigger from the current price', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  await s.harvestNow(98.5);
+  assert.equal(s.harvestTriggerPrice, 98.5);
+  assert.equal(s.harvestTriggerAbove, false);
+});
+
+test('harvestNow(triggerPrice) rejects a level within the 0.1% gap', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();                       // currentPrice 100 → band 99.9..100.1
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  await assert.rejects(() => s.harvestNow(100.05), /0\.1%|current price/i);
+  assert.equal(s.harvestTriggerPrice, null, 'a rejected arm leaves no trigger set');
+});
+
+test('harvestNow(triggerPrice) rejects a non-positive price', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  await assert.rejects(() => s.harvestNow(0), /positive/i);
+});
+
+test('harvestNow() with no price latches immediately AND clears any armed trigger', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  s.harvestTriggerPrice = 105; s.harvestTriggerAbove = true;   // pre-armed
+  const res = await s.harvestNow();
+  assert.equal(res.queued, true);
+  assert.equal(s._manualHarvestRequested, true);
+  assert.equal(s.harvestTriggerPrice, null, 'immediate harvest supersedes a pending trigger');
+});
+
+test('cancelHarvestTrigger clears an armed trigger', async () => {
+  const s = ladderStrategy();
+  s.harvestTriggerPrice = 105; s.harvestTriggerAbove = true;
+  const res = await s.cancelHarvestTrigger();
+  assert.equal(res.cancelled, true);
+  assert.equal(s.harvestTriggerPrice, null);
+  assert.equal(s.harvestTriggerAbove, null);
+});

@@ -25,6 +25,10 @@ const DEFAULT_RECOVERY_DISTANCE = 0.005;           // 0.5%
 // arm ASAP; Binance REST throttling on this VM's IP is a known live failure
 // mode, so we cannot hammer it per tick. 15s is the compromise.
 const TREND_ARM_RETRY_INTERVAL_MS = 15_000;
+// Minimum distance a manual harvest/re-anchor Trigger Price must sit from the
+// live price, so an armed trigger cannot accidentally fire on the very next
+// tick. Hard-enforced by harvestNow(); the frontend mirrors it for UX only.
+const TRIGGER_MIN_GAP_PCT = 0.001; // 0.1%
 
 function formatDuration(ms) {
   if (!ms || ms < 0) return 'N/A';
@@ -154,6 +158,11 @@ class AnchorLadderStrategy extends TradingBase {
     // ---- Phase 3: harvest-gauge cap ----
     this._lastLadderSize = null;        // last dynamic ladder base size (for gauge-full freeze)
     this._manualHarvestRequested = false; // latch: harvestNow() sets this; honored on the next free tick (transient, not persisted)
+    // Optional one-shot manual trigger (harvestNow(triggerPrice)). PERSISTED —
+    // saveState/resume carry it so a VM restart doesn't silently disarm it.
+    // Direction (`Above`) is fixed at arm time so it can't drift as price moves.
+    this.harvestTriggerPrice = null;      // number | null
+    this.harvestTriggerAbove = null;      // boolean | null: true = fire when price >= level
   }
 
   // ——— Lifecycle ——————————————————————————————————————————————————————
@@ -1666,12 +1675,59 @@ class AnchorLadderStrategy extends TradingBase {
    * sizing (see `_computeLadderBaseSize`). Throws on ineligibility (the route
    * maps it to a 409).
    */
-  async harvestNow() {
+  async harvestNow(triggerPrice = null) {
     if (!this.isRunning) throw new Error('Strategy is not running.');
     const open = !!(this.activePosition && this.activePosition.quantity > 0);
     if (!open) throw new Error('Nothing open to close.');
-    this._manualHarvestRequested = true; // honored on the next free tick
-    return { harvesting: true, queued: true, mode: this.ladderMode, price: this.currentPrice };
+
+    // No price → immediate harvest on the next free tick (today's behavior).
+    // Clear any armed trigger so an immediate Harvest-now always supersedes a
+    // pending one — the backend, not the frontend, guarantees the exclusion.
+    if (triggerPrice == null) {
+      this.harvestTriggerPrice = null;
+      this.harvestTriggerAbove = null;
+      this._manualHarvestRequested = true; // honored on the next free tick
+      return { harvesting: true, queued: true, mode: this.ladderMode, price: this.currentPrice };
+    }
+
+    // With a price → arm a one-shot trigger. The VM is the authority on
+    // validity (mirrors the ladder-geometry bounds philosophy): validate,
+    // enforce the 0.1% gap, and round to the symbol's tick size here.
+    const px = Number(triggerPrice);
+    if (!Number.isFinite(px) || px <= 0) {
+      throw new Error('Trigger price must be a positive number.');
+    }
+    const ref = this.currentPrice;
+    if (!Number.isFinite(ref) || ref <= 0) {
+      throw new Error('No live price yet — cannot arm a trigger.');
+    }
+    const rounded = this.roundPrice(px);
+    if (Math.abs(rounded - ref) < ref * TRIGGER_MIN_GAP_PCT) {
+      throw new Error(`Trigger price must be at least 0.1% from the current price (${this._formatPrice(ref)}).`);
+    }
+    this.harvestTriggerPrice = rounded;
+    this.harvestTriggerAbove = rounded > ref;
+    this._manualHarvestRequested = false; // arming is NOT an immediate harvest
+    await this.saveState();
+    this._pushHeartbeatNow?.();
+    await this.addLog(`[LADDER] harvest trigger armed @ ${this._formatPrice(rounded)} (fires when price ${this.harvestTriggerAbove ? '>=' : '<='} ${this._formatPrice(rounded)}).`);
+    return { armed: true, triggerPrice: rounded, above: this.harvestTriggerAbove, mode: this.ladderMode };
+  }
+
+  /**
+   * Cancel an armed harvest/re-anchor Trigger Price. No-op-safe (idempotent).
+   * Called by the /anchor-ladder/cancel-harvest-trigger route.
+   */
+  async cancelHarvestTrigger() {
+    const had = this.harvestTriggerPrice != null;
+    this.harvestTriggerPrice = null;
+    this.harvestTriggerAbove = null;
+    if (had) {
+      await this.saveState();
+      this._pushHeartbeatNow?.();
+      await this.addLog('[LADDER] harvest trigger cancelled.');
+    }
+    return { cancelled: true };
   }
 
   // ——— Dynamic sizing ————————————————————————————————————————————————
