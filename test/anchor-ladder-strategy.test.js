@@ -546,13 +546,74 @@ test('harvest re-anchors to the CURRENT price, unlike the anchor flatten', async
   s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
   s.activePosition = { quantity: 10, avgEntry: 100.3, entryPrice: 100.3, notional: 1003 };
   s.currentPrice = 103;
-  s._closeConsolidated = async () => { s.activePosition = null; };
+  s._closeConsolidated = async () => { s.activePosition = null; return true; };
   s._computeAccLoss = () => 0;
   s.getTotalMarginBalance = async () => 1e9;
   await s._harvestToFlat('manual_harvest');
   assert.equal(s.anchor, 103, 'the harvest re-anchors; the anchor flatten does not');
   assert.equal(s.ladderMode, 'RANGE');
   assert.ok(s.ladderLines.every(l => l.state === 'EMPTY'));
+});
+
+// ——— _harvestToFlat: a failed close must abort the rebuild, not orphan the position ———
+//
+// initializeLadder() resets every leg to EMPTY, and POSITION_OPEN is the ONLY
+// record of what this bot has open (_closeQuantity sizes every close off it).
+// Rebuilding after a failed close would leave a real position open on Binance
+// while the bot's own books read "flat, fresh ladder" — nothing would ever try
+// to close it again. These three tests pin: (1) a close that THROWS with
+// inventory open aborts and leaves the ladder intact, (2) a close that
+// SUCCEEDS still re-anchors and rebuilds exactly as before, (3) genuinely
+// nothing-to-close still re-anchors — the abort must not fire on a real no-op.
+
+test('_harvestToFlat: close throws with inventory open -> aborts, ladder left intact, position still tracked', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy({ anchor: 100 });
+  const longLegs = s.ladderLines.filter(l => l.direction === 'LONG').slice(0, 2);
+  longLegs.forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
+  s.activePosition = { quantity: 1, avgEntry: 100.3, entryPrice: 100.3, notional: 100.3, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.currentPrice = 110; // distinct from the anchor — must NOT be adopted
+  s.placeMarketOrder = async () => { throw new Error('-1001 Internal error'); };
+
+  await s._harvestToFlat('manual_harvest');
+
+  assert.equal(s.harvestCount, 0, 'harvestCount must not increment on an aborted close');
+  assert.equal(s.anchor, 100, 'anchor must stay put — no re-anchor on a failed close');
+  assert.ok(longLegs.every((l) => l.state === 'POSITION_OPEN'), 'legs must stay POSITION_OPEN — the only record of open inventory');
+  assert.ok(s._closeQuantity() > 0, 'the position must still be closable (ledger not wiped)');
+  assert.equal(s._tradingSeqInProgress, false, 'the seq lock must still release on the abort path');
+});
+
+test('_harvestToFlat: close succeeds -> harvestCount increments and re-anchors on the live price (unchanged behavior)', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy({ anchor: 100 });
+  const longLegs = s.ladderLines.filter(l => l.direction === 'LONG').slice(0, 2);
+  longLegs.forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
+  s.activePosition = { quantity: 1, avgEntry: 100.3, entryPrice: 100.3, notional: 100.3, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.currentPrice = 110; // distinct from the anchor — the re-anchor target
+  s.placeMarketOrder = async () => ({ orderId: 1, status: 'FILLED' });
+  s._waitForOrderFillConfirmation = async () => {}; // keep the success path fast
+  s.getTotalMarginBalance = async () => 1e9;
+
+  await s._harvestToFlat('manual_harvest');
+
+  assert.equal(s.harvestCount, 1, 'harvestCount increments on a genuine close');
+  assert.equal(s.anchor, 110, 're-anchored on the live price');
+  assert.ok(s.ladderLines.every((l) => l.state !== 'POSITION_OPEN'), 'ladder rebuilt — no leg left open');
+});
+
+test('_harvestToFlat: genuinely flat -> still re-anchors — the abort must not fire when nothing was open', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.activePosition = null;
+  s.currentPrice = 105;
+  s.getTotalMarginBalance = async () => 1e9;
+
+  await s._harvestToFlat('manual_harvest');
+
+  assert.equal(s.harvestCount, 1, 'a no-op close must not be mistaken for a failed one');
+  assert.equal(s.anchor, 105, 're-anchors normally when there was nothing to close');
 });
 
 // ——— Task 9: persistence, status, and resume ——————————————————————————

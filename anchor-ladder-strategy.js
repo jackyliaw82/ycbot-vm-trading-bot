@@ -880,8 +880,37 @@ class AnchorLadderStrategy extends TradingBase {
       // Self-gating and self-sizing (see `_closeQuantity`). This matters most
       // here of all the close paths: the harvest RE-ANCHORS, so anything left
       // behind would net against a geometry it was never part of.
-      try { await this._closeConsolidated('harvest'); }
-      catch (e) { await this.addLog(`ERROR harvest close: ${e.message}`); }
+      //
+      // Inventory BEFORE the close. `_closeQuantity()` sums the WS-true open-leg
+      // ledger (floored by activePosition) and returns 0 ONLY when Binance was
+      // reachable and confirmed flat — so it distinguishes "nothing to close"
+      // from "something is open".
+      const hadInventory = this._closeQuantity() > 0;
+
+      let closed = false;
+      try { closed = await this._closeConsolidated('harvest'); }
+      catch (e) { await this.addLog(`ERROR ${kind} close: ${e.message}`); }
+
+      // TOMBSTONE — a failed close MUST abort the rebuild. `initializeLadder`
+      // below resets every leg to EMPTY, and those POSITION_OPEN markings are the
+      // ONLY record of what this bot has open (`_closeQuantity` sizes every close
+      // from them). Rebuilding after a failed close ORPHANS a live position: it
+      // stays open on Binance while the bot's books read "flat, fresh ladder" and
+      // nothing ever tries to close it again. Leave the ladder INTACT instead, so
+      // the position stays tracked and the harvest can be retried. `_flattenAtAnchor`
+      // gets this right by not catching at all. Do NOT rethrow here:
+      // `handleRealtimePrice` awaits this without a catch, so a throw would escape
+      // the WS tick handler.
+      if (hadInventory && !closed) {
+        await this.addLog(
+          `WARNING: ${kind} (${reason}) ABORTED — the close did not complete, so the ladder was left ` +
+          `INTACT and the open position is still tracked. Retry the harvest, or close it manually on Binance.`,
+        );
+        await this.saveState();
+        this._pushHeartbeatNow?.();
+        return;
+      }
+
       this.harvestCount = (this.harvestCount || 0) + 1;
       this.finalTpPrice = null;
 
