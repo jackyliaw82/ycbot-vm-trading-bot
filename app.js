@@ -1529,16 +1529,36 @@ app.get('/anchor-ladder/status', (req, res) => {
 // so the response is an immediate eligibility verdict. Ineligibility throws → 409.
 app.post('/anchor-ladder/harvest-now', async (req, res) => {
   try {
+    const { strategyId, triggerPrice } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
+    }
+    // triggerPrice omitted/null → immediate harvest (today's behavior); a number
+    // → arm a one-shot trigger validated + rounded by the strategy.
+    const result = await strategy.harvestNow(triggerPrice ?? null);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(409).json({ error: error.message });
+  }
+});
+
+// Cancel an armed harvest/re-anchor Trigger Price (set via harvest-now with a
+// triggerPrice). Idempotent — clears the latch if present. 400 if the strategy
+// isn't a running Anchor Ladder.
+app.post('/anchor-ladder/cancel-harvest-trigger', async (req, res) => {
+  try {
     const { strategyId } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
     const strategy = activeStrategies.get(strategyId);
     if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
       return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
     }
-    const result = await strategy.harvestNow();
+    const result = await strategy.cancelHarvestTrigger();
     res.json({ success: true, ...result });
   } catch (error) {
-    res.status(409).json({ error: error.message });
+    res.status(400).json({ error: error.message });
   }
 });
 
