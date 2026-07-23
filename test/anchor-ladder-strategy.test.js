@@ -452,6 +452,13 @@ test('_flattenAtAnchor: an unverified close aborts the rebuild — flattenCount 
   longLegs.forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
   s.activePosition = { quantity: 1, entryPrice: 100.3, avgEntry: 100.3, notional: 100.3, unrealizedPnl: 0 };
   s.currentSide = 'LONG';
+  // Seed a live TREND state — the anchor flatten is reachable from TREND too
+  // (it is one of TREND's two exits). If the abort skipped only the rebuild
+  // but not the mode reset above it, these would still get clobbered to
+  // RANGE/null/null even though the close was never verified.
+  s.ladderMode = 'TREND';
+  s.trendDirection = 'LONG';
+  s.finalTpPrice = 12345;
   s._closeConsolidated = async () => false; // the close could not be verified
   let sizingCalled = false;
   s._computeLadderBaseSize = async () => { sizingCalled = true; return s._ladderBaseSize; };
@@ -461,8 +468,16 @@ test('_flattenAtAnchor: an unverified close aborts the rebuild — flattenCount 
   await s._flattenAtAnchor();
 
   assert.equal(s.flattenCount, 0, 'an aborted flatten must not count as committed');
+  // Vacuous by design (the anchor never moves in `_flattenAtAnchor` even on a
+  // committed flatten) — kept only as a cheap guard against a future regression.
   assert.equal(s.anchor, 100, 'the anchor must not move on an aborted flatten');
   assert.equal(sizingCalled, false, 'no re-sizing churn when the close was never verified');
+  // The abort must skip the WHOLE reset block, not just the ladder rebuild —
+  // otherwise TREND state gets silently discarded even though the position
+  // stayed open and untracked.
+  assert.equal(s.ladderMode, 'TREND', 'ladderMode must not be reset on an aborted flatten');
+  assert.equal(s.trendDirection, 'LONG', 'trendDirection must not be reset on an aborted flatten');
+  assert.equal(s.finalTpPrice, 12345, 'finalTpPrice must not be nulled on an aborted flatten');
   // Read off the LIVE array, not the captured `longLegs` references —
   // buildLadder allocates NEW leg objects and _flattenAtAnchor replaces
   // `this.ladderLines` wholesale, so the captured objects would stay
@@ -492,8 +507,14 @@ test('_flattenGrid: an unverified close keeps the leg ledger intact and returns 
   const result = await s._flattenGrid('test');
 
   assert.equal(result, false, 'an unverified flatten must report failure, not success');
-  assert.equal(openLeg.state, 'POSITION_OPEN', 'the leg ledger must survive an unverified close');
-  assert.equal(openLeg.quantity, 0.5);
+  // Read off the LIVE array, not the captured `openLeg` reference. This works
+  // today only because `_flattenGrid` mutates legs in place — if it ever
+  // reallocated (as `buildLadder` does) a stale reference would keep reading
+  // POSITION_OPEN even after a wipe underneath it. Same discipline as the
+  // `_flattenAtAnchor` test above.
+  const stillOpen = s.ladderLines.filter((l) => l.state === 'POSITION_OPEN');
+  assert.equal(stillOpen.length, 1, 'the leg ledger must survive an unverified close');
+  assert.equal(stillOpen[0].quantity, 0.5);
   assert.ok(
     logs.some((m) => m.includes('WARNING') && m.includes('leg ledger left INTACT')),
     'a loud warning is logged instead of a silent leg-wipe',
@@ -1234,13 +1255,52 @@ test('stop({flatten:true}) closes the legs when the position API is down and mem
     orderArgs, { side: 'SELL', qty: 1.4, opts: { reduceOnly: true } },
     'the leg qty AND the leg direction drive the close — neither needs the dead position API',
   );
-  assert.ok(!logs.some((m) => m.includes('confirmed flat')), 'must never claim confirmed-flat when the state is unknown');
+  assert.ok(!logs.some((m) => m.includes('position confirmed flat')), 'must never claim confirmed-flat when the state is unknown');
   assert.ok(!logs.some((m) => m.includes('nothing to flatten')), 'must never claim nothing-to-flatten when the state is unknown');
   assert.ok(
     logs.some((m) => m.includes('WARNING') && m.includes('FINAL STATE UNKNOWN')),
     'the residual verification still cannot confirm flat, and says so loudly',
   );
   assert.equal(s.executionState, 'TERMINATED', 'stop() still completes termination — it never hangs open');
+});
+
+test('stop({flatten:true}): an unverified _flattenGrid close makes stop() retry via _closeConsolidated exactly ONCE more, not in a loop', async () => {
+  // `_flattenGrid` can now return false (unverified close). stop()'s fallback
+  // branch then fires a second reduceOnly close for the same position — safe
+  // (reduceOnly can never flip a position) and a desirable retry, but newly
+  // reachable and previously untested. Every close attempt below is
+  // unverifiable (WS times out, no REST-ack qty, refresh still shows it
+  // open), so if the retry were ever turned into an unbounded loop this test
+  // must catch it — hence counting EVERY call in an array rather than
+  // capturing only the last one into a single variable.
+  const s = stubStopTail(ladderStrategy());
+  const openLeg = s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1);
+  openLeg.state = 'POSITION_OPEN';
+  openLeg.quantity = 0.6;
+  s.activePosition = { quantity: 0.6, entryPrice: 100, avgEntry: 100, notional: 60, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s._waitForOrderFillConfirmation = async () => false; // tier 1 always times out
+  s._refreshCurrentPosition = async () => {}; // tier 3 + residual check: leaves activePosition open, never fails
+  const orderCalls = [];
+  s.placeMarketOrder = async (symbol, side, qty, price, opts) => {
+    orderCalls.push({ symbol, side, qty, opts });
+    return { orderId: orderCalls.length }; // ack carries no executedQty -> tier 2 also misses
+  };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s.stop({ flatten: true });
+
+  assert.equal(orderCalls.length, 2, 'exactly two reduceOnly close attempts: _flattenGrid\'s, then stop()\'s fallback retry — never more');
+  assert.ok(
+    orderCalls.every((c) => c.side === 'SELL' && c.opts?.reduceOnly === true),
+    'both attempts close the same LONG position the same way',
+  );
+  assert.ok(
+    logs.some((m) => m.includes('WARNING') && m.includes('residual')),
+    'the residual left open after both failed attempts is reported',
+  );
+  assert.equal(s.executionState, 'TERMINATED', 'stop() still completes termination despite both closes failing to verify');
 });
 
 // ——— Adversarial re-review fix (Fix B) ———————————————————————————————————
@@ -1786,7 +1846,7 @@ test('C3: stop({flatten:true}) reports FINAL STATE UNKNOWN — never "confirmed 
   }
 
   assert.ok(
-    !logs.some((m) => m.includes('confirmed flat')),
+    !logs.some((m) => m.includes('position confirmed flat')),
     'the user must NEVER be told the position is confirmed flat while the position state is UNKNOWN',
   );
   assert.ok(

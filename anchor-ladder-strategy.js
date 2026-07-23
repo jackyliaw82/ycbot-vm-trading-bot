@@ -415,6 +415,7 @@ class AnchorLadderStrategy extends TradingBase {
     if (!closed && this._closeQuantity() > 0) {
       await this.addLog(`WARNING: flatten (${reason}) could not be verified — leg ledger left INTACT.`);
       await this.saveState();
+      this._pushHeartbeatNow?.();
       return false;
     }
 
@@ -478,6 +479,14 @@ class AnchorLadderStrategy extends TradingBase {
    *
    * Self-gating and self-sizing off `_closeQuantity()`: callers need not (and
    * must not) pre-decide what is open from a REST snapshot.
+   *
+   * Return contract (every caller depends on this): returns `true` ONLY when
+   * the close is VERIFIED (WS fill marker, a full REST-ack qty, or a REST
+   * position check confirming flat) — position state is cleared in that case
+   * and only that case. Returns `false` when there was nothing to close, when
+   * the side could not be resolved, or when the close could not be verified —
+   * in the last two cases position state is deliberately left INTACT, so the
+   * caller must NOT wipe its leg ledger.
    */
   async _closeConsolidated(reason) {
     let qty = this._closeQuantity();
@@ -527,15 +536,20 @@ class AnchorLadderStrategy extends TradingBase {
     // Tier 3 — ask Binance what the position actually is. A confirmed-flat
     // account proves the close landed even if we never saw the fill event.
     if (!verified) {
-      try { await this._refreshCurrentPosition(); } catch (_) { /* flag is set by the refresh */ }
+      // No try/catch: _refreshCurrentPosition() catches internally and NEVER
+      // throws — it signals failure via _lastPositionRefreshFailed, not an
+      // exception, so a catch here was dead code (and a silent-swallow catch
+      // is exactly the shape this fix set out to remove).
+      await this._refreshCurrentPosition();
       const stillOpen = !!(this.activePosition && this.activePosition.quantity > 0);
       if (!this._lastPositionRefreshFailed && !stillOpen) verified = true;
     }
 
     if (!verified) {
       await this.addLog(
-        `WARNING: close (${reason}) could NOT be verified — no WS fill event, no REST ack, and Binance ` +
-        `has not verified the position as closed. Position state left INTACT. Verify manually on Binance.`,
+        `WARNING: close (${reason}) for ${this.symbol} ${side} qty ${qty} could NOT be verified — no WS fill ` +
+        `event, no fill quantity in the REST ack, and Binance has not verified the position as closed. ` +
+        `Position state left INTACT. Verify manually on Binance.`,
       );
       return false;
     }
@@ -655,6 +669,7 @@ class AnchorLadderStrategy extends TradingBase {
         `INTACT so the open position stays tracked. It will retry on the next anchor crossing.`,
       );
       await this.saveState();
+      this._pushHeartbeatNow?.();
       return;
     }
 
@@ -943,10 +958,11 @@ class AnchorLadderStrategy extends TradingBase {
       // `handleRealtimePrice` awaits this without a catch, so a throw would escape
       // the WS tick handler.
       //
-      // `closed === true` only means the close order was PLACED without
-      // throwing — an unconfirmed fill is swallowed inside `_closeConsolidated`
-      // and is NOT covered by this guard (pre-existing, shared with
-      // `_flattenAtAnchor`).
+      // `closed === true` now means the close was VERIFIED — `_closeConsolidated`
+      // tiers WS fill marker -> full REST-ack qty -> REST position check before
+      // returning true, and returns `false` on anything unverified. That `false`
+      // is exactly what this guard catches, so an unconfirmed fill can no longer
+      // slip past it (shared contract with `_flattenAtAnchor`).
       //
       // Check POST-close inventory, not a pre-close snapshot: in the `!closed`
       // branch, `_closeConsolidated` never reaches its leg-clearing /
