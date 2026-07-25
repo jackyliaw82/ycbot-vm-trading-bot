@@ -2488,3 +2488,41 @@ test('start(): a failed reference-price fetch refuses the start and arms nothing
   assert.equal(s.startTriggerPrice, null, 'unknown must never read as armed');
   assert.equal(s.startTriggerAbove, null);
 });
+
+// ——— Start Mode: a pending harvest is refused / cleared, not replayed ———
+//
+// While ARMED there is no ladder and no position — a harvest requested now
+// would sit on the `_manualHarvestRequested` latch until the trigger fires,
+// then fire on the very next tick and flatten the ladder that had just been
+// built. harvestNow() refuses up front (FIX A); the fire path also clears the
+// latch belt-and-braces (FIX B) so that safety never rests on an invariant
+// enforced only by a different method.
+
+test('harvestNow() while the start trigger is armed refuses and never sets the latch', async () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.startTriggerPrice = 90;
+  s.startTriggerAbove = false;
+  await assert.rejects(() => s.harvestNow(), (err) => {
+    assert.match(err.message, /start trigger/i);
+    assert.equal(err.invalidInput, undefined, 'a state conflict must NOT be tagged invalidInput (route maps to 409, not 400)');
+    return true;
+  });
+  assert.equal(s._manualHarvestRequested, false, 'a meaningless request must never arm the latch');
+});
+
+test('start trigger fire path clears any harvest latch that slipped through (belt-and-braces)', async () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.startTriggerPrice = 90;
+  s.startTriggerAbove = false;
+  s._manualHarvestRequested = true; // forced on, as if it had slipped past harvestNow()'s guard
+  let built = false;
+  s.initializeLadder = async () => { built = true; };
+  await s.handleRealtimePrice(89.7); // crosses the trigger
+  assert.equal(built, true, 'the ladder still builds');
+  assert.equal(
+    s._manualHarvestRequested, false,
+    'a harvest requested before the ladder existed must not be replayed against the ladder that just built',
+  );
+});

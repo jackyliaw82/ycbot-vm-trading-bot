@@ -1821,6 +1821,13 @@ class AnchorLadderStrategy extends TradingBase {
         const armedAt = this.startTriggerPrice;
         this.startTriggerPrice = null;
         this.startTriggerAbove = null;
+        // Belt-and-braces: harvestNow() already refuses while startArmed (see
+        // its own guard), so this latch should never be set here — but that
+        // safety would then rest on an invariant enforced only by a DIFFERENT
+        // method, which is exactly the shape this codebase's tombstones warn
+        // about. A harvest requested before the ladder existed must not be
+        // replayed against the ladder that is about to be built.
+        this._manualHarvestRequested = false;
         await this.addLog(
           `[LADDER] START TRIGGER hit @ ${this._formatPrice(price)} ` +
           `(armed ${this._formatPrice(armedAt)}) — building the ladder.`,
@@ -2008,6 +2015,21 @@ class AnchorLadderStrategy extends TradingBase {
    * price) set `error.invalidInput = true` → the route maps those to 400.
    */
   async harvestNow(triggerPrice = null) {
+    // Start Mode: while ARMED there is no ladder and no position — the empty-
+    // ladder gate in handleRealtimePrice returns before any RANGE/TREND
+    // dispatch, so a harvest requested now would just sit on the
+    // `_manualHarvestRequested` latch until the trigger fires and consume it
+    // on the very next tick, flattening the ladder that had just been built a
+    // moment earlier. Refuse before any other gate. This is a state conflict
+    // (untagged → the route maps it to 409), not a client-input error — the
+    // request itself may be perfectly well-formed, it is just meaningless
+    // before the trigger fires.
+    if (this.startArmed) {
+      throw new Error(
+        `This strategy is waiting for its start trigger at ${this._formatPrice(this.startTriggerPrice)} — ` +
+        `there is no ladder or position to harvest yet. Stop the strategy to cancel the trigger.`,
+      );
+    }
     if (!this.isRunning) throw new Error('Strategy is not running.');
 
     // No price → immediate harvest on the next free tick (today's behavior).
