@@ -2216,3 +2216,120 @@ test('saveState persists reanchorCount', async () => {
   await s.saveState();
   assert.equal(captured.reanchorCount, 7);
 });
+
+// ——— _closeConsolidated: reduceOnly (-2022) rejection falls through to verification ———
+//
+// 2026-07-25 incident: a rejected reduceOnly close THREW out of
+// _closeConsolidated, aborting the whole tick before the verification tiers
+// below it could ask Binance what was actually open. activePosition stayed
+// stale, so _closeQuantity() kept returning it and the identical doomed close
+// was re-issued every tick for 85+ minutes. A -2022 is the exchange saying
+// "there is nothing to reduce" — it must reach tier 3, which reconciles.
+
+test('_isReduceOnlyRejected matches the proxy-flattened -2022 message and a raw code', () => {
+  const s = ladderStrategy();
+  assert.equal(s._isReduceOnlyRejected(new Error('Proxy Error: 500 - Binance API Error: -2022 - ReduceOnly Order is rejected.')), true);
+  assert.equal(s._isReduceOnlyRejected(Object.assign(new Error('rejected'), { code: -2022 })), true);
+  assert.equal(s._isReduceOnlyRejected(new Error('Binance API Error: -1021 - Timestamp for this request')), false);
+  assert.equal(s._isReduceOnlyRejected(null), false);
+});
+
+test('_isReduceOnlyRejected matches the real makeProxyRequest shape (binanceErrorCode)', () => {
+  const s = ladderStrategy();
+  assert.equal(
+    s._isReduceOnlyRejected(Object.assign(new Error('Binance API Error: -2022 - ReduceOnly Order is rejected.'), { binanceErrorCode: -2022 })),
+    true,
+  );
+  assert.equal(
+    s._isReduceOnlyRejected(Object.assign(new Error('Binance API Error: -2011 - Unknown order sent.'), { binanceErrorCode: -2011 })),
+    false,
+  );
+});
+
+test('_closeConsolidated: -2022 + Binance confirms flat verifies the close and clears state', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 0.26, entryPrice: 100, avgEntry: 100, notional: 26, unrealizedPnl: 0 };
+  s.currentSide = 'SHORT';
+  s.finalTpPrice = 95;
+  s.placeMarketOrder = async () => {
+    throw new Error('Proxy Error: 500 - Binance API Error: -2022 - ReduceOnly Order is rejected.');
+  };
+  s._waitForOrderFillConfirmation = async () => {
+    throw new Error('tier 1 must not run — there is no orderId after a rejection');
+  };
+  s._refreshCurrentPosition = async () => {
+    s._lastPositionRefreshFailed = false;
+    s.activePosition = null; // Binance: genuinely flat
+    s.currentSide = null;
+  };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  const result = await s._closeConsolidated('anchor_flatten');
+
+  assert.equal(result, true, 'a -2022 on a confirmed-flat account IS a completed close');
+  assert.equal(s.activePosition, null, 'state cleared so _closeQuantity() returns 0 and the loop cannot recur');
+  assert.equal(s.currentSide, null);
+  assert.equal(s.finalTpPrice, null);
+  assert.ok(logs.some((m) => m.includes('-2022')), 'the rejection is logged, never silently swallowed');
+});
+
+test('_closeConsolidated: -2022 + a FAILED refresh leaves state INTACT (unknown never reads as flat)', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 0.26, entryPrice: 100, avgEntry: 100, notional: 26, unrealizedPnl: 0 };
+  s.currentSide = 'SHORT';
+  s.placeMarketOrder = async () => {
+    throw new Error('Proxy Error: 500 - Binance API Error: -2022 - ReduceOnly Order is rejected.');
+  };
+  s._refreshCurrentPosition = async () => { s._lastPositionRefreshFailed = true; }; // Binance unreachable
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  const result = await s._closeConsolidated('anchor_flatten');
+
+  assert.equal(result, false, 'an unreachable Binance must never read as a completed close');
+  assert.ok(s.activePosition && s.activePosition.quantity === 0.26, 'position state survives an unresolved refresh');
+  assert.equal(s.currentSide, 'SHORT');
+  assert.ok(logs.some((m) => m.includes('WARNING')), 'the unverified close is logged loudly');
+});
+
+test('_closeConsolidated: -2022 while the position is still OPEN returns false and keeps state', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 0.26, entryPrice: 100, avgEntry: 100, notional: 26, unrealizedPnl: 0 };
+  s.currentSide = 'SHORT';
+  s.placeMarketOrder = async () => {
+    throw new Error('Proxy Error: 500 - Binance API Error: -2022 - ReduceOnly Order is rejected.');
+  };
+  s._refreshCurrentPosition = async () => {
+    s._lastPositionRefreshFailed = false;
+    s.activePosition = { quantity: 0.26, entryPrice: 100, avgEntry: 100, notional: 26, unrealizedPnl: 0 };
+    s.currentSide = 'SHORT';
+  };
+  s.addLog = async () => {};
+
+  const result = await s._closeConsolidated('anchor_flatten');
+
+  assert.equal(result, false, 'the position is still open — the close genuinely did not land');
+  assert.ok(s.activePosition && s.activePosition.quantity === 0.26);
+  assert.equal(s.currentSide, 'SHORT');
+});
+
+test('_closeConsolidated: a NON-reduceOnly order error still propagates (no blanket swallowing)', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.placeMarketOrder = async () => {
+    throw new Error('Proxy Error: 500 - Binance API Error: -1021 - Timestamp for this request is outside of the recvWindow.');
+  };
+  let refreshCalled = false;
+  s._refreshCurrentPosition = async () => { refreshCalled = true; };
+  s.addLog = async () => {};
+
+  await assert.rejects(
+    () => s._closeConsolidated('anchor_flatten'),
+    /-1021/,
+    'only -2022 falls through to verification; every other failure must still surface',
+  );
+  assert.equal(refreshCalled, false, 'no verification runs for an unrelated failure');
+  assert.ok(s.activePosition, 'state untouched');
+});
