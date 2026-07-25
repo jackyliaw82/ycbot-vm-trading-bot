@@ -1155,12 +1155,12 @@ app.get('/update-status', (req, res) => {
   });
 });
 
-// Self-service update: any authenticated user can trigger a regular update
-// of THEIR own bot (it's their VM). httpAuthMiddleware (global) still
-// enforces a valid Firebase token. Admin-only is reserved for the
-// /system/force-update endpoint below, which bypasses the "wait-for-idle"
-// guard and could disrupt a running strategy.
-app.post('/system/update', async (req, res) => {
+// Scheduled update: restricted to this VM's owner (requireVmOwner).
+// Admins pass through for the fleet release rollout (backend forwards the
+// admin bearer token). httpAuthMiddleware (global) still enforces a valid
+// Firebase token. Admin-only /system/force-update (below) bypasses the
+// "wait-for-idle" guard and could disrupt a running strategy.
+app.post('/system/update', requireVmOwner, async (req, res) => {
   if (isUpdating) {
     return res.status(409).json({ error: 'Update already in progress.', targetVersion });
   }
