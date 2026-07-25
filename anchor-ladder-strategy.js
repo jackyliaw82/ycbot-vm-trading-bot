@@ -25,6 +25,10 @@ const DEFAULT_RECOVERY_DISTANCE = 0.005;           // 0.5%
 // arm ASAP; Binance REST throttling on this VM's IP is a known live failure
 // mode, so we cannot hammer it per tick. 15s is the compromise.
 const TREND_ARM_RETRY_INTERVAL_MS = 15_000;
+// Minimum distance a manual harvest/re-anchor Trigger Price must sit from the
+// live price, so an armed trigger cannot accidentally fire on the very next
+// tick. Hard-enforced by harvestNow(); the frontend mirrors it for UX only.
+const TRIGGER_MIN_GAP_PCT = 0.001; // 0.1%
 
 function formatDuration(ms) {
   if (!ms || ms < 0) return 'N/A';
@@ -94,6 +98,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.cycleAccumulatedLoss = 0;
     this.flattenCount = 0;
     this.harvestCount = 0;
+    this.reanchorCount = 0;              // every completed _harvestToFlat (flat reset OR position harvest); FE spinner watches this
     this.initialCapital = 0;
     this.currentInitialSize = 0;         // base for DYNAMIC trend sizing (original config size; never overwritten → no compounding)
     this._ladderBaseSize = 0;            // base the LADDER is sized from: initial size, then the dynamically re-sized base after an anchor flatten / harvest
@@ -154,6 +159,11 @@ class AnchorLadderStrategy extends TradingBase {
     // ---- Phase 3: harvest-gauge cap ----
     this._lastLadderSize = null;        // last dynamic ladder base size (for gauge-full freeze)
     this._manualHarvestRequested = false; // latch: harvestNow() sets this; honored on the next free tick (transient, not persisted)
+    // Optional one-shot manual trigger (harvestNow(triggerPrice)). PERSISTED —
+    // saveState/resume carry it so a VM restart doesn't silently disarm it.
+    // Direction (`Above`) is fixed at arm time so it can't drift as price moves.
+    this.harvestTriggerPrice = null;      // number | null
+    this.harvestTriggerAbove = null;      // boolean | null: true = fire when price >= level
   }
 
   // ——— Lifecycle ——————————————————————————————————————————————————————
@@ -412,6 +422,13 @@ class AnchorLadderStrategy extends TradingBase {
     await this.addLog(`Flattening ladder: closing net position (${openLegs.length} leg(s) recorded open).`);
     const closed = await this._closeConsolidated(reason);
 
+    if (!closed && this._closeQuantity() > 0) {
+      await this.addLog(`WARNING: flatten (${reason}) could not be verified — leg ledger left INTACT.`);
+      await this.saveState();
+      this._pushHeartbeatNow?.();
+      return false;
+    }
+
     for (const leg of this.ladderLines) {
       leg.state = 'EMPTY';
       leg.quantity = null;
@@ -472,6 +489,14 @@ class AnchorLadderStrategy extends TradingBase {
    *
    * Self-gating and self-sizing off `_closeQuantity()`: callers need not (and
    * must not) pre-decide what is open from a REST snapshot.
+   *
+   * Return contract (every caller depends on this): returns `true` ONLY when
+   * the close is VERIFIED (WS fill marker, a full REST-ack qty, or a REST
+   * position check confirming flat) — position state is cleared in that case
+   * and only that case. Returns `false` when there was nothing to close, when
+   * the side could not be resolved, or when the close could not be verified —
+   * in the last two cases position state is deliberately left INTACT, so the
+   * caller must NOT wipe its leg ledger.
    */
   async _closeConsolidated(reason) {
     let qty = this._closeQuantity();
@@ -501,10 +526,44 @@ class AnchorLadderStrategy extends TradingBase {
     const closeSide = side === 'LONG' ? 'SELL' : 'BUY';
     await this.addLog(`Consolidated CLOSE ${side} qty ${qty} (${reason}).`);
     const result = await this.placeMarketOrder(this.symbol, closeSide, qty, undefined, { reduceOnly: true });
-    // Confirm the close filled on the user-data WS before dropping the in-memory
-    // position (realized PnL + fees fold in via the WS accumulators).
-    try { if (result?.orderId) await this._waitForOrderFillConfirmation(result.orderId, 3000); }
-    catch (e) { await this.addLog(`Consolidated close fill-confirm failed (${e.message}); clearing position anyway.`); }
+
+    // Verify the close ACTUALLY happened before dropping position state. Mirrors
+    // the tiering `_resolveFill` already uses on the open path. Returning true on
+    // an unverified close is what let a live position be dropped from the books.
+    // Tier 1 — user-data WS FILLED marker (fastest truth). Resolves false on
+    // timeout; it never rejects, so there is nothing to catch.
+    let verified = result?.orderId
+      ? await this._waitForOrderFillConfirmation(result.orderId, 3000)
+      : false;
+
+    // Tier 2 — the REST order-ack usually already carries the fill for a MARKET
+    // order. Require the FULL requested qty; a partial falls through to tier 3.
+    if (!verified) {
+      const acked = parseFloat(result?.executedQty);
+      if (Number.isFinite(acked) && acked >= qty) verified = true;
+    }
+
+    // Tier 3 — ask Binance what the position actually is. A confirmed-flat
+    // account proves the close landed even if we never saw the fill event.
+    if (!verified) {
+      // No try/catch: _refreshCurrentPosition() catches internally and NEVER
+      // throws — it signals failure via _lastPositionRefreshFailed, not an
+      // exception, so a catch here was dead code (and a silent-swallow catch
+      // is exactly the shape this fix set out to remove).
+      await this._refreshCurrentPosition();
+      const stillOpen = !!(this.activePosition && this.activePosition.quantity > 0);
+      if (!this._lastPositionRefreshFailed && !stillOpen) verified = true;
+    }
+
+    if (!verified) {
+      await this.addLog(
+        `WARNING: close (${reason}) for ${this.symbol} ${side} qty ${qty} could NOT be verified — no WS fill ` +
+        `event, no fill quantity in the REST ack, and Binance has not verified the position as closed. ` +
+        `Position state left INTACT. Verify manually on Binance.`,
+      );
+      return false;
+    }
+
     this.activePosition = null;
     this.currentSide = null;
     this.finalTpPrice = null;
@@ -608,7 +667,21 @@ class AnchorLadderStrategy extends TradingBase {
     // `_closeConsolidated` self-gates and self-sizes off `_closeQuantity()` —
     // no REST pre-decision about what is open, so a dead position API can
     // neither shrink this close nor block it.
-    await this._closeConsolidated('anchor_flatten');
+    const closed = await this._closeConsolidated('anchor_flatten');
+
+    // An unverified close must NOT reach the rebuild below — buildLadder() wipes
+    // the POSITION_OPEN leg ledger, the only record of open inventory. Same
+    // tombstone as _harvestToFlat. Do NOT rethrow: handleRealtimePrice awaits
+    // this without a catch, so a throw would escape the WS tick handler.
+    if (!closed && this._closeQuantity() > 0) {
+      await this.addLog(
+        `WARNING: ANCHOR FLATTEN aborted — the close could not be verified; the ladder was left ` +
+        `INTACT so the open position stays tracked. It will retry on the next anchor crossing.`,
+      );
+      await this.saveState();
+      this._pushHeartbeatNow?.();
+      return;
+    }
 
     const prevBase = this._ladderBaseSize;
     this.cycleAccumulatedLoss = this._computeAccLoss();
@@ -868,21 +941,78 @@ class AnchorLadderStrategy extends TradingBase {
     }
     this._tradingSeqInProgress = true;
     try {
+      // Was a position actually open? Drives the label and which counter bumps.
+      // `_closeQuantity()` here (pre-close) reads the WS-true leg ledger / activePosition;
+      // 0 means a genuine flat re-anchor, > 0 means a real harvest.
+      const hadInventory = this._closeQuantity() > 0;
+
       // Label the action by the sign of the position's unrealized PnL captured
       // BEFORE the close (activePosition is nulled by `_closeConsolidated`).
       // Same backend action either way; the label just distinguishes a
-      // profit-banking HARVEST from a strategic loss-taking RE-ANCHOR.
+      // profit-banking HARVEST from a strategic loss-taking RE-ANCHOR. A flat
+      // run is always RE-ANCHOR — there is no position whose PnL sign could
+      // call it a harvest.
       const closingPnl = (this.activePosition && Number.isFinite(this.activePosition.unrealizedPnl))
         ? this.activePosition.unrealizedPnl : 0;
-      const kind = closingPnl >= 0 ? 'HARVEST' : 'RE-ANCHOR';
+      const kind = !hadInventory ? 'RE-ANCHOR' : (closingPnl >= 0 ? 'HARVEST' : 'RE-ANCHOR');
       await this.addLog(`===== ${kind} (${reason}) — flatten + re-anchor =====`);
 
       // Self-gating and self-sizing (see `_closeQuantity`). This matters most
       // here of all the close paths: the harvest RE-ANCHORS, so anything left
       // behind would net against a geometry it was never part of.
-      try { await this._closeConsolidated('harvest'); }
-      catch (e) { await this.addLog(`ERROR harvest close: ${e.message}`); }
-      this.harvestCount = (this.harvestCount || 0) + 1;
+      let closed = false;
+      try { closed = await this._closeConsolidated('harvest'); }
+      catch (e) { await this.addLog(`ERROR ${kind} close: ${e.message}`); }
+
+      // TOMBSTONE — a failed close MUST abort the rebuild. `initializeLadder`
+      // below resets every leg to EMPTY, and those POSITION_OPEN markings are the
+      // ONLY record of what this bot has open (`_closeQuantity` sizes every close
+      // from them). Rebuilding after a failed close ORPHANS a live position: it
+      // stays open on Binance while the bot's books read "flat, fresh ladder" and
+      // nothing ever tries to close it again. Leave the ladder INTACT instead, so
+      // the position stays tracked and the harvest can be retried. `_flattenAtAnchor`
+      // and `_flattenGrid` now carry this same guard — no close path may wipe its
+      // leg ledger on a close it could not verify. Do NOT rethrow here:
+      // `handleRealtimePrice` awaits this without a catch, so a throw would escape
+      // the WS tick handler.
+      //
+      // `closed === true` now means the close was VERIFIED — `_closeConsolidated`
+      // tiers WS fill marker -> full REST-ack qty -> REST position check before
+      // returning true, and returns `false` on anything unverified. That `false`
+      // is exactly what this guard catches, so an unconfirmed fill can no longer
+      // slip past it (shared contract with `_flattenAtAnchor`).
+      //
+      // Check POST-close inventory, not a pre-close snapshot: in the `!closed`
+      // branch, `_closeConsolidated` never reaches its leg-clearing /
+      // `activePosition`-nulling code (that only runs after a confirmed close),
+      // so the ledger is untouched and `_closeQuantity()` still reads the true
+      // open inventory here. This also correctly stops aborting when
+      // `_closeConsolidated` internally refreshed and found the account
+      // genuinely flat (returns `false` with nothing actually open) — a
+      // pre-close snapshot would have aborted on that stale reading and
+      // blocked the re-anchor for no reason. (This check would NOT be valid
+      // after a SUCCESSFUL close: legs stay POSITION_OPEN until
+      // `initializeLadder` rebuilds them below, so `_closeQuantity()` would
+      // still read positive even though the close is fine — do not
+      // "simplify" this to run unconditionally.)
+      if (!closed && this._closeQuantity() > 0) {
+        await this.addLog(
+          `WARNING: ${kind} (${reason}) ABORTED — the close did not complete, so the ladder was left ` +
+          `INTACT and the open position is still tracked. Retry the harvest, or close it manually on Binance.`,
+        );
+        await this.saveState();
+        this._pushHeartbeatNow?.();
+        return;
+      }
+
+      // Only a VERIFIED position-close counts as a harvest. `closed` is true iff
+      // `_closeConsolidated` actually closed something; `hadInventory` was only the
+      // PRE-close belief, which can be a stale "open" that a mid-close refresh
+      // proves flat (closed=false, nothing closed). Counting that as a harvest
+      // would inflate harvestCount and wrongly mark the cycle as having traded
+      // (see `_hasNoTradingActivity`). A flat re-anchor is never a harvest.
+      if (closed) this.harvestCount = (this.harvestCount || 0) + 1;
+      this.reanchorCount = (this.reanchorCount || 0) + 1;
       this.finalTpPrice = null;
 
       this.cycleAccumulatedLoss = this._computeAccLoss();
@@ -895,7 +1025,12 @@ class AnchorLadderStrategy extends TradingBase {
       // Re-anchor on the live price — THE difference from the anchor flatten.
       await this.initializeLadder(this.currentPrice);
 
-      await this._writeStrategyFlow('HARVEST', { reason, kind, closingPnl, anchor: this.anchor, baseSize: this._ladderBaseSize }).catch(() => {});
+      // The audit label reflects what ACTUALLY happened (keyed off `closed`), not
+      // the pre-close `kind` guess — so a stale-open-but-actually-flat run records
+      // as a RE-ANCHOR here, consistent with the counter above. The opening log
+      // above keeps the pre-close `kind` as a best-effort "attempting" label.
+      const finalKind = closed ? kind : 'RE-ANCHOR';
+      await this._writeStrategyFlow('HARVEST', { reason, kind: finalKind, closingPnl, flat: !closed, reanchorCount: this.reanchorCount, anchor: this.anchor, baseSize: this._ladderBaseSize }).catch(() => {});
       await this.saveState();
     } finally {
       this._tradingSeqInProgress = false;
@@ -1004,9 +1139,12 @@ class AnchorLadderStrategy extends TradingBase {
     this.currentSide = snapshot.currentSide || null;
     this.activePosition = snapshot.currentPosition || null;
     this.finalTpPrice = snapshot.finalTpPrice || null;
+    this.harvestTriggerPrice = snapshot.harvestTriggerPrice ?? null;
+    this.harvestTriggerAbove = snapshot.harvestTriggerAbove ?? null;
     this.cycleAccumulatedLoss = snapshot.cycleAccumulatedLoss || 0;
     this.flattenCount = snapshot.flattenCount || 0;
     this.harvestCount = snapshot.harvestCount || 0;
+    this.reanchorCount = snapshot.reanchorCount || 0;
     this.initialCapital = snapshot.initialCapital || 0;
     this.initialWalletBalance = snapshot.initialWalletBalance || null;
     const sst = snapshot.cycleStartTime;
@@ -1311,6 +1449,10 @@ class AnchorLadderStrategy extends TradingBase {
     this.activePosition = null;
     this.currentSide = null;
 
+    // Any armed harvest trigger dies with the cycle (Final TP or manual Stop).
+    this.harvestTriggerPrice = null;
+    this.harvestTriggerAbove = null;
+
     // Final funding flush — capture any settlement that happened between
     // the last scheduled poll and stop. Non-critical: swallow errors.
     try {
@@ -1540,6 +1682,28 @@ class AnchorLadderStrategy extends TradingBase {
       return;
     }
 
+    // Armed price trigger — fire the manual harvest/re-anchor at a user-set
+    // level. Placed here with the manual latch, BEFORE the RANGE/TREND
+    // dispatch, so it takes precedence over the normal ladder action on this
+    // tick (identical to the manual latch). One-shot: cleared BEFORE acting so
+    // a throw mid-harvest can never leave a re-firing loop. Threshold (not
+    // prev/current bracketing) so a gap-through and a resume-past-level fire.
+    if (this.harvestTriggerPrice != null) {
+      const reached = this.harvestTriggerAbove
+        ? price >= this.harvestTriggerPrice
+        : price <= this.harvestTriggerPrice;
+      if (reached) {
+        this.harvestTriggerPrice = null;
+        this.harvestTriggerAbove = null;
+        // Re-anchor whether flat or holding — `_harvestToFlat` closes any position
+        // (nothing if flat) and re-anchors on the live price. A flat run is
+        // recorded as a RE-ANCHOR (reanchorCount), not a harvest.
+        await this._harvestToFlat('price_trigger');
+        this.lastProcessedPrice = price;
+        return;
+      }
+    }
+
     // ---- Derive the RANGE→TREND invariant BEFORE dispatching on mode. ----
     // Fully scaled (outermost leg POSITION_OPEN) always implies TREND — a
     // no-op once already TREND, and a self-heal on the first tick after a
@@ -1659,19 +1823,83 @@ class AnchorLadderStrategy extends TradingBase {
    * of firing directly — `handleRealtimePrice` honors it on the next free
    * tick, guaranteeing the harvest actually runs (no silent no-op).
    *
-   * One gate: a position must be OPEN. The action is the same regardless of the
-   * gauge — the frontend labels it Harvest (unrealized >= 0) or Re-anchor
-   * (unrealized < 0), but both queue the identical flatten + re-anchor. The
-   * gauge no longer gates this; its only remaining job is locking dynamic
-   * sizing (see `_computeLadderBaseSize`). Throws on ineligibility (the route
-   * maps it to a 409).
+   * No open-position gate: this also works while FLAT. `_harvestToFlat`
+   * (from Task 1) closes whatever is open — or nothing, if already flat —
+   * and always re-anchors on the live price, so both the immediate action
+   * and an armed trigger are valid at any time the strategy is running. A
+   * flat run records as a RE-ANCHOR (`reanchorCount`), not a harvest. The
+   * frontend still labels the button by the position's unrealized PnL —
+   * Harvest (unrealized >= 0) or Re-anchor (unrealized < 0 or flat) — but
+   * both queue the identical flatten (if any) + re-anchor. The gauge no
+   * longer gates this either way; its only remaining job is locking dynamic
+   * sizing (see `_computeLadderBaseSize`).
+   *
+   * `triggerPrice` is optional and selects between two modes:
+   *  - omitted/null → immediate harvest: latches for the next free tick (as
+   *    above), also clearing any previously-armed trigger.
+   *  - a number → arm a validated one-shot Trigger Price instead of harvesting
+   *    now; fires later off `handleRealtimePrice` when the market crosses it.
+   *
+   * Throws on ineligibility. Two error shapes, tagged so the route can tell
+   * them apart: the state conflict ('Strategy is not running.') is untagged
+   * → the route maps it to 409; trigger-price validation failures
+   * (non-positive price, no live price yet, price too close to the current
+   * price) set `error.invalidInput = true` → the route maps those to 400.
    */
-  async harvestNow() {
+  async harvestNow(triggerPrice = null) {
     if (!this.isRunning) throw new Error('Strategy is not running.');
-    const open = !!(this.activePosition && this.activePosition.quantity > 0);
-    if (!open) throw new Error('Nothing open to close.');
-    this._manualHarvestRequested = true; // honored on the next free tick
-    return { harvesting: true, queued: true, mode: this.ladderMode, price: this.currentPrice };
+
+    // No price → immediate harvest on the next free tick (today's behavior).
+    // Clear any armed trigger so an immediate Harvest-now always supersedes a
+    // pending one — the backend, not the frontend, guarantees the exclusion.
+    if (triggerPrice == null) {
+      this.harvestTriggerPrice = null;
+      this.harvestTriggerAbove = null;
+      this._manualHarvestRequested = true; // honored on the next free tick
+      return { harvesting: true, queued: true, mode: this.ladderMode, price: this.currentPrice };
+    }
+
+    // With a price → arm a one-shot trigger. The VM is the authority on
+    // validity (mirrors the ladder-geometry bounds philosophy): validate,
+    // enforce the 0.1% gap, and round to the symbol's tick size here.
+    // These are client-INPUT errors (bad/too-close price), not state
+    // conflicts — tag them so the route can map to 400 instead of 409.
+    const invalidInput = (msg) => { const e = new Error(msg); e.invalidInput = true; return e; };
+    const px = Number(triggerPrice);
+    if (!Number.isFinite(px) || px <= 0) {
+      throw invalidInput('Trigger price must be a positive number.');
+    }
+    const ref = this.currentPrice;
+    if (!Number.isFinite(ref) || ref <= 0) {
+      throw invalidInput('No live price yet — cannot arm a trigger.');
+    }
+    const rounded = this.roundPrice(px);
+    if (Math.abs(rounded - ref) < ref * TRIGGER_MIN_GAP_PCT) {
+      throw invalidInput(`Trigger price must be at least 0.1% from the current price (${this._formatPrice(ref)}).`);
+    }
+    this.harvestTriggerPrice = rounded;
+    this.harvestTriggerAbove = rounded > ref;
+    this._manualHarvestRequested = false; // arming is NOT an immediate harvest
+    await this.saveState();
+    this._pushHeartbeatNow?.();
+    await this.addLog(`[LADDER] harvest trigger armed @ ${this._formatPrice(rounded)} (fires when price ${this.harvestTriggerAbove ? '>=' : '<='} ${this._formatPrice(rounded)}).`);
+    return { armed: true, triggerPrice: rounded, above: this.harvestTriggerAbove, mode: this.ladderMode };
+  }
+
+  /**
+   * Cancel an armed harvest/re-anchor Trigger Price. No-op-safe (idempotent).
+   * Called by the /anchor-ladder/cancel-harvest-trigger route.
+   */
+  async cancelHarvestTrigger() {
+    const had = this.harvestTriggerPrice != null;
+    this.harvestTriggerPrice = null;
+    this.harvestTriggerAbove = null;
+    if (had) {
+      await this.saveState();
+      this._pushHeartbeatNow?.();
+      await this.addLog('[LADDER] harvest trigger cancelled.');
+    }
+    return { cancelled: true };
   }
 
   // ——— Dynamic sizing ————————————————————————————————————————————————
@@ -2310,6 +2538,7 @@ class AnchorLadderStrategy extends TradingBase {
       cycleAccumulatedLoss: this.cycleAccumulatedLoss,
       flattenCount: this.flattenCount,
       harvestCount: this.harvestCount,
+      reanchorCount: this.reanchorCount,
       initialCapital: this.initialCapital,
       currentInitialSize: this.currentInitialSize,
       desiredProfitUSDT: this.desiredProfitUSDT,
@@ -2336,6 +2565,8 @@ class AnchorLadderStrategy extends TradingBase {
       recoveryDistance: this.recoveryDistance,
       harvestLossThreshold: this.harvestLossThreshold,
       _lastLadderSize: this._lastLadderSize,
+      harvestTriggerPrice: this.harvestTriggerPrice ?? null,
+      harvestTriggerAbove: this.harvestTriggerAbove ?? null,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
@@ -2390,6 +2621,7 @@ class AnchorLadderStrategy extends TradingBase {
       cycleAccumulatedLoss: this.cycleAccumulatedLoss,
       flattenCount: this.flattenCount,
       harvestCount: this.harvestCount,
+      reanchorCount: this.reanchorCount,
       initialCapital: this.initialCapital,
       harvestLossThreshold: this.harvestLossThreshold,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
@@ -2406,6 +2638,8 @@ class AnchorLadderStrategy extends TradingBase {
       stepPct: this.stepPct,
       legNotional: this._legNotional(),
       ladderBaseSize: this._ladderBaseSize,
+      harvestTriggerPrice: this.harvestTriggerPrice ?? null,
+      harvestTriggerAbove: this.harvestTriggerAbove ?? null,
     };
   }
 
@@ -2464,6 +2698,7 @@ class AnchorLadderStrategy extends TradingBase {
         cycleAccumulatedLoss: this.cycleAccumulatedLoss,
         flattenCount: this.flattenCount,
         harvestCount: this.harvestCount,
+        reanchorCount: this.reanchorCount,
         initialCapital: this.initialCapital,
         initialWalletBalance: this.initialWalletBalance,
         currentInitialSize: this.currentInitialSize,
@@ -2504,6 +2739,10 @@ class AnchorLadderStrategy extends TradingBase {
         lastProcessedPrice: this.lastProcessedPrice,
         ladderBaseSize: this._ladderBaseSize,
         _lastLadderSize: this._lastLadderSize,
+        // Armed manual harvest/re-anchor trigger (one-shot price level). Persist
+        // so a VM restart / resume doesn't silently disarm it.
+        harvestTriggerPrice: this.harvestTriggerPrice ?? null,
+        harvestTriggerAbove: this.harvestTriggerAbove ?? null,
         // Geometry is per-cycle config, not a constant — resume MUST rebuild the
         // ladder this cycle actually started with (see _applySnapshotGeometry).
         stepPct: this.stepPct,

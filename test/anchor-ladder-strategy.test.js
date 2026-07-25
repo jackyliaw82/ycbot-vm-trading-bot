@@ -311,7 +311,10 @@ test('_closeConsolidated: currentSide missing is repopulated by a refresh from B
   s.currentSide = null;
   s._refreshCurrentPosition = async () => { s.currentSide = 'LONG'; };
   let orderArgs = null;
-  s.placeMarketOrder = async (symbol, side, qty) => { orderArgs = { symbol, side, qty }; return {}; };
+  s.placeMarketOrder = async (symbol, side, qty) => { orderArgs = { symbol, side, qty }; return { orderId: 1 }; };
+  // The close itself succeeds (WS confirms the fill) — this test is about the
+  // currentSide repopulation, not about fill verification tiering.
+  s._waitForOrderFillConfirmation = async () => true;
   const result = await s._closeConsolidated('test');
   assert.equal(result, true, 'the close fires once the refresh repopulates currentSide');
   assert.ok(orderArgs, 'an order was placed');
@@ -346,6 +349,176 @@ test('_closeConsolidated: nothing open returns false quietly, no order, no warni
   assert.equal(result, false);
   assert.equal(orderCalled, false);
   assert.equal(logs.length, 0, 'the normal no-op path stays quiet');
+});
+
+// ——— _closeConsolidated: tiered fill verification (WS -> REST ack -> REST position check) ———
+//
+// _waitForOrderFillConfirmation never REJECTS — it resolves true (WS
+// confirmed) or false (3s timeout) — so a close must not be treated as done
+// merely because the order was placed without throwing. These tests pin the
+// three-tier contract mirroring _resolveFill's tiering on the open path.
+
+test('_closeConsolidated: unverifiable close (WS times out, no REST ack, refresh still shows it open) returns false and leaves state intact', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.placeMarketOrder = async () => ({ orderId: 1 }); // no executedQty in the ack
+  s._waitForOrderFillConfirmation = async () => false; // WS timed out
+  s._refreshCurrentPosition = async () => {
+    // Binance still reports the position open — the close did not land.
+    s._lastPositionRefreshFailed = false;
+    s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+    s.currentSide = 'LONG';
+  };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  const result = await s._closeConsolidated('test');
+
+  assert.equal(result, false, 'an unverified close must never be reported as success');
+  assert.ok(s.activePosition && s.activePosition.quantity === 0.5, 'activePosition must stay intact, not dropped');
+  assert.equal(s.currentSide, 'LONG', 'currentSide must not be cleared on an unverified close');
+  assert.ok(
+    logs.some((m) => m.includes('WARNING') && m.includes('could NOT be verified')),
+    'a loud warning is logged instead of a silent drop',
+  );
+});
+
+test('_closeConsolidated: tier 2 — a full REST-ack executedQty verifies the close when WS times out', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.placeMarketOrder = async () => ({ orderId: 1, executedQty: '0.5' });
+  s._waitForOrderFillConfirmation = async () => false; // WS timed out
+  let refreshCalled = false;
+  s._refreshCurrentPosition = async () => { refreshCalled = true; };
+
+  const result = await s._closeConsolidated('test');
+
+  assert.equal(result, true, 'a full REST-ack fill verifies the close without needing tier 3');
+  assert.equal(refreshCalled, false, 'tier 2 succeeding must short-circuit before tier 3\'s REST refresh');
+  assert.equal(s.activePosition, null, 'position state is cleared once verified');
+  assert.equal(s.currentSide, null);
+});
+
+test('_closeConsolidated: tier 3 — a REST refresh confirming flat verifies the close when WS and the ack both miss', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.placeMarketOrder = async () => ({ orderId: 1 }); // no executedQty
+  s._waitForOrderFillConfirmation = async () => false; // WS timed out
+  s._refreshCurrentPosition = async () => {
+    s._lastPositionRefreshFailed = false;
+    s.activePosition = null; // Binance confirms flat
+    s.currentSide = null;
+  };
+
+  const result = await s._closeConsolidated('test');
+
+  assert.equal(result, true, 'a confirmed-flat REST refresh verifies the close');
+  assert.equal(s.activePosition, null);
+  assert.equal(s.currentSide, null);
+});
+
+test('_closeConsolidated: tier 3 — a FAILED refresh must NOT read as verified (unknown must never read as closed)', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.placeMarketOrder = async () => ({ orderId: 1 });
+  s._waitForOrderFillConfirmation = async () => false; // WS timed out
+  s._refreshCurrentPosition = async () => { s._lastPositionRefreshFailed = true; }; // Binance unreachable
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  const result = await s._closeConsolidated('test');
+
+  assert.equal(result, false, 'unknown state must never be treated as a verified close');
+  assert.ok(s.activePosition && s.activePosition.quantity === 0.5, 'activePosition must NOT be cleared on an unresolved refresh');
+  assert.equal(s.currentSide, 'LONG');
+  assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud warning is logged, never a silent drop');
+});
+
+// ——— _flattenAtAnchor / _flattenGrid: an unverified close must abort the leg-ledger rebuild ———
+//
+// buildLadder()/the EMPTY-reset loop wipe the POSITION_OPEN leg ledger — the
+// ONLY record of open inventory (_closeQuantity sizes every close from it).
+// Rebuilding after an unverified close would orphan a live position: it stays
+// open on Binance while the bot's own books read "flat, fresh ladder" and
+// nothing ever tries to close it again.
+
+test('_flattenAtAnchor: an unverified close aborts the rebuild — flattenCount unchanged, ladder left intact', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  const longLegs = s.ladderLines.filter(l => l.direction === 'LONG').slice(0, 2);
+  longLegs.forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
+  s.activePosition = { quantity: 1, entryPrice: 100.3, avgEntry: 100.3, notional: 100.3, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  // Seed a live TREND state — the anchor flatten is reachable from TREND too
+  // (it is one of TREND's two exits). If the abort skipped only the rebuild
+  // but not the mode reset above it, these would still get clobbered to
+  // RANGE/null/null even though the close was never verified.
+  s.ladderMode = 'TREND';
+  s.trendDirection = 'LONG';
+  s.finalTpPrice = 12345;
+  s._closeConsolidated = async () => false; // the close could not be verified
+  let sizingCalled = false;
+  s._computeLadderBaseSize = async () => { sizingCalled = true; return s._ladderBaseSize; };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s._flattenAtAnchor();
+
+  assert.equal(s.flattenCount, 0, 'an aborted flatten must not count as committed');
+  // Vacuous by design (the anchor never moves in `_flattenAtAnchor` even on a
+  // committed flatten) — kept only as a cheap guard against a future regression.
+  assert.equal(s.anchor, 100, 'the anchor must not move on an aborted flatten');
+  assert.equal(sizingCalled, false, 'no re-sizing churn when the close was never verified');
+  // The abort must skip the WHOLE reset block, not just the ladder rebuild —
+  // otherwise TREND state gets silently discarded even though the position
+  // stayed open and untracked.
+  assert.equal(s.ladderMode, 'TREND', 'ladderMode must not be reset on an aborted flatten');
+  assert.equal(s.trendDirection, 'LONG', 'trendDirection must not be reset on an aborted flatten');
+  assert.equal(s.finalTpPrice, 12345, 'finalTpPrice must not be nulled on an aborted flatten');
+  // Read off the LIVE array, not the captured `longLegs` references —
+  // buildLadder allocates NEW leg objects and _flattenAtAnchor replaces
+  // `this.ladderLines` wholesale, so the captured objects would stay
+  // POSITION_OPEN even if the ladder WAS rebuilt underneath them — asserting
+  // on `longLegs` would prove nothing.
+  assert.equal(
+    s.ladderLines.filter((l) => l.state === 'POSITION_OPEN').length, 2,
+    'the open-leg ledger must survive — it is the only record of the live position',
+  );
+  assert.ok(
+    logs.some((m) => m.includes('WARNING') && m.includes('ANCHOR FLATTEN aborted')),
+    'a loud warning is logged instead of a silent rebuild',
+  );
+});
+
+test('_flattenGrid: an unverified close keeps the leg ledger intact and returns false', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  const openLeg = s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1);
+  openLeg.state = 'POSITION_OPEN';
+  openLeg.quantity = 0.5;
+  s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s._closeConsolidated = async () => false; // unverified
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  const result = await s._flattenGrid('test');
+
+  assert.equal(result, false, 'an unverified flatten must report failure, not success');
+  // Read off the LIVE array, not the captured `openLeg` reference. This works
+  // today only because `_flattenGrid` mutates legs in place — if it ever
+  // reallocated (as `buildLadder` does) a stale reference would keep reading
+  // POSITION_OPEN even after a wipe underneath it. Same discipline as the
+  // `_flattenAtAnchor` test above.
+  const stillOpen = s.ladderLines.filter((l) => l.state === 'POSITION_OPEN');
+  assert.equal(stillOpen.length, 1, 'the leg ledger must survive an unverified close');
+  assert.equal(stillOpen[0].quantity, 0.5);
+  assert.ok(
+    logs.some((m) => m.includes('WARNING') && m.includes('leg ledger left INTACT')),
+    'a loud warning is logged instead of a silent leg-wipe',
+  );
 });
 
 // ——— Task 8: dynamic sizing, harvest, Final TP ———————————————————————
@@ -487,11 +660,6 @@ test('_recomputeFinalTpPrice: null with no position', () => {
   assert.equal(s.finalTpPrice, null);
 });
 
-test('harvestNow refuses when nothing is open', async () => {
-  const s = ladderStrategy();
-  await assert.rejects(() => s.harvestNow(), /nothing open/i);
-});
-
 test('_closeQuantity rounds the summed leg qty to stepSize (guards Binance -1111)', () => {
   // stepSize 0.01 → quantityPrecision 2, so 0.28×3 = 0.8400000000000001 must
   // come back as 0.84, not the raw float (which Binance rejects on close).
@@ -546,13 +714,133 @@ test('harvest re-anchors to the CURRENT price, unlike the anchor flatten', async
   s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
   s.activePosition = { quantity: 10, avgEntry: 100.3, entryPrice: 100.3, notional: 1003 };
   s.currentPrice = 103;
-  s._closeConsolidated = async () => { s.activePosition = null; };
+  s._closeConsolidated = async () => { s.activePosition = null; return true; };
   s._computeAccLoss = () => 0;
   s.getTotalMarginBalance = async () => 1e9;
   await s._harvestToFlat('manual_harvest');
   assert.equal(s.anchor, 103, 'the harvest re-anchors; the anchor flatten does not');
   assert.equal(s.ladderMode, 'RANGE');
   assert.ok(s.ladderLines.every(l => l.state === 'EMPTY'));
+});
+
+// ——— _harvestToFlat: a failed close must abort the rebuild, not orphan the position ———
+//
+// initializeLadder() resets every leg to EMPTY, and POSITION_OPEN is the ONLY
+// record of what this bot has open (_closeQuantity sizes every close off it).
+// Rebuilding after a failed close would leave a real position open on Binance
+// while the bot's own books read "flat, fresh ladder" — nothing would ever try
+// to close it again. These three tests pin: (1) a close that THROWS with
+// inventory open aborts and leaves the ladder intact, (2) a close that
+// SUCCEEDS still re-anchors and rebuilds exactly as before, (3) genuinely
+// nothing-to-close still re-anchors — the abort must not fire on a real no-op.
+
+test('_harvestToFlat: close throws with inventory open -> aborts, ladder left intact, position still tracked', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy({ anchor: 100 });
+  const longLegs = s.ladderLines.filter(l => l.direction === 'LONG').slice(0, 2);
+  longLegs.forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
+  s.activePosition = { quantity: 1, avgEntry: 100.3, entryPrice: 100.3, notional: 100.3, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.currentPrice = 110; // distinct from the anchor — must NOT be adopted
+  s.placeMarketOrder = async () => { throw new Error('-1001 Internal error'); };
+
+  await s._harvestToFlat('manual_harvest');
+
+  assert.equal(s.harvestCount, 0, 'harvestCount must not increment on an aborted close');
+  assert.equal(s.anchor, 100, 'anchor must stay put — no re-anchor on a failed close');
+
+  // Read off the LIVE array, not the captured `longLegs` references: buildLadder
+  // allocates NEW leg objects and initializeLadder replaces `this.ladderLines`
+  // wholesale, so the captured objects would stay POSITION_OPEN even if the
+  // ladder WAS rebuilt underneath them — asserting on `longLegs` proves nothing.
+  assert.equal(s.ladderLines.filter((l) => l.state === 'POSITION_OPEN').length, 2,
+    'the open-leg ledger must survive — it is the only record of the live position');
+  assert.equal(s._tradingSeqInProgress, false, 'the seq lock must still release on the abort path');
+});
+
+test('_harvestToFlat: close succeeds -> harvestCount increments and re-anchors on the live price (unchanged behavior)', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy({ anchor: 100 });
+  const longLegs = s.ladderLines.filter(l => l.direction === 'LONG').slice(0, 2);
+  longLegs.forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
+  s.activePosition = { quantity: 1, avgEntry: 100.3, entryPrice: 100.3, notional: 100.3, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.currentPrice = 110; // distinct from the anchor — the re-anchor target
+  s.placeMarketOrder = async () => ({ orderId: 1, status: 'FILLED' });
+  // The close succeeds (WS confirms the fill) — tier 1 of _closeConsolidated's
+  // verification. Was `async () => {}` (falsy/unverified), which under the
+  // tightened contract now reads as an UNVERIFIED close; express the intended
+  // success explicitly instead.
+  s._waitForOrderFillConfirmation = async () => true;
+  s.getTotalMarginBalance = async () => 1e9;
+
+  await s._harvestToFlat('manual_harvest');
+
+  assert.equal(s.harvestCount, 1, 'harvestCount increments on a genuine close');
+  assert.equal(s.anchor, 110, 're-anchored on the live price');
+  assert.ok(s.ladderLines.every((l) => l.state !== 'POSITION_OPEN'), 'ladder rebuilt — no leg left open');
+});
+
+test('_harvestToFlat: genuinely flat -> still re-anchors — the abort must not fire when nothing was open', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.activePosition = null;
+  s.currentPrice = 105;
+  s.getTotalMarginBalance = async () => 1e9;
+
+  await s._harvestToFlat('manual_harvest');
+
+  // A no-op close must not be mistaken for a failed one (the anchor still
+  // moves), but per the accounting split it is a RE-ANCHOR, not a HARVEST —
+  // see the dedicated "accounting split" tests below for the counters.
+  assert.equal(s.harvestCount, 0, 'a flat re-anchor must not be counted as a harvest');
+  assert.equal(s.reanchorCount, 1, 'a flat re-anchor still bumps reanchorCount');
+  assert.equal(s.anchor, 105, 're-anchors normally when there was nothing to close');
+});
+
+test('_harvestToFlat: close returns false WITHOUT throwing (side unresolved) -> aborts, ladder left intact', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  // No legs are marked open, so _closeConsolidated's leg-direction fallback
+  // finds nothing; combined with currentSide null, the initial side lookup
+  // fails outright. Only `activePosition` carries the (drifted) inventory —
+  // exactly the "no legs behind it, no side in memory" case the code calls out.
+  s.currentSide = null;
+  s.activePosition = { quantity: 1, avgEntry: 100.3, entryPrice: 100.3, notional: 100.3, unrealizedPnl: 0 };
+  s.currentPrice = 110; // distinct from the anchor — must NOT be adopted
+  // `_refreshCurrentPosition` is stubbed to a no-op by the `ladderStrategy()`
+  // fixture — it leaves `currentSide` null while the inventory (activePosition)
+  // remains, so `_closeConsolidated`'s post-refresh side check ALSO fails and
+  // it logs the "side could not be resolved" warning and returns `false`
+  // WITHOUT throwing (as opposed to the earlier throw-based abort test above).
+
+  await s._harvestToFlat('manual_harvest');
+
+  assert.equal(s.harvestCount, 0, 'harvestCount must not increment on an aborted close');
+  assert.equal(s.anchor, 100, 'anchor must stay put — no re-anchor on an unresolved-side abort');
+  assert.ok(s.activePosition && s.activePosition.quantity > 0, 'the position must still be tracked, not silently dropped');
+  assert.equal(s._tradingSeqInProgress, false, 'the seq lock must still release on the abort path');
+});
+
+test('_harvestToFlat: _closeConsolidated refreshes mid-close and proves genuinely flat -> does NOT abort, re-anchors', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  // Stale PRE-close reading, same shape as the previous test: no legs marked
+  // open, currentSide null, so the initial side lookup fails and
+  // `_closeConsolidated` refreshes internally — but THIS time the refresh
+  // proves the account genuinely flat (the case Item 1's guard fix targets:
+  // a pre-close snapshot would read "had inventory" here and wrongly abort).
+  s.currentSide = null;
+  s.activePosition = { quantity: 1, avgEntry: 100.3, entryPrice: 100.3, notional: 100.3, unrealizedPnl: 0 };
+  s._refreshCurrentPosition = async () => {
+    s.activePosition = null; // REST confirms flat
+    s.currentSide = null;
+  };
+  s.currentPrice = 105;
+  s.getTotalMarginBalance = async () => 1e9;
+
+  await s._harvestToFlat('manual_harvest');
+
+  assert.equal(s.harvestCount, 0, 'the refresh proved flat — nothing was actually closed, so it is a RE-ANCHOR, not a harvest');
+  assert.equal(s.reanchorCount, 1, 'but it still counts as a re-anchor');
+  assert.equal(s.anchor, 105, 're-anchors on the live price — the abort must not fire on a stale pre-close reading');
 });
 
 // ——— Task 9: persistence, status, and resume ——————————————————————————
@@ -967,13 +1255,52 @@ test('stop({flatten:true}) closes the legs when the position API is down and mem
     orderArgs, { side: 'SELL', qty: 1.4, opts: { reduceOnly: true } },
     'the leg qty AND the leg direction drive the close — neither needs the dead position API',
   );
-  assert.ok(!logs.some((m) => m.includes('confirmed flat')), 'must never claim confirmed-flat when the state is unknown');
+  assert.ok(!logs.some((m) => m.includes('position confirmed flat')), 'must never claim confirmed-flat when the state is unknown');
   assert.ok(!logs.some((m) => m.includes('nothing to flatten')), 'must never claim nothing-to-flatten when the state is unknown');
   assert.ok(
     logs.some((m) => m.includes('WARNING') && m.includes('FINAL STATE UNKNOWN')),
     'the residual verification still cannot confirm flat, and says so loudly',
   );
   assert.equal(s.executionState, 'TERMINATED', 'stop() still completes termination — it never hangs open');
+});
+
+test('stop({flatten:true}): an unverified _flattenGrid close makes stop() retry via _closeConsolidated exactly ONCE more, not in a loop', async () => {
+  // `_flattenGrid` can now return false (unverified close). stop()'s fallback
+  // branch then fires a second reduceOnly close for the same position — safe
+  // (reduceOnly can never flip a position) and a desirable retry, but newly
+  // reachable and previously untested. Every close attempt below is
+  // unverifiable (WS times out, no REST-ack qty, refresh still shows it
+  // open), so if the retry were ever turned into an unbounded loop this test
+  // must catch it — hence counting EVERY call in an array rather than
+  // capturing only the last one into a single variable.
+  const s = stubStopTail(ladderStrategy());
+  const openLeg = s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1);
+  openLeg.state = 'POSITION_OPEN';
+  openLeg.quantity = 0.6;
+  s.activePosition = { quantity: 0.6, entryPrice: 100, avgEntry: 100, notional: 60, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s._waitForOrderFillConfirmation = async () => false; // tier 1 always times out
+  s._refreshCurrentPosition = async () => {}; // tier 3 + residual check: leaves activePosition open, never fails
+  const orderCalls = [];
+  s.placeMarketOrder = async (symbol, side, qty, price, opts) => {
+    orderCalls.push({ symbol, side, qty, opts });
+    return { orderId: orderCalls.length }; // ack carries no executedQty -> tier 2 also misses
+  };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s.stop({ flatten: true });
+
+  assert.equal(orderCalls.length, 2, 'exactly two reduceOnly close attempts: _flattenGrid\'s, then stop()\'s fallback retry — never more');
+  assert.ok(
+    orderCalls.every((c) => c.side === 'SELL' && c.opts?.reduceOnly === true),
+    'both attempts close the same LONG position the same way',
+  );
+  assert.ok(
+    logs.some((m) => m.includes('WARNING') && m.includes('residual')),
+    'the residual left open after both failed attempts is reported',
+  );
+  assert.equal(s.executionState, 'TERMINATED', 'stop() still completes termination despite both closes failing to verify');
 });
 
 // ——— Adversarial re-review fix (Fix B) ———————————————————————————————————
@@ -1519,7 +1846,7 @@ test('C3: stop({flatten:true}) reports FINAL STATE UNKNOWN — never "confirmed 
   }
 
   assert.ok(
-    !logs.some((m) => m.includes('confirmed flat')),
+    !logs.some((m) => m.includes('position confirmed flat')),
     'the user must NEVER be told the position is confirmed flat while the position state is UNKNOWN',
   );
   assert.ok(
@@ -1629,4 +1956,263 @@ test('resume THROWS on a non-numeric (e.g. stringified) geometry value rather th
   // Number(...) coercion via its own ad hoc checks.
   const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   assert.throws(() => s._applySnapshotGeometry({ stepPct: '0.005', levelsPerSide: 8 }));
+});
+
+// ——— Trigger price: arm / cancel / validate ———
+
+test('harvestNow(triggerPrice) arms an ABOVE trigger and rounds to tick size', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();                       // currentPrice 100
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  const res = await s.harvestNow(101.239);          // ~1.2% above → rounds to 101.24
+  assert.equal(res.armed, true);
+  assert.equal(s.harvestTriggerPrice, 101.24);
+  assert.equal(s.harvestTriggerAbove, true);
+  assert.equal(s._manualHarvestRequested, false, 'arming must NOT set the immediate latch');
+});
+
+test('harvestNow(triggerPrice) rejects arming with no live price yet', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  s.currentPrice = null;                            // no live price yet
+  await assert.rejects(() => s.harvestNow(101), (err) => {
+    assert.match(err.message, /no live price/i);
+    assert.equal(err.invalidInput, true, 'client-input validation errors must be tagged invalidInput (route maps to 400)');
+    return true;
+  });
+});
+
+test('harvestNow(triggerPrice) infers a BELOW trigger from the current price', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  await s.harvestNow(98.5);
+  assert.equal(s.harvestTriggerPrice, 98.5);
+  assert.equal(s.harvestTriggerAbove, false);
+});
+
+test('harvestNow(triggerPrice) rejects a level within the 0.1% gap', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();                       // currentPrice 100 → band 99.9..100.1
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  await assert.rejects(() => s.harvestNow(100.05), (err) => {
+    assert.match(err.message, /0\.1%|current price/i);
+    assert.equal(err.invalidInput, true, 'client-input validation errors must be tagged invalidInput (route maps to 400)');
+    return true;
+  });
+  assert.equal(s.harvestTriggerPrice, null, 'a rejected arm leaves no trigger set');
+});
+
+test('harvestNow(triggerPrice) rejects a non-positive price', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  await assert.rejects(() => s.harvestNow(0), (err) => {
+    assert.match(err.message, /positive/i);
+    assert.equal(err.invalidInput, true, 'client-input validation errors must be tagged invalidInput (route maps to 400)');
+    return true;
+  });
+});
+
+test('harvestNow() with no price latches immediately AND clears any armed trigger', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
+  s.harvestTriggerPrice = 105; s.harvestTriggerAbove = true;   // pre-armed
+  const res = await s.harvestNow();
+  assert.equal(res.queued, true);
+  assert.equal(s._manualHarvestRequested, true);
+  assert.equal(s.harvestTriggerPrice, null, 'immediate harvest supersedes a pending trigger');
+});
+
+test('cancelHarvestTrigger clears an armed trigger', async () => {
+  const s = ladderStrategy();
+  s.harvestTriggerPrice = 105; s.harvestTriggerAbove = true;
+  const res = await s.cancelHarvestTrigger();
+  assert.equal(res.cancelled, true);
+  assert.equal(s.harvestTriggerPrice, null);
+  assert.equal(s.harvestTriggerAbove, null);
+});
+
+// ——— Trigger price: tick-loop firing ———
+
+test('an armed ABOVE trigger fires _harvestToFlat when price reaches the level', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: 5 };
+  s.harvestTriggerPrice = 101; s.harvestTriggerAbove = true;
+  let fired = null;
+  s._harvestToFlat = async (reason) => { fired = reason; };
+  await s.handleRealtimePrice(101);
+  assert.equal(fired, 'price_trigger');
+  assert.equal(s.harvestTriggerPrice, null, 'one-shot: cleared before acting');
+  assert.equal(s.harvestTriggerAbove, null);
+});
+
+test('an armed ABOVE trigger does NOT fire while price is below the level', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: 5 };
+  s.harvestTriggerPrice = 101; s.harvestTriggerAbove = true;
+  let fired = false;
+  s._harvestToFlat = async () => { fired = true; };
+  await s.handleRealtimePrice(100.5);
+  assert.equal(fired, false);
+  assert.equal(s.harvestTriggerPrice, 101, 'still armed');
+});
+
+test('an armed BELOW trigger fires when price gaps through the level', async () => {
+  const s = ladderStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: -3 };
+  s.harvestTriggerPrice = 99; s.harvestTriggerAbove = false;
+  let fired = null;
+  s._harvestToFlat = async (r) => { fired = r; };
+  await s.handleRealtimePrice(98);           // jumped past 99
+  assert.equal(fired, 'price_trigger');
+  assert.equal(s.harvestTriggerPrice, null);
+});
+
+test('a trigger reached while position state is UNKNOWN still harvests (never reads unknown as flat)', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();
+  // Legs are the WS-true ledger: a leg filled, but the REST refresh that would
+  // populate activePosition failed. That is UNKNOWN, not flat.
+  s.ladderLines.filter((l) => l.direction === 'LONG').slice(0, 2)
+    .forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
+  s.activePosition = null;
+  s._lastPositionRefreshFailed = true;
+  s.harvestTriggerPrice = 101; s.harvestTriggerAbove = true;
+  let fired = null;
+  s._harvestToFlat = async (r) => { fired = r; };
+  await s.handleRealtimePrice(101);
+  assert.equal(fired, 'price_trigger', 'unknown state must NOT disarm quietly');
+  assert.equal(s.harvestTriggerPrice, null);
+});
+
+test('an armed trigger NOT yet reached survives a real anchor flatten', async () => {
+  // Precondition: the tick must genuinely flatten (not merely "make one up") —
+  // stub _flattenAtAnchor and assert it fired, exactly like the plain
+  // "RANGE: crossing the anchor flattens" test above. Otherwise a tick that
+  // never flattens would pass this test while proving nothing.
+  const s = ladderStrategy();
+  let flattened = false;
+  s._flattenAtAnchor = async () => { flattened = true; };
+  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
+  s.lastProcessedPrice = 100.35;
+  s.harvestTriggerPrice = 105; s.harvestTriggerAbove = true;   // armed, nowhere near this tick
+  await s.handleRealtimePrice(99.9);                           // crosses back below the anchor
+  assert.equal(flattened, true, 'precondition: the anchor flatten actually ran');
+  assert.equal(s.harvestTriggerPrice, 105, 'the trigger must survive an anchor flatten untouched');
+  assert.equal(s.harvestTriggerAbove, true);
+});
+
+test('the trigger fires BEFORE the anchor-flatten dispatch on the same tick', async () => {
+  const s = ladderStrategy();                // anchor 100
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: 2 };
+  s.lastProcessedPrice = 100.5;
+  s.harvestTriggerPrice = 100; s.harvestTriggerAbove = false;  // trigger AT the anchor
+  let harvested = false, flattened = false;
+  s._harvestToFlat = async () => { harvested = true; };
+  s._flattenAtAnchor = async () => { flattened = true; };
+  await s.handleRealtimePrice(100);          // crosses anchor AND hits trigger
+  assert.equal(harvested, true, 'trigger wins');
+  assert.equal(flattened, false, 'anchor flatten did not run this tick');
+});
+
+// ——— Trigger price: persistence + status ———
+
+test('getStatus surfaces the armed trigger', () => {
+  const s = ladderStrategy();
+  s.harvestTriggerPrice = 105.5; s.harvestTriggerAbove = true;
+  const st = s.getStatus();
+  assert.equal(st.harvestTriggerPrice, 105.5);
+  assert.equal(st.harvestTriggerAbove, true);
+});
+
+test('getHeartbeatPayload surfaces the armed trigger', () => {
+  const s = ladderStrategy();
+  s.harvestTriggerPrice = 98; s.harvestTriggerAbove = false;
+  const hb = s.getHeartbeatPayload();
+  assert.equal(hb.harvestTriggerPrice, 98);
+  assert.equal(hb.harvestTriggerAbove, false);
+});
+
+test('saveState persists the armed trigger fields', async () => {
+  const s = ladderStrategy();
+  delete s.saveState;                        // restore the real prototype method (fixture stubs it)
+  let captured = null;
+  s.firestore = { collection: () => ({ doc: () => ({ set: async (doc) => { captured = doc; } }) }) };
+  s.harvestTriggerPrice = 105; s.harvestTriggerAbove = true;
+  await s.saveState();
+  assert.equal(captured.harvestTriggerPrice, 105);
+  assert.equal(captured.harvestTriggerAbove, true);
+});
+
+// ——— Flat re-anchor: accounting split ———
+
+test('_harvestToFlat while FLAT re-anchors, bumps reanchorCount, NOT harvestCount', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();                 // flat: activePosition null, no open legs
+  s.currentPrice = 110;                        // re-anchor target (live price)
+  s.harvestCount = 3;
+  await s._harvestToFlat('manual_harvest');
+  assert.equal(s.harvestCount, 3, 'a flat re-anchor must NOT count as a harvest');
+  assert.equal(s.reanchorCount, 1, 'reanchorCount bumps on every re-anchor');
+  assert.equal(s.anchor, 110, 're-anchored on the live price');
+});
+
+test('_harvestToFlat while HOLDING bumps BOTH harvestCount and reanchorCount', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();
+  s.ladderLines.filter(l => l.direction === 'LONG').slice(0, 2)
+    .forEach(l => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
+  s.activePosition = { quantity: 1, entryPrice: 100.3, avgEntry: 100.3, notional: 100, unrealizedPnl: 5 };
+  s.currentSide = 'LONG';
+  s._closeConsolidated = async () => true;     // verified close
+  s.harvestCount = 3;
+  await s._harvestToFlat('manual_harvest');
+  assert.equal(s.harvestCount, 4, 'a real harvest counts');
+  assert.equal(s.reanchorCount, 1, 'and also bumps reanchorCount');
+});
+
+// ——— Flat re-anchor: enablement (gate + trigger fire) ———
+
+test('harvestNow() no longer throws when flat — it latches an immediate re-anchor', async () => {
+  const s = ladderStrategy();                 // flat
+  const res = await s.harvestNow();
+  assert.equal(res.queued, true);
+  assert.equal(s._manualHarvestRequested, true);
+});
+
+test('harvestNow(triggerPrice) arms a trigger while flat', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();                 // flat, currentPrice 100
+  const res = await s.harvestNow(101.2);
+  assert.equal(res.armed, true);
+  assert.equal(s.harvestTriggerPrice, 101.2);
+});
+
+test('a trigger that fires while FLAT re-anchors (no longer disarms quietly)', async () => {
+  const s = ladderStrategy();                 // flat
+  s.harvestTriggerPrice = 101; s.harvestTriggerAbove = true;
+  let fired = null;
+  s._harvestToFlat = async (reason) => { fired = reason; };
+  await s.handleRealtimePrice(101);
+  assert.equal(fired, 'price_trigger', 'flat-at-fire now re-anchors instead of disarming');
+  assert.equal(s.harvestTriggerPrice, null, 'one-shot cleared');
+});
+
+// ——— Flat re-anchor: persistence + status ———
+
+test('getStatus and getHeartbeatPayload surface reanchorCount', () => {
+  const s = ladderStrategy();
+  s.reanchorCount = 7;
+  assert.equal(s.getStatus().reanchorCount, 7);
+  assert.equal(s.getHeartbeatPayload().reanchorCount, 7);
+});
+
+test('saveState persists reanchorCount', async () => {
+  const s = ladderStrategy();
+  delete s.saveState;                          // restore the real prototype method
+  let captured = null;
+  s.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { captured = d; } }) }) };
+  s.reanchorCount = 7;
+  await s.saveState();
+  assert.equal(captured.reanchorCount, 7);
 });

@@ -1519,15 +1519,41 @@ app.get('/anchor-ladder/status', (req, res) => {
   res.json({ strategies: ladderStrategies, count: Object.keys(ladderStrategies).length });
 });
 
-// Manual user-driven re-anchor / harvest. Single gate: a position must be open
-// (the gauge no longer gates this). Closes the open leg to flat at market
-// (reduceOnly), then re-anchors the ladder on the live price. The frontend
-// labels it Harvest (unrealized >= 0) or Re-anchor (unrealized < 0), but both
-// call this identical action. The cycle CONTINUES — this does NOT stop the
-// strategy. strategy.harvestNow() validates eligibility synchronously and
-// queues the close via the manual-harvest latch honored on the next free tick,
-// so the response is an immediate eligibility verdict. Ineligibility throws → 409.
+// Manual user-driven re-anchor / harvest. Works whether flat or holding — the
+// only gate is that the strategy is running. Closes any open position to flat at
+// market (reduceOnly; nothing to close when flat), then re-anchors the ladder on
+// the live price. A flat run is recorded as a RE-ANCHOR (reanchorCount), not a
+// harvest. The frontend labels it Harvest (unrealized >= 0), Re-anchor
+// (unrealized < 0), or Re-anchor (flat). The cycle CONTINUES — this does NOT stop
+// the strategy. strategy.harvestNow() queues the action via the manual-harvest
+// latch honored on the next free tick, so the response is an immediate verdict.
+//
+// triggerPrice omitted/null → immediate re-anchor (today's behavior); a number
+// → arm a one-shot trigger validated + rounded by the strategy. Two error
+// shapes: a genuine state conflict ('Strategy is not running.') → 409;
+// trigger-price validation failures (bad price, no live price yet, too close to
+// the current price) are tagged by the strategy (error.invalidInput) → 400. The
+// strategy remains the sole authority on trigger validity — this route does not
+// duplicate that logic.
 app.post('/anchor-ladder/harvest-now', async (req, res) => {
+  try {
+    const { strategyId, triggerPrice } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
+    }
+    const result = await strategy.harvestNow(triggerPrice ?? null);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(error.invalidInput ? 400 : 409).json({ error: error.message });
+  }
+});
+
+// Cancel an armed harvest/re-anchor Trigger Price (set via harvest-now with a
+// triggerPrice). Idempotent — clears the latch if present. 400 if the strategy
+// isn't a running Anchor Ladder.
+app.post('/anchor-ladder/cancel-harvest-trigger', async (req, res) => {
   try {
     const { strategyId } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
@@ -1535,10 +1561,10 @@ app.post('/anchor-ladder/harvest-now', async (req, res) => {
     if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
       return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
     }
-    const result = await strategy.harvestNow();
+    const result = await strategy.cancelHarvestTrigger();
     res.json({ success: true, ...result });
   } catch (error) {
-    res.status(409).json({ error: error.message });
+    res.status(400).json({ error: error.message });
   }
 });
 
