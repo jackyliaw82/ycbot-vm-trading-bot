@@ -188,6 +188,7 @@ export function createRequireVmOwner(getOwnerUid) {
       });
     }
     if (req.uid.toLowerCase() !== ownerUid) {
+      console.warn(`[http-auth] NOT_VM_OWNER ${req.method} ${req.path} — caller=${req.uid} owner=${ownerUid}`);
       return res.status(403).json({
         error: 'Forbidden — this VM does not belong to you.',
         code: 'NOT_VM_OWNER',

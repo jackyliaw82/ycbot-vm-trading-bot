@@ -31,8 +31,9 @@ test('requireVmOwner: the VM owner is allowed through', () => {
 
 test('requireVmOwner: owner match is case-insensitive (mixed-case Firebase uid vs lowercased instance name)', () => {
   const mw = createRequireVmOwner(() => 'abc123');
-  const { nextCalled } = run(mw, { uid: 'AbC123', method: 'POST', path: '/anchor-ladder/start' });
+  const { res, nextCalled } = run(mw, { uid: 'AbC123', method: 'POST', path: '/anchor-ladder/start' });
   assert.equal(nextCalled, true, 'a real Firebase uid is mixed-case; lowercasing must not 403 the owner');
+  assert.equal(res.statusCode, null, 'no response written — the request continues');
 });
 
 test('requireVmOwner: a different user is refused with NOT_VM_OWNER', () => {
@@ -55,6 +56,13 @@ test('requireVmOwner: an admin uid passes through to any VM (fleet release rollo
   const mw = createRequireVmOwner(() => 'abc123');
   const { nextCalled } = run(mw, { uid: 'admin-uid-1', method: 'POST', path: '/anchor-ladder/status' });
   assert.equal(nextCalled, true, 'admins legitimately drive other users\' VMs');
+});
+
+test('requireVmOwner: an admin still passes when the owner is unresolved (metadata outage must not lock admins out)', () => {
+  const mw = createRequireVmOwner(() => null);
+  const { res, nextCalled } = run(mw, { uid: 'admin-uid-1', method: 'POST', path: '/anchor-ladder/status' });
+  assert.equal(nextCalled, true, 'the admin check is ordered before owner-resolution so a metadata outage cannot lock admins out');
+  assert.equal(res.statusCode, null, 'no response written — the request continues');
 });
 
 test('requireVmOwner: a missing verified uid is 401, not a silent pass', () => {
