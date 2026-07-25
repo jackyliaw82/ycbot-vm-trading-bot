@@ -1682,25 +1682,12 @@ class AnchorLadderStrategy extends TradingBase {
         ? price >= this.harvestTriggerPrice
         : price <= this.harvestTriggerPrice;
       if (reached) {
-        const level = this.harvestTriggerPrice;
-        // Decide openness from `_closeQuantity()`, NOT `activePosition` — see
-        // the TOMBSTONE above `_closeQuantity()`. `activePosition` is written
-        // only by `_refreshCurrentPosition` (REST) and holds stale/null on a
-        // failed refresh; reading that as "flat" silently disarms the trigger
-        // while a real position sits open on Binance. `_closeQuantity()`
-        // returns 0 only when Binance was reachable and reported flat — a
-        // genuine flat — and otherwise falls through to the WS-true leg
-        // ledger, so UNKNOWN state still harvests.
-        const open = this._closeQuantity() > 0;
         this.harvestTriggerPrice = null;
         this.harvestTriggerAbove = null;
-        if (open) {
-          await this._harvestToFlat('price_trigger');
-        } else {
-          await this.addLog(`[LADDER] trigger price ${this._formatPrice(level)} reached but the position is already flat — disarmed.`);
-          this._pushHeartbeatNow?.();
-          await this.saveState();
-        }
+        // Re-anchor whether flat or holding — `_harvestToFlat` closes any position
+        // (nothing if flat) and re-anchors on the live price. A flat run is
+        // recorded as a RE-ANCHOR (reanchorCount), not a harvest.
+        await this._harvestToFlat('price_trigger');
         this.lastProcessedPrice = price;
         return;
       }
@@ -1825,10 +1812,15 @@ class AnchorLadderStrategy extends TradingBase {
    * of firing directly — `handleRealtimePrice` honors it on the next free
    * tick, guaranteeing the harvest actually runs (no silent no-op).
    *
-   * One gate: a position must be OPEN. The action is the same regardless of the
-   * gauge — the frontend labels it Harvest (unrealized >= 0) or Re-anchor
-   * (unrealized < 0), but both queue the identical flatten + re-anchor. The
-   * gauge no longer gates this; its only remaining job is locking dynamic
+   * No open-position gate: this also works while FLAT. `_harvestToFlat`
+   * (from Task 1) closes whatever is open — or nothing, if already flat —
+   * and always re-anchors on the live price, so both the immediate action
+   * and an armed trigger are valid at any time the strategy is running. A
+   * flat run records as a RE-ANCHOR (`reanchorCount`), not a harvest. The
+   * frontend still labels the button by the position's unrealized PnL —
+   * Harvest (unrealized >= 0) or Re-anchor (unrealized < 0 or flat) — but
+   * both queue the identical flatten (if any) + re-anchor. The gauge no
+   * longer gates this either way; its only remaining job is locking dynamic
    * sizing (see `_computeLadderBaseSize`).
    *
    * `triggerPrice` is optional and selects between two modes:
@@ -1838,16 +1830,13 @@ class AnchorLadderStrategy extends TradingBase {
    *    now; fires later off `handleRealtimePrice` when the market crosses it.
    *
    * Throws on ineligibility. Two error shapes, tagged so the route can tell
-   * them apart: state conflicts ('Strategy is not running.', 'Nothing open
-   * to close.') are untagged → the route maps them to 409; trigger-price
-   * validation failures (non-positive price, no live price yet, price too
-   * close to the current price) set `error.invalidInput = true` → the route
-   * maps those to 400.
+   * them apart: the state conflict ('Strategy is not running.') is untagged
+   * → the route maps it to 409; trigger-price validation failures
+   * (non-positive price, no live price yet, price too close to the current
+   * price) set `error.invalidInput = true` → the route maps those to 400.
    */
   async harvestNow(triggerPrice = null) {
     if (!this.isRunning) throw new Error('Strategy is not running.');
-    const open = !!(this.activePosition && this.activePosition.quantity > 0);
-    if (!open) throw new Error('Nothing open to close.');
 
     // No price → immediate harvest on the next free tick (today's behavior).
     // Clear any armed trigger so an immediate Harvest-now always supersedes a

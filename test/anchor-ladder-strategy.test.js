@@ -660,15 +660,6 @@ test('_recomputeFinalTpPrice: null with no position', () => {
   assert.equal(s.finalTpPrice, null);
 });
 
-test('harvestNow refuses when nothing is open', async () => {
-  const s = ladderStrategy();
-  await assert.rejects(() => s.harvestNow(), (err) => {
-    assert.match(err.message, /nothing open/i);
-    assert.notEqual(err.invalidInput, true, 'a state conflict must NOT be tagged invalidInput (route must map it to 409)');
-    return true;
-  });
-});
-
 test('_closeQuantity rounds the summed leg qty to stepSize (guards Binance -1111)', () => {
   // stepSize 0.01 → quantityPrecision 2, so 0.28×3 = 0.8400000000000001 must
   // come back as 0.84, not the raw float (which Binance rejects on close).
@@ -2076,17 +2067,6 @@ test('an armed BELOW trigger fires when price gaps through the level', async () 
   assert.equal(s.harvestTriggerPrice, null);
 });
 
-test('a trigger reached while FLAT disarms quietly without harvesting', async () => {
-  const s = ladderStrategy();
-  s.activePosition = null;                   // flat
-  s.harvestTriggerPrice = 101; s.harvestTriggerAbove = true;
-  let fired = false;
-  s._harvestToFlat = async () => { fired = true; };
-  await s.handleRealtimePrice(101);
-  assert.equal(fired, false, 'nothing open → no harvest');
-  assert.equal(s.harvestTriggerPrice, null, 'disarmed');
-});
-
 test('a trigger reached while position state is UNKNOWN still harvests (never reads unknown as flat)', async () => {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
   const s = ladderStrategy();
@@ -2188,4 +2168,31 @@ test('_harvestToFlat while HOLDING bumps BOTH harvestCount and reanchorCount', a
   await s._harvestToFlat('manual_harvest');
   assert.equal(s.harvestCount, 4, 'a real harvest counts');
   assert.equal(s.reanchorCount, 1, 'and also bumps reanchorCount');
+});
+
+// ——— Flat re-anchor: enablement (gate + trigger fire) ———
+
+test('harvestNow() no longer throws when flat — it latches an immediate re-anchor', async () => {
+  const s = ladderStrategy();                 // flat
+  const res = await s.harvestNow();
+  assert.equal(res.queued, true);
+  assert.equal(s._manualHarvestRequested, true);
+});
+
+test('harvestNow(triggerPrice) arms a trigger while flat', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();                 // flat, currentPrice 100
+  const res = await s.harvestNow(101.2);
+  assert.equal(res.armed, true);
+  assert.equal(s.harvestTriggerPrice, 101.2);
+});
+
+test('a trigger that fires while FLAT re-anchors (no longer disarms quietly)', async () => {
+  const s = ladderStrategy();                 // flat
+  s.harvestTriggerPrice = 101; s.harvestTriggerAbove = true;
+  let fired = null;
+  s._harvestToFlat = async (reason) => { fired = reason; };
+  await s.handleRealtimePrice(101);
+  assert.equal(fired, 'price_trigger', 'flat-at-fire now re-anchors instead of disarming');
+  assert.equal(s.harvestTriggerPrice, null, 'one-shot cleared');
 });
