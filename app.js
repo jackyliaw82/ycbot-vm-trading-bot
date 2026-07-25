@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { AnchorLadderStrategy } from './anchor-ladder-strategy.js';
+import { resolveStartTrigger } from './start-trigger-gate.js';
 import {
   minInitialSizeUSDT,
   resolveLadderGeometry,
@@ -1542,9 +1543,40 @@ app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
       });
     }
 
+    // Start trigger price — validated in full here, not just shape, so a
+    // rejection is a real 400 the user actually sees. Before this fix the
+    // 0.1%-gap/rounding check lived ONLY inside start(), which runs AFTER
+    // the non-blocking 200: a rejection there just deletes the strategy from
+    // activeStrategies, the frontend 404s, takes its "strategy gone" branch,
+    // and calls setErrorMsg(null) — the user is bounced back to the config
+    // form with no reason shown. Start Mode is the first async-rejection
+    // reason a user can trigger just by typing a number, so this is now the
+    // feature's most likely failure. resolveStartTrigger (start-trigger-gate.js)
+    // owns the whole check — shape, exchange-info warm-up, reference-price
+    // fetch, and the shared validateStartTrigger gap/rounding rule — and is
+    // gated on the trigger being PRESENT, so Immediate mode takes none of
+    // this and pays zero extra latency. Extracted into its own module rather
+    // than left inline so it is independently unit-testable (this file opens
+    // a real Firestore client and hits GCP metadata at import time, so it
+    // cannot be exercised directly via node:test).
+    const triggerResult = await resolveStartTrigger(config.startTriggerPrice, {
+      gcpProxyUrl, profileId, sharedVmProxyGcfUrl, symbol: config.symbol,
+    });
+    if (!triggerResult.ok) {
+      return res.status(triggerResult.status).json(triggerResult.body);
+    }
+    // Reused below instead of building (and reference-price-fetching) a
+    // second instance. Still null here for Immediate mode — built at the
+    // usual spot further down.
+    let strategy = triggerResult.strategy;
+
     // One strategy per profile (matches existing model). User must stop the running strategy first.
-    for (const [sId, strategy] of activeStrategies.entries()) {
-      if (strategy.profileId === profileId) {
+    // NOTE: named `running`, not `strategy` — the outer `let strategy` above
+    // (the start-trigger validation instance) is in scope for this whole
+    // handler, and shadowing it here would make `strategy` mean two
+    // different things inside one 60-line window.
+    for (const [sId, running] of activeStrategies.entries()) {
+      if (running.profileId === profileId) {
         return res.status(400).json({
           error: `A strategy for profile ${profileId} is already running. Stop it before starting Anchor Ladder.`,
           strategyId: sId,
@@ -1586,7 +1618,10 @@ app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
     }
     // ──────────────────────────────────────────────────────────────────────
 
-    const strategy = new AnchorLadderStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
+    // Reuse the instance the start-trigger validation above already built
+    // (Immediate-mode requests never entered that branch, so `strategy` is
+    // still null here for them — build it now, same as before this fix).
+    if (!strategy) strategy = new AnchorLadderStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
     strategy.userId = req.uid || userId;
 
     const strategyId = `anchor_ladder_${profileId}_${Date.now()}`;
@@ -1621,8 +1656,21 @@ app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
       })
       .catch((error) => {
         console.error(`Failed to start Anchor Ladder Strategy ${strategyId}:`, error);
+        // NOTE: the parent Firestore doc does not exist yet at this point — the
+        // id is freshly minted, initFirestoreCollections only builds
+        // references, and addLog writes to the `logs` SUBcollection (leaving
+        // the parent a phantom doc). A bare `.doc(strategyId).update({...})`
+        // rejects NOT_FOUND and would be silently swallowed by a trailing
+        // `.catch(() => {})`, so a start rejected after the non-blocking 200
+        // would vanish without a trace. Go through saveState() instead — it
+        // already persists criticalError and `.set(..., {merge:true})`s the
+        // full doc shape (userId/profileId/type/...) so the frontend's query
+        // can actually see it. isRunning must be false BEFORE saveState runs
+        // so that is what gets persisted.
         strategy.isRunning = false;
+        strategy.criticalError = `start_failed: ${error.message}`;
         activeStrategies.delete(strategyId);
+        strategy.saveState().catch(() => {});
       });
   } catch (error) {
     console.error('Failed to start Anchor Ladder Strategy:', error);

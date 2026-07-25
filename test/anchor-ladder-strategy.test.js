@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AnchorLadderStrategy } from '../anchor-ladder-strategy.js';
+import { AnchorLadderStrategy, validateStartTrigger } from '../anchor-ladder-strategy.js';
 import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, LADDER_STEP_PCT_MAX, LADDER_LEVELS_MAX } from '../ladder-levels.js';
 import { precisionFormatter } from '../precisionUtils.js';
 
@@ -45,6 +45,20 @@ function ladderStrategy({ mode = 'RANGE', anchor = 100, base = 1000 } = {}) {
 test('_legNotional splits the base evenly across 5 levels', () => {
   const s = ladderStrategy({ base: 10000 });
   assert.equal(s._legNotional(), 2000);
+});
+
+// FIX round 3's FIX 2: without this, an ARMED start-trigger fire (the ladder
+// builds mid-run, not at strategy boot) can leave the frontend showing ARMED
+// for up to 30s — the WS-connected UI disables its REST poll and relies on
+// the 30s strategy_update safety net, and no leg fill can heal it on the
+// anchoring tick (price == anchor). Also tightens the harvest re-anchor path,
+// which calls initializeLadder() too.
+test('initializeLadder pushes an immediate heartbeat after saving state', async () => {
+  const s = ladderStrategy();
+  let heartbeatCalls = 0;
+  s._pushHeartbeatNow = () => { heartbeatCalls++; };
+  await s.initializeLadder(105);
+  assert.equal(heartbeatCalls, 1, 'the ARMED (or harvest re-anchor) -> live transition must push immediately');
 });
 
 test('start() rejects an initial size below the 50 USDT minimum', async () => {
@@ -2332,4 +2346,317 @@ test('_closeConsolidated: a NON-reduceOnly order error still propagates (no blan
   );
   assert.equal(refreshCalled, false, 'no verification runs for an unrelated failure');
   assert.ok(s.activePosition, 'state untouched');
+});
+
+// ——— Start Mode: an armed start trigger defers the ladder ———
+//
+// start() validates the level against a freshly fetched reference price (the
+// WS has not ticked yet at that point), stores it, and the tick gate holds the
+// ladder until the price reaches it. The anchor is then the LIVE price, not the
+// trigger level.
+
+test('startArmed is DERIVED: true only while a trigger is set AND no ladder exists', () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.startTriggerPrice = null;
+  assert.equal(s.startArmed, false, 'no trigger = not armed');
+  s.startTriggerPrice = 90;
+  assert.equal(s.startArmed, true, 'trigger + no ladder = armed');
+  s.ladderLines = buildLadder(100, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE);
+  assert.equal(s.startArmed, false, 'once the ladder exists the strategy is live, not armed');
+  // Getter-only — no setter was defined, so ESM strict mode throws on
+  // assignment. Free regression lock against someone later turning this back
+  // into a stored field (the exact drift `_trendFinalTpArmed` tombstones).
+  assert.throws(() => { s.startArmed = true; });
+});
+
+test('start trigger: a tick that has NOT reached the level does not build the ladder', async () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.startTriggerPrice = 90;
+  s.startTriggerAbove = false;      // armed below → fires on a fall
+  let built = false;
+  s.initializeLadder = async () => { built = true; };
+  await s.handleRealtimePrice(95);
+  assert.equal(built, false, 'price has not fallen to the trigger — the ladder must stay unbuilt');
+  assert.equal(s.startTriggerPrice, 90, 'the trigger stays armed');
+});
+
+test('start trigger: reaching the level clears it and anchors on the LIVE price', async () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.startTriggerPrice = 90;
+  s.startTriggerAbove = false;
+  let anchoredAt = null;
+  s.initializeLadder = async (p) => { anchoredAt = p; };
+  await s.handleRealtimePrice(89.7);   // gapped THROUGH the trigger
+  assert.equal(anchoredAt, 89.7, 'the anchor is the live price, not the 90 trigger level');
+  assert.equal(s.startTriggerPrice, null, 'one-shot — the trigger is cleared');
+  assert.equal(s.startTriggerAbove, null);
+});
+
+test('start trigger: an upward trigger fires on a rise', async () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.startTriggerPrice = 110;
+  s.startTriggerAbove = true;
+  let anchoredAt = null;
+  s.initializeLadder = async (p) => { anchoredAt = p; };
+  await s.handleRealtimePrice(105);
+  assert.equal(anchoredAt, null, 'not yet reached');
+  await s.handleRealtimePrice(110.4);
+  assert.equal(anchoredAt, 110.4);
+});
+
+test('start trigger: with NO trigger armed the ladder builds on the first tick as before', async () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.startTriggerPrice = null;
+  let anchoredAt = null;
+  s.initializeLadder = async (p) => { anchoredAt = p; };
+  await s.handleRealtimePrice(100);
+  assert.equal(anchoredAt, 100, 'Immediate mode is unchanged');
+});
+
+// ——— Start Mode: arm-time validation in start() ———
+//
+// Mirrors harvestNow(triggerPrice)'s dedicated arm-time tests above: rounding,
+// both directions, the 0.1% gap, and bad input — but through start(), which is
+// where the brief's central safety rule lives ("an already-satisfied or
+// too-close level must be REJECTED"). Reuses stubBootInternals() (the same
+// harness the existing "sizes the minNotional gate" start()-test drives) so
+// start() can run all the way through its network-touching setup in tests.
+// _fetchReferencePrice is stubbed directly rather than through
+// makeProxyRequest — stubBootInternals' makeProxyRequest always throws (it
+// exists to prove _refreshCurrentPosition fails safely), which would be the
+// wrong signal for a reference-price fetch that's meant to succeed.
+
+function startModeStrategy() {
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  stubBootInternals(s);
+  s.getWalletBalance = async () => 1000;
+  s._fetchReferencePrice = async () => 100; // reference price for every test below
+  // Genuinely flat by default (mirrors ladderStrategy()'s own no-op stub) —
+  // stubBootInternals' makeProxyRequest always throws, which would otherwise
+  // make _refreshCurrentPosition fail and trip the FIX-3 refusal below for
+  // every test here, not just the ones that mean to exercise it.
+  s._refreshCurrentPosition = async () => {};
+  return s;
+}
+
+test('start(): a start trigger inside the 0.1% gap is rejected and nothing is armed', async () => {
+  const s = startModeStrategy();
+  await assert.rejects(
+    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 100.05 }),
+    /0\.1%/,
+  );
+  assert.equal(s.startTriggerPrice, null, 'a rejected arm leaves no trigger set');
+  assert.equal(s.startTriggerAbove, null);
+});
+
+test('start(): a trigger ABOVE the reference arms startTriggerAbove=true', async () => {
+  const s = startModeStrategy();
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 });
+    assert.equal(s.startTriggerPrice, 110);
+    assert.equal(s.startTriggerAbove, true);
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+});
+
+test('start(): a trigger BELOW the reference arms startTriggerAbove=false', async () => {
+  const s = startModeStrategy();
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 90 });
+    assert.equal(s.startTriggerPrice, 90);
+    assert.equal(s.startTriggerAbove, false);
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+});
+
+test('start(): a non-positive start trigger price is rejected', async () => {
+  const s = startModeStrategy();
+  await assert.rejects(
+    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 0 }),
+    /positive number/,
+  );
+  assert.equal(s.startTriggerPrice, null);
+});
+
+test('start(): a non-finite start trigger price is rejected', async () => {
+  const s = startModeStrategy();
+  await assert.rejects(
+    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 'not-a-number' }),
+    /positive number/,
+  );
+  assert.equal(s.startTriggerPrice, null);
+});
+
+test('start(): a failed reference-price fetch refuses the start and arms nothing', async () => {
+  const s = startModeStrategy();
+  s._fetchReferencePrice = async () => {
+    throw new Error('Could not read a reference price from Binance to validate the start trigger.');
+  };
+  await assert.rejects(
+    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 }),
+    /reference price/,
+    'an unknown reference must refuse the start, never arm on a guess',
+  );
+  assert.equal(s.startTriggerPrice, null, 'unknown must never read as armed');
+  assert.equal(s.startTriggerAbove, null);
+});
+
+// ——— Start Mode: refuse to arm over an existing/unverifiable position ———
+//
+// While ARMED, the tick returns before any RANGE/TREND dispatch, so a
+// pre-existing position would have no anchor, no Final TP, and no stop-loss
+// for an unbounded period. Two distinct failure shapes, both refused.
+
+test('start(): refuses to arm a start trigger over an existing position', async () => {
+  const s = startModeStrategy();
+  s._refreshCurrentPosition = async () => {
+    s._lastPositionRefreshFailed = false; // Binance WAS reachable...
+    s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+    s.currentSide = 'LONG'; // ...and answered "not flat"
+  };
+  await assert.rejects(
+    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 }),
+    /existing position/i,
+  );
+  assert.equal(s.startTriggerPrice, null, 'a refused arm must not persist a spurious armed trigger');
+  assert.equal(s.startTriggerAbove, null);
+});
+
+test('start(): refuses to arm a start trigger when the position check could not complete', async () => {
+  const s = startModeStrategy();
+  s._refreshCurrentPosition = async () => {
+    s._lastPositionRefreshFailed = true; // Binance was NOT reachable — "flat" cannot be trusted
+  };
+  await assert.rejects(
+    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 }),
+    /did not complete|not known whether/i,
+  );
+  assert.equal(s.startTriggerPrice, null);
+  assert.equal(s.startTriggerAbove, null);
+});
+
+test('start(): arms fine when the account is confirmed genuinely flat', async () => {
+  const s = startModeStrategy(); // default stub: _lastPositionRefreshFailed stays false, activePosition stays null
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 });
+    assert.equal(s.startTriggerPrice, 110);
+    assert.equal(s.startTriggerAbove, true);
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+});
+
+// FIX round 5: initializeLadder() pushes on the FIRING path, but nothing
+// pushed on ARMING — start() ended with a bare saveState(). During ARMED,
+// nothing else pushes either (saveTrade / initializeLadder / flatten-harvest
+// paths all sit idle while waiting), and the WS-connected frontend disables
+// its 3s REST poll, so the freshly-armed state would otherwise only reach the
+// UI via the 30s safety-net broadcast — up to 30s where the app cannot even
+// confirm the arm succeeded.
+test('start() pushes an immediate heartbeat once armed', async () => {
+  const s = startModeStrategy();
+  let heartbeatCalls = 0;
+  s._pushHeartbeatNow = () => { heartbeatCalls++; };
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 });
+    assert.equal(heartbeatCalls, 1, 'the freshly-armed state must reach the frontend immediately, not wait on the 30s safety net');
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+});
+
+// ——— validateStartTrigger: the shared pure validator (FIX round 3) ———
+//
+// The SAME function both the /anchor-ladder/start route and start() call —
+// "one validator, two gates", mirroring resolveLadderGeometry's pattern.
+// Tested directly since it is a pure, exported function: the most honest
+// surface, no strategy fixture needed.
+
+test('validateStartTrigger: rejects a level inside the 0.1% gap', () => {
+  const result = validateStartTrigger(100.05, 100, 'BTCUSDT');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /0\.1%/);
+});
+
+test('validateStartTrigger: a level ABOVE the reference is valid with above=true', () => {
+  const result = validateStartTrigger(110, 100, 'BTCUSDT');
+  assert.equal(result.ok, true);
+  assert.equal(result.above, true);
+  assert.equal(result.rounded, 110);
+});
+
+test('validateStartTrigger: a level BELOW the reference is valid with above=false', () => {
+  const result = validateStartTrigger(90, 100, 'BTCUSDT');
+  assert.equal(result.ok, true);
+  assert.equal(result.above, false);
+  assert.equal(result.rounded, 90);
+});
+
+test('validateStartTrigger: rejects a non-numeric price', () => {
+  const result = validateStartTrigger('not-a-number', 100, 'BTCUSDT');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /positive number/);
+});
+
+test('validateStartTrigger: rejects zero', () => {
+  const result = validateStartTrigger(0, 100, 'BTCUSDT');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /positive number/);
+});
+
+test('validateStartTrigger: rejects a negative price', () => {
+  const result = validateStartTrigger(-50, 100, 'BTCUSDT');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /positive number/);
+});
+
+test('validateStartTrigger: rejects Infinity', () => {
+  const result = validateStartTrigger(Infinity, 100, 'BTCUSDT');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /positive number/);
+});
+
+// ——— Start Mode: a pending harvest is refused / cleared, not replayed ———
+//
+// While ARMED there is no ladder and no position — a harvest requested now
+// would sit on the `_manualHarvestRequested` latch until the trigger fires,
+// then fire on the very next tick and flatten the ladder that had just been
+// built. harvestNow() refuses up front (FIX A); the fire path also clears the
+// latch belt-and-braces (FIX B) so that safety never rests on an invariant
+// enforced only by a different method.
+
+test('harvestNow() while the start trigger is armed refuses and never sets the latch', async () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.startTriggerPrice = 90;
+  s.startTriggerAbove = false;
+  await assert.rejects(() => s.harvestNow(), (err) => {
+    assert.match(err.message, /start trigger/i);
+    assert.equal(err.invalidInput, undefined, 'a state conflict must NOT be tagged invalidInput (route maps to 409, not 400)');
+    return true;
+  });
+  assert.equal(s._manualHarvestRequested, false, 'a meaningless request must never arm the latch');
+});
+
+test('start trigger fire path clears any harvest latch that slipped through (belt-and-braces)', async () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.startTriggerPrice = 90;
+  s.startTriggerAbove = false;
+  s._manualHarvestRequested = true; // forced on, as if it had slipped past harvestNow()'s guard
+  let built = false;
+  s.initializeLadder = async () => { built = true; };
+  await s.handleRealtimePrice(89.7); // crosses the trigger
+  assert.equal(built, true, 'the ladder still builds');
+  assert.equal(
+    s._manualHarvestRequested, false,
+    'a harvest requested before the ladder existed must not be replayed against the ladder that just built',
+  );
 });
