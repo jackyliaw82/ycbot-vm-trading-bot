@@ -98,6 +98,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.cycleAccumulatedLoss = 0;
     this.flattenCount = 0;
     this.harvestCount = 0;
+    this.reanchorCount = 0;              // every completed _harvestToFlat (flat reset OR position harvest); FE spinner watches this
     this.initialCapital = 0;
     this.currentInitialSize = 0;         // base for DYNAMIC trend sizing (original config size; never overwritten → no compounding)
     this._ladderBaseSize = 0;            // base the LADDER is sized from: initial size, then the dynamically re-sized base after an anchor flatten / harvest
@@ -940,13 +941,20 @@ class AnchorLadderStrategy extends TradingBase {
     }
     this._tradingSeqInProgress = true;
     try {
+      // Was a position actually open? Drives the label and which counter bumps.
+      // `_closeQuantity()` here (pre-close) reads the WS-true leg ledger / activePosition;
+      // 0 means a genuine flat re-anchor, > 0 means a real harvest.
+      const hadInventory = this._closeQuantity() > 0;
+
       // Label the action by the sign of the position's unrealized PnL captured
       // BEFORE the close (activePosition is nulled by `_closeConsolidated`).
       // Same backend action either way; the label just distinguishes a
-      // profit-banking HARVEST from a strategic loss-taking RE-ANCHOR.
+      // profit-banking HARVEST from a strategic loss-taking RE-ANCHOR. A flat
+      // run is always RE-ANCHOR — there is no position whose PnL sign could
+      // call it a harvest.
       const closingPnl = (this.activePosition && Number.isFinite(this.activePosition.unrealizedPnl))
         ? this.activePosition.unrealizedPnl : 0;
-      const kind = closingPnl >= 0 ? 'HARVEST' : 'RE-ANCHOR';
+      const kind = !hadInventory ? 'RE-ANCHOR' : (closingPnl >= 0 ? 'HARVEST' : 'RE-ANCHOR');
       await this.addLog(`===== ${kind} (${reason}) — flatten + re-anchor =====`);
 
       // Self-gating and self-sizing (see `_closeQuantity`). This matters most
@@ -997,7 +1005,9 @@ class AnchorLadderStrategy extends TradingBase {
         return;
       }
 
-      this.harvestCount = (this.harvestCount || 0) + 1;
+      // Only a real position-close counts as a harvest; a flat re-anchor does not.
+      if (hadInventory) this.harvestCount = (this.harvestCount || 0) + 1;
+      this.reanchorCount = (this.reanchorCount || 0) + 1;
       this.finalTpPrice = null;
 
       this.cycleAccumulatedLoss = this._computeAccLoss();
@@ -1010,7 +1020,7 @@ class AnchorLadderStrategy extends TradingBase {
       // Re-anchor on the live price — THE difference from the anchor flatten.
       await this.initializeLadder(this.currentPrice);
 
-      await this._writeStrategyFlow('HARVEST', { reason, kind, closingPnl, anchor: this.anchor, baseSize: this._ladderBaseSize }).catch(() => {});
+      await this._writeStrategyFlow('HARVEST', { reason, kind, closingPnl, flat: !hadInventory, reanchorCount: this.reanchorCount, anchor: this.anchor, baseSize: this._ladderBaseSize }).catch(() => {});
       await this.saveState();
     } finally {
       this._tradingSeqInProgress = false;

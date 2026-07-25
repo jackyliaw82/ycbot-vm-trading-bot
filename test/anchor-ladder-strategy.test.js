@@ -798,7 +798,11 @@ test('_harvestToFlat: genuinely flat -> still re-anchors — the abort must not 
 
   await s._harvestToFlat('manual_harvest');
 
-  assert.equal(s.harvestCount, 1, 'a no-op close must not be mistaken for a failed one');
+  // A no-op close must not be mistaken for a failed one (the anchor still
+  // moves), but per the accounting split it is a RE-ANCHOR, not a HARVEST —
+  // see the dedicated "accounting split" tests below for the counters.
+  assert.equal(s.harvestCount, 0, 'a flat re-anchor must not be counted as a harvest');
+  assert.equal(s.reanchorCount, 1, 'a flat re-anchor still bumps reanchorCount');
   assert.equal(s.anchor, 105, 're-anchors normally when there was nothing to close');
 });
 
@@ -2157,4 +2161,31 @@ test('saveState persists the armed trigger fields', async () => {
   await s.saveState();
   assert.equal(captured.harvestTriggerPrice, 105);
   assert.equal(captured.harvestTriggerAbove, true);
+});
+
+// ——— Flat re-anchor: accounting split ———
+
+test('_harvestToFlat while FLAT re-anchors, bumps reanchorCount, NOT harvestCount', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();                 // flat: activePosition null, no open legs
+  s.currentPrice = 110;                        // re-anchor target (live price)
+  s.harvestCount = 3;
+  await s._harvestToFlat('manual_harvest');
+  assert.equal(s.harvestCount, 3, 'a flat re-anchor must NOT count as a harvest');
+  assert.equal(s.reanchorCount, 1, 'reanchorCount bumps on every re-anchor');
+  assert.equal(s.anchor, 110, 're-anchored on the live price');
+});
+
+test('_harvestToFlat while HOLDING bumps BOTH harvestCount and reanchorCount', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy();
+  s.ladderLines.filter(l => l.direction === 'LONG').slice(0, 2)
+    .forEach(l => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
+  s.activePosition = { quantity: 1, entryPrice: 100.3, avgEntry: 100.3, notional: 100, unrealizedPnl: 5 };
+  s.currentSide = 'LONG';
+  s._closeConsolidated = async () => true;     // verified close
+  s.harvestCount = 3;
+  await s._harvestToFlat('manual_harvest');
+  assert.equal(s.harvestCount, 4, 'a real harvest counts');
+  assert.equal(s.reanchorCount, 1, 'and also bumps reanchorCount');
 });
