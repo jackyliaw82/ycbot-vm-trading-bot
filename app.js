@@ -30,7 +30,7 @@ import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import os from 'os';
 import wsBroadcast from './ws-broadcast.js';
-import { httpAuthMiddleware, requireAdmin, createRequireVmOwner } from './http-auth.js';
+import { httpAuthMiddleware, requireAdmin, createRequireVmOwner, isAllowedVmUser } from './http-auth.js';
 import { checkBillingGate } from './billing-gate.js';
 
 const app = express();
@@ -346,6 +346,16 @@ server.on('upgrade', async (request, socket, head) => {
 
   try {
     const decoded = await admin.auth().verifyIdToken(token);
+    // A valid token proves WHO is connecting, not WHOSE VM this is. The 25s
+    // broadcast below pushes health + every running strategy's heartbeat to all
+    // connected clients, so admitting a foreign user leaks another user's live
+    // position, PnL and mode. Same ownership rule as the HTTP guard.
+    if (!isAllowedVmUser(decoded.uid, VM_OWNER_UID)) {
+      console.warn(`[WS] NOT_VM_OWNER — refused ${decoded.uid} (owner=${VM_OWNER_UID})`);
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
     wss.handleUpgrade(request, socket, head, (ws) => {
       handleClientConnection(ws, decoded.uid);
     });
