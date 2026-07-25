@@ -1005,8 +1005,13 @@ class AnchorLadderStrategy extends TradingBase {
         return;
       }
 
-      // Only a real position-close counts as a harvest; a flat re-anchor does not.
-      if (hadInventory) this.harvestCount = (this.harvestCount || 0) + 1;
+      // Only a VERIFIED position-close counts as a harvest. `closed` is true iff
+      // `_closeConsolidated` actually closed something; `hadInventory` was only the
+      // PRE-close belief, which can be a stale "open" that a mid-close refresh
+      // proves flat (closed=false, nothing closed). Counting that as a harvest
+      // would inflate harvestCount and wrongly mark the cycle as having traded
+      // (see `_hasNoTradingActivity`). A flat re-anchor is never a harvest.
+      if (closed) this.harvestCount = (this.harvestCount || 0) + 1;
       this.reanchorCount = (this.reanchorCount || 0) + 1;
       this.finalTpPrice = null;
 
@@ -1020,7 +1025,12 @@ class AnchorLadderStrategy extends TradingBase {
       // Re-anchor on the live price — THE difference from the anchor flatten.
       await this.initializeLadder(this.currentPrice);
 
-      await this._writeStrategyFlow('HARVEST', { reason, kind, closingPnl, flat: !hadInventory, reanchorCount: this.reanchorCount, anchor: this.anchor, baseSize: this._ladderBaseSize }).catch(() => {});
+      // The audit label reflects what ACTUALLY happened (keyed off `closed`), not
+      // the pre-close `kind` guess — so a stale-open-but-actually-flat run records
+      // as a RE-ANCHOR here, consistent with the counter above. The opening log
+      // above keeps the pre-close `kind` as a best-effort "attempting" label.
+      const finalKind = closed ? kind : 'RE-ANCHOR';
+      await this._writeStrategyFlow('HARVEST', { reason, kind: finalKind, closingPnl, flat: !closed, reanchorCount: this.reanchorCount, anchor: this.anchor, baseSize: this._ladderBaseSize }).catch(() => {});
       await this.saveState();
     } finally {
       this._tradingSeqInProgress = false;

@@ -838,7 +838,8 @@ test('_harvestToFlat: _closeConsolidated refreshes mid-close and proves genuinel
 
   await s._harvestToFlat('manual_harvest');
 
-  assert.equal(s.harvestCount, 1, 'a refresh-confirmed-flat close must not be mistaken for a failed one');
+  assert.equal(s.harvestCount, 0, 'the refresh proved flat — nothing was actually closed, so it is a RE-ANCHOR, not a harvest');
+  assert.equal(s.reanchorCount, 1, 'but it still counts as a re-anchor');
   assert.equal(s.anchor, 105, 're-anchors on the live price — the abort must not fire on a stale pre-close reading');
 });
 
