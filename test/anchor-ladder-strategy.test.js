@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AnchorLadderStrategy } from '../anchor-ladder-strategy.js';
+import { AnchorLadderStrategy, validateStartTrigger } from '../anchor-ladder-strategy.js';
 import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, LADDER_STEP_PCT_MAX, LADDER_LEVELS_MAX } from '../ladder-levels.js';
 import { precisionFormatter } from '../precisionUtils.js';
 
@@ -2422,6 +2422,11 @@ function startModeStrategy() {
   stubBootInternals(s);
   s.getWalletBalance = async () => 1000;
   s._fetchReferencePrice = async () => 100; // reference price for every test below
+  // Genuinely flat by default (mirrors ladderStrategy()'s own no-op stub) —
+  // stubBootInternals' makeProxyRequest always throws, which would otherwise
+  // make _refreshCurrentPosition fail and trip the FIX-3 refusal below for
+  // every test here, not just the ones that mean to exercise it.
+  s._refreshCurrentPosition = async () => {};
   return s;
 }
 
@@ -2487,6 +2492,78 @@ test('start(): a failed reference-price fetch refuses the start and arms nothing
   );
   assert.equal(s.startTriggerPrice, null, 'unknown must never read as armed');
   assert.equal(s.startTriggerAbove, null);
+});
+
+// ——— Start Mode: refuse to arm over an existing/unverifiable position ———
+//
+// While ARMED, the tick returns before any RANGE/TREND dispatch, so a
+// pre-existing position would have no anchor, no Final TP, and no stop-loss
+// for an unbounded period. Two distinct failure shapes, both refused.
+
+test('start(): refuses to arm a start trigger over an existing position', async () => {
+  const s = startModeStrategy();
+  s._refreshCurrentPosition = async () => {
+    s._lastPositionRefreshFailed = false; // Binance WAS reachable...
+    s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
+    s.currentSide = 'LONG'; // ...and answered "not flat"
+  };
+  await assert.rejects(
+    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 }),
+    /existing position/i,
+  );
+  assert.equal(s.startTriggerPrice, null, 'a refused arm must not persist a spurious armed trigger');
+  assert.equal(s.startTriggerAbove, null);
+});
+
+test('start(): refuses to arm a start trigger when the position check could not complete', async () => {
+  const s = startModeStrategy();
+  s._refreshCurrentPosition = async () => {
+    s._lastPositionRefreshFailed = true; // Binance was NOT reachable — "flat" cannot be trusted
+  };
+  await assert.rejects(
+    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 }),
+    /did not complete|not known whether/i,
+  );
+  assert.equal(s.startTriggerPrice, null);
+  assert.equal(s.startTriggerAbove, null);
+});
+
+test('start(): arms fine when the account is confirmed genuinely flat', async () => {
+  const s = startModeStrategy(); // default stub: _lastPositionRefreshFailed stays false, activePosition stays null
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 });
+    assert.equal(s.startTriggerPrice, 110);
+    assert.equal(s.startTriggerAbove, true);
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+});
+
+// ——— validateStartTrigger: the shared pure validator (FIX round 3) ———
+//
+// The SAME function both the /anchor-ladder/start route and start() call —
+// "one validator, two gates", mirroring resolveLadderGeometry's pattern.
+// Tested directly since it is a pure, exported function: the most honest
+// surface, no strategy fixture needed.
+
+test('validateStartTrigger: rejects a level inside the 0.1% gap', () => {
+  const result = validateStartTrigger(100.05, 100, 'BTCUSDT');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /0\.1%/);
+});
+
+test('validateStartTrigger: a level ABOVE the reference is valid with above=true', () => {
+  const result = validateStartTrigger(110, 100, 'BTCUSDT');
+  assert.equal(result.ok, true);
+  assert.equal(result.above, true);
+  assert.equal(result.rounded, 110);
+});
+
+test('validateStartTrigger: a level BELOW the reference is valid with above=false', () => {
+  const result = validateStartTrigger(90, 100, 'BTCUSDT');
+  assert.equal(result.ok, true);
+  assert.equal(result.above, false);
+  assert.equal(result.rounded, 90);
 });
 
 // ——— Start Mode: a pending harvest is refused / cleared, not replayed ———

@@ -13,6 +13,7 @@ import {
   resolveLadderGeometry,
 } from './ladder-levels.js';
 import { planLadderActions, averageOpenEntry } from './ladder-crossings.js';
+import { precisionFormatter } from './precisionUtils.js';
 
 const MARGIN_HEADROOM_FLOOR_PCT = 30;              // free margin floor for sizing safety
 const HARVEST_LOSS_THRESHOLD_PCT = 0.08;           // 8% of initial capital — gate for HARVEST eligibility
@@ -41,6 +42,43 @@ function formatDuration(ms) {
   if (hours > 0 || days > 0) result += `${hours}h `;
   result += `${minutes}m ${seconds}s`;
   return result.trim();
+}
+
+/**
+ * Validate + round a proposed start-trigger price against a reference price.
+ *
+ * PURE — no I/O, no `this`. The same "one validator, two gates" pattern
+ * `resolveLadderGeometry` (ladder-levels.js) uses for the ladder-geometry
+ * bounds, and for the same reason: the /anchor-ladder/start route calls this
+ * (after fetching its own reference price) so a bad start-trigger price is a
+ * real 400 the user actually sees — today the 0.1%-gap/rounding check only
+ * lives inside start(), which runs AFTER the non-blocking 200; a rejection
+ * there just deletes the strategy from activeStrategies, the frontend 404s,
+ * takes its "strategy gone" branch, and calls setErrorMsg(null) — the user is
+ * bounced back to the config form with NO reason shown. start() calls this
+ * SAME function too, as the authoritative backstop a direct API call cannot
+ * bypass — the two call sites must never be able to silently re-diverge on
+ * what counts as a valid trigger (see resolveLadderGeometry's own docstring
+ * for the history of exactly that happening once already, for a different
+ * gate).
+ *
+ * Returns { ok: true, rounded, above } or { ok: false, error }.
+ */
+function validateStartTrigger(rawPrice, referencePrice, symbol) {
+  const px = Number(rawPrice);
+  if (!Number.isFinite(px) || px <= 0) {
+    return { ok: false, error: 'Start trigger price must be a positive number.' };
+  }
+  const rounded = precisionFormatter.roundPrice(px, symbol);
+  if (Math.abs(rounded - referencePrice) < referencePrice * TRIGGER_MIN_GAP_PCT) {
+    return {
+      ok: false,
+      error: `Start trigger price must be at least 0.1% away from the current price ` +
+        `(${precisionFormatter.formatPrice(referencePrice, symbol)}). ` +
+        `${precisionFormatter.formatPrice(rounded, symbol)} is too close to it.`,
+    };
+  }
+  return { ok: true, rounded, above: rounded > referencePrice };
 }
 
 /**
@@ -276,29 +314,24 @@ class AnchorLadderStrategy extends TradingBase {
 
     // ── Start Mode ────────────────────────────────────────────────────────
     // Absent / null / '' = Immediate: anchor on the first tick, as always.
-    // With a price, arm a one-shot start trigger. The VM is the authority
-    // (same philosophy as the ladder-geometry bounds): validate, enforce the
-    // 0.1% gap, and round to the symbol's tick size HERE, so an old frontend
-    // or a direct API call cannot arm a level that is already satisfied and
-    // would deploy capital the instant the strategy starts.
+    // With a price, arm a one-shot start trigger. validateStartTrigger is the
+    // SAME validator the /anchor-ladder/start route runs (after fetching its
+    // own reference price) so a bad price is a real 400 the caller sees
+    // instead of a start() rejection buried after the non-blocking 200. This
+    // call is the authoritative backstop — the VM is the authority (same
+    // philosophy as the ladder-geometry bounds) — so a direct API call
+    // cannot bypass it and arm a level that is already satisfied.
     if (config.startTriggerPrice != null && config.startTriggerPrice !== '') {
-      const px = Number(config.startTriggerPrice);
-      if (!Number.isFinite(px) || px <= 0) {
-        throw new Error('Start trigger price must be a positive number.');
-      }
       const ref = await this._fetchReferencePrice();
-      const rounded = this.roundPrice(px);
-      if (Math.abs(rounded - ref) < ref * TRIGGER_MIN_GAP_PCT) {
-        throw new Error(
-          `Start trigger price must be at least 0.1% away from the current price ` +
-          `(${this._formatPrice(ref)}). ${this._formatPrice(rounded)} is too close to it.`,
-        );
+      const check = validateStartTrigger(config.startTriggerPrice, ref, this.symbol);
+      if (!check.ok) {
+        throw new Error(check.error);
       }
-      this.startTriggerPrice = rounded;
-      this.startTriggerAbove = rounded > ref;
+      this.startTriggerPrice = check.rounded;
+      this.startTriggerAbove = check.above;
       await this.addLog(
-        `[LADDER] START TRIGGER armed @ ${this._formatPrice(rounded)} — the ladder will build when price ` +
-        `${this.startTriggerAbove ? 'rises to' : 'falls to'} it (reference ${this._formatPrice(ref)}).`,
+        `[LADDER] START TRIGGER armed @ ${this._formatPrice(check.rounded)} — the ladder will build when price ` +
+        `${check.above ? 'rises to' : 'falls to'} it (reference ${this._formatPrice(ref)}).`,
       );
     }
 
@@ -344,18 +377,53 @@ class AnchorLadderStrategy extends TradingBase {
     // unguarded throw escapes start() (see the note in resume()).
     await this._refreshCurrentPosition();
 
-    // Start Mode: warn if an inherited position will sit unmanaged while
-    // ARMED. Checked here rather than inline in the arming block above —
-    // `activePosition` isn't populated until the refresh just above runs, so
-    // `_closeQuantity()` would always read 0 at arm time. While ARMED, the
-    // empty-ladder gate returns before the RANGE/TREND dispatch, so any
-    // pre-existing position is not managed until the trigger fires. Log
-    // only — this does not change start() behaviour.
-    if (this.startTriggerPrice != null && this._closeQuantity() > 0) {
-      await this.addLog(
-        `WARNING: an existing position (qty ${this._closeQuantity()}) was detected on ${this.symbol} — ` +
-        `it will be left UNMANAGED until the start trigger @ ${this._formatPrice(this.startTriggerPrice)} fires.`,
-      );
+    // Start Mode: REFUSE to arm a deferred start over an existing or
+    // unverifiable position. While ARMED, the empty-ladder gate returns
+    // before any RANGE/TREND dispatch, so a pre-existing position would have
+    // no anchor, no Final TP, and no stop-loss for an UNBOUNDED period —
+    // upgraded from a warning because that is not a state the user can
+    // reason about. Checked here rather than inline in the arming block
+    // above — `activePosition` isn't populated until the refresh just above
+    // runs, so `_closeQuantity()` would always read 0 at arm time.
+    //
+    // Two DISTINCT failure shapes, both refused:
+    //  - a CONFIRMED open position (`_closeQuantity() > 0`) — Binance was
+    //    reachable and answered "not flat".
+    //  - an UNVERIFIABLE one (`_lastPositionRefreshFailed`) — the refresh
+    //    itself failed, so "flat" cannot be trusted. `_closeQuantity()` alone
+    //    would read 0 here too (no legs recorded yet on a fresh cycle, no
+    //    REST-confirmed qty either) — exactly the "unknown reads as flat"
+    //    shape this codebase's tombstones warn against, not a genuine
+    //    all-clear, so it needs its own explicit check.
+    //
+    // cleanupWebSockets() first: this throw lands after the WS setup above,
+    // and start() has no other throw point this late in the sequence — the
+    // caller (app.js's non-blocking .catch()) does not tear down WebSockets
+    // on a start() rejection, so leaving them connected here would leak the
+    // sockets and their ping/reconnect timers. Also null the trigger fields
+    // the arming block above already set — that same .catch() DOES call
+    // saveState(), and a failed/stopped doc must not persist a spurious
+    // still-armed trigger it never got the chance to honor.
+    if (this.startTriggerPrice != null) {
+      if (this._closeQuantity() > 0) {
+        const qty = this._closeQuantity();
+        this.cleanupWebSockets();
+        this.startTriggerPrice = null;
+        this.startTriggerAbove = null;
+        throw new Error(
+          `Cannot arm a start trigger: an existing position (qty ${qty}) was detected on ` +
+          `${this.symbol}. Close it manually first, or start in Immediate mode so the ladder anchors around it now.`,
+        );
+      }
+      if (this._lastPositionRefreshFailed) {
+        this.cleanupWebSockets();
+        this.startTriggerPrice = null;
+        this.startTriggerAbove = null;
+        throw new Error(
+          `Cannot arm a start trigger: the position check for ${this.symbol} did not complete, so it is not ` +
+          `known whether the account is flat. Try again once Binance is reachable.`,
+        );
+      }
     }
 
     // Funding poll baseline + scheduler. Anchor at strategy start so the
@@ -416,6 +484,14 @@ class AnchorLadderStrategy extends TradingBase {
       `leg ${this._formatNotional(this._legNotional())} USDT`,
     );
     await this.saveState();
+    // Push immediately — with a healthy WS the frontend disables its REST
+    // poll and relies on the 30s strategy_update safety net. Without this,
+    // an ARMED start-trigger fire (ladder builds mid-run, not at strategy
+    // boot) can leave the UI showing ARMED — phantom start line, harvest
+    // control still hidden — for up to 30s, and no leg fill can heal it on
+    // the anchoring tick (price == anchor; legs sit at ±stepPct). Also
+    // tightens the existing harvest re-anchor path, which calls this too.
+    this._pushHeartbeatNow?.();
   }
 
   // Each leg is an equal slice of the ladder base. The base is the initial size
@@ -1832,6 +1908,15 @@ class AnchorLadderStrategy extends TradingBase {
           `[LADDER] START TRIGGER hit @ ${this._formatPrice(price)} ` +
           `(armed ${this._formatPrice(armedAt)}) — building the ladder.`,
         );
+        // Sizing was captured at arm time (start()) but is spent NOW, at fire
+        // time — that gap is unbounded (the trigger can sit for hours or
+        // days). Not re-derived here — that would change sizing semantics
+        // and is out of scope — just surfaced so a size that may now look
+        // stale is visible in the log rather than silently deployed.
+        await this.addLog(
+          `[LADDER] Deploying ${this._formatNotional(this._ladderBaseSize || this.currentInitialSize || 0)} USDT ` +
+          `total (${this._formatNotional(this._legNotional())} USDT/leg) — sized when the strategy started.`,
+        );
       }
       // The anchor is the LIVE price, not the trigger level — price can gap
       // through the level, and the ladder must be built around where the market
@@ -2015,6 +2100,13 @@ class AnchorLadderStrategy extends TradingBase {
    * price) set `error.invalidInput = true` → the route maps those to 400.
    */
   async harvestNow(triggerPrice = null) {
+    // isRunning FIRST: a stopped strategy must report "not running", not
+    // "waiting for its start trigger" — stop() clears the trigger, so a
+    // stopped-but-still-armed state shouldn't be reachable, but the ORDER
+    // still matters for which message a caller sees if that invariant is
+    // ever wrong. Both map to 409, so this is wording only.
+    if (!this.isRunning) throw new Error('Strategy is not running.');
+
     // Start Mode: while ARMED there is no ladder and no position — the empty-
     // ladder gate in handleRealtimePrice returns before any RANGE/TREND
     // dispatch, so a harvest requested now would just sit on the
@@ -2030,7 +2122,6 @@ class AnchorLadderStrategy extends TradingBase {
         `there is no ladder or position to harvest yet. Stop the strategy to cancel the trigger.`,
       );
     }
-    if (!this.isRunning) throw new Error('Strategy is not running.');
 
     // No price → immediate harvest on the next free tick (today's behavior).
     // Clear any armed trigger so an immediate Harvest-now always supersedes a
@@ -2960,5 +3051,5 @@ class AnchorLadderStrategy extends TradingBase {
 
 }
 
-export { AnchorLadderStrategy };
+export { AnchorLadderStrategy, validateStartTrigger };
 export default AnchorLadderStrategy;

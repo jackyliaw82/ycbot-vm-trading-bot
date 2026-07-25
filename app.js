@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { AnchorLadderStrategy } from './anchor-ladder-strategy.js';
+import { AnchorLadderStrategy, validateStartTrigger } from './anchor-ladder-strategy.js';
 import {
   minInitialSizeUSDT,
   resolveLadderGeometry,
@@ -1465,15 +1465,53 @@ app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
       });
     }
 
-    // Shape only — the authoritative 0.1% gap check needs a live reference
-    // price and lives in start(). Catching an obviously bad value here lets the
-    // route answer 400 instead of failing after the non-blocking 200.
+    // Start trigger price — validated in full here, not just shape, so a
+    // rejection is a real 400 the user actually sees. Before this fix the
+    // 0.1%-gap/rounding check lived ONLY inside start(), which runs AFTER
+    // the non-blocking 200: a rejection there just deletes the strategy from
+    // activeStrategies, the frontend 404s, takes its "strategy gone" branch,
+    // and calls setErrorMsg(null) — the user is bounced back to the config
+    // form with no reason shown. Start Mode is the first async-rejection
+    // reason a user can trigger just by typing a number, so this is now the
+    // feature's most likely failure. Gated on the trigger being PRESENT —
+    // Immediate mode takes none of this and pays zero extra latency.
     const stp = config.startTriggerPrice;
-    if (stp != null && stp !== '' && !(Number(stp) > 0)) {
-      return res.status(400).json({
-        error: 'Start trigger price must be a positive number.',
-        code: 'START_TRIGGER_INVALID',
-      });
+    let strategy = null; // hoisted so a validated instance can be reused below instead of built twice
+    if (stp != null && stp !== '') {
+      // Cheap shape check first — no network call for obviously bad input
+      // (a string, 0, negative). Also what stops a garbage value from
+      // reaching a wasted reference-price fetch below.
+      if (!(Number(stp) > 0)) {
+        return res.status(400).json({
+          error: 'Start trigger price must be a positive number.',
+          code: 'START_TRIGGER_INVALID',
+        });
+      }
+      // Reuse the SAME instance for the actual start below (see the
+      // `if (!strategy) strategy = new AnchorLadderStrategy(...)` a bit
+      // further down) rather than fetching a reference price twice and
+      // paying for a second Firestore client. `symbol` is set now purely so
+      // _fetchReferencePrice/validateStartTrigger use the right one; start()
+      // re-sets it identically from `config` regardless.
+      strategy = new AnchorLadderStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
+      strategy.symbol = config.symbol || 'BTCUSDT';
+      let ref;
+      try {
+        ref = await strategy._fetchReferencePrice();
+      } catch (err) {
+        return res.status(400).json({
+          error: `Could not validate the start trigger price: ${err.message}`,
+          code: 'START_TRIGGER_UNVERIFIABLE',
+        });
+      }
+      // validateStartTrigger is the SAME pure validator start() calls as its
+      // own authoritative backstop (a direct API call must not be able to
+      // bypass it) — "one validator, two gates", so the route and start()
+      // can never silently re-diverge on what counts as a valid trigger.
+      const check = validateStartTrigger(stp, ref, strategy.symbol);
+      if (!check.ok) {
+        return res.status(400).json({ error: check.error, code: 'START_TRIGGER_INVALID' });
+      }
     }
 
     // One strategy per profile (matches existing model). User must stop the running strategy first.
@@ -1520,7 +1558,10 @@ app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
     }
     // ──────────────────────────────────────────────────────────────────────
 
-    const strategy = new AnchorLadderStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
+    // Reuse the instance the start-trigger validation above already built
+    // (Immediate-mode requests never entered that branch, so `strategy` is
+    // still null here for them — build it now, same as before this fix).
+    if (!strategy) strategy = new AnchorLadderStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
     strategy.userId = req.uid || userId;
 
     const strategyId = `anchor_ladder_${profileId}_${Date.now()}`;
