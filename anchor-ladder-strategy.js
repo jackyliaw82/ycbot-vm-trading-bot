@@ -164,6 +164,15 @@ class AnchorLadderStrategy extends TradingBase {
     // Direction (`Above`) is fixed at arm time so it can't drift as price moves.
     this.harvestTriggerPrice = null;      // number | null
     this.harvestTriggerAbove = null;      // boolean | null: true = fire when price >= level
+
+    // ── Start Mode ────────────────────────────────────────────────────────
+    // Optional: defer building the ladder until the price reaches a level the
+    // user chose at deployment. null = Immediate (anchor on the first tick).
+    // Direction is captured at arm time in start(), exactly like the harvest
+    // trigger, so a level above the reference fires on a rise and below on a
+    // fall. Cleared the moment it fires — one-shot.
+    this.startTriggerPrice = null;   // number | null
+    this.startTriggerAbove = null;   // boolean | null
   }
 
   // ——— Lifecycle ——————————————————————————————————————————————————————
@@ -264,6 +273,35 @@ class AnchorLadderStrategy extends TradingBase {
       await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
       throw new Error(msg);
     }
+
+    // ── Start Mode ────────────────────────────────────────────────────────
+    // Absent / null / '' = Immediate: anchor on the first tick, as always.
+    // With a price, arm a one-shot start trigger. The VM is the authority
+    // (same philosophy as the ladder-geometry bounds): validate, enforce the
+    // 0.1% gap, and round to the symbol's tick size HERE, so an old frontend
+    // or a direct API call cannot arm a level that is already satisfied and
+    // would deploy capital the instant the strategy starts.
+    if (config.startTriggerPrice != null && config.startTriggerPrice !== '') {
+      const px = Number(config.startTriggerPrice);
+      if (!Number.isFinite(px) || px <= 0) {
+        throw new Error('Start trigger price must be a positive number.');
+      }
+      const ref = await this._fetchReferencePrice();
+      const rounded = this.roundPrice(px);
+      if (Math.abs(rounded - ref) < ref * TRIGGER_MIN_GAP_PCT) {
+        throw new Error(
+          `Start trigger price must be at least 0.1% away from the current price ` +
+          `(${this._formatPrice(ref)}). ${this._formatPrice(rounded)} is already at or past it.`,
+        );
+      }
+      this.startTriggerPrice = rounded;
+      this.startTriggerAbove = rounded > ref;
+      await this.addLog(
+        `[LADDER] START TRIGGER armed @ ${this._formatPrice(rounded)} — the ladder will build when price ` +
+        `${this.startTriggerAbove ? 'rises to' : 'falls to'} it (reference ${this._formatPrice(ref)}).`,
+      );
+    }
+
     // Initial capital snapshot — drives the harvest gate and the sizing self-regulation loop.
     this.initialWalletBalance = await this.getWalletBalance();
     this.initialCapital = this.initialWalletBalance || this.currentInitialSize;
@@ -313,6 +351,28 @@ class AnchorLadderStrategy extends TradingBase {
 
     await this.addLog('AnchorLadderStrategy running — awaiting first tick to build the ladder.');
     await this.saveState();
+  }
+
+  /**
+   * A REST mark price for validating a start trigger.
+   *
+   * start() runs BEFORE the price WS has ticked, so `this.currentPrice` is null
+   * there and cannot be used the way harvestNow() uses it. Same endpoint the
+   * REST fallback polls (see trading-base.js's _restPollInterval).
+   *
+   * THROWS on failure — deliberately. We cannot check the 0.1% gap without a
+   * reference, and arming an unvalidated trigger could deploy capital at a
+   * moment the user never chose. Refuse the start instead.
+   */
+  async _fetchReferencePrice() {
+    const data = await this.makeProxyRequest(
+      '/fapi/v1/premiumIndex', 'GET', { symbol: this.symbol }, false, 'futures',
+    );
+    const px = parseFloat(data?.markPrice);
+    if (!Number.isFinite(px) || px <= 0) {
+      throw new Error('Could not read a reference price from Binance to validate the start trigger.');
+    }
+    return px;
   }
 
   /**
@@ -792,6 +852,17 @@ class AnchorLadderStrategy extends TradingBase {
   }
 
   /**
+   * Is this strategy waiting for its start trigger?
+   *
+   * DERIVED, never stored. A stored copy would be a second source of truth for
+   * one fact and would drift — the same failure `_trendFinalTpArmed` documents.
+   * The ladder existing is what makes the strategy live, so that is the test.
+   */
+  get startArmed() {
+    return this.startTriggerPrice != null && !this.ladderLines.length;
+  }
+
+  /**
    * Fully scaled -> TREND. Passive from here: the position is KEPT EXACTLY AS-IS.
    *
    * Deliberately does NOT flatten and re-open (which is what the old
@@ -1175,6 +1246,8 @@ class AnchorLadderStrategy extends TradingBase {
     this.finalTpPrice = snapshot.finalTpPrice || null;
     this.harvestTriggerPrice = snapshot.harvestTriggerPrice ?? null;
     this.harvestTriggerAbove = snapshot.harvestTriggerAbove ?? null;
+    this.startTriggerPrice = snapshot.startTriggerPrice ?? null;
+    this.startTriggerAbove = snapshot.startTriggerAbove ?? null;
     this.cycleAccumulatedLoss = snapshot.cycleAccumulatedLoss || 0;
     this.flattenCount = snapshot.flattenCount || 0;
     this.harvestCount = snapshot.harvestCount || 0;
@@ -1702,6 +1775,25 @@ class AnchorLadderStrategy extends TradingBase {
     // ---- Ladder gate: anchor on the first tick (and after a harvest). ----
     // No market data needed — the anchor IS the price — so no retry throttle.
     if (!this.ladderLines.length) {
+      // Start Mode: hold the ladder until the armed level is reached. Returning
+      // here leaves the strategy running and ARMED — there is no position and no
+      // ladder to act on, so nothing else on this tick applies.
+      if (this.startTriggerPrice != null) {
+        const hit = this.startTriggerAbove
+          ? price >= this.startTriggerPrice
+          : price <= this.startTriggerPrice;
+        if (!hit) return;
+        const armedAt = this.startTriggerPrice;
+        this.startTriggerPrice = null;
+        this.startTriggerAbove = null;
+        await this.addLog(
+          `[LADDER] START TRIGGER hit @ ${this._formatPrice(price)} ` +
+          `(armed ${this._formatPrice(armedAt)}) — building the ladder.`,
+        );
+      }
+      // The anchor is the LIVE price, not the trigger level — price can gap
+      // through the level, and the ladder must be built around where the market
+      // actually is.
       await this.initializeLadder(price);
       return;
     }
@@ -2601,6 +2693,9 @@ class AnchorLadderStrategy extends TradingBase {
       _lastLadderSize: this._lastLadderSize,
       harvestTriggerPrice: this.harvestTriggerPrice ?? null,
       harvestTriggerAbove: this.harvestTriggerAbove ?? null,
+      startTriggerPrice: this.startTriggerPrice ?? null,
+      startTriggerAbove: this.startTriggerAbove ?? null,
+      startArmed: this.startArmed,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
@@ -2674,6 +2769,9 @@ class AnchorLadderStrategy extends TradingBase {
       ladderBaseSize: this._ladderBaseSize,
       harvestTriggerPrice: this.harvestTriggerPrice ?? null,
       harvestTriggerAbove: this.harvestTriggerAbove ?? null,
+      startTriggerPrice: this.startTriggerPrice ?? null,
+      startTriggerAbove: this.startTriggerAbove ?? null,
+      startArmed: this.startArmed,
     };
   }
 
@@ -2777,6 +2875,11 @@ class AnchorLadderStrategy extends TradingBase {
         // so a VM restart / resume doesn't silently disarm it.
         harvestTriggerPrice: this.harvestTriggerPrice ?? null,
         harvestTriggerAbove: this.harvestTriggerAbove ?? null,
+        // Armed Start Mode trigger (one-shot price level deferring the FIRST
+        // ladder build). Persist so a VM restart / resume doesn't silently
+        // disarm it and fall back to Immediate on the next tick.
+        startTriggerPrice: this.startTriggerPrice ?? null,
+        startTriggerAbove: this.startTriggerAbove ?? null,
         // Geometry is per-cycle config, not a constant — resume MUST rebuild the
         // ladder this cycle actually started with (see _applySnapshotGeometry).
         stepPct: this.stepPct,

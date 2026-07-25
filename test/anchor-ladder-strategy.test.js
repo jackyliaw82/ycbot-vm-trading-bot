@@ -2333,3 +2333,69 @@ test('_closeConsolidated: a NON-reduceOnly order error still propagates (no blan
   assert.equal(refreshCalled, false, 'no verification runs for an unrelated failure');
   assert.ok(s.activePosition, 'state untouched');
 });
+
+// ——— Start Mode: an armed start trigger defers the ladder ———
+//
+// start() validates the level against a freshly fetched reference price (the
+// WS has not ticked yet at that point), stores it, and the tick gate holds the
+// ladder until the price reaches it. The anchor is then the LIVE price, not the
+// trigger level.
+
+test('startArmed is DERIVED: true only while a trigger is set AND no ladder exists', () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.startTriggerPrice = null;
+  assert.equal(s.startArmed, false, 'no trigger = not armed');
+  s.startTriggerPrice = 90;
+  assert.equal(s.startArmed, true, 'trigger + no ladder = armed');
+  s.ladderLines = buildLadder(100, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE);
+  assert.equal(s.startArmed, false, 'once the ladder exists the strategy is live, not armed');
+});
+
+test('start trigger: a tick that has NOT reached the level does not build the ladder', async () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.startTriggerPrice = 90;
+  s.startTriggerAbove = false;      // armed below → fires on a fall
+  let built = false;
+  s.initializeLadder = async () => { built = true; };
+  await s.handleRealtimePrice(95);
+  assert.equal(built, false, 'price has not fallen to the trigger — the ladder must stay unbuilt');
+  assert.equal(s.startTriggerPrice, 90, 'the trigger stays armed');
+});
+
+test('start trigger: reaching the level clears it and anchors on the LIVE price', async () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.startTriggerPrice = 90;
+  s.startTriggerAbove = false;
+  let anchoredAt = null;
+  s.initializeLadder = async (p) => { anchoredAt = p; };
+  await s.handleRealtimePrice(89.7);   // gapped THROUGH the trigger
+  assert.equal(anchoredAt, 89.7, 'the anchor is the live price, not the 90 trigger level');
+  assert.equal(s.startTriggerPrice, null, 'one-shot — the trigger is cleared');
+  assert.equal(s.startTriggerAbove, null);
+});
+
+test('start trigger: an upward trigger fires on a rise', async () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.startTriggerPrice = 110;
+  s.startTriggerAbove = true;
+  let anchoredAt = null;
+  s.initializeLadder = async (p) => { anchoredAt = p; };
+  await s.handleRealtimePrice(105);
+  assert.equal(anchoredAt, null, 'not yet reached');
+  await s.handleRealtimePrice(110.4);
+  assert.equal(anchoredAt, 110.4);
+});
+
+test('start trigger: with NO trigger armed the ladder builds on the first tick as before', async () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.startTriggerPrice = null;
+  let anchoredAt = null;
+  s.initializeLadder = async (p) => { anchoredAt = p; };
+  await s.handleRealtimePrice(100);
+  assert.equal(anchoredAt, 100, 'Immediate mode is unchanged');
+});

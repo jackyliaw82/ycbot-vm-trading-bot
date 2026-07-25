@@ -1465,6 +1465,17 @@ app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
       });
     }
 
+    // Shape only — the authoritative 0.1% gap check needs a live reference
+    // price and lives in start(). Catching an obviously bad value here lets the
+    // route answer 400 instead of failing after the non-blocking 200.
+    const stp = config.startTriggerPrice;
+    if (stp != null && stp !== '' && !(Number(stp) > 0)) {
+      return res.status(400).json({
+        error: 'Start trigger price must be a positive number.',
+        code: 'START_TRIGGER_INVALID',
+      });
+    }
+
     // One strategy per profile (matches existing model). User must stop the running strategy first.
     for (const [sId, strategy] of activeStrategies.entries()) {
       if (strategy.profileId === profileId) {
@@ -1546,6 +1557,11 @@ app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
         console.error(`Failed to start Anchor Ladder Strategy ${strategyId}:`, error);
         strategy.isRunning = false;
         activeStrategies.delete(strategyId);
+        firestore.collection('strategies').doc(strategyId).update({
+          isRunning: false,
+          criticalError: `start_failed: ${error.message}`,
+          lastUpdated: new Date(),
+        }).catch(() => {});
       });
   } catch (error) {
     console.error('Failed to start Anchor Ladder Strategy:', error);
