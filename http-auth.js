@@ -144,6 +144,60 @@ export function requireAdmin(req, res, next) {
 }
 
 /**
+ * Per-route middleware restricting an endpoint to THIS VM's owner.
+ *
+ * Each user gets a dedicated VM, but every VM is publicly addressable via its
+ * per-user A record (https://vm-user-<uid>.vm.ycbot.trade). httpAuthMiddleware
+ * proves WHO the caller is; it never checks WHOSE VM is being called. Without
+ * this guard any authenticated user can POST /anchor-ladder/start to another
+ * user's VM with their own credentials in the body. That trades the caller's
+ * OWN account (no fund breach), but it strands a live instance on a foreign VM
+ * while the strategy doc carries the caller's uid — so the caller's own VM
+ * resumes the same doc on its next restart and two instances trade one account.
+ * That is the 2026-07-25 duplicate-instance incident, reachable deliberately,
+ * and the caller's Stop button cannot reach the twin.
+ *
+ * Admin uids pass through: the fleet release rollout legitimately drives other
+ * users' VMs (backend-service release.service.ts -> /system/update,
+ * /system/force-update).
+ *
+ * FAIL CLOSED: when the VM cannot determine its own owner it serves NOBODY —
+ * the same rule the recovery scan follows. Unknown must never read as safe.
+ * Set the VM_OWNER_UID env var as the escape hatch if metadata is unavailable.
+ *
+ * @param getOwnerUid function returning the lowercased owner uid (or null).
+ *   MUST be a function: app.js assigns VM_OWNER_UID via a top-level await, so a
+ *   by-value capture would be null forever.
+ */
+export function createRequireVmOwner(getOwnerUid) {
+  return function requireVmOwner(req, res, next) {
+    if (!AUTH_REQUIRED) {
+      console.warn(`[http-auth] VM-OWNER BYPASS ${req.method} ${req.path} — AUTH_REQUIRED=false`);
+      return next();
+    }
+    if (!req.uid) {
+      return res.status(401).json({ error: 'Unauthorized — no verified uid', code: 'AUTH_MISSING' });
+    }
+    if (ADMIN_UIDS.has(req.uid)) return next();
+
+    const ownerUid = getOwnerUid();
+    if (!ownerUid) {
+      return res.status(403).json({
+        error: 'Forbidden — this VM cannot determine its owner, so it is refusing all user requests. See the [VM-OWNER] log line for the reason.',
+        code: 'VM_OWNER_UNKNOWN',
+      });
+    }
+    if (req.uid.toLowerCase() !== ownerUid) {
+      return res.status(403).json({
+        error: 'Forbidden — this VM does not belong to you.',
+        code: 'NOT_VM_OWNER',
+      });
+    }
+    return next();
+  };
+}
+
+/**
  * Test-only export: lets unit tests inspect or override the public-path set
  * without poking at module internals.
  */

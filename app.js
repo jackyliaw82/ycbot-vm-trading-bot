@@ -30,7 +30,7 @@ import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import os from 'os';
 import wsBroadcast from './ws-broadcast.js';
-import { httpAuthMiddleware, requireAdmin } from './http-auth.js';
+import { httpAuthMiddleware, requireAdmin, createRequireVmOwner } from './http-auth.js';
 import { checkBillingGate } from './billing-gate.js';
 
 const app = express();
@@ -217,6 +217,11 @@ async function loadRelayAuthToken() {
 }
 
 VM_OWNER_UID = await resolveVmOwnerUid();
+
+// Restricts the per-user endpoints below to this VM's owner. Late-bound getter:
+// VM_OWNER_UID is assigned just above by a top-level await.
+const requireVmOwner = createRequireVmOwner(() => VM_OWNER_UID);
+
 await loadRelayAuthToken();
 
 startupStatus.phase = 'ready';
@@ -487,7 +492,7 @@ app.get('/health', (req, res) => {
 // Generic Firestore query endpoints (used by AI strategies)
 
 // New endpoint to fetch strategy-specific trades
-app.get('/strategy/:strategyId/trades', async (req, res) => {
+app.get('/strategy/:strategyId/trades', requireVmOwner, async (req, res) => {
   try {
     const { strategyId } = req.params;
     // Hardcode Firestore project ID and database ID
@@ -514,7 +519,7 @@ app.get('/strategy/:strategyId/trades', async (req, res) => {
 });
 
 // NEW: Endpoint to fetch strategy-specific logs
-app.get('/strategy/:strategyId/logs', async (req, res) => {
+app.get('/strategy/:strategyId/logs', requireVmOwner, async (req, res) => {
   try {
     const { strategyId } = req.params;
     const logsRef = firestore.collection('strategies').doc(strategyId).collection('logs');
@@ -537,7 +542,7 @@ app.get('/strategy/:strategyId/logs', async (req, res) => {
 });
 
 // Endpoint to fetch strategy flow events
-app.get('/strategy/:strategyId/strategyFlow', async (req, res) => {
+app.get('/strategy/:strategyId/strategyFlow', requireVmOwner, async (req, res) => {
   try {
     const { strategyId } = req.params;
     const flowRef = firestore.collection('strategies').doc(strategyId).collection('strategyFlow');
@@ -570,7 +575,7 @@ app.get('/strategy/:strategyId/strategyFlow', async (req, res) => {
 });
 
 // Endpoint to fetch futures balance history (DEPRECATED - no longer used)
-app.get('/wallet-history', async (req, res) => {
+app.get('/wallet-history', requireVmOwner, async (req, res) => {
   res.status(410).json({
     error: 'This endpoint has been deprecated. Futures balance history is no longer tracked.',
     timestamp: new Date().toISOString()
@@ -578,7 +583,7 @@ app.get('/wallet-history', async (req, res) => {
 });
 
 // List all strategies endpoint
-app.get('/strategies', async (req, res) => {
+app.get('/strategies', requireVmOwner, async (req, res) => {
   try {
     // For a "one user per VM" setup, this endpoint should ideally be filtered by the user associated with this VM.
     // However, since the VM itself doesn't inherently know the user ID without a request context,
@@ -612,7 +617,7 @@ app.get('/strategies', async (req, res) => {
 });
 
 // New endpoint to fetch specific strategy details
-app.get('/strategies/:strategyId', async (req, res) => {
+app.get('/strategies/:strategyId', requireVmOwner, async (req, res) => {
   try {
     const { strategyId } = req.params;
     const strategyDoc = await firestore.collection('strategies').doc(strategyId).get();
@@ -1398,7 +1403,7 @@ async function reportVersionOnStartup(retryCount = 0) {
 
 // ——— Anchor Ladder Strategy endpoints ————————————————————————————————
 
-app.post('/anchor-ladder/prepare-symbol', (req, res) => {
+app.post('/anchor-ladder/prepare-symbol', requireVmOwner, (req, res) => {
   const { symbol } = req.body || {};
   if (!symbol || typeof symbol !== 'string') {
     return res.status(400).json({ error: 'symbol is required' });
@@ -1418,7 +1423,7 @@ app.post('/anchor-ladder/prepare-symbol', (req, res) => {
   return res.json({ ok: true, symbol: normalized });
 });
 
-app.post('/anchor-ladder/start', async (req, res) => {
+app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
   if (isUpdating) {
     return res.status(503).json({ error: 'VM is currently updating.', code: 'VM_UPDATING' });
   }
@@ -1548,7 +1553,7 @@ app.post('/anchor-ladder/start', async (req, res) => {
   }
 });
 
-app.post('/anchor-ladder/stop', async (req, res) => {
+app.post('/anchor-ladder/stop', requireVmOwner, async (req, res) => {
   try {
     const { strategyId, flatten } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
@@ -1578,7 +1583,7 @@ app.post('/anchor-ladder/stop', async (req, res) => {
 // stepPct, legNotional, ladderBaseSize — alongside the base TradingBase
 // fields. Unlike the retired grid strategy's status route, no extra
 // field-bolting is needed here; getStatus() IS the response.
-app.get('/anchor-ladder/status', (req, res) => {
+app.get('/anchor-ladder/status', requireVmOwner, (req, res) => {
   const { strategyId } = req.query;
 
   if (strategyId) {
@@ -1615,7 +1620,7 @@ app.get('/anchor-ladder/status', (req, res) => {
 // the current price) are tagged by the strategy (error.invalidInput) → 400. The
 // strategy remains the sole authority on trigger validity — this route does not
 // duplicate that logic.
-app.post('/anchor-ladder/harvest-now', async (req, res) => {
+app.post('/anchor-ladder/harvest-now', requireVmOwner, async (req, res) => {
   try {
     const { strategyId, triggerPrice } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
@@ -1633,7 +1638,7 @@ app.post('/anchor-ladder/harvest-now', async (req, res) => {
 // Cancel an armed harvest/re-anchor Trigger Price (set via harvest-now with a
 // triggerPrice). Idempotent — clears the latch if present. 400 if the strategy
 // isn't a running Anchor Ladder.
-app.post('/anchor-ladder/cancel-harvest-trigger', async (req, res) => {
+app.post('/anchor-ladder/cancel-harvest-trigger', requireVmOwner, async (req, res) => {
   try {
     const { strategyId } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
@@ -1654,7 +1659,7 @@ app.post('/anchor-ladder/cancel-harvest-trigger', async (req, res) => {
 // fires here; the new Final TP target just takes effect on the next price
 // tick. Shipped user feature carried over from AI Reversal; adjustProfitTarget
 // survives unchanged on AnchorLadderStrategy.
-app.post('/anchor-ladder/adjust-profit-target', async (req, res) => {
+app.post('/anchor-ladder/adjust-profit-target', requireVmOwner, async (req, res) => {
   try {
     const { strategyId, desiredProfitPercent } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
@@ -1680,7 +1685,7 @@ app.post('/anchor-ladder/adjust-profit-target', async (req, res) => {
 // on every position event (open / reverse / harvest / anchor-flatten /
 // final_tp_hit). Used by the position chart to place TP segment boundaries
 // at EXACT event moments instead of heartbeat-resolution timestamps.
-app.get('/anchor-ladder/strategy-flow', async (req, res) => {
+app.get('/anchor-ladder/strategy-flow', requireVmOwner, async (req, res) => {
   try {
     const { strategyId, limit: queryLimit } = req.query;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
