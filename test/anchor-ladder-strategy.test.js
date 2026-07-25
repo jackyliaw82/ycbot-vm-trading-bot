@@ -2350,6 +2350,10 @@ test('startArmed is DERIVED: true only while a trigger is set AND no ladder exis
   assert.equal(s.startArmed, true, 'trigger + no ladder = armed');
   s.ladderLines = buildLadder(100, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE);
   assert.equal(s.startArmed, false, 'once the ladder exists the strategy is live, not armed');
+  // Getter-only — no setter was defined, so ESM strict mode throws on
+  // assignment. Free regression lock against someone later turning this back
+  // into a stored field (the exact drift `_trendFinalTpArmed` tombstones).
+  assert.throws(() => { s.startArmed = true; });
 });
 
 test('start trigger: a tick that has NOT reached the level does not build the ladder', async () => {
@@ -2398,4 +2402,89 @@ test('start trigger: with NO trigger armed the ladder builds on the first tick a
   s.initializeLadder = async (p) => { anchoredAt = p; };
   await s.handleRealtimePrice(100);
   assert.equal(anchoredAt, 100, 'Immediate mode is unchanged');
+});
+
+// ——— Start Mode: arm-time validation in start() ———
+//
+// Mirrors harvestNow(triggerPrice)'s dedicated arm-time tests above: rounding,
+// both directions, the 0.1% gap, and bad input — but through start(), which is
+// where the brief's central safety rule lives ("an already-satisfied or
+// too-close level must be REJECTED"). Reuses stubBootInternals() (the same
+// harness the existing "sizes the minNotional gate" start()-test drives) so
+// start() can run all the way through its network-touching setup in tests.
+// _fetchReferencePrice is stubbed directly rather than through
+// makeProxyRequest — stubBootInternals' makeProxyRequest always throws (it
+// exists to prove _refreshCurrentPosition fails safely), which would be the
+// wrong signal for a reference-price fetch that's meant to succeed.
+
+function startModeStrategy() {
+  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  stubBootInternals(s);
+  s.getWalletBalance = async () => 1000;
+  s._fetchReferencePrice = async () => 100; // reference price for every test below
+  return s;
+}
+
+test('start(): a start trigger inside the 0.1% gap is rejected and nothing is armed', async () => {
+  const s = startModeStrategy();
+  await assert.rejects(
+    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 100.05 }),
+    /0\.1%/,
+  );
+  assert.equal(s.startTriggerPrice, null, 'a rejected arm leaves no trigger set');
+  assert.equal(s.startTriggerAbove, null);
+});
+
+test('start(): a trigger ABOVE the reference arms startTriggerAbove=true', async () => {
+  const s = startModeStrategy();
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 });
+    assert.equal(s.startTriggerPrice, 110);
+    assert.equal(s.startTriggerAbove, true);
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+});
+
+test('start(): a trigger BELOW the reference arms startTriggerAbove=false', async () => {
+  const s = startModeStrategy();
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 90 });
+    assert.equal(s.startTriggerPrice, 90);
+    assert.equal(s.startTriggerAbove, false);
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+});
+
+test('start(): a non-positive start trigger price is rejected', async () => {
+  const s = startModeStrategy();
+  await assert.rejects(
+    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 0 }),
+    /positive number/,
+  );
+  assert.equal(s.startTriggerPrice, null);
+});
+
+test('start(): a non-finite start trigger price is rejected', async () => {
+  const s = startModeStrategy();
+  await assert.rejects(
+    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 'not-a-number' }),
+    /positive number/,
+  );
+  assert.equal(s.startTriggerPrice, null);
+});
+
+test('start(): a failed reference-price fetch refuses the start and arms nothing', async () => {
+  const s = startModeStrategy();
+  s._fetchReferencePrice = async () => {
+    throw new Error('Could not read a reference price from Binance to validate the start trigger.');
+  };
+  await assert.rejects(
+    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 }),
+    /reference price/,
+    'an unknown reference must refuse the start, never arm on a guess',
+  );
+  assert.equal(s.startTriggerPrice, null, 'unknown must never read as armed');
+  assert.equal(s.startTriggerAbove, null);
 });

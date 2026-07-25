@@ -1555,13 +1555,21 @@ app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
       })
       .catch((error) => {
         console.error(`Failed to start Anchor Ladder Strategy ${strategyId}:`, error);
+        // NOTE: the parent Firestore doc does not exist yet at this point — the
+        // id is freshly minted, initFirestoreCollections only builds
+        // references, and addLog writes to the `logs` SUBcollection (leaving
+        // the parent a phantom doc). A bare `.doc(strategyId).update({...})`
+        // rejects NOT_FOUND and would be silently swallowed by a trailing
+        // `.catch(() => {})`, so a start rejected after the non-blocking 200
+        // would vanish without a trace. Go through saveState() instead — it
+        // already persists criticalError and `.set(..., {merge:true})`s the
+        // full doc shape (userId/profileId/type/...) so the frontend's query
+        // can actually see it. isRunning must be false BEFORE saveState runs
+        // so that is what gets persisted.
         strategy.isRunning = false;
+        strategy.criticalError = `start_failed: ${error.message}`;
         activeStrategies.delete(strategyId);
-        firestore.collection('strategies').doc(strategyId).update({
-          isRunning: false,
-          criticalError: `start_failed: ${error.message}`,
-          lastUpdated: new Date(),
-        }).catch(() => {});
+        strategy.saveState().catch(() => {});
       });
   } catch (error) {
     console.error('Failed to start Anchor Ladder Strategy:', error);

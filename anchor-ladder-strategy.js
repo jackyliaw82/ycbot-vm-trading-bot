@@ -291,7 +291,7 @@ class AnchorLadderStrategy extends TradingBase {
       if (Math.abs(rounded - ref) < ref * TRIGGER_MIN_GAP_PCT) {
         throw new Error(
           `Start trigger price must be at least 0.1% away from the current price ` +
-          `(${this._formatPrice(ref)}). ${this._formatPrice(rounded)} is already at or past it.`,
+          `(${this._formatPrice(ref)}). ${this._formatPrice(rounded)} is too close to it.`,
         );
       }
       this.startTriggerPrice = rounded;
@@ -343,6 +343,20 @@ class AnchorLadderStrategy extends TradingBase {
     // detectCurrentPosition() call here: it now THROWS on an API error, and an
     // unguarded throw escapes start() (see the note in resume()).
     await this._refreshCurrentPosition();
+
+    // Start Mode: warn if an inherited position will sit unmanaged while
+    // ARMED. Checked here rather than inline in the arming block above —
+    // `activePosition` isn't populated until the refresh just above runs, so
+    // `_closeQuantity()` would always read 0 at arm time. While ARMED, the
+    // empty-ladder gate returns before the RANGE/TREND dispatch, so any
+    // pre-existing position is not managed until the trigger fires. Log
+    // only — this does not change start() behaviour.
+    if (this.startTriggerPrice != null && this._closeQuantity() > 0) {
+      await this.addLog(
+        `WARNING: an existing position (qty ${this._closeQuantity()}) was detected on ${this.symbol} — ` +
+        `it will be left UNMANAGED until the start trigger @ ${this._formatPrice(this.startTriggerPrice)} fires.`,
+      );
+    }
 
     // Funding poll baseline + scheduler. Anchor at strategy start so the
     // first poll only catches entries from THIS cycle.
@@ -1556,9 +1570,14 @@ class AnchorLadderStrategy extends TradingBase {
     this.activePosition = null;
     this.currentSide = null;
 
-    // Any armed harvest trigger dies with the cycle (Final TP or manual Stop).
+    // Any armed trigger dies with the cycle (Final TP or manual Stop) — start
+    // and harvest triggers are the same rule: a terminated strategy must never
+    // keep reporting armed (startArmed derives off ladderLines.length, which
+    // stays empty for a cycle that stopped before its first tick).
     this.harvestTriggerPrice = null;
     this.harvestTriggerAbove = null;
+    this.startTriggerPrice = null;
+    this.startTriggerAbove = null;
 
     // Final funding flush — capture any settlement that happened between
     // the last scheduled poll and stop. Non-critical: swallow errors.
@@ -1779,6 +1798,22 @@ class AnchorLadderStrategy extends TradingBase {
       // here leaves the strategy running and ARMED — there is no position and no
       // ladder to act on, so nothing else on this tick applies.
       if (this.startTriggerPrice != null) {
+        // Direction must be a real boolean. `? :` treats null/undefined as
+        // falsy, which reads as "fires on a fall" — for a trigger armed ABOVE
+        // whose direction was lost, price is by definition already below it,
+        // so it would fire on the very next tick and deploy the full initial
+        // size at a moment the user never chose. Unknown must never read as
+        // actionable: disarm instead of guessing a direction.
+        if (typeof this.startTriggerAbove !== 'boolean') {
+          await this.addLog(
+            `ERROR: start trigger @ ${this._formatPrice(this.startTriggerPrice)} has no direction — ` +
+            `DISARMING rather than firing at an unchosen moment.`,
+          );
+          this.startTriggerPrice = null;
+          this.startTriggerAbove = null;
+          await this.saveState();
+          return;
+        }
         const hit = this.startTriggerAbove
           ? price >= this.startTriggerPrice
           : price <= this.startTriggerPrice;
