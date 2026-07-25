@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
-import { AnchorLadderStrategy, validateStartTrigger } from './anchor-ladder-strategy.js';
+import { AnchorLadderStrategy } from './anchor-ladder-strategy.js';
+import { resolveStartTrigger } from './start-trigger-gate.js';
 import {
   minInitialSizeUSDT,
   resolveLadderGeometry,
@@ -1473,50 +1474,32 @@ app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
     // and calls setErrorMsg(null) — the user is bounced back to the config
     // form with no reason shown. Start Mode is the first async-rejection
     // reason a user can trigger just by typing a number, so this is now the
-    // feature's most likely failure. Gated on the trigger being PRESENT —
-    // Immediate mode takes none of this and pays zero extra latency.
-    const stp = config.startTriggerPrice;
-    let strategy = null; // hoisted so a validated instance can be reused below instead of built twice
-    if (stp != null && stp !== '') {
-      // Cheap shape check first — no network call for obviously bad input
-      // (a string, 0, negative). Also what stops a garbage value from
-      // reaching a wasted reference-price fetch below.
-      if (!(Number(stp) > 0)) {
-        return res.status(400).json({
-          error: 'Start trigger price must be a positive number.',
-          code: 'START_TRIGGER_INVALID',
-        });
-      }
-      // Reuse the SAME instance for the actual start below (see the
-      // `if (!strategy) strategy = new AnchorLadderStrategy(...)` a bit
-      // further down) rather than fetching a reference price twice and
-      // paying for a second Firestore client. `symbol` is set now purely so
-      // _fetchReferencePrice/validateStartTrigger use the right one; start()
-      // re-sets it identically from `config` regardless.
-      strategy = new AnchorLadderStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
-      strategy.symbol = config.symbol || 'BTCUSDT';
-      let ref;
-      try {
-        ref = await strategy._fetchReferencePrice();
-      } catch (err) {
-        return res.status(400).json({
-          error: `Could not validate the start trigger price: ${err.message}`,
-          code: 'START_TRIGGER_UNVERIFIABLE',
-        });
-      }
-      // validateStartTrigger is the SAME pure validator start() calls as its
-      // own authoritative backstop (a direct API call must not be able to
-      // bypass it) — "one validator, two gates", so the route and start()
-      // can never silently re-diverge on what counts as a valid trigger.
-      const check = validateStartTrigger(stp, ref, strategy.symbol);
-      if (!check.ok) {
-        return res.status(400).json({ error: check.error, code: 'START_TRIGGER_INVALID' });
-      }
+    // feature's most likely failure. resolveStartTrigger (start-trigger-gate.js)
+    // owns the whole check — shape, exchange-info warm-up, reference-price
+    // fetch, and the shared validateStartTrigger gap/rounding rule — and is
+    // gated on the trigger being PRESENT, so Immediate mode takes none of
+    // this and pays zero extra latency. Extracted into its own module rather
+    // than left inline so it is independently unit-testable (this file opens
+    // a real Firestore client and hits GCP metadata at import time, so it
+    // cannot be exercised directly via node:test).
+    const triggerResult = await resolveStartTrigger(config.startTriggerPrice, {
+      gcpProxyUrl, profileId, sharedVmProxyGcfUrl, symbol: config.symbol,
+    });
+    if (!triggerResult.ok) {
+      return res.status(triggerResult.status).json(triggerResult.body);
     }
+    // Reused below instead of building (and reference-price-fetching) a
+    // second instance. Still null here for Immediate mode — built at the
+    // usual spot further down.
+    let strategy = triggerResult.strategy;
 
     // One strategy per profile (matches existing model). User must stop the running strategy first.
-    for (const [sId, strategy] of activeStrategies.entries()) {
-      if (strategy.profileId === profileId) {
+    // NOTE: named `running`, not `strategy` — the outer `let strategy` above
+    // (the start-trigger validation instance) is in scope for this whole
+    // handler, and shadowing it here would make `strategy` mean two
+    // different things inside one 60-line window.
+    for (const [sId, running] of activeStrategies.entries()) {
+      if (running.profileId === profileId) {
         return res.status(400).json({
           error: `A strategy for profile ${profileId} is already running. Stop it before starting Anchor Ladder.`,
           strategyId: sId,

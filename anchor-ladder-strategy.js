@@ -400,14 +400,21 @@ class AnchorLadderStrategy extends TradingBase {
     // and start() has no other throw point this late in the sequence — the
     // caller (app.js's non-blocking .catch()) does not tear down WebSockets
     // on a start() rejection, so leaving them connected here would leak the
-    // sockets and their ping/reconnect timers. Also null the trigger fields
-    // the arming block above already set — that same .catch() DOES call
-    // saveState(), and a failed/stopped doc must not persist a spurious
-    // still-armed trigger it never got the chance to honor.
+    // sockets and their ping/reconnect timers. `_scheduleVolumeRefresh()`
+    // (also above) is the SAME shape — its 5-minute `_volumeRefreshInterval`
+    // isn't touched by cleanupWebSockets() either, so it needs its own clear;
+    // stop() already does this exact form for the same reason, mirrored here.
+    // Also null the trigger fields the arming block above already set — that
+    // same .catch() DOES call saveState(), and a failed/stopped doc must not
+    // persist a spurious still-armed trigger it never got the chance to honor.
     if (this.startTriggerPrice != null) {
       if (this._closeQuantity() > 0) {
         const qty = this._closeQuantity();
         this.cleanupWebSockets();
+        if (this._volumeRefreshInterval) {
+          clearInterval(this._volumeRefreshInterval);
+          this._volumeRefreshInterval = null;
+        }
         this.startTriggerPrice = null;
         this.startTriggerAbove = null;
         throw new Error(
@@ -417,6 +424,10 @@ class AnchorLadderStrategy extends TradingBase {
       }
       if (this._lastPositionRefreshFailed) {
         this.cleanupWebSockets();
+        if (this._volumeRefreshInterval) {
+          clearInterval(this._volumeRefreshInterval);
+          this._volumeRefreshInterval = null;
+        }
         this.startTriggerPrice = null;
         this.startTriggerAbove = null;
         throw new Error(

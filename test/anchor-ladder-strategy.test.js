@@ -47,6 +47,20 @@ test('_legNotional splits the base evenly across 5 levels', () => {
   assert.equal(s._legNotional(), 2000);
 });
 
+// FIX round 3's FIX 2: without this, an ARMED start-trigger fire (the ladder
+// builds mid-run, not at strategy boot) can leave the frontend showing ARMED
+// for up to 30s — the WS-connected UI disables its REST poll and relies on
+// the 30s strategy_update safety net, and no leg fill can heal it on the
+// anchoring tick (price == anchor). Also tightens the harvest re-anchor path,
+// which calls initializeLadder() too.
+test('initializeLadder pushes an immediate heartbeat after saving state', async () => {
+  const s = ladderStrategy();
+  let heartbeatCalls = 0;
+  s._pushHeartbeatNow = () => { heartbeatCalls++; };
+  await s.initializeLadder(105);
+  assert.equal(heartbeatCalls, 1, 'the ARMED (or harvest re-anchor) -> live transition must push immediately');
+});
+
 test('start() rejects an initial size below the 50 USDT minimum', async () => {
   const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   s.addLog = async () => {};
@@ -2564,6 +2578,30 @@ test('validateStartTrigger: a level BELOW the reference is valid with above=fals
   assert.equal(result.ok, true);
   assert.equal(result.above, false);
   assert.equal(result.rounded, 90);
+});
+
+test('validateStartTrigger: rejects a non-numeric price', () => {
+  const result = validateStartTrigger('not-a-number', 100, 'BTCUSDT');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /positive number/);
+});
+
+test('validateStartTrigger: rejects zero', () => {
+  const result = validateStartTrigger(0, 100, 'BTCUSDT');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /positive number/);
+});
+
+test('validateStartTrigger: rejects a negative price', () => {
+  const result = validateStartTrigger(-50, 100, 'BTCUSDT');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /positive number/);
+});
+
+test('validateStartTrigger: rejects Infinity', () => {
+  const result = validateStartTrigger(Infinity, 100, 'BTCUSDT');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /positive number/);
 });
 
 // ——— Start Mode: a pending harvest is refused / cleared, not replayed ———
