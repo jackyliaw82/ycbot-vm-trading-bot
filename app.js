@@ -5,6 +5,10 @@ import {
   minInitialSizeUSDT,
   resolveLadderGeometry,
 } from './ladder-levels.js';
+import {
+  ownerUidFromInstanceName,
+  selectRecoverableStrategies,
+} from './ladder-recovery.js';
 
 // TradFi-Perps symbols are gated by Binance behind a separate trading agreement
 // (error -4411 fires for unsigned accounts). The reversal strategy's symbol
@@ -113,6 +117,47 @@ startupStatus.phase = 'initializing_firebase';
 initializeFirebaseAdmin();
 startupStatus.firebaseReady = true;
 
+// ─── VM owner identity ───────────────────────────────────────────────────────
+// The backend provisions each user's dedicated VM as `vm-user-<uid.toLowerCase()>`
+// (backend-service gcf-orchestration.service.ts), so the instance name IS the
+// ownership record. Resolved ONCE at boot and used for two things:
+//   1. the relay auth token lookup (relay_auth_tokens/<uid.toLowerCase()>)
+//   2. the restart-recovery owner filter — without it a VM resumes OTHER users'
+//      strategies and trades their Binance accounts (2026-07-25 incident).
+// Local dev / manual override: set VM_OWNER_UID in the environment.
+let VM_OWNER_UID = null;
+
+async function fetchInstanceName() {
+  const res = await fetch(
+    'http://metadata.google.internal/computeMetadata/v1/instance/name',
+    { headers: { 'Metadata-Flavor': 'Google' }, signal: AbortSignal.timeout(2000) }
+  );
+  if (!res.ok) throw new Error(`metadata HTTP ${res.status}`);
+  return (await res.text()).trim();
+}
+
+async function resolveVmOwnerUid() {
+  if (process.env.VM_OWNER_UID) {
+    const uid = process.env.VM_OWNER_UID.trim().toLowerCase();
+    console.log(`[VM-OWNER] Using VM_OWNER_UID from env: ${uid}`);
+    return uid;
+  }
+  let instanceName;
+  try {
+    instanceName = await fetchInstanceName();
+  } catch (err) {
+    console.warn(`[VM-OWNER] Could not read instance name from GCP metadata (${err.message}) — owner UNKNOWN`);
+    return null;
+  }
+  const uid = ownerUidFromInstanceName(instanceName);
+  if (!uid) {
+    console.warn(`[VM-OWNER] Instance name '${instanceName}' does not match vm-user-* — owner UNKNOWN`);
+    return null;
+  }
+  console.log(`[VM-OWNER] Resolved owner uid=${uid} from instance name '${instanceName}'`);
+  return uid;
+}
+
 // ─── Relay auth token ────────────────────────────────────────────────────────
 // Per-VM token stored in Firestore at relay_auth_tokens/{uid.toLowerCase()}.
 // Backend writes it at provision time; ycbot-ws-relay validates incoming
@@ -125,23 +170,11 @@ async function loadRelayAuthToken() {
     console.log('[RELAY-AUTH] RELAY_AUTH_TOKEN already set in env; skipping Firestore lookup');
     return;
   }
-  let instanceName;
-  try {
-    const res = await fetch(
-      'http://metadata.google.internal/computeMetadata/v1/instance/name',
-      { headers: { 'Metadata-Flavor': 'Google' }, signal: AbortSignal.timeout(2000) }
-    );
-    if (!res.ok) throw new Error(`metadata HTTP ${res.status}`);
-    instanceName = (await res.text()).trim();
-  } catch (err) {
-    console.warn(`[RELAY-AUTH] Could not read instance name from GCP metadata (${err.message}); bot will connect to relay without a token`);
+  const docId = VM_OWNER_UID;
+  if (!docId) {
+    console.warn('[RELAY-AUTH] VM owner uid unresolved; bot will connect to relay without a token');
     return;
   }
-  if (!instanceName.startsWith('vm-user-')) {
-    console.warn(`[RELAY-AUTH] Instance name '${instanceName}' does not match vm-user-* pattern; skipping token lookup`);
-    return;
-  }
-  const docId = instanceName.slice('vm-user-'.length);
   try {
     const doc = await firestore.collection('relay_auth_tokens').doc(docId).get();
     if (!doc.exists) {
@@ -159,6 +192,8 @@ async function loadRelayAuthToken() {
     console.error(`[RELAY-AUTH] Failed to load token from Firestore: ${err.message}`);
   }
 }
+
+VM_OWNER_UID = await resolveVmOwnerUid();
 await loadRelayAuthToken();
 
 startupStatus.phase = 'ready';
@@ -634,10 +669,20 @@ process.on('SIGINT', () => {
 async function recoverActiveStrategies() {
   try {
     console.log('[RECOVERY] Scanning Firestore for orphaned strategies...');
-    // Single query for ALL running strategies; the loop below allowlists on
-    // the `anchor_ladder_` id prefix and skips everything else (retired
-    // ai_reversal_ / ai_dual_ / ai_hedge_ docs) — see the allowlist comment
-    // inside the loop for the full rationale.
+
+    // FAIL CLOSED. The `strategies` collection is SHARED across every user's
+    // dedicated VM, and a resumed doc trades through the proxy carried inside
+    // it — i.e. the DOC OWNER's Binance account. A VM that cannot prove which
+    // user it belongs to must therefore resume NOTHING; resuming "just in case"
+    // is how one user's VM ended up trading another user's account.
+    if (!VM_OWNER_UID) {
+      console.error(
+        '[RECOVERY] ABORT — this VM could not determine its owner uid (GCP metadata unavailable and VM_OWNER_UID unset). ' +
+        'Resuming NOTHING: resuming without verifying ownership would trade another user\'s Binance account.'
+      );
+      return;
+    }
+
     const snapshot = await firestore.collection('strategies')
       .where('isRunning', '==', true)
       .get();
@@ -647,7 +692,18 @@ async function recoverActiveStrategies() {
       return;
     }
 
-    console.log(`[RECOVERY] Found ${snapshot.size} orphaned strategy(s) — resuming...`);
+    const { resume, skippedForeign, skippedNoUserId } = selectRecoverableStrategies(
+      snapshot.docs.map((d) => ({ id: d.id, userId: d.data().userId })),
+      VM_OWNER_UID,
+    );
+    const resumable = new Set(resume);
+
+    console.log(
+      `[RECOVERY] ${snapshot.size} running doc(s) — resuming ${resume.length} owned by ${VM_OWNER_UID}, ` +
+      `skipped ${skippedForeign} foreign, ${skippedNoUserId} without a userId.`
+    );
+
+    if (!resume.length) return;
 
     for (const doc of snapshot.docs) {
       const data = doc.data();
@@ -659,12 +715,10 @@ async function recoverActiveStrategies() {
         continue;
       }
 
-      // AnchorLadder is the only strategy that exists. Anything else in
-      // `strategies` is a leftover doc from a retired one (ai_reversal_ /
-      // ai_dual_ / ai_hedge_) whose persisted state is a different shape and
-      // cannot be resumed as a ladder. Skip silently — no live user can have
-      // one: every account onboarded from here only ever runs AnchorLadder.
-      if (!strategyId.startsWith('anchor_ladder_')) continue;
+      // Ownership + strategy-type allowlisting were both decided above by
+      // selectRecoverableStrategies(); anything absent from that set is either
+      // another user's strategy or a retired doc shape, and must NOT be resumed.
+      if (!resumable.has(strategyId)) continue;
 
       try {
         const strategy = new AnchorLadderStrategy(
