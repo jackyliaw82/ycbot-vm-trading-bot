@@ -36,6 +36,7 @@ test('selectRecoverableStrategies: a doc with no userId is skipped, never assume
   const out = selectRecoverableStrategies(records, 'abc123');
   assert.deepEqual(out.resume, ['anchor_ladder_p3_3']);
   assert.equal(out.skippedNoUserId, 2);
+  assert.deepEqual(out.noUserIdIds, ['anchor_ladder_p1_1', 'anchor_ladder_p2_2'], 'the skipped ids are named, not just counted');
 });
 
 test('selectRecoverableStrategies: non-anchor_ladder_ docs are excluded and not counted as skips', () => {
@@ -56,6 +57,6 @@ test('selectRecoverableStrategies: a falsy ownerUid THROWS — the caller must f
 });
 
 test('selectRecoverableStrategies: empty or missing input is safe', () => {
-  assert.deepEqual(selectRecoverableStrategies([], 'abc123'), { resume: [], skippedForeign: 0, skippedNoUserId: 0 });
-  assert.deepEqual(selectRecoverableStrategies(undefined, 'abc123'), { resume: [], skippedForeign: 0, skippedNoUserId: 0 });
+  assert.deepEqual(selectRecoverableStrategies([], 'abc123'), { resume: [], skippedForeign: 0, skippedNoUserId: 0, noUserIdIds: [] });
+  assert.deepEqual(selectRecoverableStrategies(undefined, 'abc123'), { resume: [], skippedForeign: 0, skippedNoUserId: 0, noUserIdIds: [] });
 });

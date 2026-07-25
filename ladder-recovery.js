@@ -46,6 +46,12 @@ export function ownerUidFromInstanceName(instanceName) {
  *
  * Comparison is case-insensitive: the instance name lowercases the uid, while
  * the stored userId is the original mixed-case Firebase uid.
+ *
+ * Returns `{ resume, skippedForeign, skippedNoUserId, noUserIdIds }` — `resume`
+ * is the list of resumable strategy ids, `skippedForeign`/`skippedNoUserId` are
+ * aggregate counts, and `noUserIdIds` additionally lists the ids skipped for a
+ * missing/empty `userId` so a caller can log which specific docs need attention
+ * instead of just a count.
  */
 export function selectRecoverableStrategies(records, ownerUid) {
   if (!ownerUid) {
@@ -57,6 +63,7 @@ export function selectRecoverableStrategies(records, ownerUid) {
   const resume = [];
   let skippedForeign = 0;
   let skippedNoUserId = 0;
+  const noUserIdIds = [];
 
   for (const record of records || []) {
     const id = record && record.id;
@@ -65,11 +72,11 @@ export function selectRecoverableStrategies(records, ownerUid) {
     if (typeof id !== 'string' || !id.startsWith(STRATEGY_ID_PREFIX)) continue;
 
     const userId = record.userId;
-    if (typeof userId !== 'string' || !userId) { skippedNoUserId++; continue; }
+    if (typeof userId !== 'string' || !userId) { skippedNoUserId++; noUserIdIds.push(id); continue; }
     if (userId.toLowerCase() !== owner) { skippedForeign++; continue; }
 
     resume.push(id);
   }
 
-  return { resume, skippedForeign, skippedNoUserId };
+  return { resume, skippedForeign, skippedNoUserId, noUserIdIds };
 }

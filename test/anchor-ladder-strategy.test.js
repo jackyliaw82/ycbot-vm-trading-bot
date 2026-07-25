@@ -2234,6 +2234,18 @@ test('_isReduceOnlyRejected matches the proxy-flattened -2022 message and a raw 
   assert.equal(s._isReduceOnlyRejected(null), false);
 });
 
+test('_isReduceOnlyRejected matches the real makeProxyRequest shape (binanceErrorCode)', () => {
+  const s = ladderStrategy();
+  assert.equal(
+    s._isReduceOnlyRejected(Object.assign(new Error('Binance API Error: -2022 - ReduceOnly Order is rejected.'), { binanceErrorCode: -2022 })),
+    true,
+  );
+  assert.equal(
+    s._isReduceOnlyRejected(Object.assign(new Error('Binance API Error: -2011 - Unknown order sent.'), { binanceErrorCode: -2011 })),
+    false,
+  );
+});
+
 test('_closeConsolidated: -2022 + Binance confirms flat verifies the close and clears state', async () => {
   const s = ladderStrategy();
   s.activePosition = { quantity: 0.26, entryPrice: 100, avgEntry: 100, notional: 26, unrealizedPnl: 0 };

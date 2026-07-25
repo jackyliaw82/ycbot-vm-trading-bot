@@ -127,13 +127,36 @@ startupStatus.firebaseReady = true;
 // Local dev / manual override: set VM_OWNER_UID in the environment.
 let VM_OWNER_UID = null;
 
+// Bounded retries: PM2 (autorestart, restart_delay: 5000) can start the bot
+// early in VM boot, when the GCP metadata server may be legitimately slow or
+// not yet reachable. Before owner-scoped recovery existed, a metadata blip
+// only cost the relay token; now it disables ALL strategy recovery for the
+// process lifetime, so a single failed attempt is no longer acceptable. Still
+// bounded and still fails closed (returns/throws) — no infinite retry loop.
+const INSTANCE_NAME_MAX_ATTEMPTS = 3;
+const INSTANCE_NAME_RETRY_DELAYS_MS = [500, 1000];
+
 async function fetchInstanceName() {
-  const res = await fetch(
-    'http://metadata.google.internal/computeMetadata/v1/instance/name',
-    { headers: { 'Metadata-Flavor': 'Google' }, signal: AbortSignal.timeout(2000) }
-  );
-  if (!res.ok) throw new Error(`metadata HTTP ${res.status}`);
-  return (await res.text()).trim();
+  let lastErr;
+  for (let attempt = 1; attempt <= INSTANCE_NAME_MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(
+        'http://metadata.google.internal/computeMetadata/v1/instance/name',
+        { headers: { 'Metadata-Flavor': 'Google' }, signal: AbortSignal.timeout(2000) }
+      );
+      if (!res.ok) throw new Error(`metadata HTTP ${res.status}`);
+      return (await res.text()).trim();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < INSTANCE_NAME_MAX_ATTEMPTS) {
+        const delayMs = INSTANCE_NAME_RETRY_DELAYS_MS[attempt - 1];
+        console.warn(`[VM-OWNER] Metadata read attempt ${attempt}/${INSTANCE_NAME_MAX_ATTEMPTS} failed (${err.message}) — retrying in ${delayMs}ms`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+  console.warn(`[VM-OWNER] Metadata read failed after ${INSTANCE_NAME_MAX_ATTEMPTS} attempts — giving up (${lastErr.message})`);
+  throw lastErr;
 }
 
 async function resolveVmOwnerUid() {
@@ -677,7 +700,7 @@ async function recoverActiveStrategies() {
     // is how one user's VM ended up trading another user's account.
     if (!VM_OWNER_UID) {
       console.error(
-        '[RECOVERY] ABORT — this VM could not determine its owner uid (GCP metadata unavailable and VM_OWNER_UID unset). ' +
+        '[RECOVERY] ABORT — this VM could not determine its owner uid (owner uid unresolved — see the [VM-OWNER] log line above for the reason). ' +
         'Resuming NOTHING: resuming without verifying ownership would trade another user\'s Binance account.'
       );
       return;
@@ -692,7 +715,7 @@ async function recoverActiveStrategies() {
       return;
     }
 
-    const { resume, skippedForeign, skippedNoUserId } = selectRecoverableStrategies(
+    const { resume, skippedForeign, skippedNoUserId, noUserIdIds } = selectRecoverableStrategies(
       snapshot.docs.map((d) => ({ id: d.id, userId: d.data().userId })),
       VM_OWNER_UID,
     );
@@ -702,6 +725,9 @@ async function recoverActiveStrategies() {
       `[RECOVERY] ${snapshot.size} running doc(s) — resuming ${resume.length} owned by ${VM_OWNER_UID}, ` +
       `skipped ${skippedForeign} foreign, ${skippedNoUserId} without a userId.`
     );
+    if (noUserIdIds.length) {
+      console.warn(`[RECOVERY] Skipped for missing userId: ${noUserIdIds.join(', ')}`);
+    }
 
     if (!resume.length) return;
 
@@ -1479,7 +1505,7 @@ app.post('/anchor-ladder/start', async (req, res) => {
     // ──────────────────────────────────────────────────────────────────────
 
     const strategy = new AnchorLadderStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
-    strategy.userId = userId;
+    strategy.userId = req.uid || userId;
 
     const strategyId = `anchor_ladder_${profileId}_${Date.now()}`;
     strategy.strategyId = strategyId;

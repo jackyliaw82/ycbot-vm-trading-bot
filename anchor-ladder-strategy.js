@@ -485,14 +485,15 @@ class AnchorLadderStrategy extends TradingBase {
    * Binance -2022 "ReduceOnly Order is rejected" — the exchange refusing a
    * reduceOnly order because there is nothing left to reduce.
    *
-   * The GCF proxy flattens the Binance error into the thrown Error's MESSAGE
-   * ("Proxy Error: 500 - Binance API Error: -2022 - ReduceOnly Order is
-   * rejected."), so in practice there is no numeric `code` to key on; `code` is
-   * still checked first in case the proxy is ever changed to preserve it.
+   * `makeProxyRequest` (trading-base.js) attaches the Binance error code to
+   * the thrown Error as `binanceErrorCode` — the same field `cancelOrder`
+   * keys on for -2011 (trading-base.js) — so that structured field is the
+   * primary signal here. `err.code` and the message substring are last-resort
+   * fallbacks for any path that loses the structured field.
    */
   _isReduceOnlyRejected(err) {
     if (!err) return false;
-    if (err.code === -2022 || err.code === '-2022') return true;
+    if (err.binanceErrorCode === -2022 || err.code === -2022 || err.code === '-2022') return true;
     return String(err.message || '').includes('-2022');
   }
 
