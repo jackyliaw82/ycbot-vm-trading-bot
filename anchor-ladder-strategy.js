@@ -482,6 +482,21 @@ class AnchorLadderStrategy extends TradingBase {
   }
 
   /**
+   * Binance -2022 "ReduceOnly Order is rejected" — the exchange refusing a
+   * reduceOnly order because there is nothing left to reduce.
+   *
+   * The GCF proxy flattens the Binance error into the thrown Error's MESSAGE
+   * ("Proxy Error: 500 - Binance API Error: -2022 - ReduceOnly Order is
+   * rejected."), so in practice there is no numeric `code` to key on; `code` is
+   * still checked first in case the proxy is ever changed to preserve it.
+   */
+  _isReduceOnlyRejected(err) {
+    if (!err) return false;
+    if (err.code === -2022 || err.code === '-2022') return true;
+    return String(err.message || '').includes('-2022');
+  }
+
+  /**
    * Close the full net one-way position to flat — the SINGLE close primitive
    * for the whole strategy. reduceOnly is REQUIRED (not positionSide, which is
    * a hedge-mode concept) — without it a sub-minNotional close is rejected by
@@ -525,7 +540,25 @@ class AnchorLadderStrategy extends TradingBase {
     }
     const closeSide = side === 'LONG' ? 'SELL' : 'BUY';
     await this.addLog(`Consolidated CLOSE ${side} qty ${qty} (${reason}).`);
-    const result = await this.placeMarketOrder(this.symbol, closeSide, qty, undefined, { reduceOnly: true });
+    let result;
+    try {
+      result = await this.placeMarketOrder(this.symbol, closeSide, qty, undefined, { reduceOnly: true });
+    } catch (err) {
+      // A reduceOnly rejection is EVIDENCE the position may already be flat —
+      // it is Binance saying "there is nothing to reduce". Rethrowing here
+      // aborted the whole tick before the verification tiers below could ask
+      // what is actually open, so the same doomed close was re-issued every
+      // tick forever (the -2022 runaway of 2026-07-25). Fall through instead:
+      // tier 1 and 2 self-skip without an order result, and tier 3 answers
+      // authoritatively. An unreachable or still-open Binance still resolves to
+      // "unverified", which leaves the leg ledger INTACT exactly as before.
+      if (!this._isReduceOnlyRejected(err)) throw err;
+      await this.addLog(
+        `Close (${reason}) for ${this.symbol} ${side} qty ${qty} was rejected by Binance as reduceOnly (-2022) — ` +
+        `verifying the real position before deciding.`,
+      );
+      result = null;
+    }
 
     // Verify the close ACTUALLY happened before dropping position state. Mirrors
     // the tiering `_resolveFill` already uses on the open path. Returning true on
