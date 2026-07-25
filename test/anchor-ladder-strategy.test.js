@@ -2196,3 +2196,22 @@ test('a trigger that fires while FLAT re-anchors (no longer disarms quietly)', a
   assert.equal(fired, 'price_trigger', 'flat-at-fire now re-anchors instead of disarming');
   assert.equal(s.harvestTriggerPrice, null, 'one-shot cleared');
 });
+
+// ——— Flat re-anchor: persistence + status ———
+
+test('getStatus and getHeartbeatPayload surface reanchorCount', () => {
+  const s = ladderStrategy();
+  s.reanchorCount = 7;
+  assert.equal(s.getStatus().reanchorCount, 7);
+  assert.equal(s.getHeartbeatPayload().reanchorCount, 7);
+});
+
+test('saveState persists reanchorCount', async () => {
+  const s = ladderStrategy();
+  delete s.saveState;                          // restore the real prototype method
+  let captured = null;
+  s.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { captured = d; } }) }) };
+  s.reanchorCount = 7;
+  await s.saveState();
+  assert.equal(captured.reanchorCount, 7);
+});

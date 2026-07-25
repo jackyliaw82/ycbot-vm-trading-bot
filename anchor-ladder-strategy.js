@@ -1134,6 +1134,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.cycleAccumulatedLoss = snapshot.cycleAccumulatedLoss || 0;
     this.flattenCount = snapshot.flattenCount || 0;
     this.harvestCount = snapshot.harvestCount || 0;
+    this.reanchorCount = snapshot.reanchorCount || 0;
     this.initialCapital = snapshot.initialCapital || 0;
     this.initialWalletBalance = snapshot.initialWalletBalance || null;
     const sst = snapshot.cycleStartTime;
@@ -2527,6 +2528,7 @@ class AnchorLadderStrategy extends TradingBase {
       cycleAccumulatedLoss: this.cycleAccumulatedLoss,
       flattenCount: this.flattenCount,
       harvestCount: this.harvestCount,
+      reanchorCount: this.reanchorCount,
       initialCapital: this.initialCapital,
       currentInitialSize: this.currentInitialSize,
       desiredProfitUSDT: this.desiredProfitUSDT,
@@ -2609,6 +2611,7 @@ class AnchorLadderStrategy extends TradingBase {
       cycleAccumulatedLoss: this.cycleAccumulatedLoss,
       flattenCount: this.flattenCount,
       harvestCount: this.harvestCount,
+      reanchorCount: this.reanchorCount,
       initialCapital: this.initialCapital,
       harvestLossThreshold: this.harvestLossThreshold,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
@@ -2685,6 +2688,7 @@ class AnchorLadderStrategy extends TradingBase {
         cycleAccumulatedLoss: this.cycleAccumulatedLoss,
         flattenCount: this.flattenCount,
         harvestCount: this.harvestCount,
+        reanchorCount: this.reanchorCount,
         initialCapital: this.initialCapital,
         initialWalletBalance: this.initialWalletBalance,
         currentInitialSize: this.currentInitialSize,
