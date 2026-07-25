@@ -144,6 +144,25 @@ export function requireAdmin(req, res, next) {
 }
 
 /**
+ * The single definition of "may this uid operate this VM?".
+ *
+ * Shared by createRequireVmOwner (HTTP) and the /ws upgrade handler so the
+ * ownership rule has ONE definition. Two copies of one rule drift, and a drift
+ * here fails open — which is the bug class this codebase keeps producing.
+ *
+ * Case-insensitive against ownerUid: VM_OWNER_UID is lowercased (derived from
+ * the GCP instance name `vm-user-<uid.toLowerCase()>`) while a Firebase uid is
+ * mixed case. Admins are allowed on any VM — the fleet release rollout drives
+ * other users' VMs. Fail closed on an unresolved owner.
+ */
+export function isAllowedVmUser(uid, ownerUid) {
+  if (!uid) return false;
+  if (ADMIN_UIDS.has(uid)) return true;
+  if (!ownerUid) return false;
+  return String(uid).toLowerCase() === String(ownerUid).toLowerCase();
+}
+
+/**
  * Per-route middleware restricting an endpoint to THIS VM's owner.
  *
  * Each user gets a dedicated VM, but every VM is publicly addressable via its
@@ -178,23 +197,21 @@ export function createRequireVmOwner(getOwnerUid) {
     if (!req.uid) {
       return res.status(401).json({ error: 'Unauthorized — no verified uid', code: 'AUTH_MISSING' });
     }
-    if (ADMIN_UIDS.has(req.uid)) return next();
-
     const ownerUid = getOwnerUid();
+    if (isAllowedVmUser(req.uid, ownerUid)) return next();
+
+    // Not allowed — the remaining branches only choose which reason to report.
     if (!ownerUid) {
       return res.status(403).json({
         error: 'Forbidden — this VM cannot determine its owner, so it is refusing all user requests. See the [VM-OWNER] log line for the reason.',
         code: 'VM_OWNER_UNKNOWN',
       });
     }
-    if (req.uid.toLowerCase() !== ownerUid) {
-      console.warn(`[http-auth] NOT_VM_OWNER ${req.method} ${req.path} — caller=${req.uid} owner=${ownerUid}`);
-      return res.status(403).json({
-        error: 'Forbidden — this VM does not belong to you.',
-        code: 'NOT_VM_OWNER',
-      });
-    }
-    return next();
+    console.warn(`[http-auth] NOT_VM_OWNER ${req.method} ${req.path} — caller=${req.uid} owner=${ownerUid}`);
+    return res.status(403).json({
+      error: 'Forbidden — this VM does not belong to you.',
+      code: 'NOT_VM_OWNER',
+    });
   };
 }
 

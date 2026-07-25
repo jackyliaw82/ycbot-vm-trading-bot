@@ -30,7 +30,7 @@ import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import os from 'os';
 import wsBroadcast from './ws-broadcast.js';
-import { httpAuthMiddleware, requireAdmin, createRequireVmOwner } from './http-auth.js';
+import { httpAuthMiddleware, requireAdmin, createRequireVmOwner, isAllowedVmUser } from './http-auth.js';
 import { checkBillingGate } from './billing-gate.js';
 
 const app = express();
@@ -346,6 +346,16 @@ server.on('upgrade', async (request, socket, head) => {
 
   try {
     const decoded = await admin.auth().verifyIdToken(token);
+    // A valid token proves WHO is connecting, not WHOSE VM this is. The 25s
+    // broadcast below pushes health + every running strategy's heartbeat to all
+    // connected clients, so admitting a foreign user leaks another user's live
+    // position, PnL and mode. Same ownership rule as the HTTP guard.
+    if (!isAllowedVmUser(decoded.uid, VM_OWNER_UID)) {
+      console.warn(`[WS] NOT_VM_OWNER — refused ${decoded.uid} (owner=${VM_OWNER_UID})`);
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
     wss.handleUpgrade(request, socket, head, (ws) => {
       handleClientConnection(ws, decoded.uid);
     });
@@ -491,10 +501,44 @@ app.get('/health', (req, res) => {
 
 // Generic Firestore query endpoints (used by AI strategies)
 
+/**
+ * Is `strategyId` a strategy belonging to `uid`?
+ *
+ * The `strategies` collection is SHARED across every user's dedicated VM, so a
+ * strategyId alone proves nothing — requireVmOwner establishes that the CALLER
+ * owns this VM, and this establishes that the DOC belongs to that same caller.
+ *
+ * Exact-match comparison: `data.userId` and `req.uid` are both the original
+ * mixed-case Firebase uid. (Do NOT lowercase here — that is the VM_OWNER_UID
+ * rule, which compares against a uid derived from the GCP instance name.)
+ *
+ * A doc with no `userId` cannot be attributed and is treated as NOT owned —
+ * fail closed. It is logged so an orphaned doc is diagnosable rather than just
+ * invisible.
+ */
+async function strategyOwnedByCaller(strategyId, uid) {
+  if (!uid) {
+    console.warn(`[AUTHZ] no uid on strategyOwnedByCaller(strategyId=${strategyId}) — treating as NOT owned (fail closed; is HTTP_AUTH_REQUIRED=false?)`);
+  }
+  const doc = await firestore.collection('strategies').doc(strategyId).get();
+  if (!doc.exists) return { exists: false, owned: false, data: null };
+  const data = doc.data();
+  if (!data.userId) {
+    console.warn(`[AUTHZ] strategies/${strategyId} has no userId — treating as NOT owned (fail closed)`);
+    return { exists: true, owned: false, data };
+  }
+  return { exists: true, owned: data.userId === uid, data };
+}
+
 // New endpoint to fetch strategy-specific trades
 app.get('/strategy/:strategyId/trades', requireVmOwner, async (req, res) => {
   try {
     const { strategyId } = req.params;
+    const { exists, owned } = await strategyOwnedByCaller(strategyId, req.uid);
+    // 404 rather than 403 — see /strategies/:strategyId.
+    if (!exists || !owned) {
+      return res.status(404).json({ error: 'Strategy not found' });
+    }
     // Hardcode Firestore project ID and database ID
     const tradesRef = firestore.collection('strategies').doc(strategyId).collection('trades');
     // Use `timestamp` (always set in saveTrade via `new Date()`) rather than `time`
@@ -522,6 +566,11 @@ app.get('/strategy/:strategyId/trades', requireVmOwner, async (req, res) => {
 app.get('/strategy/:strategyId/logs', requireVmOwner, async (req, res) => {
   try {
     const { strategyId } = req.params;
+    const { exists, owned } = await strategyOwnedByCaller(strategyId, req.uid);
+    // 404 rather than 403 — see /strategies/:strategyId.
+    if (!exists || !owned) {
+      return res.status(404).json({ error: 'Strategy not found' });
+    }
     const logsRef = firestore.collection('strategies').doc(strategyId).collection('logs');
     const snapshot = await logsRef.orderBy('timestamp', 'asc').get(); // Order by timestamp ascending
 
@@ -545,6 +594,11 @@ app.get('/strategy/:strategyId/logs', requireVmOwner, async (req, res) => {
 app.get('/strategy/:strategyId/strategyFlow', requireVmOwner, async (req, res) => {
   try {
     const { strategyId } = req.params;
+    const { exists, owned } = await strategyOwnedByCaller(strategyId, req.uid);
+    // 404 rather than 403 — see /strategies/:strategyId.
+    if (!exists || !owned) {
+      return res.status(404).json({ error: 'Strategy not found' });
+    }
     const flowRef = firestore.collection('strategies').doc(strategyId).collection('strategyFlow');
     const snapshot = await flowRef.orderBy('timestamp', 'asc').get(); // Order by timestamp ascending
 
@@ -585,27 +639,50 @@ app.get('/wallet-history', requireVmOwner, async (req, res) => {
 // List all strategies endpoint
 app.get('/strategies', requireVmOwner, async (req, res) => {
   try {
-    // For a "one user per VM" setup, this endpoint should ideally be filtered by the user associated with this VM.
-    // However, since the VM itself doesn't inherently know the user ID without a request context,
-    // we'll fetch all strategies from Firestore and let the frontend filter.
-    // In a more advanced setup, you'd pass a userId to this endpoint.
+    if (!req.uid) {
+      console.warn(`[AUTHZ] no req.uid on ${req.method} ${req.path} — returning no strategies (fail closed; is HTTP_AUTH_REQUIRED=false?)`);
+    }
+    // The `strategies` collection is SHARED across every user's dedicated VM, so
+    // an unfiltered read returns OTHER users' strategies. (The comment that used
+    // to sit here said the VM "doesn't inherently know the user ID" — that has
+    // been false since v1.2.5, which resolves the VM's owner at boot; and
+    // req.uid is the authenticated caller, already proven by requireVmOwner to
+    // be that owner.)
+    //
+    // Filtered in memory rather than with .where('userId','==',uid): combining a
+    // where() with the existing orderBy('createdAt') needs a composite Firestore
+    // index, and a missing index fails at RUNTIME. The collection is small
+    // (a handful of strategies per user), so this costs nothing and needs no
+    // index deployment.
     const strategiesRef = firestore.collection('strategies');
     const snapshot = await strategiesRef.orderBy('createdAt', 'desc').get(); // Order by creation date, newest first
-    
-    const strategies = snapshot.docs.map(doc => {
-      const data = doc.data();
-      return {
-        strategyId: doc.id,
+
+    // Decode each doc's proto once (DocumentSnapshot.data() re-decodes on every
+    // call) and carry {id, data} through the filter/map chain below.
+    const docs = snapshot.docs.map(doc => ({ id: doc.id, data: doc.data() }));
+
+    // Docs with no userId can't be attributed to anyone and are dropped below —
+    // log which ones so a legacy doc vanishing from a user's list is
+    // diagnosable rather than silently invisible (mirrors ladder-recovery.js's
+    // noUserIdIds).
+    const noUserIdIds = docs.filter(({ data }) => !data.userId).map(({ id }) => id);
+    if (noUserIdIds.length) {
+      console.warn(`[AUTHZ] /strategies dropped ${noUserIdIds.length} doc(s) with no userId: ${noUserIdIds.join(', ')}`);
+    }
+
+    const strategies = docs
+      .filter(({ data }) => data.userId === req.uid)
+      .map(({ id, data }) => ({
+        strategyId: id,
         profileId: data.profileId, // ADDED: Include profileId from Firestore document
         symbol: data.symbol,
         createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null, // Convert Firestore Timestamp to ISO string
         totalPnL: data.totalPnL || 0,
         accumulatedRealizedPnL: data.accumulatedRealizedPnL || 0,
         accumulatedTradingFees: data.accumulatedTradingFees || 0,
-        isRunning: activeStrategies.has(doc.id) && activeStrategies.get(doc.id).isRunning, // Check if currently running on this VM
-      };
-    });
-    
+        isRunning: activeStrategies.has(id) && activeStrategies.get(id).isRunning, // Check if currently running on this VM
+      }));
+
     res.json({ strategies });
   } catch (error) {
     console.error('Failed to list strategies:', error);
@@ -620,13 +697,13 @@ app.get('/strategies', requireVmOwner, async (req, res) => {
 app.get('/strategies/:strategyId', requireVmOwner, async (req, res) => {
   try {
     const { strategyId } = req.params;
-    const strategyDoc = await firestore.collection('strategies').doc(strategyId).get();
+    const { exists, owned, data } = await strategyOwnedByCaller(strategyId, req.uid);
 
-    if (!strategyDoc.exists) {
+    // 404 (not 403) when it exists but is not the caller's: a 403 would confirm
+    // that this strategyId is real, leaking the existence of other users' rows.
+    if (!exists || !owned) {
       return res.status(404).json({ error: 'Strategy not found' });
     }
-
-    const data = strategyDoc.data();
     const formattedData = { ...data };
 
     // Convert Firestore Timestamps to ISO strings for frontend consumption
@@ -1094,12 +1171,12 @@ app.get('/update-status', (req, res) => {
   });
 });
 
-// Self-service update: any authenticated user can trigger a regular update
-// of THEIR own bot (it's their VM). httpAuthMiddleware (global) still
-// enforces a valid Firebase token. Admin-only is reserved for the
-// /system/force-update endpoint below, which bypasses the "wait-for-idle"
-// guard and could disrupt a running strategy.
-app.post('/system/update', async (req, res) => {
+// Scheduled update: restricted to this VM's owner (requireVmOwner).
+// Admins pass through for the fleet release rollout (backend forwards the
+// admin bearer token). httpAuthMiddleware (global) still enforces a valid
+// Firebase token. Admin-only /system/force-update (below) bypasses the
+// "wait-for-idle" guard and could disrupt a running strategy.
+app.post('/system/update', requireVmOwner, async (req, res) => {
   if (isUpdating) {
     return res.status(409).json({ error: 'Update already in progress.', targetVersion });
   }
@@ -1689,6 +1766,12 @@ app.get('/anchor-ladder/strategy-flow', requireVmOwner, async (req, res) => {
   try {
     const { strategyId, limit: queryLimit } = req.query;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+
+    const { exists, owned } = await strategyOwnedByCaller(strategyId, req.uid);
+    // 404 rather than 403 — see /strategies/:strategyId.
+    if (!exists || !owned) {
+      return res.status(404).json({ error: 'Strategy not found' });
+    }
 
     const flowLimit = parseInt(queryLimit) || 200;
     const flowRef = firestore.collection('strategies').doc(strategyId).collection('strategyFlow');

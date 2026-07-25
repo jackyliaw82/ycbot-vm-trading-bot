@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 // ADMIN_UIDS + AUTH_REQUIRED are read at module load — set env BEFORE importing.
 process.env.HTTP_ADMIN_UIDS = 'admin-uid-1';
 process.env.HTTP_AUTH_REQUIRED = 'true';
-const { createRequireVmOwner } = await import('../http-auth.js');
+const { createRequireVmOwner, isAllowedVmUser } = await import('../http-auth.js');
 
 function mockRes() {
   return {
@@ -61,7 +61,7 @@ test('requireVmOwner: an admin uid passes through to any VM (fleet release rollo
 test('requireVmOwner: an admin still passes when the owner is unresolved (metadata outage must not lock admins out)', () => {
   const mw = createRequireVmOwner(() => null);
   const { res, nextCalled } = run(mw, { uid: 'admin-uid-1', method: 'POST', path: '/anchor-ladder/status' });
-  assert.equal(nextCalled, true, 'the admin check is ordered before owner-resolution so a metadata outage cannot lock admins out');
+  assert.equal(nextCalled, true, 'an admin passes even when the owner is unresolved (a metadata outage must not lock admins out)');
   assert.equal(res.statusCode, null, 'no response written — the request continues');
 });
 
@@ -81,4 +81,29 @@ test('requireVmOwner: getOwnerUid is called per request, not captured once', () 
   owner = 'abc123'; // resolved later, as the top-level await does at boot
   const second = run(mw, { uid: 'abc123', method: 'GET', path: '/anchor-ladder/status' });
   assert.equal(second.nextCalled, true, 'late binding — the getter must be re-read each request');
+});
+
+test('isAllowedVmUser: the VM owner is allowed, case-insensitively', () => {
+  assert.equal(isAllowedVmUser('abc123', 'abc123'), true);
+  assert.equal(isAllowedVmUser('AbC123', 'abc123'), true, 'a mixed-case Firebase uid must match the lowercased owner uid');
+});
+
+test('isAllowedVmUser: a different user is refused', () => {
+  assert.equal(isAllowedVmUser('someone-else', 'abc123'), false);
+});
+
+test('isAllowedVmUser: an unresolved owner refuses everyone except admins (fail closed)', () => {
+  assert.equal(isAllowedVmUser('abc123', null), false);
+  assert.equal(isAllowedVmUser('abc123', ''), false);
+  assert.equal(isAllowedVmUser('admin-uid-1', null), true, 'admins must not be locked out by a metadata outage');
+});
+
+test('isAllowedVmUser: an admin is allowed on any VM', () => {
+  assert.equal(isAllowedVmUser('admin-uid-1', 'someone-elses-vm'), true);
+});
+
+test('isAllowedVmUser: a missing uid is refused', () => {
+  assert.equal(isAllowedVmUser(null, 'abc123'), false);
+  assert.equal(isAllowedVmUser(undefined, 'abc123'), false);
+  assert.equal(isAllowedVmUser('', 'abc123'), false);
 });
