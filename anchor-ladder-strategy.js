@@ -444,6 +444,17 @@ class AnchorLadderStrategy extends TradingBase {
 
     await this.addLog('AnchorLadderStrategy running — awaiting first tick to build the ladder.');
     await this.saveState();
+    // Push immediately — unconditional (not gated on a trigger being set):
+    // an ARMED start pushes so the frontend can confirm it within the same
+    // request/response cycle rather than waiting on the 30s strategy_update
+    // safety net (the WS-connected UI disables its 3s REST poll, so that
+    // safety net is the ONLY other path); an Immediate start pushes one
+    // harmless extra heartbeat moments before the first tick's own push from
+    // initializeLadder(). Gating this on startTriggerPrice would save that
+    // one harmless push at the cost of a branch to keep in sync with the
+    // arming logic above — not worth it. Synchronous + internally
+    // try/caught, so no await (see _pushHeartbeatNow's own doc).
+    this._pushHeartbeatNow?.();
   }
 
   /**

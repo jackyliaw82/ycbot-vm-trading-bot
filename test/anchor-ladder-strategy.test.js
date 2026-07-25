@@ -2553,6 +2553,25 @@ test('start(): arms fine when the account is confirmed genuinely flat', async ()
   }
 });
 
+// FIX round 5: initializeLadder() pushes on the FIRING path, but nothing
+// pushed on ARMING — start() ended with a bare saveState(). During ARMED,
+// nothing else pushes either (saveTrade / initializeLadder / flatten-harvest
+// paths all sit idle while waiting), and the WS-connected frontend disables
+// its 3s REST poll, so the freshly-armed state would otherwise only reach the
+// UI via the 30s safety-net broadcast — up to 30s where the app cannot even
+// confirm the arm succeeded.
+test('start() pushes an immediate heartbeat once armed', async () => {
+  const s = startModeStrategy();
+  let heartbeatCalls = 0;
+  s._pushHeartbeatNow = () => { heartbeatCalls++; };
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 });
+    assert.equal(heartbeatCalls, 1, 'the freshly-armed state must reach the frontend immediately, not wait on the 30s safety net');
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+});
+
 // ——— validateStartTrigger: the shared pure validator (FIX round 3) ———
 //
 // The SAME function both the /anchor-ladder/start route and start() call —
