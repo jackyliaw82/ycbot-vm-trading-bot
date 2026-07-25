@@ -517,6 +517,9 @@ app.get('/health', (req, res) => {
  * invisible.
  */
 async function strategyOwnedByCaller(strategyId, uid) {
+  if (!uid) {
+    console.warn(`[AUTHZ] no uid on strategyOwnedByCaller(strategyId=${strategyId}) — treating as NOT owned (fail closed; is HTTP_AUTH_REQUIRED=false?)`);
+  }
   const doc = await firestore.collection('strategies').doc(strategyId).get();
   if (!doc.exists) return { exists: false, owned: false, data: null };
   const data = doc.data();
@@ -636,6 +639,9 @@ app.get('/wallet-history', requireVmOwner, async (req, res) => {
 // List all strategies endpoint
 app.get('/strategies', requireVmOwner, async (req, res) => {
   try {
+    if (!req.uid) {
+      console.warn(`[AUTHZ] no req.uid on ${req.method} ${req.path} — returning no strategies (fail closed; is HTTP_AUTH_REQUIRED=false?)`);
+    }
     // The `strategies` collection is SHARED across every user's dedicated VM, so
     // an unfiltered read returns OTHER users' strategies. (The comment that used
     // to sit here said the VM "doesn't inherently know the user ID" — that has
@@ -651,22 +657,32 @@ app.get('/strategies', requireVmOwner, async (req, res) => {
     const strategiesRef = firestore.collection('strategies');
     const snapshot = await strategiesRef.orderBy('createdAt', 'desc').get(); // Order by creation date, newest first
 
-    const strategies = snapshot.docs
-      .filter(doc => doc.data().userId === req.uid)
-      .map(doc => {
-      const data = doc.data();
-      return {
-        strategyId: doc.id,
+    // Decode each doc's proto once (DocumentSnapshot.data() re-decodes on every
+    // call) and carry {id, data} through the filter/map chain below.
+    const docs = snapshot.docs.map(doc => ({ id: doc.id, data: doc.data() }));
+
+    // Docs with no userId can't be attributed to anyone and are dropped below —
+    // log which ones so a legacy doc vanishing from a user's list is
+    // diagnosable rather than silently invisible (mirrors ladder-recovery.js's
+    // noUserIdIds).
+    const noUserIdIds = docs.filter(({ data }) => !data.userId).map(({ id }) => id);
+    if (noUserIdIds.length) {
+      console.warn(`[AUTHZ] /strategies dropped ${noUserIdIds.length} doc(s) with no userId: ${noUserIdIds.join(', ')}`);
+    }
+
+    const strategies = docs
+      .filter(({ data }) => data.userId === req.uid)
+      .map(({ id, data }) => ({
+        strategyId: id,
         profileId: data.profileId, // ADDED: Include profileId from Firestore document
         symbol: data.symbol,
         createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null, // Convert Firestore Timestamp to ISO string
         totalPnL: data.totalPnL || 0,
         accumulatedRealizedPnL: data.accumulatedRealizedPnL || 0,
         accumulatedTradingFees: data.accumulatedTradingFees || 0,
-        isRunning: activeStrategies.has(doc.id) && activeStrategies.get(doc.id).isRunning, // Check if currently running on this VM
-      };
-    });
-    
+        isRunning: activeStrategies.has(id) && activeStrategies.get(id).isRunning, // Check if currently running on this VM
+      }));
+
     res.json({ strategies });
   } catch (error) {
     console.error('Failed to list strategies:', error);
@@ -1750,6 +1766,12 @@ app.get('/anchor-ladder/strategy-flow', requireVmOwner, async (req, res) => {
   try {
     const { strategyId, limit: queryLimit } = req.query;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+
+    const { exists, owned } = await strategyOwnedByCaller(strategyId, req.uid);
+    // 404 rather than 403 — see /strategies/:strategyId.
+    if (!exists || !owned) {
+      return res.status(404).json({ error: 'Strategy not found' });
+    }
 
     const flowLimit = parseInt(queryLimit) || 200;
     const flowRef = firestore.collection('strategies').doc(strategyId).collection('strategyFlow');

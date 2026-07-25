@@ -61,7 +61,7 @@ test('requireVmOwner: an admin uid passes through to any VM (fleet release rollo
 test('requireVmOwner: an admin still passes when the owner is unresolved (metadata outage must not lock admins out)', () => {
   const mw = createRequireVmOwner(() => null);
   const { res, nextCalled } = run(mw, { uid: 'admin-uid-1', method: 'POST', path: '/anchor-ladder/status' });
-  assert.equal(nextCalled, true, 'the admin check is ordered before owner-resolution so a metadata outage cannot lock admins out');
+  assert.equal(nextCalled, true, 'an admin passes even when the owner is unresolved (a metadata outage must not lock admins out)');
   assert.equal(res.statusCode, null, 'no response written — the request continues');
 });
 
