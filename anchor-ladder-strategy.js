@@ -2198,6 +2198,44 @@ class AnchorLadderStrategy extends TradingBase {
     return { cancelled: true };
   }
 
+  /**
+   * Edit the START trigger price while the strategy is ARMED (waiting for its
+   * trigger, ladder not yet built). Backend for the "edit trigger" pencil in the
+   * frontend's Waiting-to-Start panel.
+   *
+   * Only valid while `startArmed`. Error shapes are tagged like harvestNow so the
+   * route can split them: a state conflict (not running / not armed — already
+   * fired) is untagged -> 409; trigger-price validation failures set
+   * `error.invalidInput = true` -> 400. Re-uses validateStartTrigger — the SAME
+   * gate start() enforces — against the live mark price, so a direct API call can
+   * never diverge from the UI on what counts as a valid trigger.
+   */
+  async updateStartTrigger(rawPrice) {
+    if (!this.isRunning) throw new Error('Strategy is not running.');
+    if (!this.startArmed) {
+      throw new Error(
+        'This strategy is no longer waiting for a start trigger — the ladder has ' +
+        'already started, so there is nothing to edit.',
+      );
+    }
+    const invalidInput = (msg) => { const e = new Error(msg); e.invalidInput = true; return e; };
+    const ref = this.currentPrice;
+    if (!Number.isFinite(ref) || ref <= 0) {
+      throw invalidInput('No live price yet — cannot validate the new trigger.');
+    }
+    const check = validateStartTrigger(rawPrice, ref, this.symbol);
+    if (!check.ok) throw invalidInput(check.error);
+    this.startTriggerPrice = check.rounded;
+    this.startTriggerAbove = check.above;
+    await this.saveState();
+    this._pushHeartbeatNow?.();
+    await this.addLog(
+      `[LADDER] start trigger updated @ ${this._formatPrice(check.rounded)} ` +
+      `(anchors when price ${check.above ? 'rises to' : 'falls to'} ${this._formatPrice(check.rounded)}).`,
+    );
+    return { startTriggerPrice: check.rounded, startTriggerAbove: check.above };
+  }
+
   // ——— Dynamic sizing ————————————————————————————————————————————————
 
   /**
@@ -2825,6 +2863,11 @@ class AnchorLadderStrategy extends TradingBase {
       strategyId: this.strategyId,
       strategyType: 'anchorLadder',
       symbol: this.symbol,
+      // Price precision (decimals) from the cached exchange info, so the frontend
+      // formats ALL prices (ladder levels, anchor, trigger inputs) at the pair's
+      // real tick precision instead of a magnitude heuristic. Static per symbol,
+      // so it rides getStatus() (loaded once) rather than the slim heartbeat.
+      pricePrecision: precisionFormatter.getPricePrecision(this.symbol),
       isRunning: this.isRunning,
       executionState: this.executionState,
       subState: this.subState,

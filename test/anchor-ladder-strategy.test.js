@@ -2572,6 +2572,58 @@ test('start() pushes an immediate heartbeat once armed', async () => {
   }
 });
 
+// ——— updateStartTrigger: edit the armed start trigger (Waiting-to-Start pencil) ———
+
+// An ARMED strategy: a start trigger is set and no ladder has been built yet.
+function armedStrategy() {
+  const s = ladderStrategy();
+  s.ladderLines = [];          // no ladder yet -> startArmed === true
+  s.startTriggerPrice = 110;
+  s.startTriggerAbove = true;
+  s.currentPrice = 100;        // live reference for validation
+  return s;
+}
+
+test('updateStartTrigger revalidates against the live price, updates, and pushes a heartbeat', async () => {
+  const s = armedStrategy();
+  assert.equal(s.startArmed, true, 'sanity: the fixture is armed');
+  let heartbeatCalls = 0;
+  s._pushHeartbeatNow = () => { heartbeatCalls++; };
+  const res = await s.updateStartTrigger(90);   // 10% below the live 100 -> valid, below
+  assert.equal(s.startTriggerPrice, 90);
+  assert.equal(s.startTriggerAbove, false);
+  assert.equal(res.startTriggerPrice, 90);
+  assert.equal(heartbeatCalls, 1, 'the edited trigger must reach the frontend immediately');
+});
+
+test('updateStartTrigger rejects a price inside the 0.1% gap as client input (400-mapped)', async () => {
+  const s = armedStrategy();
+  await assert.rejects(
+    () => s.updateStartTrigger(100.05),         // 0.05% from the live 100
+    (e) => e.invalidInput === true && /0\.1%/.test(e.message),
+  );
+  assert.equal(s.startTriggerPrice, 110, 'a rejected edit leaves the armed trigger untouched');
+});
+
+test('updateStartTrigger refuses once the ladder has started (state conflict, 409-mapped)', async () => {
+  const s = armedStrategy();
+  s.ladderLines = buildLadder(100, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE); // built -> no longer armed
+  await assert.rejects(
+    () => s.updateStartTrigger(90),
+    (e) => e.invalidInput !== true && /no longer waiting/.test(e.message),
+  );
+});
+
+// getStatus carries the pair's real price precision so the frontend formats
+// every price at tick precision instead of a magnitude heuristic.
+test('getStatus surfaces the pair price precision from the cached exchange info', () => {
+  precisionFormatter.cachePrecision('TESTUSDT', 0.001, 0.01, 5); // tickSize 0.001 -> 3 decimals
+  const s = ladderStrategy();
+  s.symbol = 'TESTUSDT';
+  s._computeAccLoss = () => 0;
+  assert.equal(s.getStatus().pricePrecision, 3);
+});
+
 // ——— validateStartTrigger: the shared pure validator (FIX round 3) ———
 //
 // The SAME function both the /anchor-ladder/start route and start() call —
