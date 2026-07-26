@@ -10,16 +10,6 @@ import {
   ownerUidFromInstanceName,
   selectRecoverableStrategies,
 } from './ladder-recovery.js';
-
-// TradFi-Perps symbols are gated by Binance behind a separate trading agreement
-// (error -4411 fires for unsigned accounts). The reversal strategy's symbol
-// dropdown filters these out and /prepare-symbol rejects them server-side.
-const TRADFI_PERPS_PREFIXES = ['CL', 'NG', 'GC', 'SI', 'HG', 'ZB', 'ZN', 'ZT', 'MSTR', 'COIN', 'TSLA', 'NVDA', 'AAPL', 'AMZN', 'GOOG', 'META', 'MSFT'];
-function isTradFiPerps(symbol) {
-  if (!symbol || typeof symbol !== 'string') return false;
-  const upper = symbol.toUpperCase();
-  return TRADFI_PERPS_PREFIXES.some(p => upper.startsWith(p) && (upper.endsWith('USDT') || upper.endsWith('USDC')));
-}
 import http from 'http';
 import { WebSocketServer, WebSocket as WsClient } from 'ws';
 import { Firestore, Timestamp, FieldValue } from '@google-cloud/firestore';
@@ -1487,12 +1477,6 @@ app.post('/anchor-ladder/prepare-symbol', requireVmOwner, (req, res) => {
     return res.status(400).json({ error: 'symbol is required' });
   }
   const normalized = symbol.toUpperCase();
-  if (isTradFiPerps(normalized)) {
-    return res.status(400).json({
-      error: `${normalized} is a TradFi-Perps contract; sign the Binance TradFi-Perps agreement in the UI before trading. Anchor Ladder does not support these symbols.`,
-      code: 'TRADFI_PERPS_BLOCKED',
-    });
-  }
   if (warmSymbol === normalized && warmWs && warmWs.readyState === WsClient.OPEN) {
     return res.json({ ok: true, alreadyWarm: true, symbol: normalized });
   }
@@ -1511,13 +1495,6 @@ app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
 
     if (!profileId || !gcpProxyUrl || !sharedVmProxyGcfUrl || !config) {
       return res.status(400).json({ error: 'profileId, gcpProxyUrl, sharedVmProxyGcfUrl, and config are required.' });
-    }
-
-    if (isTradFiPerps(config.symbol)) {
-      return res.status(400).json({
-        error: `${config.symbol} is a TradFi-Perps contract; not supported by Anchor Ladder.`,
-        code: 'TRADFI_PERPS_BLOCKED',
-      });
     }
 
     // Defence in depth — AnchorLadderStrategy.start() gates on the geometry
