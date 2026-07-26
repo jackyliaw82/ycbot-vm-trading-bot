@@ -917,6 +917,12 @@ class AnchorLadderStrategy extends TradingBase {
       flattenCount: this.flattenCount,
     }).catch(() => {});
     await this.saveState();
+    // A WS-connected UI disables its REST poll and updates status only from
+    // strategy_update heartbeats. This path rebuilds the ladder directly (not
+    // via initializeLadder, which pushes its own), so broadcast the RANGE
+    // rebuild now — otherwise the panels/chart stay stale until the next
+    // heartbeat from another event or the 30s safety net.
+    this._pushHeartbeatNow?.();
   }
 
   /**
@@ -1030,6 +1036,10 @@ class AnchorLadderStrategy extends TradingBase {
       direction, avgEntry: avg, finalTpPrice: this.finalTpPrice, armed: this._trendFinalTpArmed,
     }).catch(() => {});
     await this.saveState();
+    // Mode just flipped RANGE -> TREND with no leg fill on this tick, so nothing
+    // else pushes a heartbeat; broadcast now or the Levels & Targets panel +
+    // chart wait for the next heartbeat (a later fill or the 30s safety net).
+    this._pushHeartbeatNow?.();
   }
 
   /**

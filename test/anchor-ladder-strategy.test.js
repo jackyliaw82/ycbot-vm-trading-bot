@@ -61,6 +61,37 @@ test('initializeLadder pushes an immediate heartbeat after saving state', async 
   assert.equal(heartbeatCalls, 1, 'the ARMED (or harvest re-anchor) -> live transition must push immediately');
 });
 
+// Same WS-poll-disabled rationale: anchor flatten rebuilds the ladder DIRECTLY
+// (not via initializeLadder), so it must push its own heartbeat or the panels/
+// chart show the pre-flatten ladder until the next heartbeat / 30s safety net.
+test('_flattenAtAnchor pushes an immediate heartbeat after the RANGE rebuild', async () => {
+  const s = flattenReady();
+  let heartbeatCalls = 0;
+  s._pushHeartbeatNow = () => { heartbeatCalls++; };
+  await s._flattenAtAnchor();
+  assert.equal(s.ladderMode, 'RANGE', 'sanity: the committed-flatten (not abort) path ran');
+  assert.equal(heartbeatCalls, 1, 'the anchor-flatten rebuild must reach the frontend immediately');
+});
+
+// _enterTrend flips ladderMode RANGE -> TREND mid-cycle with no leg fill on the
+// tick, so nothing else pushes — the mode switch must broadcast itself or the
+// Levels & Targets panel waits up to 30s for the safety-net heartbeat.
+test('_enterTrend pushes an immediate heartbeat on the RANGE -> TREND switch', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.ladderLines.filter(l => l.direction === 'LONG').forEach(l => { l.state = 'POSITION_OPEN'; l.quantity = 20; l.fillPrice = l.price; });
+  s.currentSide = 'LONG';
+  s.desiredProfitUSDT = 100;
+  s._refreshCurrentPosition = async () => {
+    s._lastPositionRefreshFailed = false;
+    s.activePosition = { quantity: 100, entryPrice: 100.4, avgEntry: 100.4, notional: 10040, unrealizedPnl: 0 };
+  };
+  let heartbeatCalls = 0;
+  s._pushHeartbeatNow = () => { heartbeatCalls++; };
+  await s._enterTrend('LONG');
+  assert.equal(s.ladderMode, 'TREND', 'sanity: the transition ran');
+  assert.equal(heartbeatCalls, 1, 'the RANGE -> TREND switch must reach the frontend immediately');
+});
+
 test('start() rejects an initial size below the 50 USDT minimum', async () => {
   const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   s.addLog = async () => {};
