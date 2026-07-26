@@ -1755,6 +1755,27 @@ app.post('/anchor-ladder/cancel-harvest-trigger', requireVmOwner, async (req, re
   }
 });
 
+// Edit the START trigger price while the strategy is ARMED (waiting for its
+// trigger, ladder not yet built). Re-validates the 0.1% gap + tick rounding
+// against the live price (the same gate /start enforces). 400 on bad/too-close
+// input, 409 if the strategy is running but no longer armed (trigger already
+// fired); the not-running/not-found guard here returns 400 like harvest-now.
+app.post('/anchor-ladder/update-start-trigger', requireVmOwner, async (req, res) => {
+  try {
+    const { strategyId, triggerPrice } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+    if (triggerPrice == null) return res.status(400).json({ error: 'triggerPrice is required.' });
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
+    }
+    const result = await strategy.updateStartTrigger(triggerPrice);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(error.invalidInput ? 400 : 409).json({ error: error.message });
+  }
+});
+
 // Manual user-driven edit of the cycle's desired-profit % while running. The
 // bot converts the % to USDT against initialCapital (the cycle-start basis),
 // recomputes Final TP, and persists. Allowed in any subState — no trade
