@@ -3075,6 +3075,49 @@ test('a trail harvest retries once the 5s window has elapsed', async () => {
   assert.equal(attempts, 2, 'the retry must actually self-heal, not stay stuck forever');
 });
 
+// ——— Final-review Finding 1: the throttled branch must NOT advance
+// lastProcessedPrice — nothing was processed, so the band must be re-scanned
+// next tick (same convention as the _tradingSeqInProgress guard). Advancing
+// it silently swallows the band, letting a later tick fill the very leg
+// trailing exists to suppress. This bug was invisible to per-task review.
+
+test('a throttled trail retry does NOT advance lastProcessedPrice', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  s._harvestToFlat = async () => false;   // aborted every attempt (unverified close)
+  await s.handleRealtimePrice(99.7);      // fires (first attempt, not throttled yet)
+  assert.equal(s.lastProcessedPrice, 99.7, 'the firing tick DOES advance lastProcessedPrice — fire-path behavior is unchanged');
+  await s.handleRealtimePrice(99.6);      // throttled: nothing processed this tick
+  assert.equal(s.lastProcessedPrice, 99.7, 'a throttled tick must NOT advance lastProcessedPrice — the band must be re-scanned, not swallowed');
+  await s.handleRealtimePrice(99.5);      // still throttled
+  assert.equal(s.lastProcessedPrice, 99.7, 'lastProcessedPrice must stay pinned for the whole throttle window');
+});
+
+test('a throttled retry does not let a later bounce-back tick fill the suppressed leg', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  s._harvestToFlat = async () => false;   // every attempt aborts (unverified close)
+  const filled = [];
+  s._fillLeg = async (leg) => { filled.push(leg); };
+
+  // First-ever tick lands right at the trail level (~99.73) — strictly above
+  // S1 (99.7) by the 10%-of-a-step buffer. Fires, aborts, arms the throttle.
+  await s.handleRealtimePrice(99.73);
+  assert.equal(s.lastProcessedPrice, 99.73);
+
+  // Throttled ticks drop well past S1. Under the bug these would advance
+  // lastProcessedPrice past S1 without ever scanning it for a fill.
+  await s.handleRealtimePrice(99.5);
+  await s.handleRealtimePrice(99.4);
+
+  // Bounce back above the trail level: trailing does not re-fire (reached is
+  // false), so this tick falls through to planLadderActions. With the fix,
+  // prevPrice is still pinned at 99.73 (never swallowed S1); with the bug it
+  // would be ~99.4, and the band [99.4, 99.8] would fill S1.
+  await s.handleRealtimePrice(99.8);
+  assert.equal(filled.length, 0, 'S1 must not fill: trailing exists specifically to suppress this leg');
+});
+
 test('a SUCCESSFUL trail harvest leaves no retry throttle pending', async () => {
   const s = ladderStrategy({ anchor: 100 });
   s.trailDirection = 'DOWN';
@@ -3093,4 +3136,29 @@ test('turning trailing off clears a pending retry throttle', async () => {
   s._trailRetryLastTs = Date.now();
   await s.setTrailDirection(null);
   assert.equal(s._trailRetryLastTs, null);
+});
+
+// ——— Final-review Finding 3: the throttle must be armed pessimistically, so
+// a THROW from _harvestToFlat (e.g. a Firestore failure in saveState/addLog
+// after the close) still throttles the retry — not just a returned `false`.
+// The exception must still propagate; it is not swallowed.
+
+test('a throwing _harvestToFlat still arms the throttle', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  s._harvestToFlat = async () => { throw new Error('firestore boom'); };
+  await assert.rejects(() => s.handleRealtimePrice(99.7), /firestore boom/);
+  assert.ok(s._trailRetryLastTs != null, 'a throw must arm the throttle just like a returned false would');
+  assert.equal(s.trailDirection, 'DOWN', 'trailing must stay ARMED even when the close attempt throws — disarming would fail open');
+});
+
+test('after a throwing _harvestToFlat, the very next tick is throttled, not re-fired', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  let attempts = 0;
+  s._harvestToFlat = async () => { attempts++; throw new Error('firestore boom'); };
+  await assert.rejects(() => s.handleRealtimePrice(99.7));
+  assert.equal(attempts, 1);
+  await s.handleRealtimePrice(99.6);   // would re-fire immediately (the same per-tick storm Task 6 prevents) if the throw failed to arm the throttle
+  assert.equal(attempts, 1, 'the throttle armed by the throw must suppress the very next tick');
 });

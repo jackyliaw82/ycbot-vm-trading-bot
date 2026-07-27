@@ -2074,13 +2074,22 @@ class AnchorLadderStrategy extends TradingBase {
         // a degraded close state.
         const now = Date.now();
         if (this._trailRetryLastTs != null && (now - this._trailRetryLastTs) < TRAIL_RETRY_INTERVAL_MS) {
-          this.lastProcessedPrice = price;
+          // Do NOT advance lastProcessedPrice: nothing was processed this tick,
+          // so the band must be re-scanned next tick (same convention as the
+          // _tradingSeqInProgress guard above). Advancing it here would let
+          // the very leg trailing exists to suppress open on a later tick once
+          // the throttle clears past it.
           return;
         }
+        // Pessimistic: set BEFORE the call so a throw (e.g. Firestore failure
+        // in saveState/addLog after the close) still arms the throttle —
+        // otherwise the next tick re-fires immediately, the same per-tick
+        // storm this throttle exists to prevent, just via the throw path.
+        this._trailRetryLastTs = now;
         const completed = await this._harvestToFlat('trail');
         // Trailing stays ARMED on failure BY DESIGN: disarming would fail open,
         // resuming the entries the user armed trailing to suppress.
-        this._trailRetryLastTs = completed ? null : now;
+        if (completed) this._trailRetryLastTs = null;
         this.lastProcessedPrice = price;
         return;
       }
