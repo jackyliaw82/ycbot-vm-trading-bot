@@ -1755,6 +1755,27 @@ app.post('/anchor-ladder/cancel-harvest-trigger', requireVmOwner, async (req, re
   }
 });
 
+// Turn Anchor Trailing on/off. `direction`: 'UP' | 'DOWN' | null (null = off).
+// Accepted whenever the strategy is running — including while ARMED or in
+// TREND, where it simply lies dormant. Error mapping matches harvest-now:
+// invalid direction → 400 (tagged invalidInput), not-running → 409; the
+// not-found guard returns 400 like its siblings.
+app.post('/anchor-ladder/trail', requireVmOwner, async (req, res) => {
+  try {
+    const { strategyId, direction } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+    if (!('direction' in req.body)) return res.status(400).json({ error: 'direction is required.' });
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
+    }
+    const result = await strategy.setTrailDirection(direction ?? null);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(error.invalidInput ? 400 : 409).json({ error: error.message });
+  }
+});
+
 // Edit the START trigger price while the strategy is ARMED (waiting for its
 // trigger, ladder not yet built). Re-validates the 0.1% gap + tick rounding
 // against the live price (the same gate /start enforces). 400 on bad/too-close
