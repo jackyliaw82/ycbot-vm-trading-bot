@@ -7,6 +7,7 @@ import {
   LADDER_LEVELS_MIN, LADDER_LEVELS_MAX,
   MIN_LEG_USDT, minInitialSizeUSDT,
   resolveLadderGeometry,
+  trailLevel, TRAIL_BUFFER_FRAC,
 } from '../ladder-levels.js';
 
 test('defaults are the spec values', () => {
@@ -216,4 +217,49 @@ test('buildLadder: honours non-default geometry', () => {
   // The inversion holds at any geometry: LONG above, SHORT below.
   assert.ok(longs.every(p => p > 200));
   assert.ok(shorts.every(p => p < 200));
+});
+
+test('trailLevel DOWN sits between the anchor and the raw S1 price', () => {
+  const anchor = 100, stepPct = 0.003;
+  const rawS1 = anchor - stepPct * anchor;          // 99.7
+  const level = trailLevel(anchor, stepPct, 'DOWN');
+  assert.ok(level < anchor, 'must be below the anchor');
+  assert.ok(level > rawS1, 'must sit INSIDE S1 (anchor side), never at or past it');
+  assert.ok(Math.abs(level - 99.73) < 1e-9, `expected 99.73, got ${level}`);
+});
+
+test('trailLevel UP sits between the anchor and the raw L1 price', () => {
+  const anchor = 100, stepPct = 0.003;
+  const rawL1 = anchor + stepPct * anchor;          // 100.3
+  const level = trailLevel(anchor, stepPct, 'UP');
+  assert.ok(level > anchor);
+  assert.ok(level < rawL1, 'must sit INSIDE L1 (anchor side), never at or past it');
+  assert.ok(Math.abs(level - 100.27) < 1e-9, `expected 100.27, got ${level}`);
+});
+
+// The whole point of the buffer: the gap to the raw level must be a real
+// price distance, far larger than one tick, at BOTH ends of the step range.
+test('trailLevel keeps a buffer of 10% of a step at both step bounds', () => {
+  for (const stepPct of [0.003, 0.02]) {
+    for (const direction of ['UP', 'DOWN']) {
+      const anchor = 100;
+      const raw = direction === 'UP' ? anchor * (1 + stepPct) : anchor * (1 - stepPct);
+      const level = trailLevel(anchor, stepPct, direction);
+      const gap = Math.abs(raw - level);
+      assert.ok(
+        Math.abs(gap - TRAIL_BUFFER_FRAC * stepPct * anchor) < 1e-9,
+        `${direction} @ ${stepPct}: gap ${gap} != ${TRAIL_BUFFER_FRAC * stepPct * anchor}`,
+      );
+    }
+  }
+});
+
+test('trailLevel rejects an invalid anchor, step, or direction', () => {
+  assert.throws(() => trailLevel(0, 0.003, 'UP'), /anchor/);
+  assert.throws(() => trailLevel(-5, 0.003, 'UP'), /anchor/);
+  assert.throws(() => trailLevel(NaN, 0.003, 'UP'), /anchor/);
+  assert.throws(() => trailLevel(100, 0, 'UP'), /stepPct/);
+  assert.throws(() => trailLevel(100, NaN, 'UP'), /stepPct/);
+  assert.throws(() => trailLevel(100, 0.003, 'SIDEWAYS'), /direction/);
+  assert.throws(() => trailLevel(100, 0.003, null), /direction/);
 });

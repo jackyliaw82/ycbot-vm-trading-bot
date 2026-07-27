@@ -55,6 +55,46 @@ export function buildLadder(anchor, stepPct = LADDER_STEP_PCT, levelsPerSide = L
   return legs;
 }
 
+// How far INSIDE S1/L1 (toward the anchor) the Anchor Trailing level sits, as a
+// fraction of one step. NOT cosmetic: leg prices are raw (`anchor ± k*step`)
+// while any armed price would be tick-ROUNDED (precisionUtils.roundPrice uses
+// nearest-rounding). A level placed exactly AT S1/L1 can therefore round one
+// tick PAST the leg, opening a window where the leg fills before the trail
+// fires — the bot then opens a position and flattens it on the very next tick,
+// paying fees for nothing. 10% of a step is orders of magnitude larger than one
+// tick on every supported symbol, so that window cannot exist.
+export const TRAIL_BUFFER_FRAC = 0.1;
+
+/**
+ * The price at which Anchor Trailing re-anchors, derived from the live anchor.
+ *
+ * PURE and deliberately UNROUNDED — the caller compares it against the raw mark
+ * price. Rounding it here would reintroduce exactly the failure the buffer
+ * exists to prevent.
+ *
+ * Never stored anywhere: the trail level is always derived from the CURRENT
+ * anchor, so it tracks every re-anchor for free. Two copies of one fact drift
+ * (see `_trendFinalTpArmed` in CLAUDE.md) — do not cache this.
+ *
+ * @param {number} anchor
+ * @param {number} stepPct
+ * @param {'UP'|'DOWN'} direction
+ * @returns {number}
+ */
+export function trailLevel(anchor, stepPct, direction) {
+  if (!Number.isFinite(anchor) || anchor <= 0) {
+    throw new Error(`trailLevel: anchor must be a positive finite number (got ${anchor})`);
+  }
+  if (!Number.isFinite(stepPct) || stepPct <= 0) {
+    throw new Error(`trailLevel: stepPct must be a positive finite number (got ${stepPct})`);
+  }
+  if (direction !== 'UP' && direction !== 'DOWN') {
+    throw new Error(`trailLevel: direction must be 'UP' or 'DOWN' (got ${direction})`);
+  }
+  const effective = (1 - TRAIL_BUFFER_FRAC) * stepPct;
+  return direction === 'UP' ? anchor * (1 + effective) : anchor * (1 - effective);
+}
+
 /**
  * The SINGLE definition of valid ladder geometry. Both the HTTP route
  * (app.js, which must answer synchronously) and start() (which runs after the
