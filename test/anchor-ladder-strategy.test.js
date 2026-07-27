@@ -3037,3 +3037,60 @@ test('a trail re-anchor moves the level so the NEXT level tracks the new anchor'
   assert.ok(Math.abs(s.anchor - 99.73) < 1e-9);
   assert.ok(Math.abs(s._trailLevel() - 99.73 * (1 - 0.9 * 0.003)) < 1e-9);
 });
+
+// ——— Anchor Trailing: retry throttle on an aborted harvest ———
+
+test('an aborted trail harvest does NOT re-attempt on the very next tick', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  let attempts = 0;
+  s._harvestToFlat = async () => { attempts++; return false; };   // aborted (unverified close)
+  await s.handleRealtimePrice(99.7);
+  await s.handleRealtimePrice(99.6);
+  await s.handleRealtimePrice(99.5);
+  assert.equal(attempts, 1, 'three ticks past the level must yield ONE close attempt, not three');
+  assert.equal(s.trailDirection, 'DOWN', 'must stay ARMED — disarming here would fail open');
+});
+
+test('an aborted trail harvest SUPPRESSES ladder fills during the retry window', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  s._harvestToFlat = async () => false;
+  const filled = [];
+  s._fillLeg = async (leg) => { filled.push(leg); };
+  await s.handleRealtimePrice(99.7);
+  await s.handleRealtimePrice(99.4);        // would otherwise cross S1 (99.7) and fill
+  assert.equal(filled.length, 0, 'the leg trailing exists to prevent must not fill mid-retry');
+});
+
+test('a trail harvest retries once the 5s window has elapsed', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  let attempts = 0;
+  s._harvestToFlat = async () => { attempts++; return false; };
+  await s.handleRealtimePrice(99.7);
+  assert.equal(attempts, 1);
+  s._trailRetryLastTs = Date.now() - 5_001;   // pretend 5s passed
+  await s.handleRealtimePrice(99.7);
+  assert.equal(attempts, 2, 'the retry must actually self-heal, not stay stuck forever');
+});
+
+test('a SUCCESSFUL trail harvest leaves no retry throttle pending', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  s._harvestToFlat = async () => {
+    s.anchor = s.currentPrice;
+    s.ladderLines = buildLadder(s.anchor, s.stepPct, s.levelsPerSide);
+    return true;
+  };
+  s.currentPrice = 99.7;
+  await s.handleRealtimePrice(99.7);
+  assert.equal(s._trailRetryLastTs, null, 'success must clear the throttle');
+});
+
+test('turning trailing off clears a pending retry throttle', async () => {
+  const s = ladderStrategy();
+  s._trailRetryLastTs = Date.now();
+  await s.setTrailDirection(null);
+  assert.equal(s._trailRetryLastTs, null);
+});

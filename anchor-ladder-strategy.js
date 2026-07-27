@@ -31,6 +31,15 @@ const TREND_ARM_RETRY_INTERVAL_MS = 15_000;
 // live price, so an armed trigger cannot accidentally fire on the very next
 // tick. Hard-enforced by harvestNow(); the frontend mirrors it for UX only.
 const TRIGGER_MIN_GAP_PCT = 0.001; // 0.1%
+// Minimum spacing between Anchor Trailing close attempts after an ABORTED
+// harvest. `_harvestToFlat` leaves the ladder INTACT when a close cannot be
+// verified while inventory remains (its tombstone) — so the anchor does not
+// move, the derived trail level does not move, price is still past it, and
+// trailing would re-fire EVERY TICK, each one another reduceOnly order at
+// Binance. This THROTTLES that retry; it does not suppress it. Retrying is
+// correct — the unclosed position genuinely needs another attempt and the retry
+// is what self-heals it. Matches the anchor-flatten retry latch's cadence.
+const TRAIL_RETRY_INTERVAL_MS = 5_000;
 
 function formatDuration(ms) {
   if (!ms || ms < 0) return 'N/A';
@@ -2058,7 +2067,20 @@ class AnchorLadderStrategy extends TradingBase {
       const reached = level != null
         && (this.trailDirection === 'UP' ? price >= level - eps : price <= level + eps);
       if (reached) {
-        await this._harvestToFlat('trail');
+        // A prior attempt ABORTED (unverified close, inventory still tracked).
+        // Wait out the cadence — and SUPPRESS this tick's ladder actions while
+        // waiting, because falling through to planLadderActions would fill the
+        // very leg trailing exists to prevent, right when the bot is already in
+        // a degraded close state.
+        const now = Date.now();
+        if (this._trailRetryLastTs != null && (now - this._trailRetryLastTs) < TRAIL_RETRY_INTERVAL_MS) {
+          this.lastProcessedPrice = price;
+          return;
+        }
+        const completed = await this._harvestToFlat('trail');
+        // Trailing stays ARMED on failure BY DESIGN: disarming would fail open,
+        // resuming the entries the user armed trailing to suppress.
+        this._trailRetryLastTs = completed ? null : now;
         this.lastProcessedPrice = price;
         return;
       }
