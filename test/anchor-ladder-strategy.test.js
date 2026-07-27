@@ -2743,3 +2743,66 @@ test('start trigger fire path clears any harvest latch that slipped through (bel
     'a harvest requested before the ladder existed must not be replayed against the ladder that just built',
   );
 });
+
+// ——— Anchor Trailing: persistence ———
+
+test('trailDirection defaults to null (trailing off)', () => {
+  const s = ladderStrategy();
+  assert.equal(s.trailDirection, null);
+});
+
+test('trailDirection survives a saveState -> resume round trip', async () => {
+  const src = ladderStrategy();
+  src.trailDirection = 'DOWN';
+  let doc = null;
+  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
+  await AnchorLadderStrategy.prototype.saveState.call(src);
+  assert.equal(doc.trailDirection, 'DOWN', 'saveState must persist it');
+
+  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
+  cleanupResumeTimers(dst);
+
+  // Without this, a forced VM redeploy silently disarms trailing and the bot
+  // resumes opening the very entries the user armed it to suppress.
+  assert.equal(dst.trailDirection, 'DOWN', 'resume must restore it');
+});
+
+test('getStatus and getHeartbeatPayload both expose trailDirection', () => {
+  const s = ladderStrategy();
+  s.trailDirection = 'UP';
+  assert.equal(s.getStatus().trailDirection, 'UP');
+  assert.equal(s.getHeartbeatPayload().trailDirection, 'UP');
+});
+
+test('a resumed trailing strategy logs that trailing is still armed', async () => {
+  const src = ladderStrategy();
+  src.trailDirection = 'UP';
+  let doc = null;
+  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
+  await AnchorLadderStrategy.prototype.saveState.call(src);
+
+  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const logs = [];
+  dst.addLog = async (m) => { logs.push(m); };
+  await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
+  cleanupResumeTimers(dst);
+
+  assert.ok(
+    logs.some((m) => /trailing resumed/i.test(m)),
+    `restored state must never be silent; got: ${JSON.stringify(logs)}`,
+  );
+});
+
+test('stop() clears trailing — a terminated cycle must not stay armed', async () => {
+  // ladderStrategy() alone doesn't stub the rest of stop()'s I/O (funding
+  // poll, WS cleanup, no-trade doc delete, hero-profit); reuse stubStopTail,
+  // the same helper the file's other direct stop()-prototype tests use, so
+  // this exercises the real clear without needing a firestore double.
+  const s = stubStopTail(ladderStrategy());
+  s.trailDirection = 'DOWN';
+  s._trailRetryLastTs = Date.now();
+  await AnchorLadderStrategy.prototype.stop.call(s, { flatten: false, reason: 'manual' });
+  assert.equal(s.trailDirection, null);
+});

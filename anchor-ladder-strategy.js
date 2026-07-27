@@ -203,6 +203,18 @@ class AnchorLadderStrategy extends TradingBase {
     this.harvestTriggerPrice = null;      // number | null
     this.harvestTriggerAbove = null;      // boolean | null: true = fire when price >= level
 
+    // Anchor Trailing — the anchor follows price in ONE user-chosen direction,
+    // auto re-anchoring at ~S1 (DOWN) / ~L1 (UP) instead of opening that leg.
+    // PERSISTED: a redeploy that silently disarmed this would resume opening the
+    // very entries the user armed trailing to suppress — a textbook fail-open.
+    // The trail LEVEL is never stored; it is derived from the live anchor
+    // (see `_trailLevel`), so it tracks every re-anchor automatically.
+    this.trailDirection = null;          // 'UP' | 'DOWN' | null (null = off)
+    // Throttle timestamp for retrying an ABORTED trail harvest (Task 6).
+    // TRANSIENT — deliberately NOT persisted: a timestamp carried across a
+    // restart would wrongly suppress the first post-boot attempt.
+    this._trailRetryLastTs = null;
+
     // ── Start Mode ────────────────────────────────────────────────────────
     // Optional: defer building the ladder until the price reaches a level the
     // user chose at deployment. null = Immediate (anchor on the first tick).
@@ -1370,6 +1382,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.harvestTriggerAbove = snapshot.harvestTriggerAbove ?? null;
     this.startTriggerPrice = snapshot.startTriggerPrice ?? null;
     this.startTriggerAbove = snapshot.startTriggerAbove ?? null;
+    this.trailDirection = snapshot.trailDirection ?? null;
     this.cycleAccumulatedLoss = snapshot.cycleAccumulatedLoss || 0;
     this.flattenCount = snapshot.flattenCount || 0;
     this.harvestCount = snapshot.harvestCount || 0;
@@ -1496,6 +1509,13 @@ class AnchorLadderStrategy extends TradingBase {
     this._recomputeFinalTpPrice();
 
     await this.addLog(`[RECOVERY] subState=${this.subState} side=${this.currentSide || 'NONE'} flattens=${this.flattenCount} harvests=${this.harvestCount} accLoss=${this.cycleAccumulatedLoss.toFixed(4)} USDT`);
+
+    if (this.trailDirection) {
+      await this.addLog(
+        `[LADDER] trailing resumed (Trail ${this.trailDirection === 'UP' ? 'Up' : 'Down'}) — ` +
+        `the anchor keeps following price ${this.trailDirection === 'UP' ? 'up' : 'down'}.`,
+      );
+    }
 
     await this.saveState();
 
@@ -1686,6 +1706,9 @@ class AnchorLadderStrategy extends TradingBase {
     this.harvestTriggerAbove = null;
     this.startTriggerPrice = null;
     this.startTriggerAbove = null;
+    // Trailing dies with the cycle too — same rule as the start/harvest triggers:
+    // a terminated strategy must never keep reporting an armed feature.
+    this.trailDirection = null;
 
     // Final funding flush — capture any settlement that happened between
     // the last scheduled poll and stop. Non-critical: swallow errors.
@@ -2918,6 +2941,7 @@ class AnchorLadderStrategy extends TradingBase {
       harvestTriggerAbove: this.harvestTriggerAbove ?? null,
       startTriggerPrice: this.startTriggerPrice ?? null,
       startTriggerAbove: this.startTriggerAbove ?? null,
+      trailDirection: this.trailDirection ?? null,
       startArmed: this.startArmed,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
@@ -2994,6 +3018,7 @@ class AnchorLadderStrategy extends TradingBase {
       harvestTriggerAbove: this.harvestTriggerAbove ?? null,
       startTriggerPrice: this.startTriggerPrice ?? null,
       startTriggerAbove: this.startTriggerAbove ?? null,
+      trailDirection: this.trailDirection ?? null,
       startArmed: this.startArmed,
     };
   }
@@ -3103,6 +3128,9 @@ class AnchorLadderStrategy extends TradingBase {
         // disarm it and fall back to Immediate on the next tick.
         startTriggerPrice: this.startTriggerPrice ?? null,
         startTriggerAbove: this.startTriggerAbove ?? null,
+        // Anchor Trailing — PERSISTED so a redeploy doesn't silently disarm it
+        // (see the constructor comment for the full fail-open rationale).
+        trailDirection: this.trailDirection ?? null,
         // Geometry is per-cycle config, not a constant — resume MUST rebuild the
         // ladder this cycle actually started with (see _applySnapshotGeometry).
         stepPct: this.stepPct,
