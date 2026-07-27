@@ -1172,11 +1172,16 @@ class AnchorLadderStrategy extends TradingBase {
    * cycleAccumulatedLoss on its own.
    *
    * Manual only. There is no automatic harvest.
+   *
+   * @returns {Promise<boolean>} `true` only when the close + re-anchor completed
+   *   (reached `initializeLadder`); `false` on the in-flight skip and on the
+   *   tombstone abort. Anchor Trailing uses this to decide whether to schedule a
+   *   bounded retry — it must NEVER infer the outcome from observed side effects.
    */
   async _harvestToFlat(reason) {
     if (this._tradingSeqInProgress) {
       await this.addLog(`Harvest (${reason}) skipped — a trading sequence is in progress; retry.`);
-      return;
+      return false;
     }
     this._tradingSeqInProgress = true;
     try {
@@ -1241,7 +1246,7 @@ class AnchorLadderStrategy extends TradingBase {
         );
         await this.saveState();
         this._pushHeartbeatNow?.();
-        return;
+        return false;
       }
 
       // Only a VERIFIED position-close counts as a harvest. `closed` is true iff
@@ -1271,6 +1276,7 @@ class AnchorLadderStrategy extends TradingBase {
       const finalKind = closed ? kind : 'RE-ANCHOR';
       await this._writeStrategyFlow('HARVEST', { reason, kind: finalKind, closingPnl, flat: !closed, reanchorCount: this.reanchorCount, anchor: this.anchor, baseSize: this._ladderBaseSize }).catch(() => {});
       await this.saveState();
+      return true;
     } finally {
       this._tradingSeqInProgress = false;
     }

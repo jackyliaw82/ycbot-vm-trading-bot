@@ -888,6 +888,50 @@ test('_harvestToFlat: _closeConsolidated refreshes mid-close and proves genuinel
   assert.equal(s.anchor, 105, 're-anchors on the live price — the abort must not fire on a stale pre-close reading');
 });
 
+// ——— _harvestToFlat completion signal ———
+
+test('_harvestToFlat returns false when a trading sequence is already in flight', async () => {
+  const s = ladderStrategy();
+  s._tradingSeqInProgress = true;
+  assert.equal(await s._harvestToFlat('trail'), false);
+});
+
+test('_harvestToFlat returns false when the close is unverified and inventory remains', async () => {
+  const s = ladderStrategy();
+  s.ladderLines.filter((l) => l.direction === 'LONG').slice(0, 2)
+    .forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
+  // _closeQuantity() reads restQty off activePosition first (see its own
+  // "REST reachable and reported flat" short-circuit) — without this, a null
+  // activePosition reads as "genuinely flat" regardless of the leg ledger, so
+  // the tombstone's `_closeQuantity() > 0` check would never fire. Same
+  // "inventory open" precondition the sibling tombstone test above (line 787)
+  // uses.
+  s.activePosition = { quantity: 1, avgEntry: 100.3, entryPrice: 100.3, notional: 100.3, unrealizedPnl: 0 };
+  s._closeConsolidated = async () => false;        // unverified close
+  let rebuilt = false;
+  s.initializeLadder = async () => { rebuilt = true; };
+  assert.equal(await s._harvestToFlat('trail'), false);
+  assert.equal(rebuilt, false, 'the tombstone must still abort the rebuild');
+});
+
+test('_harvestToFlat returns true after a completed re-anchor', async () => {
+  const s = ladderStrategy();
+  s._closeConsolidated = async () => true;
+  s._computeAccLoss = () => 0;
+  s._computeLadderBaseSize = async () => 1000;
+  s.initializeLadder = async () => {};
+  assert.equal(await s._harvestToFlat('trail'), true);
+});
+
+test('_harvestToFlat returns true for a flat re-anchor (nothing to close)', async () => {
+  const s = ladderStrategy();                       // no legs open, activePosition null
+  s._closeConsolidated = async () => false;         // nothing closed because nothing was open
+  s._computeAccLoss = () => 0;
+  s._computeLadderBaseSize = async () => 1000;
+  s.initializeLadder = async () => {};
+  assert.equal(await s._harvestToFlat('trail'), true, 'a flat re-anchor completes; it never aborts');
+});
+
 // ——— Task 9: persistence, status, and resume ——————————————————————————
 
 // resume() does real Binance/WS/Firestore I/O beyond restoring fields
