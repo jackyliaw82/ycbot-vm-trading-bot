@@ -2215,6 +2215,8 @@ class AnchorLadderStrategy extends TradingBase {
     this.harvestTriggerPrice = rounded;
     this.harvestTriggerAbove = rounded > ref;
     this._manualHarvestRequested = false; // arming is NOT an immediate harvest
+    this.trailDirection = null;           // exclusive with Anchor Trailing (see setTrailDirection)
+    this._trailRetryLastTs = null;
     await this.saveState();
     this._pushHeartbeatNow?.();
     await this.addLog(`[LADDER] harvest trigger armed @ ${this._formatPrice(rounded)} (fires when price ${this.harvestTriggerAbove ? '>=' : '<='} ${this._formatPrice(rounded)}).`);
@@ -2235,6 +2237,58 @@ class AnchorLadderStrategy extends TradingBase {
       await this.addLog('[LADDER] harvest trigger cancelled.');
     }
     return { cancelled: true };
+  }
+
+  /**
+   * Turn Anchor Trailing on (with a direction) or off.
+   *
+   * Accepted at ANY time while running — including while `startArmed` or in
+   * TREND. It is a state change, not an action: with no RANGE ladder it simply
+   * lies dormant until one exists (see the tick guard in `handleRealtimePrice`).
+   *
+   * Direction is EXCLUSIVE — switching overwrites, so there is no separate
+   * "off first" step.
+   *
+   * STRICT, not coercing: only the exact strings 'UP'/'DOWN' or null are
+   * accepted. 'up', 0, true, and '' are NOT valid and are REJECTED, never
+   * silently defaulted — unknown input must read as invalid, never as safe
+   * (same philosophy as `resolveLadderGeometry`).
+   *
+   * Error shapes match `harvestNow` so the route can map them: a bad direction
+   * sets `.invalidInput = true` (→ 400); `!isRunning` is untagged (→ 409).
+   *
+   * @param {'UP'|'DOWN'|null} direction
+   * @returns {Promise<{trailDirection: 'UP'|'DOWN'|null}>}
+   */
+  async setTrailDirection(direction) {
+    if (!this.isRunning) throw new Error('Strategy is not running.');
+    if (direction !== 'UP' && direction !== 'DOWN' && direction !== null) {
+      const e = new Error("Trail direction must be 'UP', 'DOWN', or null.");
+      e.invalidInput = true;
+      throw e;
+    }
+
+    this.trailDirection = direction;
+    // A pending retry belongs to the direction that scheduled it.
+    this._trailRetryLastTs = null;
+
+    if (direction) {
+      // Trailing and the one-shot Trigger Price are one conceptual affordance,
+      // so they are mutually exclusive — and the BACKEND guarantees it, never
+      // the frontend (mirrors harvestNow() superseding a pending trigger).
+      this.harvestTriggerPrice = null;
+      this.harvestTriggerAbove = null;
+    }
+
+    await this.saveState();
+    this._pushHeartbeatNow?.();
+    await this.addLog(
+      direction
+        ? `[LADDER] Anchor Trailing ON — Trail ${direction === 'UP' ? 'Up' : 'Down'}; ` +
+          `the anchor will follow price ${direction === 'UP' ? 'up' : 'down'}.`
+        : '[LADDER] Anchor Trailing OFF.',
+    );
+    return { trailDirection: this.trailDirection };
   }
 
   /**

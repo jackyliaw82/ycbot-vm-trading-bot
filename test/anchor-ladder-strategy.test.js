@@ -2121,6 +2121,65 @@ test('cancelHarvestTrigger clears an armed trigger', async () => {
   assert.equal(s.harvestTriggerAbove, null);
 });
 
+// ——— Anchor Trailing: activation ———
+
+test('setTrailDirection accepts UP, DOWN and null', async () => {
+  const s = ladderStrategy();
+  assert.deepEqual(await s.setTrailDirection('UP'), { trailDirection: 'UP' });
+  assert.equal(s.trailDirection, 'UP');
+  await s.setTrailDirection('DOWN');
+  assert.equal(s.trailDirection, 'DOWN', 'switching overwrites — direction is exclusive');
+  await s.setTrailDirection(null);
+  assert.equal(s.trailDirection, null, 'null turns trailing off');
+});
+
+test('setTrailDirection rejects an invalid direction as client input (400)', async () => {
+  const s = ladderStrategy();
+  for (const bad of ['up', 'SIDEWAYS', 0, true, {}, 'UP ']) {
+    await assert.rejects(() => s.setTrailDirection(bad), (err) => {
+      assert.equal(err.invalidInput, true, `${JSON.stringify(bad)} must tag invalidInput`);
+      return true;
+    });
+  }
+  assert.equal(s.trailDirection, null, 'a rejected call must leave trailing untouched');
+});
+
+test('setTrailDirection refuses when the strategy is not running (409)', async () => {
+  const s = ladderStrategy();
+  s.isRunning = false;
+  await assert.rejects(() => s.setTrailDirection('UP'), (err) => {
+    assert.equal(err.invalidInput, undefined, 'a state conflict must NOT be tagged as input error');
+    return /not running/i.test(err.message);
+  });
+});
+
+test('activating trailing clears an armed one-shot trigger', async () => {
+  const s = ladderStrategy();
+  s.harvestTriggerPrice = 105; s.harvestTriggerAbove = true;
+  await s.setTrailDirection('DOWN');
+  assert.equal(s.harvestTriggerPrice, null, 'the two are mutually exclusive');
+  assert.equal(s.harvestTriggerAbove, null);
+});
+
+test('arming a one-shot trigger clears trailing', async () => {
+  const s = ladderStrategy();
+  s.currentPrice = 100;
+  s.trailDirection = 'DOWN';
+  await s.harvestNow(101.5);
+  assert.equal(s.trailDirection, null, 'the backend, not the frontend, enforces exclusion');
+  assert.equal(s.harvestTriggerPrice, 101.5);
+});
+
+test('turning trailing off is accepted even while ARMED or in TREND (it just lies dormant)', async () => {
+  const armed = ladderStrategy();
+  armed.ladderLines = [];                   // startArmed derives off an empty ladder
+  armed.startTriggerPrice = 105;
+  assert.deepEqual(await armed.setTrailDirection('UP'), { trailDirection: 'UP' });
+
+  const trend = ladderStrategy({ mode: 'TREND' });
+  assert.deepEqual(await trend.setTrailDirection('DOWN'), { trailDirection: 'DOWN' });
+});
+
 // ——— Trigger price: tick-loop firing ———
 
 test('an armed ABOVE trigger fires _harvestToFlat when price reaches the level', async () => {
