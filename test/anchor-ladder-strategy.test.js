@@ -2133,6 +2133,54 @@ test('setTrailDirection accepts UP, DOWN and null', async () => {
   assert.equal(s.trailDirection, null, 'null turns trailing off');
 });
 
+// The level is the whole point of the line — "Trail Up" alone forces the reader to
+// recompute anchor*(1 ± 0.9*stepPct) by hand to know what was actually armed.
+test('setTrailDirection logs the trail LEVEL, not just the direction', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy({ anchor: 100 });      // step 0.3% -> up 100.27, down 99.73
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+
+  await s.setTrailDirection('UP');
+  assert.match(logs.at(-1), /Trail Up @ 100\.27/, `got: ${logs.at(-1)}`);
+
+  await s.setTrailDirection('DOWN');
+  assert.match(logs.at(-1), /Trail Down @ 99\.73/, `got: ${logs.at(-1)}`);
+
+  await s.setTrailDirection(null);
+  assert.match(logs.at(-1), /Anchor Trailing OFF/);
+});
+
+test('the armed log flags the TREND pause instead of promising an imminent re-anchor', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+
+  await s.setTrailDirection('UP');
+  assert.match(logs.at(-1), /100\.27/, 'the level still shows while paused');
+  assert.match(logs.at(-1), /PAUSED while in TREND/, `got: ${logs.at(-1)}`);
+  assert.doesNotMatch(
+    logs.at(-1), /will follow price/,
+    'must not read as an active follow while trailing is dormant',
+  );
+});
+
+// Armed via Start Mode: no ladder yet, so there is no anchor to derive a level from.
+// Printing a bogus number (or "NaN") would be worse than saying it is pending.
+test('setTrailDirection says the level is pending when there is no ladder yet', async () => {
+  const s = ladderStrategy();
+  s.ladderLines = [];
+  s.anchor = null;
+  s.startTriggerPrice = 105;                      // startArmed
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+
+  await s.setTrailDirection('DOWN');
+  assert.match(logs.at(-1), /level pending/, `got: ${logs.at(-1)}`);
+  assert.doesNotMatch(logs.at(-1), /NaN|undefined|null/, 'never print a bogus level');
+});
+
 test('setTrailDirection rejects an invalid direction as client input (400)', async () => {
   const s = ladderStrategy();
   for (const bad of ['up', 'SIDEWAYS', 0, true, {}, 'UP ']) {

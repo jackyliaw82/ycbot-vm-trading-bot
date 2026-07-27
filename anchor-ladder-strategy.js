@@ -2359,12 +2359,25 @@ class AnchorLadderStrategy extends TradingBase {
 
     await this.saveState();
     this._pushHeartbeatNow?.();
-    await this.addLog(
-      direction
-        ? `[LADDER] Anchor Trailing ON — Trail ${direction === 'UP' ? 'Up' : 'Down'}; ` +
-          `the anchor will follow price ${direction === 'UP' ? 'up' : 'down'}.`
-        : '[LADDER] Anchor Trailing OFF.',
-    );
+    // Log the LEVEL, not just the direction — "Trail Up" alone leaves the reader
+    // to recompute anchor*(1 ± 0.9*stepPct) by hand to know what was armed.
+    // `_trailLevel()` reads the live anchor, and `this.trailDirection` is already
+    // assigned above, so it resolves here. It returns null while ARMED (no ladder,
+    // hence no anchor yet) — say so rather than printing a bogus number, and flag
+    // the TREND pause so the line never reads as an imminent action it isn't.
+    if (direction) {
+      const level = this._trailLevel();
+      const side = direction === 'UP' ? 'Up' : 'Down';
+      const where = level != null
+        ? `@ ${this._formatPrice(level)}`
+        : '(level pending — no ladder yet)';
+      const when = this.ladderMode === 'TREND'
+        ? ' — PAUSED while in TREND; resumes on the next return to RANGE.'
+        : `; the anchor will follow price ${direction === 'UP' ? 'up' : 'down'}.`;
+      await this.addLog(`[LADDER] Anchor Trailing ON — Trail ${side} ${where}${when}`);
+    } else {
+      await this.addLog('[LADDER] Anchor Trailing OFF.');
+    }
     return { trailDirection: this.trailDirection };
   }
 
