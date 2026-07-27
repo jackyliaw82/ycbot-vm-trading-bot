@@ -11,6 +11,7 @@ import {
   LADDER_LEVELS_PER_SIDE,
   minInitialSizeUSDT,
   resolveLadderGeometry,
+  trailLevel,
 } from './ladder-levels.js';
 import { planLadderActions, averageOpenEntry } from './ladder-crossings.js';
 import { precisionFormatter } from './precisionUtils.js';
@@ -792,6 +793,16 @@ class AnchorLadderStrategy extends TradingBase {
   _isGaugeFull() {
     return this.initialCapital > 0
       && this.cycleAccumulatedLoss >= this.harvestLossThreshold * this.initialCapital;
+  }
+
+  /**
+   * The live Anchor Trailing level, or null when trailing is off / the anchor
+   * is unusable. DERIVED every call — never cached, so it tracks re-anchors.
+   */
+  _trailLevel() {
+    if (!this.trailDirection || !Number.isFinite(this.anchor) || this.anchor <= 0) return null;
+    if (!Number.isFinite(this.stepPct) || this.stepPct <= 0) return null;
+    return trailLevel(this.anchor, this.stepPct, this.trailDirection);
   }
 
   /**
@@ -2013,6 +2024,41 @@ class AnchorLadderStrategy extends TradingBase {
         // (nothing if flat) and re-anchors on the live price. A flat run is
         // recorded as a RE-ANCHOR (reanchorCount), not a harvest.
         await this._harvestToFlat('price_trigger');
+        this.lastProcessedPrice = price;
+        return;
+      }
+    }
+
+    // ---- Anchor Trailing — auto re-anchor at ~S1 (DOWN) / ~L1 (UP). ----
+    // Placed with the other triggers, BEFORE _reconcileTrendInvariant and the
+    // RANGE/TREND dispatch, so the re-anchor PREEMPTS the level's leg fill on
+    // this tick. That ordering — not timing luck — is the whole guarantee that
+    // the trailed-past leg never opens; do not move this below planLadderActions.
+    //
+    // RANGE-only BY THE GUARD: this is what makes trailing dormant in TREND,
+    // preserving TREND's exactly-two passive exits (Final TP / anchor). It is
+    // dormant, NOT disarmed — an anchor flatten back to RANGE resumes it with
+    // no re-arm step, because the level derives from the live anchor.
+    //
+    // Threshold (>=/<=), not prev/current bracketing, so a gap-through and a
+    // resume-past-level both fire.
+    //
+    // `level` is deliberately UNROUNDED (ladder-levels.js), so it carries the
+    // ordinary binary floating-point rounding of the `anchor * (1 ± frac)`
+    // multiplication — e.g. anchor 100 yields a DOWN level a few 1e-14 BELOW
+    // the mathematical 99.73, not above it. A bare `<=`/`>=` would then miss a
+    // price landing exactly on the intended level. A relative epsilon many
+    // orders of magnitude below the 10%-of-a-step buffer (itself already
+    // orders of magnitude above one tick) absorbs that rounding without
+    // weakening the buffer's guarantee.
+    if (this.trailDirection && this.ladderMode === 'RANGE' && !this.startArmed
+        && this.ladderLines.length && Number.isFinite(this.anchor)) {
+      const level = this._trailLevel();
+      const eps = level != null ? Math.abs(level) * 1e-9 : 0;
+      const reached = level != null
+        && (this.trailDirection === 'UP' ? price >= level - eps : price <= level + eps);
+      if (reached) {
+        await this._harvestToFlat('trail');
         this.lastProcessedPrice = price;
         return;
       }

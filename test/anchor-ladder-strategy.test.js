@@ -2909,3 +2909,131 @@ test('stop() clears trailing — a terminated cycle must not stay armed', async 
   await AnchorLadderStrategy.prototype.stop.call(s, { flatten: false, reason: 'manual' });
   assert.equal(s.trailDirection, null);
 });
+
+// ——— Anchor Trailing: tick firing ———
+
+test('_trailLevel derives from the LIVE anchor and returns null when off', () => {
+  const s = ladderStrategy({ anchor: 100 });
+  assert.equal(s._trailLevel(), null, 'off → no level');
+  s.trailDirection = 'DOWN';
+  assert.ok(Math.abs(s._trailLevel() - 99.73) < 1e-9);
+  s.anchor = 200;
+  assert.ok(Math.abs(s._trailLevel() - 199.46) < 1e-9, 'must track the new anchor with no re-arm');
+});
+
+test('Trail Down fires _harvestToFlat when price reaches the trail level', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  let fired = null;
+  s._harvestToFlat = async (reason) => { fired = reason; return true; };
+  await s.handleRealtimePrice(99.73);
+  assert.equal(fired, 'trail');
+  assert.equal(s.trailDirection, 'DOWN', 'trailing is NOT one-shot — it stays armed');
+});
+
+test('Trail Up fires when price reaches the upside trail level', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'UP';
+  let fired = null;
+  s._harvestToFlat = async (reason) => { fired = reason; return true; };
+  await s.handleRealtimePrice(100.27);
+  assert.equal(fired, 'trail');
+});
+
+test('trailing does NOT fire before the level is reached', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  let fired = false;
+  s._harvestToFlat = async () => { fired = true; return true; };
+  await s.handleRealtimePrice(99.8);          // inside the level
+  assert.equal(fired, false);
+});
+
+test('trailing fires when price GAPS through the level', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  let fired = null;
+  s._harvestToFlat = async (r) => { fired = r; return true; };
+  await s.handleRealtimePrice(95);            // jumped well past 99.73
+  assert.equal(fired, 'trail', 'threshold test, not band-crossing');
+});
+
+test('trailing is DORMANT in TREND — it never fires and never disarms', async () => {
+  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  s.trendDirection = 'SHORT';
+  s.finalTpPrice = 95;
+  s.trailDirection = 'DOWN';
+  let fired = false;
+  s._harvestToFlat = async () => { fired = true; return true; };
+  s._flattenAtAnchor = async () => {};
+  s._checkFinalTpHit = () => false;
+  s._reconcileTrendInvariant = async () => {};
+  await s.handleRealtimePrice(99.7);
+  assert.equal(fired, false, 'TREND keeps exactly its two passive exits — no third');
+  assert.equal(s.trailDirection, 'DOWN', 'dormant, NOT disarmed — it must resume in RANGE');
+});
+
+test('trailing does not fire while the strategy is ARMED (no ladder yet)', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.ladderLines = [];                          // startArmed
+  s.startTriggerPrice = 95;
+  s.trailDirection = 'DOWN';
+  let fired = false;
+  s._harvestToFlat = async () => { fired = true; return true; };
+  s.initializeLadder = async () => {};
+  await s.handleRealtimePrice(99.5);
+  assert.equal(fired, false);
+});
+
+// THE CORE INVARIANT — the entire point of the feature and of the §3 buffer.
+test('with trailing ON, the S1 leg NEVER opens — the anchor moves instead', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  const filled = [];
+  s._fillLeg = async (leg) => { filled.push(leg); };
+  // Simulate a REAL re-anchor: move the anchor to the live price and rebuild.
+  s._harvestToFlat = async () => {
+    s.anchor = s.currentPrice;
+    s.ladderLines = buildLadder(s.anchor, s.stepPct, s.levelsPerSide);
+    return true;
+  };
+  // Walk price down through several would-be S1 levels.
+  for (const px of [99.9, 99.73, 99.5, 99.2, 98.9]) {
+    s.currentPrice = px;
+    await s.handleRealtimePrice(px);
+  }
+  assert.equal(filled.length, 0, `no leg may fill while trailing; filled: ${filled.length}`);
+  assert.equal(
+    s.ladderLines.some((l) => l.state === 'POSITION_OPEN'), false,
+    'the S1 leg must never reach POSITION_OPEN',
+  );
+  assert.ok(s.anchor < 100, `the anchor must have trailed down, got ${s.anchor}`);
+});
+
+// Spec §4.3 / §8.2: after a restart, price may ALREADY be past the level.
+// Because direction comes from trailDirection (never from a current-vs-price
+// comparison, which is what inverts harvestNow's one-shot direction), this
+// correctly fires rather than arming backwards.
+test('a resumed trail whose level is already passed fires on the next tick', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  s.lastProcessedPrice = null;              // fresh post-resume state
+  let fired = null;
+  s._harvestToFlat = async (r) => { fired = r; return true; };
+  await s.handleRealtimePrice(97);          // already well below the 99.73 level
+  assert.equal(fired, 'trail');
+});
+
+test('a trail re-anchor moves the level so the NEXT level tracks the new anchor', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  s._harvestToFlat = async () => {
+    s.anchor = s.currentPrice;
+    s.ladderLines = buildLadder(s.anchor, s.stepPct, s.levelsPerSide);
+    return true;
+  };
+  s.currentPrice = 99.73;
+  await s.handleRealtimePrice(99.73);
+  assert.ok(Math.abs(s.anchor - 99.73) < 1e-9);
+  assert.ok(Math.abs(s._trailLevel() - 99.73 * (1 - 0.9 * 0.003)) < 1e-9);
+});
