@@ -3494,3 +3494,87 @@ test('an anchor flatten disarms the price but keeps the profit target', async ()
   assert.equal(s.desiredProfitUSDT, 29.2, 'the cycle-level goal survives');
   assert.equal(s.minDesiredProfitUSDT, 5, 'and the config floor is untouched');
 });
+
+// ——— Armed trigger: 'stop' action ends the cycle instead of re-anchoring ———
+
+function triggerActionStrategy({ action = 'reanchor' } = {}) {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy({ anchor: 100 });
+  s.activePosition = { quantity: 10, entryPrice: 98, avgEntry: 98, notional: 980, unrealizedPnl: 20 };
+  s.harvestTriggerPrice = 99;
+  s.harvestTriggerAbove = false;          // set BELOW price -> fires on a fall
+  s.harvestTriggerAction = action;
+  return s;
+}
+
+test("a 'stop' trigger ends the cycle rather than re-anchoring", async () => {
+  const s = triggerActionStrategy({ action: 'stop' });
+  let stopped = null, reanchored = false;
+  s.stop = async (o) => { stopped = o; };
+  s._harvestToFlat = async () => { reanchored = true; return true; };
+  await s.handleRealtimePrice(99);
+  assert.equal(reanchored, false, 'must NOT rebuild the ladder');
+  assert.deepEqual(stopped, { flatten: true, reason: 'protect' });
+});
+
+test("the default 'reanchor' trigger still re-anchors and keeps trading", async () => {
+  const s = triggerActionStrategy({ action: 'reanchor' });
+  let stopped = false, fired = null;
+  s.stop = async () => { stopped = true; };
+  s._harvestToFlat = async (r) => { fired = r; return true; };
+  await s.handleRealtimePrice(99);
+  assert.equal(fired, 'price_trigger');
+  assert.equal(stopped, false, 'the cycle must continue');
+});
+
+// One-shot discipline: the action is read BEFORE the clears, and reset after, so
+// a stale 'stop' can never attach itself to a later plain re-anchor trigger.
+test('firing clears the action back to reanchor', async () => {
+  const s = triggerActionStrategy({ action: 'stop' });
+  s.stop = async () => {};
+  await s.handleRealtimePrice(99);
+  assert.equal(s.harvestTriggerPrice, null);
+  assert.equal(s.harvestTriggerAction, 'reanchor');
+});
+
+test('harvestNow arms the stop action and rejects an unknown one', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.currentPrice = 100;
+  const r = await s.harvestNow(98, { action: 'stop' });
+  assert.equal(r.action, 'stop');
+  assert.equal(s.harvestTriggerAction, 'stop');
+
+  await assert.rejects(() => s.harvestNow(97, { action: 'liquidate' }), (err) => {
+    assert.equal(err.invalidInput, true, 'an unknown action is client input, not a state conflict');
+    return /reanchor.*stop/i.test(err.message);
+  });
+});
+
+test('an armed stop survives a save/resume round trip', async () => {
+  const src = ladderStrategy({ anchor: 100 });
+  src.harvestTriggerPrice = 98; src.harvestTriggerAbove = false; src.harvestTriggerAction = 'stop';
+  let doc = null;
+  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
+  await AnchorLadderStrategy.prototype.saveState.call(src);
+  assert.equal(doc.harvestTriggerAction, 'stop');
+
+  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
+  cleanupResumeTimers(dst);
+  assert.equal(dst.harvestTriggerAction, 'stop', 'a redeploy must not downgrade a stop to a re-anchor');
+});
+
+// A snapshot written before this field existed was armed under the old
+// behaviour; resuming it as a cycle-ending stop would be a nasty surprise.
+test('a legacy snapshot without the field resumes as reanchor', async () => {
+  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  await dst.resume({
+    strategyId: 'anchor_ladder_legacy_test',   // resume() needs it for Firestore init
+    isRunning: true, symbol: 'BTCUSDT',
+    harvestTriggerPrice: 98, harvestTriggerAbove: false,   // note: no harvestTriggerAction
+  });
+  cleanupResumeTimers(dst);
+  assert.equal(dst.harvestTriggerAction, 'reanchor');
+});

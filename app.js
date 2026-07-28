@@ -1724,13 +1724,17 @@ app.get('/anchor-ladder/status', requireVmOwner, (req, res) => {
 // duplicate that logic.
 app.post('/anchor-ladder/harvest-now', requireVmOwner, async (req, res) => {
   try {
-    const { strategyId, triggerPrice } = req.body;
+    // `action` selects what an armed trigger DOES on arrival: 'reanchor'
+    // (default, today's behaviour) or 'stop' — close and end the cycle, for
+    // banking a profit without rebuilding the ladder. Ignored for an immediate
+    // harvest (no triggerPrice), which has nothing to schedule.
+    const { strategyId, triggerPrice, action } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
     const strategy = activeStrategies.get(strategyId);
     if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
       return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
     }
-    const result = await strategy.harvestNow(triggerPrice ?? null);
+    const result = await strategy.harvestNow(triggerPrice ?? null, { action: action ?? 'reanchor' });
     res.json({ success: true, ...result });
   } catch (error) {
     res.status(error.invalidInput ? 400 : 409).json({ error: error.message });

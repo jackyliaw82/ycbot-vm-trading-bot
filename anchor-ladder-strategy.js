@@ -219,6 +219,14 @@ class AnchorLadderStrategy extends TradingBase {
     // Direction (`Above`) is fixed at arm time so it can't drift as price moves.
     this.harvestTriggerPrice = null;      // number | null
     this.harvestTriggerAbove = null;      // boolean | null: true = fire when price >= level
+    // WHAT the armed trigger does on arrival. The trigger already owns the
+    // "when" — validation, the 0.1% gap, tick rounding, persistence, resume,
+    // cancel, and the pre-dispatch tick slot — so the stop variant is one extra
+    // bit rather than a parallel mechanism that could drift out of step with it.
+    // 'reanchor' (default) = close + re-anchor + keep trading, today's behaviour.
+    // 'stop'               = close + END the cycle, for banking a profit and
+    //                        walking away rather than rebuilding the ladder.
+    this.harvestTriggerAction = 'reanchor';   // 'reanchor' | 'stop'
 
     // Anchor Trailing — the anchor follows price in ONE user-chosen direction,
     // auto re-anchoring at ~S1 (DOWN) / ~L1 (UP) instead of opening that leg.
@@ -1442,6 +1450,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.finalTpPrice = snapshot.finalTpPrice || null;
     this.harvestTriggerPrice = snapshot.harvestTriggerPrice ?? null;
     this.harvestTriggerAbove = snapshot.harvestTriggerAbove ?? null;
+    this.harvestTriggerAction = snapshot.harvestTriggerAction === 'stop' ? 'stop' : 'reanchor';
     this.startTriggerPrice = snapshot.startTriggerPrice ?? null;
     this.startTriggerAbove = snapshot.startTriggerAbove ?? null;
     this.trailDirection = snapshot.trailDirection ?? null;
@@ -1766,6 +1775,7 @@ class AnchorLadderStrategy extends TradingBase {
     // stays empty for a cycle that stopped before its first tick).
     this.harvestTriggerPrice = null;
     this.harvestTriggerAbove = null;
+    this.harvestTriggerAction = 'reanchor';
     this.startTriggerPrice = null;
     this.startTriggerAbove = null;
     // Trailing dies with the cycle too — same rule as the start/harvest triggers:
@@ -2063,8 +2073,19 @@ class AnchorLadderStrategy extends TradingBase {
         ? price >= this.harvestTriggerPrice
         : price <= this.harvestTriggerPrice;
       if (reached) {
+        const action = this.harvestTriggerAction;
         this.harvestTriggerPrice = null;
         this.harvestTriggerAbove = null;
+        this.harvestTriggerAction = 'reanchor';
+        if (action === 'stop') {
+          // Close and END the cycle. Read BEFORE the clears above so a throw
+          // mid-stop cannot leave a re-firing trigger, same one-shot discipline
+          // the re-anchor path uses.
+          this._tradingSeqInProgress = true;
+          try { await this.stop({ flatten: true, reason: 'protect' }); }
+          finally { this._tradingSeqInProgress = false; }
+          return;
+        }
         // Re-anchor whether flat or holding — `_harvestToFlat` closes any position
         // (nothing if flat) and re-anchors on the live price. A flat run is
         // recorded as a RE-ANCHOR (reanchorCount), not a harvest.
@@ -2434,7 +2455,7 @@ class AnchorLadderStrategy extends TradingBase {
    * (non-positive price, no live price yet, price too close to the current
    * price) set `error.invalidInput = true` → the route maps those to 400.
    */
-  async harvestNow(triggerPrice = null) {
+  async harvestNow(triggerPrice = null, { action = 'reanchor' } = {}) {
     // isRunning FIRST: a stopped strategy must report "not running", not
     // "waiting for its start trigger" — stop() clears the trigger, so a
     // stopped-but-still-armed state shouldn't be reachable, but the ORDER
@@ -2464,6 +2485,7 @@ class AnchorLadderStrategy extends TradingBase {
     if (triggerPrice == null) {
       this.harvestTriggerPrice = null;
       this.harvestTriggerAbove = null;
+      this.harvestTriggerAction = 'reanchor';
       this._manualHarvestRequested = true; // honored on the next free tick
       return { harvesting: true, queued: true, mode: this.ladderMode, price: this.currentPrice };
     }
@@ -2486,15 +2508,26 @@ class AnchorLadderStrategy extends TradingBase {
     if (Math.abs(rounded - ref) < ref * TRIGGER_MIN_GAP_PCT) {
       throw invalidInput(`Trigger price must be at least 0.1% from the current price (${this._formatPrice(ref)}).`);
     }
+    // STRICT: only the two known actions. An unrecognised value must not
+    // silently become a cycle-ending stop, nor silently become a re-anchor when
+    // the caller meant to stop — reject it and make the caller say what it wants.
+    if (action !== 'reanchor' && action !== 'stop') {
+      throw invalidInput("Trigger action must be 'reanchor' or 'stop'.");
+    }
     this.harvestTriggerPrice = rounded;
     this.harvestTriggerAbove = rounded > ref;
+    this.harvestTriggerAction = action;
     this._manualHarvestRequested = false; // arming is NOT an immediate harvest
     this.trailDirection = null;           // exclusive with Anchor Trailing (see setTrailDirection)
     this._trailRetryLastTs = null;
     await this.saveState();
     this._pushHeartbeatNow?.();
-    await this.addLog(`[LADDER] harvest trigger armed @ ${this._formatPrice(rounded)} (fires when price ${this.harvestTriggerAbove ? '>=' : '<='} ${this._formatPrice(rounded)}).`);
-    return { armed: true, triggerPrice: rounded, above: this.harvestTriggerAbove, mode: this.ladderMode };
+    await this.addLog(
+      `[LADDER] ${action === 'stop' ? 'PROTECT' : 'harvest'} trigger armed @ ${this._formatPrice(rounded)} ` +
+      `(fires when price ${this.harvestTriggerAbove ? '>=' : '<='} ${this._formatPrice(rounded)}` +
+      `${action === 'stop' ? ' — closes and ENDS the cycle' : ' — closes and re-anchors'}).`,
+    );
+    return { armed: true, triggerPrice: rounded, above: this.harvestTriggerAbove, action, mode: this.ladderMode };
   }
 
   /**
@@ -2505,6 +2538,7 @@ class AnchorLadderStrategy extends TradingBase {
     const had = this.harvestTriggerPrice != null;
     this.harvestTriggerPrice = null;
     this.harvestTriggerAbove = null;
+    this.harvestTriggerAction = 'reanchor';
     if (had) {
       await this.saveState();
       this._pushHeartbeatNow?.();
@@ -2552,6 +2586,7 @@ class AnchorLadderStrategy extends TradingBase {
       // the frontend (mirrors harvestNow() superseding a pending trigger).
       this.harvestTriggerPrice = null;
       this.harvestTriggerAbove = null;
+      this.harvestTriggerAction = 'reanchor';
     }
 
     await this.saveState();
@@ -3287,6 +3322,7 @@ class AnchorLadderStrategy extends TradingBase {
       _lastLadderSize: this._lastLadderSize,
       harvestTriggerPrice: this.harvestTriggerPrice ?? null,
       harvestTriggerAbove: this.harvestTriggerAbove ?? null,
+      harvestTriggerAction: this.harvestTriggerAction ?? 'reanchor',
       startTriggerPrice: this.startTriggerPrice ?? null,
       startTriggerAbove: this.startTriggerAbove ?? null,
       trailDirection: this.trailDirection ?? null,
@@ -3365,6 +3401,7 @@ class AnchorLadderStrategy extends TradingBase {
       ladderBaseSize: this._ladderBaseSize,
       harvestTriggerPrice: this.harvestTriggerPrice ?? null,
       harvestTriggerAbove: this.harvestTriggerAbove ?? null,
+      harvestTriggerAction: this.harvestTriggerAction ?? 'reanchor',
       startTriggerPrice: this.startTriggerPrice ?? null,
       startTriggerAbove: this.startTriggerAbove ?? null,
       trailDirection: this.trailDirection ?? null,
@@ -3474,6 +3511,7 @@ class AnchorLadderStrategy extends TradingBase {
         // so a VM restart / resume doesn't silently disarm it.
         harvestTriggerPrice: this.harvestTriggerPrice ?? null,
         harvestTriggerAbove: this.harvestTriggerAbove ?? null,
+        harvestTriggerAction: this.harvestTriggerAction ?? 'reanchor',
         // Armed Start Mode trigger (one-shot price level deferring the FIRST
         // ladder build). Persist so a VM restart / resume doesn't silently
         // disarm it and fall back to Immediate on the next tick.
