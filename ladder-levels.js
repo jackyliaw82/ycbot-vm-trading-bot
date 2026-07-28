@@ -81,6 +81,29 @@ export const TRAIL_BUFFER_FRAC = 0.1;
  * @param {'UP'|'DOWN'} direction
  * @returns {number}
  */
+/**
+ * Which ladder side stops filling while Anchor Trailing is armed.
+ *
+ * THE INVERSION AGAIN: LONG levels sit ABOVE the anchor and SHORT BELOW (see
+ * `buildLadder`). So trailing UP walks into the LONG side and trailing DOWN into
+ * the SHORT side — those are the legs the trail level is racing, and the ones
+ * that must not fill. Getting this backwards would suppress the side that is not
+ * in play while leaving the racing side live: the exact bug this exists to
+ * prevent, and invisible until it costs money.
+ *
+ * Single definition, exported and surfaced through `getStatus` so the frontend
+ * never re-derives it — a UI that inverted this would HIDE a side that is
+ * actually still trading.
+ *
+ * @param {'UP'|'DOWN'|null|undefined} trailDirection
+ * @returns {'LONG'|'SHORT'|null}
+ */
+export function suppressedSideFor(trailDirection) {
+  if (trailDirection === 'UP') return 'LONG';
+  if (trailDirection === 'DOWN') return 'SHORT';
+  return null;
+}
+
 export function trailLevel(anchor, stepPct, direction) {
   if (!Number.isFinite(anchor) || anchor <= 0) {
     throw new Error(`trailLevel: anchor must be a positive finite number (got ${anchor})`);

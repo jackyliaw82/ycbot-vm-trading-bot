@@ -97,3 +97,49 @@ test('averageOpenEntry falls back to the level price when fillPrice is missing',
   Object.assign(l1, { state: 'POSITION_OPEN', quantity: 10, fillPrice: null });
   assert.ok(Math.abs(averageOpenEntry(legs, 'LONG') - 100.3) < 1e-9);
 });
+
+// ——— Anchor Trailing: the suppressed side stops filling ———
+
+test('planLadderActions skips EMPTY legs on the suppressed side', () => {
+  const legs = [
+    { levelIndex: 1, direction: 'LONG',  price: 100.3, state: 'EMPTY' },
+    { levelIndex: 2, direction: 'LONG',  price: 100.6, state: 'EMPTY' },
+    { levelIndex: 1, direction: 'SHORT', price: 99.7,  state: 'EMPTY' },
+  ];
+  // Trail Up suppresses LONG: price running up through both LONG levels fills none.
+  const up = planLadderActions({ prevPrice: 100, currentPrice: 100.7, anchor: 100, legs, suppressDirection: 'LONG' });
+  assert.equal(up.fills.length, 0, 'no LONG leg may fill while trailing up');
+
+  // The other side is untouched — trailing only removes the side it walks into.
+  // Band stays BELOW the anchor: crossing it would trip Rule 1 (flatten wins,
+  // fills nothing) and the assertion would prove nothing about suppression.
+  const down = planLadderActions({ prevPrice: 99.9, currentPrice: 99.6, anchor: 100, legs, suppressDirection: 'LONG' });
+  assert.equal(down.fills.length, 1);
+  assert.equal(down.fills[0].direction, 'SHORT');
+});
+
+test('planLadderActions suppresses SHORT when trailing down', () => {
+  const legs = [
+    { levelIndex: 1, direction: 'SHORT', price: 99.7, state: 'EMPTY' },
+    { levelIndex: 1, direction: 'LONG',  price: 100.3, state: 'EMPTY' },
+  ];
+  const r = planLadderActions({ prevPrice: 100, currentPrice: 99.5, anchor: 100, legs, suppressDirection: 'SHORT' });
+  assert.equal(r.fills.length, 0);
+});
+
+// Suppression must never hide an ANCHOR CROSS: the flatten is what closes real
+// inventory, and losing it would strand a position.
+test('the anchor flatten still fires while a side is suppressed', () => {
+  const legs = [{ levelIndex: 1, direction: 'LONG', price: 100.3, state: 'EMPTY' }];
+  const r = planLadderActions({ prevPrice: 100.5, currentPrice: 99.5, anchor: 100, legs, suppressDirection: 'LONG' });
+  assert.equal(r.flatten, true);
+});
+
+// Default must be "suppress nothing" — an omitted param cannot silently disable a side.
+test('planLadderActions suppresses nothing by default', () => {
+  const legs = [
+    { levelIndex: 1, direction: 'LONG',  price: 100.3, state: 'EMPTY' },
+    { levelIndex: 1, direction: 'SHORT', price: 99.7,  state: 'EMPTY' },
+  ];
+  assert.equal(planLadderActions({ prevPrice: 100, currentPrice: 100.4, anchor: 100, legs }).fills.length, 1);
+});

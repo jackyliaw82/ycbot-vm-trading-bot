@@ -923,6 +923,61 @@ test('_harvestToFlat returns true after a completed re-anchor', async () => {
   assert.equal(await s._harvestToFlat('trail'), true);
 });
 
+// ——— Anchor Trailing: the fire log names the level that triggered ———
+
+test('a trail fire logs the direction and the level that was hit', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy({ anchor: 100 });          // Trail Down level = 99.73
+  s.trailDirection = 'DOWN';
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  s._closeConsolidated = async () => true;
+  s._computeAccLoss = () => 0;
+  s._computeLadderBaseSize = async () => 1000;
+  s.initializeLadder = async () => {};
+
+  await s._harvestToFlat('trail');
+  const header = logs.find((m) => /flatten \+ re-anchor/.test(m));
+  assert.match(header, /trail Down @ 99\.73/, `got: ${header}`);
+});
+
+// The level MUST be read before initializeLadder moves the anchor — otherwise the
+// log would name the NEXT ladder's level instead of the one that actually fired.
+test('the trail fire log names the OLD level, not the post-re-anchor one', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  s._closeConsolidated = async () => true;
+  s._computeAccLoss = () => 0;
+  s._computeLadderBaseSize = async () => 1000;
+  // Simulate the real re-anchor: the anchor moves to the live price.
+  s.currentPrice = 99.73;
+  s.initializeLadder = async (px) => { s.anchor = px; };
+
+  await s._harvestToFlat('trail');
+  const header = logs.find((m) => /flatten \+ re-anchor/.test(m));
+  assert.match(header, /99\.73/, 'must be the level that fired (old anchor 100)');
+  assert.doesNotMatch(header, /99\.46/, 'must NOT be the NEXT ladder level (new anchor 99.73)');
+});
+
+test('a non-trail reason keeps its bare label', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'DOWN';                          // armed, but not the trigger
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  s._closeConsolidated = async () => true;
+  s._computeAccLoss = () => 0;
+  s._computeLadderBaseSize = async () => 1000;
+  s.initializeLadder = async () => {};
+
+  await s._harvestToFlat('manual_harvest');
+  const header = logs.find((m) => /flatten \+ re-anchor/.test(m));
+  assert.match(header, /\(manual_harvest\)/, `got: ${header}`);
+  assert.doesNotMatch(header, /trail/, 'only a trail fire names a trail level');
+});
+
 test('_harvestToFlat returns true for a flat re-anchor (nothing to close)', async () => {
   const s = ladderStrategy();                       // no legs open, activePosition null
   s._closeConsolidated = async () => false;         // nothing closed because nothing was open
@@ -3209,4 +3264,233 @@ test('after a throwing _harvestToFlat, the very next tick is throttled, not re-f
   assert.equal(attempts, 1);
   await s.handleRealtimePrice(99.6);   // would re-fire immediately (the same per-tick storm Task 6 prevents) if the throw failed to arm the throttle
   assert.equal(attempts, 1, 'the throttle armed by the throw must suppress the very next tick');
+});
+
+// ——— Anchor Trailing: the trailed side is removed from play ———
+
+// The reason this exists: a trail level seated 0.9 of a step inside L1 was STILL
+// losing the race to L1 under real volatility. Removing the leg is structural —
+// there is nothing left to race, even on a gap that would skip past L1 to L3.
+test('with Trail Up armed, no LONG leg fills even on a gap past several levels', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'UP';
+  const filled = [];
+  s._fillLeg = async (leg) => { filled.push(leg); };
+  s._harvestToFlat = async () => { s.anchor = s.currentPrice; s.ladderLines = buildLadder(s.anchor, s.stepPct, s.levelsPerSide); return true; };
+  s.lastProcessedPrice = 100;
+  s.currentPrice = 101.2;
+  await s.handleRealtimePrice(101.2);            // gaps past L1..L4 in one tick
+  assert.equal(filled.length, 0, `no LONG leg may fill; filled ${filled.length}`);
+});
+
+test('the SHORT side still fills normally while Trail Up is armed', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.trailDirection = 'UP';                        // suppresses LONG only
+  const filled = [];
+  s._fillLeg = async (leg) => { filled.push(leg); leg.state = 'POSITION_OPEN'; };
+  s.lastProcessedPrice = 99.9;                    // stay below the anchor: no cross
+  await s.handleRealtimePrice(99.6);
+  assert.ok(filled.length > 0, 'the untrailed side must keep trading');
+  assert.ok(filled.every((l) => l.direction === 'SHORT'));
+});
+
+// Suppression must NEVER drop a leg that holds inventory — that would orphan the
+// position and hand _closeConsolidated a mixed-side ledger it assumes is impossible.
+test('arming trailing never removes a leg that already holds inventory', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  const l1 = s.ladderLines.find((l) => l.direction === 'LONG' && l.levelIndex === 1);
+  l1.state = 'POSITION_OPEN'; l1.quantity = 0.5;
+  s.trailDirection = 'UP';                        // suppress LONG *after* it filled
+  s._harvestToFlat = async () => true;
+  s.lastProcessedPrice = 100;
+  await s.handleRealtimePrice(100.1);
+  const still = s.ladderLines.find((l) => l.direction === 'LONG' && l.levelIndex === 1);
+  assert.equal(still.state, 'POSITION_OPEN', 'open inventory must survive suppression');
+  assert.equal(still.quantity, 0.5);
+});
+
+test('getStatus surfaces trailSuppressedSide so the UI never re-derives the inversion', () => {
+  const s = ladderStrategy();
+  assert.equal(s.getStatus().trailSuppressedSide, null);
+  s.trailDirection = 'UP';
+  assert.equal(s.getStatus().trailSuppressedSide, 'LONG', 'LONG levels sit ABOVE the anchor');
+  s.trailDirection = 'DOWN';
+  assert.equal(s.getStatus().trailSuppressedSide, 'SHORT');
+  assert.equal(s.getHeartbeatPayload().trailSuppressedSide, 'SHORT');
+});
+
+// ——— Final TP manual level ———
+
+function tpStrategy({ side = 'LONG', entry = 100, qty = 10, accLoss = 0, minProfit = 5 } = {}) {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  s.trendDirection = side;
+  s.activePosition = { quantity: qty, entryPrice: entry, avgEntry: entry, notional: entry * qty, unrealizedPnl: 0 };
+  s.cycleAccumulatedLoss = accLoss;
+  s.desiredProfitUSDT = minProfit;
+  s.minDesiredProfitUSDT = minProfit;
+  s._recomputeFinalTpPrice();
+  return s;
+}
+
+test('projectProfitAtPrice inverts the Final TP formula exactly', () => {
+  const s = tpStrategy();                       // entry 100, qty 10, accLoss 0, floor 5
+  // At the armed Final TP the projection must equal the desired profit itself —
+  // if these disagree the editor previews one number and arms another.
+  const p = s.projectProfitAtPrice(s.finalTpPrice);
+  assert.ok(Math.abs(p.projectedProfitUSDT - s.desiredProfitUSDT) < 1e-6,
+    `projected ${p.projectedProfitUSDT} != desired ${s.desiredProfitUSDT}`);
+});
+
+test('a higher Final TP projects more profit and is accepted (LONG)', async () => {
+  const s = tpStrategy();
+  const base = s.finalTpPrice;
+  const r = await s.adjustFinalTp({ price: base + 1 });        // +1 * qty 10 = +10 USDT
+  assert.ok(r.desiredProfitUSDT > 5, `expected > floor, got ${r.desiredProfitUSDT}`);
+  assert.ok(Math.abs(s.finalTpPrice - (base + 1)) < 1e-6, 'the armed TP must land on the level asked for');
+});
+
+// THE INVERSION: a SHORT's Final TP sits BELOW entry, so more profit = LOWER price.
+// A price-based "must be higher" check would reject the good level and accept a bad one.
+test('for a SHORT, a LOWER Final TP is the more profitable one and is accepted', async () => {
+  const s = tpStrategy({ side: 'SHORT' });
+  const base = s.finalTpPrice;
+  assert.ok(base < 100, 'precondition: a SHORT TP sits below entry');
+  const r = await s.adjustFinalTp({ price: base - 1 });
+  assert.ok(r.desiredProfitUSDT > 5);
+  assert.ok(Math.abs(s.finalTpPrice - (base - 1)) < 1e-6);
+});
+
+test('a level projecting LESS than the config floor is rejected as bad input', async () => {
+  const s = tpStrategy();
+  const base = s.finalTpPrice;
+  await assert.rejects(() => s.adjustFinalTp({ price: base - 0.5 }), (err) => {
+    assert.equal(err.invalidInput, true, 'floor breach is a 400, not a 409');
+    return /config/i.test(err.message);
+  });
+  assert.equal(s.desiredProfitUSDT, 5, 'a rejected edit must not move the target');
+});
+
+test('the SHORT floor is enforced in the inverted direction too', async () => {
+  const s = tpStrategy({ side: 'SHORT' });
+  const base = s.finalTpPrice;
+  await assert.rejects(() => s.adjustFinalTp({ price: base + 0.5 }), (err) => err.invalidInput === true);
+});
+
+test('reset returns to the config target, not to the last edited value', async () => {
+  const s = tpStrategy();
+  const base = s.finalTpPrice;
+  await s.adjustFinalTp({ price: base + 3 });
+  assert.ok(s.desiredProfitUSDT > 5);
+  const r = await s.adjustFinalTp({ reset: true });
+  assert.equal(r.desiredProfitUSDT, 5, 'floor is the CONFIG value, not the raised one');
+  assert.ok(Math.abs(s.finalTpPrice - base) < 1e-6, 'and the price returns to the original target');
+});
+
+test('adjustFinalTp refuses on unverified position state (never guesses a target)', async () => {
+  const s = tpStrategy();
+  s._lastPositionRefreshFailed = true;
+  await assert.rejects(() => s.adjustFinalTp({ price: s.finalTpPrice + 5 }), (err) => {
+    assert.equal(err.invalidInput, undefined, 'a state conflict is a 409, not a 400');
+    return /no verified open position/i.test(err.message);
+  });
+});
+
+test('adjustFinalTp rejects a non-positive level', async () => {
+  const s = tpStrategy();
+  await assert.rejects(() => s.adjustFinalTp({ price: 0 }), (err) => err.invalidInput === true);
+});
+
+// ——— Final TP: the % path must work in RANGE / while flat ———
+
+// Regression: gating the editor on TREND removed the ability to set the profit
+// target during RANGE, where it still matters — it is what _recomputeFinalTpPrice
+// derives from the moment the outermost leg trips TREND.
+test('profitUSDT sets the target while FLAT in RANGE (no position to price off)', async () => {
+  const s = ladderStrategy({ anchor: 100 });      // RANGE, activePosition null
+  s.minDesiredProfitUSDT = 5;
+  s.desiredProfitUSDT = 5;
+  const r = await s.adjustFinalTp({ profitUSDT: 12 });
+  assert.equal(r.desiredProfitUSDT, 12);
+  assert.equal(s.finalTpPrice, null, 'no position yet, so no armed level — by design');
+});
+
+test('the profitUSDT path enforces the same config floor as the price path', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.minDesiredProfitUSDT = 5;
+  s.desiredProfitUSDT = 5;
+  await assert.rejects(() => s.adjustFinalTp({ profitUSDT: 4 }), (err) => {
+    assert.equal(err.invalidInput, true);
+    return /config/i.test(err.message);
+  });
+  assert.equal(s.desiredProfitUSDT, 5, 'a rejected target must not move');
+});
+
+test('a profitUSDT set in RANGE arms the expected Final TP once TREND begins', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy({ anchor: 100 });
+  s.minDesiredProfitUSDT = 5; s.desiredProfitUSDT = 5;
+  await s.adjustFinalTp({ profitUSDT: 20 });
+  // Now the cycle scales out and enters TREND with a real position.
+  s.ladderMode = 'TREND';
+  s.trendDirection = 'LONG';
+  s.activePosition = { quantity: 10, entryPrice: 100, avgEntry: 100, notional: 1000, unrealizedPnl: 0 };
+  s.cycleAccumulatedLoss = 0;
+  s._recomputeFinalTpPrice();
+  const back = s.projectProfitAtPrice(s.finalTpPrice);
+  assert.ok(Math.abs(back.projectedProfitUSDT - 20) < 1e-6,
+    `the RANGE-set target must survive into TREND; got ${back.projectedProfitUSDT}`);
+});
+
+// ——— A manual profit target carries across an anchor flatten — loudly ———
+
+function trendEntryStrategy({ desired = 5, floor = 5 } = {}) {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy({ anchor: 100 });
+  s.desiredProfitUSDT = desired;
+  s.minDesiredProfitUSDT = floor;
+  s.activePosition = { quantity: 10, entryPrice: 97, avgEntry: 97, notional: 970, unrealizedPnl: 0 };
+  s.currentSide = 'SHORT';
+  s._refreshCurrentPosition = async () => {};
+  s._writeStrategyFlow = async () => {};
+  s._pushHeartbeatNow = () => {};
+  return s;
+}
+
+test('_enterTrend announces a manual target carried in from an earlier direction', async () => {
+  const s = trendEntryStrategy({ desired: 29.2, floor: 5 });
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  await s._enterTrend('SHORT');
+  const carry = logs.find((m) => /carrying the manual profit target/i.test(m));
+  assert.ok(carry, `expected a carry-over notice; got: ${JSON.stringify(logs)}`);
+  assert.match(carry, /29\.20/, 'names the carried target');
+  assert.match(carry, /5\.00/, 'and the config target it exceeds');
+});
+
+test('_enterTrend stays quiet when the target is still the config one', async () => {
+  const s = trendEntryStrategy({ desired: 5, floor: 5 });
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  await s._enterTrend('SHORT');
+  assert.equal(logs.some((m) => /carrying the manual profit target/i.test(m)), false,
+    'an untouched target is not worth a warning');
+});
+
+// The behaviour the notice explains: the target itself must NOT reset.
+test('an anchor flatten disarms the price but keeps the profit target', async () => {
+  const s = ladderStrategy({ anchor: 100 });
+  s.desiredProfitUSDT = 29.2;
+  s.minDesiredProfitUSDT = 5;
+  s.ladderMode = 'TREND';
+  s.trendDirection = 'LONG';
+  s.finalTpPrice = 103;
+  s.activePosition = { quantity: 10, entryPrice: 100, avgEntry: 100, notional: 1000, unrealizedPnl: 0 };
+  s._closeConsolidated = async () => true;
+  s._computeAccLoss = () => 20;
+  s._computeLadderBaseSize = async () => 1000;
+  await s._flattenAtAnchor();
+  assert.equal(s.finalTpPrice, null, 'the level dies with the position');
+  assert.equal(s.desiredProfitUSDT, 29.2, 'the cycle-level goal survives');
+  assert.equal(s.minDesiredProfitUSDT, 5, 'and the config floor is untouched');
 });

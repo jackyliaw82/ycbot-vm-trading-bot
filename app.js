@@ -1803,6 +1803,31 @@ app.post('/anchor-ladder/update-start-trigger', requireVmOwner, async (req, res)
 // fires here; the new Final TP target just takes effect on the next price
 // tick. Shipped user feature carried over from AI Reversal; adjustProfitTarget
 // survives unchanged on AnchorLadderStrategy.
+// Move the Final TP to a user-chosen LEVEL, or reset it to the config target.
+// Body: { strategyId, price } to set, or { strategyId, reset: true } to restore
+// the config view's desired profit. The bot back-solves the level into a profit
+// target and lets _recomputeFinalTpPrice re-derive the price, so this never
+// becomes a second writer of finalTpPrice. 400 on a bad/too-low level (the
+// config target is a hard floor), 409 when there is no verified position to
+// derive against; the not-found guard returns 400 like its siblings.
+app.post('/anchor-ladder/adjust-final-tp', requireVmOwner, async (req, res) => {
+  try {
+    const { strategyId, price, profitUSDT, reset } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+    if (price == null && profitUSDT == null && reset !== true) {
+      return res.status(400).json({ error: 'Provide a price, a profitUSDT, or reset: true.' });
+    }
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
+    }
+    const result = await strategy.adjustFinalTp({ price: price ?? null, profitUSDT: profitUSDT ?? null, reset: reset === true });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(error.invalidInput ? 400 : 409).json({ error: error.message });
+  }
+});
+
 app.post('/anchor-ladder/adjust-profit-target', requireVmOwner, async (req, res) => {
   try {
     const { strategyId, desiredProfitPercent } = req.body;

@@ -12,6 +12,7 @@ import {
   minInitialSizeUSDT,
   resolveLadderGeometry,
   trailLevel,
+  suppressedSideFor,
 } from './ladder-levels.js';
 import { planLadderActions, averageOpenEntry } from './ladder-crossings.js';
 import { precisionFormatter } from './precisionUtils.js';
@@ -170,6 +171,12 @@ class AnchorLadderStrategy extends TradingBase {
     this.recoveryDistance = DEFAULT_RECOVERY_DISTANCE;
     this.harvestLossThreshold = HARVEST_LOSS_THRESHOLD_PCT;
     this.desiredProfitUSDT = 0;
+    // The config view's desired profit, captured once per cycle and never
+    // overwritten by an edit. It is the FLOOR: a manually-moved Final TP may
+    // only ever project MORE profit than the config asked for, and Reset
+    // returns to exactly this. `desiredProfitUSDT` cannot serve as the floor
+    // because every edit overwrites it in place.
+    this.minDesiredProfitUSDT = 0;
 
     // Volume profile — chart-only. Refreshed by _refreshVolumeSnapshot from
     // the salvaged VolumeProfile module so the frontend chart can overlay
@@ -255,6 +262,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.recoveryDistance = config.recoveryDistance ?? DEFAULT_RECOVERY_DISTANCE;
     this.harvestLossThreshold = config.harvestLossThreshold ?? HARVEST_LOSS_THRESHOLD_PCT;
     this.desiredProfitUSDT = config.desiredProfitUSDT || 0;
+    this.minDesiredProfitUSDT = this.desiredProfitUSDT;   // the config value IS the floor
     this.currentInitialSize = config.initialSize || 0;
     this._ladderBaseSize = this.currentInitialSize; // initial ladder uses the initial size; a harvest later carries the last consolidated notional
 
@@ -1064,6 +1072,22 @@ class AnchorLadderStrategy extends TradingBase {
       `===== TREND ${direction} (fully scaled @ ${this._formatPrice(this.currentPrice)}) ===== ` +
       `avg entry ${this._formatPrice(avg)} | Final TP ${this.finalTpPrice != null ? this._formatPrice(this.finalTpPrice) : 'UNARMED — see WARNING above'}`,
     );
+
+    // A manually-raised profit target is a CYCLE-level goal: it survives every
+    // anchor flatten, including one that flips the cycle to the opposite side.
+    // That is deliberate, but it is invisible — the level the user originally
+    // picked is long gone (the flatten nulls finalTpPrice), while the profit it
+    // implied silently keeps setting every subsequent target, on top of an
+    // accumulated loss that the flatten just grew. Say so at the moment it takes
+    // effect, so a distant target is explained rather than discovered.
+    const floorUSDT = this.minDesiredProfitUSDT || 0;
+    if ((this.desiredProfitUSDT || 0) > floorUSDT + 1e-9) {
+      await this.addLog(
+        `[LADDER] carrying the manual profit target ${this._formatNotional(this.desiredProfitUSDT)} USDT ` +
+        `into this TREND (config target ${this._formatNotional(floorUSDT)} USDT) — ` +
+        `Final TP sits further out as a result. Reset it from Position Control to return to config.`,
+      );
+    }
     await this._writeStrategyFlow('TREND_ENTER', {
       direction, avgEntry: avg, finalTpPrice: this.finalTpPrice, armed: this._trendFinalTpArmed,
     }).catch(() => {});
@@ -1219,7 +1243,18 @@ class AnchorLadderStrategy extends TradingBase {
       const closingPnl = (this.activePosition && Number.isFinite(this.activePosition.unrealizedPnl))
         ? this.activePosition.unrealizedPnl : 0;
       const kind = !hadInventory ? 'RE-ANCHOR' : (closingPnl >= 0 ? 'HARVEST' : 'RE-ANCHOR');
-      await this.addLog(`===== ${kind} (${reason}) — flatten + re-anchor =====`);
+      // For a trail fire, name the level that actually triggered. `_trailLevel()`
+      // derives off the CURRENT anchor, and `initializeLadder` has not run yet at
+      // this point, so it still reads the OLD anchor — i.e. exactly the level that
+      // was hit, not the one the next ladder will use. Reading it any later would
+      // silently log the wrong number.
+      let detail = reason;
+      if (reason === 'trail' && this.trailDirection) {
+        const level = this._trailLevel();
+        detail = `trail ${this.trailDirection === 'UP' ? 'Up' : 'Down'}`
+          + (level != null ? ` @ ${this._formatPrice(level)}` : '');
+      }
+      await this.addLog(`===== ${kind} (${detail}) — flatten + re-anchor =====`);
 
       // Self-gating and self-sizing (see `_closeQuantity`). This matters most
       // here of all the close paths: the harvest RE-ANCHORS, so anything left
@@ -1388,6 +1423,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.recoveryDistance = snapshot.config?.recoveryDistance ?? DEFAULT_RECOVERY_DISTANCE;
     this.harvestLossThreshold = snapshot.config?.harvestLossThreshold ?? HARVEST_LOSS_THRESHOLD_PCT;
     this.desiredProfitUSDT = snapshot.config?.desiredProfitUSDT || 0;
+    this.minDesiredProfitUSDT = snapshot.minDesiredProfitUSDT ?? this.desiredProfitUSDT;
     this.currentInitialSize = snapshot.currentInitialSize || snapshot.config?.initialSize || 0;
 
     // ---- ladder state ----
@@ -2128,6 +2164,11 @@ class AnchorLadderStrategy extends TradingBase {
     // ---- RANGE ----
     const plan = planLadderActions({
       prevPrice: this.lastProcessedPrice, currentPrice: price, anchor: this.anchor, legs: this.ladderLines,
+      // Anchor Trailing suppresses the side it is walking into — the trail level
+      // was still losing the race to L1/S1 under real volatility, so the leg is
+      // removed from play entirely rather than out-margined. FILLS only: legs
+      // already holding inventory stay in the ledger and close normally.
+      suppressDirection: suppressedSideFor(this.trailDirection),
     });
 
     if (plan.flatten) {
@@ -2198,6 +2239,162 @@ class AnchorLadderStrategy extends TradingBase {
       desiredProfitPercent: pct,
       desiredProfitUSDT: this.desiredProfitUSDT,
       initialCapital: this.initialCapital,
+      finalTpPrice: this.finalTpPrice,
+    };
+  }
+
+  /**
+   * Project what closing at `price` would net, WITHOUT changing anything.
+   *
+   * This is the number the Final TP editor shows while the user types, and it
+   * is the same quantity `desiredProfitUSDT` denotes: at the Final TP,
+   * `needed = accLoss + desiredProfit + closingFee`, so the cycle's net lands
+   * exactly on `desiredProfit`. Inverting `_recomputeFinalTpPrice` here — the
+   * SAME accLoss and the SAME entry-based closing-fee estimate — is what makes
+   * the editor's preview and the resulting target agree; deriving it any other
+   * way would show one number and arm another.
+   *
+   * PURE: no mutation, no I/O. Returns null when there is nothing to project
+   * from (no verified position, no side, degenerate price).
+   *
+   * @param {number} price
+   * @returns {{projectedProfitUSDT: number, side: 'LONG'|'SHORT'} | null}
+   */
+  projectProfitAtPrice(price) {
+    if (this._lastPositionRefreshFailed) return null;   // unknown must never read as safe
+    const pos = this.activePosition;
+    if (!pos || !(pos.quantity > 0)) return null;
+    const qty = pos.quantity;
+    const entry = pos.entryPrice || pos.avgEntry;
+    if (!entry || !Number.isFinite(price) || price <= 0) return null;
+    const side = this.trendDirection || this.currentSide;
+    if (side !== 'LONG' && side !== 'SHORT') return null;
+
+    // Signed distance IN THE PROFITABLE DIRECTION. A LONG profits above entry,
+    // a SHORT below — so a level on the wrong side yields a negative gain and
+    // is rejected by the floor check below rather than silently flipping sign.
+    const gain = side === 'LONG' ? (price - entry) * qty : (entry - price) * qty;
+    const notional = pos.notional || entry * qty || 0;
+    const estimatedClosingFee = notional * FEE_RATE;
+    return {
+      projectedProfitUSDT: gain - (this.cycleAccumulatedLoss || 0) - estimatedClosingFee,
+      side,
+    };
+  }
+
+  /**
+   * Move the Final TP to a user-chosen LEVEL, or reset it to the config target.
+   *
+   * Writes `desiredProfitUSDT` and lets `_recomputeFinalTpPrice()` re-derive the
+   * price — deliberately NOT a second writer of `finalTpPrice`. That method is
+   * the single choke point enforcing "a target may only be derived from
+   * Binance-VERIFIED position data"; assigning a price directly here would walk
+   * straight past the `_lastPositionRefreshFailed` guard, and because the TREND
+   * exit gate is `if (this.finalTpPrice && ...)` the guessed target would be
+   * ACTED ON. Back-solving keeps that invariant intact for free.
+   *
+   * The FLOOR is `minDesiredProfitUSDT` — the config view's desired profit,
+   * captured at cycle start. A manual level may only project MORE than config
+   * asked for; `reset: true` returns to exactly it.
+   *
+   * Validated on PROFIT, never on price: a SHORT's Final TP sits BELOW entry, so
+   * "must be higher" is inverted on that side and a price comparison would let a
+   * short cycle set a target worth less than config asked for.
+   *
+   * Error shapes match harvestNow: client-input problems set `.invalidInput`
+   * (route → 400); state conflicts are untagged (route → 409).
+   *
+   * @param {{price?: number, reset?: boolean}} input
+   */
+  async adjustFinalTp({ price = null, profitUSDT = null, reset = false } = {}) {
+    if (!this.isRunning) throw new Error('Strategy is not running.');
+    const invalidInput = (msg) => { const e = new Error(msg); e.invalidInput = true; return e; };
+
+    if (reset) {
+      this.desiredProfitUSDT = this.minDesiredProfitUSDT || 0;
+      this._recomputeFinalTpPrice();
+      await this.saveState();
+      this._pushHeartbeatNow?.();
+      await this.addLog(
+        `[LADDER] Final TP reset to the config target — desired profit ` +
+        `${this._formatNotional(this.desiredProfitUSDT)} USDT` +
+        (this.finalTpPrice ? ` (Final TP ${this._formatPrice(this.finalTpPrice)}).` : '.'),
+      );
+      return {
+        reset: true,
+        desiredProfitUSDT: this.desiredProfitUSDT,
+        minDesiredProfitUSDT: this.minDesiredProfitUSDT,
+        finalTpPrice: this.finalTpPrice,
+      };
+    }
+
+    // Set the TARGET directly, without a level. This is the path that works in
+    // RANGE — and while flat — where there is no position to back-solve a price
+    // from, but the profit target still matters: it is what `_recomputeFinalTpPrice`
+    // will derive the Final TP from the moment the outermost leg trips TREND.
+    // Routed through this method rather than `adjustProfitTarget` so the config
+    // floor is enforced in ONE place; a second entry point that skipped it would
+    // let the target be set below what config asked for.
+    if (profitUSDT != null) {
+      const want = Number(profitUSDT);
+      if (!Number.isFinite(want)) throw invalidInput('Profit target must be a number.');
+      const floorUSDT = this.minDesiredProfitUSDT || 0;
+      if (want < floorUSDT - 1e-9) {
+        throw invalidInput(
+          `${this._formatNotional(want)} USDT is below the ${this._formatNotional(floorUSDT)} USDT ` +
+          `target set in the config. Raise it, or Reset.`,
+        );
+      }
+      const prev = this.desiredProfitUSDT || 0;
+      this.desiredProfitUSDT = want;
+      this._recomputeFinalTpPrice();   // null in RANGE/flat by design — armed later by _enterTrend
+      await this.saveState();
+      this._pushHeartbeatNow?.();
+      await this.addLog(
+        `[LADDER] profit target ${this._formatNotional(prev)} → ${this._formatNotional(want)} USDT ` +
+        (this.finalTpPrice ? `(Final TP ${this._formatPrice(this.finalTpPrice)}).` : '(no position yet — applies when TREND arms).'),
+      );
+      return {
+        desiredProfitUSDT: this.desiredProfitUSDT,
+        minDesiredProfitUSDT: floorUSDT,
+        finalTpPrice: this.finalTpPrice,
+      };
+    }
+
+    const px = Number(price);
+    if (!Number.isFinite(px) || px <= 0) throw invalidInput('Final TP must be a positive number.');
+
+    // A Final TP only exists against a verified open position. Refusing here is
+    // a STATE conflict, not bad input — the request may be perfectly well-formed.
+    const projected = this.projectProfitAtPrice(px);
+    if (!projected) {
+      throw new Error('Final TP cannot be set right now — no verified open position to derive it from.');
+    }
+
+    const floor = this.minDesiredProfitUSDT || 0;
+    // Tolerance absorbs float noise so re-submitting the level the UI just
+    // displayed as exactly-at-floor is not rejected for a sub-cent shortfall.
+    if (projected.projectedProfitUSDT < floor - 1e-9) {
+      throw invalidInput(
+        `That level projects ${this._formatNotional(projected.projectedProfitUSDT)} USDT, below the ` +
+        `${this._formatNotional(floor)} USDT target set in the config. ` +
+        `Move the Final TP further ${projected.side === 'LONG' ? 'up' : 'down'}, or Reset.`,
+      );
+    }
+
+    const before = this.desiredProfitUSDT || 0;
+    this.desiredProfitUSDT = projected.projectedProfitUSDT;
+    this._recomputeFinalTpPrice();
+    await this.saveState();
+    this._pushHeartbeatNow?.();
+    await this.addLog(
+      `[LADDER] Final TP moved to ${this._formatPrice(this.finalTpPrice ?? px)} — desired profit ` +
+      `${this._formatNotional(before)} → ${this._formatNotional(this.desiredProfitUSDT)} USDT ` +
+      `(config floor ${this._formatNotional(floor)}).`,
+    );
+    return {
+      desiredProfitUSDT: this.desiredProfitUSDT,
+      minDesiredProfitUSDT: floor,
       finalTpPrice: this.finalTpPrice,
     };
   }
@@ -3064,6 +3261,7 @@ class AnchorLadderStrategy extends TradingBase {
       initialCapital: this.initialCapital,
       currentInitialSize: this.currentInitialSize,
       desiredProfitUSDT: this.desiredProfitUSDT,
+      minDesiredProfitUSDT: this.minDesiredProfitUSDT,
 
       // Ladder state — the frontend's status/chart view renders these
       // directly. `mode` is the alias the frontend actually reads
@@ -3092,6 +3290,7 @@ class AnchorLadderStrategy extends TradingBase {
       startTriggerPrice: this.startTriggerPrice ?? null,
       startTriggerAbove: this.startTriggerAbove ?? null,
       trailDirection: this.trailDirection ?? null,
+      trailSuppressedSide: suppressedSideFor(this.trailDirection),
       startArmed: this.startArmed,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
@@ -3169,6 +3368,7 @@ class AnchorLadderStrategy extends TradingBase {
       startTriggerPrice: this.startTriggerPrice ?? null,
       startTriggerAbove: this.startTriggerAbove ?? null,
       trailDirection: this.trailDirection ?? null,
+      trailSuppressedSide: suppressedSideFor(this.trailDirection),
       startArmed: this.startArmed,
     };
   }
@@ -3256,6 +3456,7 @@ class AnchorLadderStrategy extends TradingBase {
         // (HistoricalDataTab reads d.desiredProfitUSDT / d.positionSizeUSDT /
         // d.priceType / d.recoveryFactor etc. directly.)
         desiredProfitUSDT: this.desiredProfitUSDT,
+        minDesiredProfitUSDT: this.minDesiredProfitUSDT,
         positionSizeUSDT: this.currentInitialSize,
         priceType: this.priceType,
         recoveryFactor: this.recoveryFactor,
@@ -3281,6 +3482,7 @@ class AnchorLadderStrategy extends TradingBase {
         // Anchor Trailing — PERSISTED so a redeploy doesn't silently disarm it
         // (see the constructor comment for the full fail-open rationale).
         trailDirection: this.trailDirection ?? null,
+        trailSuppressedSide: suppressedSideFor(this.trailDirection),
         // Geometry is per-cycle config, not a constant — resume MUST rebuild the
         // ladder this cycle actually started with (see _applySnapshotGeometry).
         stepPct: this.stepPct,
