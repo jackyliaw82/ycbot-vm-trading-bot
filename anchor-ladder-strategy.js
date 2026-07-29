@@ -235,6 +235,19 @@ class AnchorLadderStrategy extends TradingBase {
     // The trail LEVEL is never stored; it is derived from the live anchor
     // (see `_trailLevel`), so it tracks every re-anchor automatically.
     this.trailDirection = null;          // 'UP' | 'DOWN' | null (null = off)
+    // How far trailing has walked the anchor, measured against the anchor as of
+    // the last NON-trail re-anchor. Trail fires are the only thing that moves the
+    // anchor AWAY from this baseline; every other re-anchor (cycle start, manual
+    // harvest, harvest-trigger) resets the baseline to the new anchor. That is
+    // what keeps "trail-attributed gain" and "anchor vs baseline" the SAME
+    // number — attribute it to trailing without the indicator ever being able to
+    // contradict the anchor on screen.
+    this.trailBaselineAnchor = null;     // number | null
+    this.trailMoveCount = 0;             // trail fires since the baseline was set
+    // The direction that produced the movement, kept so the sign still means
+    // "improvement" after trailing is switched OFF (there is no live direction
+    // to read then, but the anchor is still where trailing left it).
+    this.trailLastDirection = null;      // 'UP' | 'DOWN' | null
     // Throttle timestamp for retrying an ABORTED trail harvest (Task 6).
     // TRANSIENT — deliberately NOT persisted: a timestamp carried across a
     // restart would wrongly suppress the first post-boot attempt.
@@ -525,8 +538,16 @@ class AnchorLadderStrategy extends TradingBase {
    * anchor IS the current price and the step is fixed — so it cannot fail and
    * needs no retry throttle.
    */
-  async initializeLadder(currentPrice) {
+  async initializeLadder(currentPrice, { trailMove = false } = {}) {
     this.anchor = currentPrice;
+    // Baseline bookkeeping lives HERE, at the single site that writes the
+    // anchor, rather than at the call sites — a future caller cannot forget it.
+    if (trailMove) {
+      this.trailMoveCount = (this.trailMoveCount || 0) + 1;   // baseline deliberately untouched
+    } else {
+      this.trailBaselineAnchor = currentPrice;                // cycle start / manual harvest / trigger
+      this.trailMoveCount = 0;
+    }
     this.ladderLines = buildLadder(currentPrice, this.stepPct, this.levelsPerSide);
     this.ladderMode = 'RANGE';
     this.trendDirection = null;
@@ -824,6 +845,33 @@ class AnchorLadderStrategy extends TradingBase {
    * The live Anchor Trailing level, or null when trailing is off / the anchor
    * is unusable. DERIVED every call — never cached, so it tracks re-anchors.
    */
+  /**
+   * How far trailing has improved the anchor, as a percentage, or null when
+   * trailing has not moved it yet.
+   *
+   * SIGNED BY INTENT, not by price: trailing UP wants a HIGHER anchor (a better
+   * short entry later), trailing DOWN wants a LOWER one — so both read positive
+   * while trailing is working. Switching direction therefore flips the sign of
+   * the same untouched movement, which is the point: +2.4% of upward progress is
+   * -2.4% of progress once you have decided you wanted it lower.
+   *
+   * Computed from PRICES, never from `trailMoveCount * 0.1%` — the steps compound
+   * (24 moves is 2.43%, not 2.40%), and a count-derived figure would slowly drift
+   * away from the anchor it claims to describe.
+   */
+  _trailGainPct() {
+    const base = this.trailBaselineAnchor;
+    if (!Number.isFinite(base) || base <= 0) return null;
+    if (!Number.isFinite(this.anchor) || this.anchor <= 0) return null;
+    if (!(this.trailMoveCount > 0)) return null;          // nothing to report yet
+    // Armed -> the live direction (so a fresh switch flips the sign at once).
+    // Off   -> whichever direction actually produced the movement.
+    const dir = this.trailDirection || this.trailLastDirection;
+    if (dir !== 'UP' && dir !== 'DOWN') return null;
+    const raw = (this.anchor - base) / base;
+    return (dir === 'UP' ? raw : -raw) * 100;
+  }
+
   _trailLevel() {
     if (!this.trailDirection || !Number.isFinite(this.anchor) || this.anchor <= 0) return null;
     if (!Number.isFinite(this.stepPct) || this.stepPct <= 0) return null;
@@ -1330,7 +1378,10 @@ class AnchorLadderStrategy extends TradingBase {
       );
 
       // Re-anchor on the live price — THE difference from the anchor flatten.
-      await this.initializeLadder(this.currentPrice);
+      // `reason` decides whether this counts as trailing walking the anchor or
+      // as a fresh baseline: a manual harvest or a fired trigger starts the
+      // measurement over from wherever it lands.
+      await this.initializeLadder(this.currentPrice, { trailMove: reason === 'trail' });
 
       // The audit label reflects what ACTUALLY happened (keyed off `closed`), not
       // the pre-close `kind` guess — so a stale-open-but-actually-flat run records
@@ -1454,6 +1505,11 @@ class AnchorLadderStrategy extends TradingBase {
     this.startTriggerPrice = snapshot.startTriggerPrice ?? null;
     this.startTriggerAbove = snapshot.startTriggerAbove ?? null;
     this.trailDirection = snapshot.trailDirection ?? null;
+    // Legacy snapshots predate these: fall back to the restored anchor so the
+    // indicator reads 0% rather than inventing a gain against a null baseline.
+    this.trailBaselineAnchor = snapshot.trailBaselineAnchor ?? snapshot.anchor ?? null;
+    this.trailMoveCount = snapshot.trailMoveCount ?? 0;
+    this.trailLastDirection = snapshot.trailLastDirection ?? snapshot.trailDirection ?? null;
     this.cycleAccumulatedLoss = snapshot.cycleAccumulatedLoss || 0;
     this.flattenCount = snapshot.flattenCount || 0;
     this.harvestCount = snapshot.harvestCount || 0;
@@ -2577,6 +2633,7 @@ class AnchorLadderStrategy extends TradingBase {
     }
 
     this.trailDirection = direction;
+    if (direction) this.trailLastDirection = direction;   // survives switching OFF
     // A pending retry belongs to the direction that scheduled it.
     this._trailRetryLastTs = null;
 
@@ -3326,6 +3383,10 @@ class AnchorLadderStrategy extends TradingBase {
       startTriggerPrice: this.startTriggerPrice ?? null,
       startTriggerAbove: this.startTriggerAbove ?? null,
       trailDirection: this.trailDirection ?? null,
+      trailBaselineAnchor: this.trailBaselineAnchor ?? null,
+      trailMoveCount: this.trailMoveCount ?? 0,
+      trailLastDirection: this.trailLastDirection ?? null,
+      trailGainPct: this._trailGainPct(),
       trailSuppressedSide: suppressedSideFor(this.trailDirection),
       startArmed: this.startArmed,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
@@ -3405,6 +3466,10 @@ class AnchorLadderStrategy extends TradingBase {
       startTriggerPrice: this.startTriggerPrice ?? null,
       startTriggerAbove: this.startTriggerAbove ?? null,
       trailDirection: this.trailDirection ?? null,
+      trailBaselineAnchor: this.trailBaselineAnchor ?? null,
+      trailMoveCount: this.trailMoveCount ?? 0,
+      trailLastDirection: this.trailLastDirection ?? null,
+      trailGainPct: this._trailGainPct(),
       trailSuppressedSide: suppressedSideFor(this.trailDirection),
       startArmed: this.startArmed,
     };
@@ -3520,6 +3585,10 @@ class AnchorLadderStrategy extends TradingBase {
         // Anchor Trailing — PERSISTED so a redeploy doesn't silently disarm it
         // (see the constructor comment for the full fail-open rationale).
         trailDirection: this.trailDirection ?? null,
+        trailBaselineAnchor: this.trailBaselineAnchor ?? null,
+        trailMoveCount: this.trailMoveCount ?? 0,
+        trailLastDirection: this.trailLastDirection ?? null,
+        trailGainPct: this._trailGainPct(),
         trailSuppressedSide: suppressedSideFor(this.trailDirection),
         // Geometry is per-cycle config, not a constant — resume MUST rebuild the
         // ladder this cycle actually started with (see _applySnapshotGeometry).

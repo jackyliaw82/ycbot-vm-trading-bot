@@ -224,7 +224,7 @@ test('trailLevel DOWN sits between the anchor and the raw S1 price', () => {
   const rawS1 = anchor - stepPct * anchor;          // 99.7
   const level = trailLevel(anchor, stepPct, 'DOWN');
   assert.ok(level < anchor, 'must be below the anchor');
-  assert.ok(level > rawS1, 'must sit INSIDE S1 (anchor side), never at or past it');
+  assert.ok(level > rawS1, 'must sit INSIDE S1 (anchor side)');
   assert.ok(Math.abs(level - 99.73) < 1e-9, `expected 99.73, got ${level}`);
 });
 
@@ -233,14 +233,15 @@ test('trailLevel UP sits between the anchor and the raw L1 price', () => {
   const rawL1 = anchor + stepPct * anchor;          // 100.3
   const level = trailLevel(anchor, stepPct, 'UP');
   assert.ok(level > anchor);
-  assert.ok(level < rawL1, 'must sit INSIDE L1 (anchor side), never at or past it');
+  assert.ok(level < rawL1, 'must sit INSIDE L1 (anchor side)');
   assert.ok(Math.abs(level - 100.27) < 1e-9, `expected 100.27, got ${level}`);
 });
 
-// The whole point of the buffer: the gap to the raw level must be a real
-// price distance, far larger than one tick, at BOTH ends of the step range.
-test('trailLevel keeps a buffer of 10% of a step at both step bounds', () => {
-  for (const stepPct of [0.003, 0.02]) {
+// PROPORTIONAL, not a fixed percentage — this is the property that keeps the
+// trail on the same scale as the ladder. If it ever decouples, widening the step
+// stops widening the trail and the anchor starts out-running the ladder.
+test('trailLevel scales with the step at both bounds of the supported range', () => {
+  for (const stepPct of [LADDER_STEP_PCT_MIN, 0.01, LADDER_STEP_PCT_MAX]) {
     for (const direction of ['UP', 'DOWN']) {
       const anchor = 100;
       const raw = direction === 'UP' ? anchor * (1 + stepPct) : anchor * (1 - stepPct);
@@ -248,7 +249,7 @@ test('trailLevel keeps a buffer of 10% of a step at both step bounds', () => {
       const gap = Math.abs(raw - level);
       assert.ok(
         Math.abs(gap - TRAIL_BUFFER_FRAC * stepPct * anchor) < 1e-9,
-        `${direction} @ ${stepPct}: gap ${gap} != ${TRAIL_BUFFER_FRAC * stepPct * anchor}`,
+        `${direction} @ ${stepPct}: gap ${gap}`,
       );
     }
   }

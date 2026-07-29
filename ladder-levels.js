@@ -56,21 +56,28 @@ export function buildLadder(anchor, stepPct = LADDER_STEP_PCT, levelsPerSide = L
 }
 
 // How far INSIDE S1/L1 (toward the anchor) the Anchor Trailing level sits, as a
-// fraction of one step. NOT cosmetic: leg prices are raw (`anchor ± k*step`)
-// while any armed price would be tick-ROUNDED (precisionUtils.roundPrice uses
-// nearest-rounding). A level placed exactly AT S1/L1 can therefore round one
-// tick PAST the leg, opening a window where the leg fills before the trail
-// fires — the bot then opens a position and flattens it on the very next tick,
-// paying fees for nothing. 10% of a step is orders of magnitude larger than one
-// tick on every supported symbol, so that window cannot exist.
+// fraction of one step. So the trail fires after ~0.9 of a step of travel.
+//
+// WHY PROPORTIONAL, not a fixed percentage: it keeps the trail on the SAME SCALE
+// as the ladder. Widen `ladderStepPct` and the trail widens with it; a fixed
+// offset would silently become 20x tighter than L1 on a 2% ladder. It also bounds
+// re-anchor frequency to roughly one per 0.9 steps of travel — a fixed 0.1% at
+// the 0.3% default fired ~5x more often (every re-anchor being a real close
+// order, a ladder rebuild, a Firestore write and a log line) while measurably
+// changing neither realised loss nor the anchor gain.
+//
+// NOTE: the ORIGINAL reason for the 0.9 was to fire before L1/S1 could fill.
+// That constraint is gone — Anchor Trailing now suppresses its own side's legs
+// entirely, so the trailed-into leg cannot fill at any offset. The factor is kept
+// for the scale and frequency reasons above, and could be raised past 1.0 without
+// risking a leg fill.
 export const TRAIL_BUFFER_FRAC = 0.1;
 
 /**
  * The price at which Anchor Trailing re-anchors, derived from the live anchor.
  *
  * PURE and deliberately UNROUNDED — the caller compares it against the raw mark
- * price. Rounding it here would reintroduce exactly the failure the buffer
- * exists to prevent.
+ * price. Rounding it here could invert the ordering against the raw leg prices.
  *
  * Never stored anywhere: the trail level is always derived from the CURRENT
  * anchor, so it tracks every re-anchor for free. Two copies of one fact drift

@@ -952,7 +952,9 @@ test('the trail fire log names the OLD level, not the post-re-anchor one', async
   s._closeConsolidated = async () => true;
   s._computeAccLoss = () => 0;
   s._computeLadderBaseSize = async () => 1000;
-  // Simulate the real re-anchor: the anchor moves to the live price.
+  // Simulate the real re-anchor: the anchor moves to the live price — i.e. to the
+  // level that just fired (99.73). The NEW anchor's own trail level is then
+  // 99.73 * (1 - 0.9*0.003) = 99.46, and that is the number the log must NOT show.
   s.currentPrice = 99.73;
   s.initializeLadder = async (px) => { s.anchor = px; };
 
@@ -3048,7 +3050,7 @@ test('trailing does NOT fire before the level is reached', async () => {
   s.trailDirection = 'DOWN';
   let fired = false;
   s._harvestToFlat = async () => { fired = true; return true; };
-  await s.handleRealtimePrice(99.8);          // inside the level
+  await s.handleRealtimePrice(99.8);          // still inside the 99.73 level
   assert.equal(fired, false);
 });
 
@@ -3577,4 +3579,128 @@ test('a legacy snapshot without the field resumes as reanchor', async () => {
   });
   cleanupResumeTimers(dst);
   assert.equal(dst.harvestTriggerAction, 'reanchor');
+});
+
+// ——— Anchor Trailing: how far the anchor has been walked ———
+
+function gainStrategy() {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = ladderStrategy({ anchor: 85 });
+  s.saveState = async () => {};
+  s._pushHeartbeatNow = () => {};
+  return s;
+}
+
+test('a fresh cycle reports no trail gain until trailing actually moves the anchor', async () => {
+  const s = gainStrategy();
+  await s.initializeLadder(85);
+  assert.equal(s.trailBaselineAnchor, 85);
+  assert.equal(s.trailMoveCount, 0);
+  assert.equal(s._trailGainPct(), null, '0 moves must read as nothing to report, not 0%');
+});
+
+test('trail moves accumulate against a FIXED baseline and compound', async () => {
+  const s = gainStrategy();
+  await s.initializeLadder(85);
+  s.trailDirection = 'UP';
+  let px = 85;
+  for (let i = 0; i < 24; i++) { px *= 1.001; await s.initializeLadder(px, { trailMove: true }); }
+  assert.equal(s.trailBaselineAnchor, 85, 'the baseline must NOT move on a trail fire');
+  assert.equal(s.trailMoveCount, 24);
+  // 24 compounding 0.1% steps is 2.43%, NOT 24 x 0.1% = 2.40%.
+  assert.ok(Math.abs(s._trailGainPct() - 2.4287) < 0.001, `got ${s._trailGainPct()}`);
+});
+
+// The exact sequence asked for: Up gains, then switching to Down flips the SIGN
+// of the same untouched movement.
+test('switching direction flips the sign against the same baseline', async () => {
+  const s = gainStrategy();
+  await s.initializeLadder(85);
+  s.trailDirection = 'UP'; s.trailLastDirection = 'UP';
+  await s.initializeLadder(87.06, { trailMove: true });
+  const up = s._trailGainPct();
+  assert.ok(up > 2.4 && up < 2.5, `expected ~+2.42%, got ${up}`);
+
+  s.trailDirection = 'DOWN';
+  const down = s._trailGainPct();
+  assert.ok(Math.abs(down + up) < 1e-9, `expected the exact negation, got ${down} vs ${up}`);
+  assert.equal(s.trailBaselineAnchor, 85, 'the baseline must survive a direction switch');
+});
+
+test('a manual harvest re-baselines and resets the count', async () => {
+  const s = gainStrategy();
+  await s.initializeLadder(85);
+  s.trailDirection = 'UP';
+  await s.initializeLadder(87.06, { trailMove: true });
+  assert.equal(s.trailMoveCount, 1);
+
+  await s.initializeLadder(84.10);          // no trailMove -> manual harvest / trigger
+  assert.equal(s.trailBaselineAnchor, 84.10, 'a non-trail re-anchor starts the measurement over');
+  assert.equal(s.trailMoveCount, 0);
+  assert.equal(s._trailGainPct(), null);
+});
+
+// Switching trailing OFF must not erase the reading — the anchor is still where
+// trailing left it, and that is exactly when the number informs the next move.
+test('the gain survives trailing being switched off, using the last direction', async () => {
+  const s = gainStrategy();
+  await s.initializeLadder(85);
+  await s.setTrailDirection('UP');
+  await s.initializeLadder(87.06, { trailMove: true });
+  await s.setTrailDirection(null);
+  assert.equal(s.trailDirection, null);
+  assert.equal(s.trailLastDirection, 'UP', 'the producing direction is remembered');
+  assert.ok((s._trailGainPct() ?? 0) > 2.4, 'the reading must persist while trailing is off');
+});
+
+test('an anchor flatten leaves the baseline and the count untouched', async () => {
+  const s = gainStrategy();
+  await s.initializeLadder(85);
+  s.trailDirection = 'UP';
+  await s.initializeLadder(87.06, { trailMove: true });
+  const before = s._trailGainPct();
+
+  s._closeConsolidated = async () => true;
+  s._computeAccLoss = () => 0;
+  s._computeLadderBaseSize = async () => 1000;
+  await s._flattenAtAnchor();               // rebuilds on the SAME anchor
+  assert.equal(s.trailBaselineAnchor, 85);
+  assert.equal(s.trailMoveCount, 1);
+  assert.equal(s._trailGainPct(), before, 'a flatten does not move the anchor, so it cannot move this');
+});
+
+test('the trail gain survives a save/resume round trip', async () => {
+  const src = gainStrategy();
+  await src.initializeLadder(85);
+  src.trailDirection = 'UP'; src.trailLastDirection = 'UP';
+  await src.initializeLadder(87.06, { trailMove: true });
+
+  let doc = null;
+  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
+  await AnchorLadderStrategy.prototype.saveState.call(src);
+  assert.equal(doc.trailBaselineAnchor, 85);
+  assert.equal(doc.trailMoveCount, 1);
+
+  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
+  cleanupResumeTimers(dst);
+  // Without persistence a redeploy would report 0% while the anchor had genuinely travelled.
+  assert.equal(dst.trailBaselineAnchor, 85);
+  assert.ok((dst._trailGainPct() ?? 0) > 2.4);
+});
+
+test('a legacy snapshot falls back to its own anchor, never a bogus gain', async () => {
+  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  await dst.resume({
+    strategyId: 'anchor_ladder_legacy_gain', isRunning: true, symbol: 'BTCUSDT',
+    // resume() aborts early without these, before reaching any restore line.
+    gcfProxyUrl: 'http://proxy.invalid', sharedVmProxyGcfUrl: 'http://vm.invalid',
+    anchor: 90, trailDirection: 'UP',      // note: no trailBaselineAnchor / trailMoveCount
+  });
+  cleanupResumeTimers(dst);
+  assert.equal(dst.trailBaselineAnchor, 90);
+  assert.equal(dst.trailMoveCount, 0);
+  assert.equal(dst._trailGainPct(), null);
 });
