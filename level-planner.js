@@ -51,6 +51,16 @@ export function validateLevels(levels, { currentPrice, atr, tickSize } = {}) {
   bullLevel = roundToTick(bullLevel, tickSize);
   bearLevel = roundToTick(bearLevel, tickSize);
 
+  // Rounding can turn a huge-but-finite raw input into Infinity (e.g.
+  // 1e308 / 0.1 overflows), and Infinity sails through every relational
+  // check below (it is > currentPrice, < currentPrice, and "separated" by
+  // any finite ATR). Re-check finiteness AFTER rounding, not just on the
+  // raw input, or this module fails open on exactly the hazard its own
+  // doc comment above warns about.
+  if (!finitePos(bullLevel) || !finitePos(bearLevel)) {
+    return { ok: false, reason: `level is not finite after tick-rounding: bullLevel=${bullLevel}, bearLevel=${bearLevel}` };
+  }
+
   if (bullLevel <= currentPrice) {
     return { ok: false, reason: `bullLevel ${bullLevel} must be above current price ${currentPrice}` };
   }

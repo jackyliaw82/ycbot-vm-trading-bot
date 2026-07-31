@@ -1,9 +1,15 @@
 // System prompt for ReversalLadder level selection. Adapted from the deleted
-// ai-reversal-prompt.js (git show 06e4199^:ai-reversal-prompt.js) — the level
-// placement reasoning and hard constraints are carried over verbatim because
-// they already describe this exact mechanic. Dropped: the SIZE VETO and
-// HARVEST_PRICE contexts, which belonged to mechanics this strategy no longer
-// has. A harvest now simply re-runs PLAN.
+// ai-reversal-prompt.js (git show 06e4199^:ai-reversal-prompt.js). The hard
+// constraints are carried over verbatim (modulo cosmetic symbol swaps: −→-,
+// ≥→>=, ×→x) because they already describe this exact mechanic. The level
+// placement guidance is DELIBERATELY RELAXED, not verbatim: "must straddle
+// the POC" softened to "should", an explicit escape hatch added ("MAY place
+// a level outside a void where other evidence supports a higher breakout
+// probability"), and the original's CVD follow-through / multi-timeframe-
+// alignment lines dropped. These are intentional product decisions, not
+// drift — do not "restore" them to match the original. Also dropped: the
+// SIZE VETO and HARVEST_PRICE contexts, which belonged to mechanics this
+// strategy no longer has. A harvest now simply re-runs PLAN.
 export const LEVELS_SYSTEM_PROMPT = `You select two price levels for a mechanical reversal ladder.
 
 MECHANIC

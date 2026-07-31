@@ -57,6 +57,20 @@ test('validateLevels: a missing or non-finite ATR skips the separation check, no
   assert.equal(validateLevels({ bullLevel: 99, bearLevel: 101 }, opts({ atr: null })).ok, false);
 });
 
+test('validateLevels: separation EXACTLY 1.5x ATR is accepted (boundary is >=)', () => {
+  // atr 2 -> minSep 3 exactly. sep 3 must pass, not fail on a strict '<'.
+  const r = validateLevels({ bullLevel: 101.5, bearLevel: 98.5 }, opts());
+  assert.equal(r.ok, true, 'separation exactly at the 1.5x ATR floor must be accepted');
+});
+
+test('validateLevels: atr:Infinity skips the separation check rather than rejecting', () => {
+  // finitePos(Infinity) is false, so an infinite ATR must fall through to
+  // "no separation check", the same as a missing/null ATR — never treated
+  // as an impossible-to-satisfy minimum separation.
+  const r = validateLevels({ bullLevel: 101, bearLevel: 99 }, opts({ atr: Infinity }));
+  assert.equal(r.ok, true, 'an infinite ATR must not reject an otherwise valid pair');
+});
+
 test('validateLevels: rejects non-numeric, NaN and non-positive levels', () => {
   for (const bad of [{ bullLevel: 'x', bearLevel: 96 }, { bullLevel: NaN, bearLevel: 96 },
                      { bullLevel: 104, bearLevel: 0 }, { bullLevel: 104, bearLevel: -5 }, null]) {
@@ -68,6 +82,16 @@ test('validateLevels: rounding must not violate the invariant it just checked', 
   // bull 100.04 rounds DOWN to 100.0 == currentPrice, which is no longer valid.
   const r = validateLevels({ bullLevel: 100.04, bearLevel: 90 }, opts({ tickSize: 0.1 }));
   assert.equal(r.ok, false, 'a level that rounds onto current price must be rejected');
+});
+
+test('validateLevels: rejects a level that overflows to Infinity after rounding', () => {
+  // 1e308 / 0.1 tick-rounds to Infinity, which then sails through every
+  // relational check (> currentPrice, < currentPrice, ATR-separated) unless
+  // finiteness is re-checked AFTER rounding.
+  const r = validateLevels({ bullLevel: 1e308, bearLevel: 50 }, opts());
+  assert.equal(r.ok, false, 'an Infinity level must never validate');
+  assert.equal(typeof r.reason, 'string');
+  assert.ok(/finite/i.test(r.reason), `reason should call out non-finiteness: ${r.reason}`);
 });
 
 test('validateLevels: every rejection carries a reason', () => {
@@ -85,8 +109,11 @@ const okPlanner = (json, usage = { inputTokens: 1, outputTokens: 1, cacheRead: 0
   ({ consult: async () => ({ json, usage }) });
 
 test('planLevels: uses the AI pair when it validates', async () => {
+  // Raw AI values are off-tick (0.1 tick size) on purpose: this pins that
+  // planLevels returns the ROUNDED verdict values, not the raw json ones
+  // (json.bullLevel/json.bearLevel would still be 105.04/94.96).
   const r = await planLevels({
-    planner: okPlanner({ decision: 'PLAN', bullLevel: 105, bearLevel: 95, rationale: 'because', confidence: 0.7 }),
+    planner: okPlanner({ decision: 'PLAN', bullLevel: 105.04, bearLevel: 94.96, rationale: 'because', confidence: 0.7 }),
     context: planCtx(),
   });
   assert.equal(r.source, 'ai');
@@ -116,6 +143,18 @@ test('planLevels: falls back when the AI pair FAILS validation', async () => {
   assert.equal(r.source, 'fallback');
   assert.equal(r.bullLevel, 106);
   assert.ok(/bullLevel/.test(r.error), `reason should name the failure: ${r.error}`);
+});
+
+test('planLevels: returns null when the fallback pair itself FAILS validation', async () => {
+  // Two voids that straddle price (98-99 below, 101-102 above) so
+  // selectVoidPair returns a NON-null pair (bull 101 / bear 99), but the
+  // separation is only 2 while atr:2 demands >= 3 (1.5x). The fallback must
+  // be run through the SAME validation as the AI path, not trusted blindly.
+  const r = await planLevels({
+    planner: { consult: async () => { throw new Error('down'); } },
+    context: planCtx({ profile: { rangeVoids: [{ priceLow: 98, priceHigh: 99 }, { priceLow: 101, priceHigh: 102 }] } }),
+  });
+  assert.equal(r, null, 'a fallback pair that fails validation must yield null, not the raw pair');
 });
 
 test('planLevels: fallback is still validated, not trusted blindly', async () => {
