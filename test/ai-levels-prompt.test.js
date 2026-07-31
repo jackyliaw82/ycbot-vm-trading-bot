@@ -216,3 +216,32 @@ test('circular reference in depth does not throw and does not leak placeholders'
   // bidQty: 5 should still appear, or the line should be omitted if circular refs cause the whole thing to be dropped
   assert.ok(!m.includes('Orderbook') || m.includes('5'), 'either omit Orderbook or include the usable bidQty');
 });
+
+test('a shared (non-circular) object reference under two keys is not mistaken for a cycle', () => {
+  // This is a DAG, not a cycle: `shared` appears twice in the graph but never
+  // contains itself. A visited-set that is never cleared on unwind (i.e. scoped
+  // to the whole traversal instead of the current recursion path) would treat
+  // the second encounter as a false-positive cycle and silently drop it.
+  const shared = { qty: 55 };
+  const m = buildPlanUserMessage({
+    symbol: 'BTCUSDT',
+    currentPrice: 100000,
+    depth: { a: shared, b: shared },
+  });
+  assert.ok(!/undefined|NaN|null/.test(m), `leaked placeholder:\n${m}`);
+  assert.ok(m.includes('Orderbook'), 'Orderbook line must be present');
+  assert.ok(m.includes('"a":{"qty":55}'), `key "a" must survive:\n${m}`);
+  assert.ok(m.includes('"b":{"qty":55}'), `key "b" must survive (must not be dropped as a false cycle):\n${m}`);
+});
+
+test('a shared (non-circular) array reference under two keys is not mistaken for a cycle', () => {
+  const sharedArr = [1, 2, 3];
+  const m = buildPlanUserMessage({
+    symbol: 'BTCUSDT',
+    currentPrice: 100000,
+    depth: { a: sharedArr, b: sharedArr },
+  });
+  assert.ok(!/undefined|NaN|null/.test(m), `leaked placeholder:\n${m}`);
+  assert.ok(m.includes('"a":[1,2,3]'), `key "a" must survive:\n${m}`);
+  assert.ok(m.includes('"b":[1,2,3]'), `key "b" must survive (must not be dropped as a false cycle):\n${m}`);
+});

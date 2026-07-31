@@ -53,24 +53,29 @@ const n = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 const line = (label, v, suffix = '') => (v === null ? null : `${label}: ${v}${suffix}`);
 
 // Recursively sanitise an object/array, dropping non-finite numbers and null/undefined values.
-// Uses a WeakSet to guard against circular references.
+// Uses a WeakSet scoped to the current recursion PATH (not the whole traversal) to guard
+// against circular references: a node is added before recursing into it and removed again
+// on unwind, so only a true ancestor (an object that contains itself) counts as a cycle. A
+// DAG — the same object reachable via two different keys/branches — is not an ancestor of
+// itself on either branch and must be preserved in full on both.
 function sanitiseDepth(val, visited = new WeakSet()) {
   if (val === null || val === undefined) return undefined;
   if (typeof val === 'number') {
     return Number.isFinite(val) ? val : undefined;
   }
   if (Array.isArray(val)) {
-    // Guard against circular array references
+    // Guard against circular array references (this array is its own ancestor)
     if (visited.has(val)) return undefined;
     visited.add(val);
     // Filter array: drop nulls, undefined, non-finite numbers; keep only usable values
     const filtered = val
       .map(item => sanitiseDepth(item, visited))
       .filter(item => item !== undefined);
+    visited.delete(val); // unwind: this array is no longer on the active path
     return filtered.length > 0 ? filtered : undefined;
   }
   if (typeof val === 'object') {
-    // Guard against circular object references
+    // Guard against circular object references (this object is its own ancestor)
     if (visited.has(val)) return undefined;
     visited.add(val);
     // Recursively sanitise object entries
@@ -81,6 +86,7 @@ function sanitiseDepth(val, visited = new WeakSet()) {
         sanitised[key] = sanitised_val;
       }
     }
+    visited.delete(val); // unwind: this object is no longer on the active path
     return Object.keys(sanitised).length > 0 ? sanitised : undefined;
   }
   return val; // strings, booleans, etc. pass through
