@@ -55,7 +55,13 @@ export async function buildLevelContext({
     if (Object.keys(profile).length) ctx.profile = profile;
 
     if (isObj(voidRes.pair)) {
-      ctx.voidPair = { bullLevel: voidRes.pair.bullLevel, bearLevel: voidRes.pair.bearLevel };
+      const { bullLevel, bearLevel } = voidRes.pair;
+      // A half-populated pair is worse than none — the fallback consumer
+      // (selectVoidPair's caller) expects both sides, so an omission here
+      // must be total, not per-field like the other setNum() writes.
+      if (isFiniteNum(bullLevel) && isFiniteNum(bearLevel)) {
+        ctx.voidPair = { bullLevel, bearLevel };
+      }
     } else {
       // §9 of the design: after the widen chain is exhausted, tell the model
       // explicitly rather than letting it infer from an absent field.
@@ -75,11 +81,18 @@ export async function buildLevelContext({
   return ctx;
 }
 
-const isObj = (v) => v !== null && typeof v === 'object';
+// Excludes arrays deliberately: every call site expects a plain record to read
+// named fields off (profile.poc, pair.bullLevel, depthRes.bidVolume, ...). An
+// array is `typeof 'object'` but has none of those, so letting one through
+// either reads as undefined (harmless) or, for a field assigned wholesale
+// (ctx.depth), survives verbatim and renders as "Orderbook: [1,2,3]".
+const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+const isFiniteNum = (v) => typeof v === 'number' && Number.isFinite(v);
 
 /** Assign only finite numbers. A NaN or Infinity would print into the prompt. */
 function setNum(target, key, value) {
-  if (typeof value === 'number' && Number.isFinite(value)) target[key] = value;
+  if (isFiniteNum(value)) target[key] = value;
 }
 
 /** Invoke a duck-typed source method; a missing source or method is not an error. */

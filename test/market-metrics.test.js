@@ -261,6 +261,22 @@ test('getOpenInterestChange: a zero baseline yields null rather than Infinity', 
   assert.equal(r, null, 'dividing by a zero baseline must not produce Infinity');
 });
 
+test('getOpenInterestChange: only the oldest reading is zero yields null', async () => {
+  // secondLatest (10) is nonzero here, isolating the `oldest === 0` half of the
+  // guard — a regressed check of only `secondLatest === 0` would wrongly pass.
+  const mm = new MarketMetrics(fakeStrategy(async () => [oiRow(0), oiRow(10), oiRow(12)]));
+  const r = await mm.getOpenInterestChange('BTCUSDT');
+  assert.equal(r, null, 'dividing by a zero oldest reading must not produce Infinity');
+});
+
+test('getOpenInterestChange: only the second-latest reading is zero yields null', async () => {
+  // oldest (10) is nonzero here, isolating the `secondLatest === 0` half of the
+  // guard — a regressed check of only `oldest === 0` would wrongly pass.
+  const mm = new MarketMetrics(fakeStrategy(async () => [oiRow(10), oiRow(0), oiRow(12)]));
+  const r = await mm.getOpenInterestChange('BTCUSDT');
+  assert.equal(r, null, 'dividing by a zero second-latest reading must not produce Infinity');
+});
+
 test('getOpenInterestChange: a failed fetch returns null, never throws', async () => {
   const mm = new MarketMetrics(fakeStrategy(async () => { throw new Error('down'); }));
   assert.equal(await mm.getOpenInterestChange('BTCUSDT'), null);

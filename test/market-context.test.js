@@ -99,3 +99,15 @@ test('buildLevelContext: never throws when a source returns a malformed shape', 
   const c = await buildLevelContext(args({ marketMetrics: mm, volumeProfile: vp }));
   assert.equal(c.symbol, 'BTCUSDT');
 });
+
+test('buildLevelContext: a half-non-finite void pair is omitted entirely, not half-written', async () => {
+  const vp = { getVoidProfile: async () => ({ window: '24h', profile, pair: { bullLevel: NaN, bearLevel: 97.8 } }) };
+  const c = await buildLevelContext(args({ volumeProfile: vp }));
+  assert.equal(c.voidPair, undefined, 'a pair with one non-finite side must not survive at all');
+});
+
+test('buildLevelContext: a source resolving to an array is treated as malformed, not a plain object', async () => {
+  const mm = { ...okMm, getOrderbookDepth: async () => [1, 2, 3] };
+  const c = await buildLevelContext(args({ marketMetrics: mm }));
+  assert.equal(c.depth, undefined, 'an array must never survive as ctx.depth');
+});
