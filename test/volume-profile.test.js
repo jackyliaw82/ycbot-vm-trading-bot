@@ -1,11 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { computeVolumeProfile, selectVoidPair } from '../volume-profile.js';
+import { computeVolumeProfile, selectVoidPair, VolumeProfile, WINDOWS } from '../volume-profile.js';
 
 // Candle shape per parseKlines: { open, high, low, close, volume, ... }
 const candle = (low, high, volume) => ({ open: low, high, low, close: high, volume });
 
 const profileWithVoids = (voids) => ({ rangeVoids: voids });
+
+// Minimal strategy double — VolumeProfile only duck-types makeProxyRequest.
+const fakeStrategy = (onCall) => ({ makeProxyRequest: onCall });
+const kline = (v) => [0, '100', '101', '99', '100.5', String(v), 0, '0', 0, '0', '0', '0'];
 
 test('computeVolumeProfile: POC lands on the heaviest price bin', () => {
   const candles = [
@@ -139,4 +143,38 @@ test('selectVoidPair: tolerates a missing or empty profile', () => {
   assert.equal(selectVoidPair(null, 101), null);
   assert.equal(selectVoidPair({ rangeVoids: [] }, 101), null);
   assert.equal(selectVoidPair({}, 101), null);
+});
+
+test('WINDOWS: every window fits inside Binance\'s 1500-kline cap', () => {
+  for (const w of WINDOWS) {
+    assert.ok(w.bars <= 1500, `${w.key} asks for ${w.bars} bars`);
+    assert.ok(w.bins > 0);
+  }
+  assert.deepEqual(WINDOWS.map(w => w.key), ['24h', '48h', '7d']);
+});
+
+test('_getCandles: caches per interval, so windows do not evict each other', async () => {
+  const calls = [];
+  const vp = new VolumeProfile(fakeStrategy(async (_p, _m, params) => {
+    calls.push(params.interval);
+    return [kline(5)];
+  }));
+  await vp._getCandles('BTCUSDT', '1m', 1440);
+  await vp._getCandles('BTCUSDT', '5m', 576);
+  await vp._getCandles('BTCUSDT', '1m', 1440);   // cached — must NOT refetch
+  assert.deepEqual(calls, ['1m', '5m']);
+});
+
+test('_getCandles: a failed fetch returns the stale cache, not an empty profile', async () => {
+  let fail = false;
+  const vp = new VolumeProfile(fakeStrategy(async () => {
+    if (fail) throw new Error('network');
+    return [kline(7)];
+  }));
+  const first = await vp._getCandles('BTCUSDT', '1m', 1440);
+  assert.equal(first.length, 1);
+  fail = true;
+  vp.invalidate('BTCUSDT');
+  const second = await vp._getCandles('BTCUSDT', '1m', 1440);
+  assert.deepEqual(second, [], 'invalidated cache + failure yields empty, never a throw');
 });

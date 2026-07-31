@@ -7,6 +7,19 @@ const VP_CACHE_TTL_MS = 10 * 60 * 1000;      // 10 min volume profile cache
 const CANDLE_CACHE_TTL_MS = 5 * 60 * 1000;   // 5 min 1m-candle cache
 const VP_24H_1M_BARS = 1440;                 // 1m × 1440 = 24h (fine profile source)
 const VP_BIN_COUNT_24H = 200;                // 24h profile bins — supported by 1m data
+
+// Widen chain for ReversalLadder level selection. Tried in order until a void
+// pair straddles live price. WIDENING, never shifting the window back: a
+// shifted window can sit entirely on one side of current price and yield no
+// valid level at all, whereas a wider window always contains the last 24h.
+// Bar counts stay under Binance's 1500-kline-per-request cap, so each window
+// is a single fetch. Coarser windows get fewer bins — 200 bins over 7d of 1h
+// candles would be resolving noise.
+export const WINDOWS = [
+  { key: '24h', interval: '1m', bars: 1440, bins: VP_BIN_COUNT_24H },
+  { key: '48h', interval: '5m', bars: 576,  bins: VP_BIN_COUNT_24H },
+  { key: '7d',  interval: '1h', bars: 168,  bins: 100 },
+];
 const VP_VALUE_AREA_PCT = 0.70;              // 70% volume defines value area
 // Hybrid HVN/LVN detection — local extrema (Pine-style) + absolute-significance gate.
 const HVN_STRENGTH_FRAC = 0.05;              // HVN peak window = ±5% of bins (Pine strength, scaled to binCount)
@@ -234,28 +247,30 @@ export class VolumeProfile {
   constructor(strategy) {
     this.strategy = strategy;
     this._vpCache = new Map();       // symbol -> { profile, at }
-    this._candleCache = new Map();   // symbol -> { candles, ts }
+    this._candleCache = new Map();   // symbol:interval:limit -> { candles, ts }
   }
 
-  // ——— 24h 1m candle fetcher ——————————————————————————————————————————
-  // 1440 bars × 1m = exactly 24h, fetched in a single request (Binance klines
-  // cap is 1500). Feeds the 24h volume profile — 5× finer than the 5m window,
-  // which is what makes the 200-bin HVN/LVN resolution meaningful rather than
-  // just slicing the same smear thinner.
+  // ——— Generic candle fetcher ——————————————————————————————————————————
+  // Cached per symbol:interval:limit so the widen chain's windows (WINDOWS,
+  // above) do not evict one another. 1440 bars × 1m = exactly 24h in a single
+  // request (Binance klines cap is 1500); the 24h profile is the finest —
+  // 5× the 5m window — which is what makes the 200-bin HVN/LVN resolution
+  // meaningful rather than just slicing the same smear thinner.
 
-  async _get24hCandles1m(symbol) {
+  async _getCandles(symbol, interval, limit) {
+    const key = `${symbol}:${interval}:${limit}`;
     const now = Date.now();
-    const cached = this._candleCache.get(symbol);
+    const cached = this._candleCache.get(key);
     if (cached && (now - cached.ts) < CANDLE_CACHE_TTL_MS) {
       return cached.candles;
     }
     try {
-      const klines = await this.strategy.makeProxyRequest('/fapi/v1/klines', 'GET', { symbol, interval: '1m', limit: VP_24H_1M_BARS }, false, 'futures');
+      const klines = await this.strategy.makeProxyRequest('/fapi/v1/klines', 'GET', { symbol, interval, limit }, false, 'futures');
       const candles = parseKlines(klines);
-      this._candleCache.set(symbol, { candles, ts: now });
+      this._candleCache.set(key, { candles, ts: now });
       return candles;
     } catch (error) {
-      console.error(`Failed to fetch 24h (1m) candles: ${error.message}`);
+      console.error(`Failed to fetch ${interval} candles (${limit}): ${error.message}`);
       return cached?.candles || [];
     }
   }
@@ -269,7 +284,7 @@ export class VolumeProfile {
       return cached.profile;
     }
     try {
-      const candles = await this._get24hCandles1m(symbol);
+      const candles = await this._getCandles(symbol, '1m', VP_24H_1M_BARS);
       if (!candles || candles.length === 0) return null;
       const profile = computeVolumeProfile(candles, VP_BIN_COUNT_24H);
       this._vpCache.set(symbol, { profile, at: now });
@@ -282,6 +297,8 @@ export class VolumeProfile {
 
   invalidate(symbol) {
     this._vpCache.delete(symbol);
-    this._candleCache.delete(symbol);
+    for (const key of this._candleCache.keys()) {
+      if (key.startsWith(`${symbol}:`)) this._candleCache.delete(key);
+    }
   }
 }
