@@ -3,6 +3,10 @@
 // MODEL_PRICING near the top) so restored cost figures stay comparable with the
 // historical ones already recorded against past cycles.
 //
+// NOTE: deepseek-v4-pro's rates include a 75% discount that expired 2026-05-31.
+// At 2026-07-31 market pricing it would be 4x higher. Rates are frozen
+// deliberately for historical continuity rather than current market rates.
+//
 // DeepSeek's Anthropic-compatible endpoint does NOT honour cache_control, so a
 // cache MISS is billed at the full input rate — cacheWrite5m therefore mirrors
 // `input` rather than carrying Anthropic's 1.25x write premium. cacheRead is
@@ -17,7 +21,10 @@ export const MODEL_PRICING = {
 const FALLBACK_MODEL = 'deepseek-v4-flash';
 const MILLION = 1_000_000;
 
-const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+const num = (v) => {
+  const n = typeof v === 'number' && Number.isFinite(v) ? v : 0;
+  return Math.max(0, n);
+};
 
 /**
  * Cost in USD for one call's token usage. Unknown models fall back to the
@@ -26,7 +33,10 @@ const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
  */
 export function usageCostUsd(usage, model) {
   if (!usage || typeof usage !== 'object') return 0;
-  const p = MODEL_PRICING[model] || MODEL_PRICING[FALLBACK_MODEL];
+  // Guard against prototype-chain pollution: only accept own properties of MODEL_PRICING.
+  const p = (typeof model === 'string' && Object.prototype.hasOwnProperty.call(MODEL_PRICING, model))
+    ? MODEL_PRICING[model]
+    : MODEL_PRICING[FALLBACK_MODEL];
   return (
     num(usage.inputTokens) * p.input +
     num(usage.outputTokens) * p.output +
