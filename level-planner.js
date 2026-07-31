@@ -1,3 +1,6 @@
+import { selectVoidPair } from './volume-profile.js';
+import { LEVELS_SYSTEM_PROMPT, buildPlanUserMessage, buildAskUserMessage } from './ai-levels-prompt.js';
+
 // Validation for AI-proposed entry levels. This is the last gate before a
 // number becomes a real order trigger, so it is deliberately fail-closed:
 // anything it cannot positively verify is rejected, and the caller falls back
@@ -64,4 +67,71 @@ export function validateLevels(levels, { currentPrice, atr, tickSize } = {}) {
   }
 
   return { ok: true, bullLevel, bearLevel };
+}
+
+/**
+ * Produce a validated { bullLevel, bearLevel } for a cycle.
+ *
+ * Two routes, in order: the AI, then the mechanical void edges. The fallback is
+ * NOT a lesser path to be skipped when the AI answers — an AI pair that fails
+ * validation is discarded and the fallback runs anyway, because an unvalidated
+ * level becomes a real order trigger.
+ *
+ * Returns null only when neither route yields a valid pair. That is a genuine
+ * "cannot start" and the caller must treat it as one, not substitute a guess.
+ */
+export async function planLevels({ planner, context, mode = 'plan', question } = {}) {
+  const c = context || {};
+  const opts = { currentPrice: c.currentPrice, atr: c.atr, tickSize: c.tickSize };
+  let usage = null;
+  let error = null;
+
+  if (planner && typeof planner.consult === 'function') {
+    try {
+      const userMessage = mode === 'ask'
+        ? buildAskUserMessage(c, question)
+        : buildPlanUserMessage(c);
+      const { json, usage: u } = await planner.consult(LEVELS_SYSTEM_PROMPT, userMessage);
+      usage = u || null;
+      const verdict = validateLevels(json, opts);
+      if (verdict.ok) {
+        return {
+          bullLevel: verdict.bullLevel,
+          bearLevel: verdict.bearLevel,
+          source: 'ai',
+          rationale: typeof json?.rationale === 'string' ? json.rationale : null,
+          confidence: typeof json?.confidence === 'number' ? json.confidence : null,
+          usage,
+          error: null,
+        };
+      }
+      error = `AI levels rejected: ${verdict.reason}`;
+      console.error(`[level-planner] ${error}`);
+    } catch (e) {
+      error = e.message;
+      console.error(`[level-planner] consult failed: ${e.message}`);
+    }
+  } else {
+    error = 'no planner supplied';
+  }
+
+  // Mechanical fallback — the void edges from Phase 1, run through the SAME
+  // validation. A fallback nobody checked is just a different way to place a
+  // bad order.
+  const pair = selectVoidPair(c.profile, c.currentPrice);
+  if (!pair) return null;
+  const verdict = validateLevels(pair, opts);
+  if (!verdict.ok) {
+    console.error(`[level-planner] fallback also rejected: ${verdict.reason}`);
+    return null;
+  }
+  return {
+    bullLevel: verdict.bullLevel,
+    bearLevel: verdict.bearLevel,
+    source: 'fallback',
+    rationale: null,
+    confidence: null,
+    usage,
+    error,
+  };
 }

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { roundToTick, validateLevels, ATR_SEPARATION_MULT } from '../level-planner.js';
+import { planLevels } from '../level-planner.js';
 
 const opts = (over = {}) => ({ currentPrice: 100, atr: 2, tickSize: 0.1, ...over });
 
@@ -73,4 +74,83 @@ test('validateLevels: every rejection carries a reason', () => {
   const r = validateLevels({ bullLevel: 99, bearLevel: 96 }, opts());
   assert.equal(typeof r.reason, 'string');
   assert.ok(r.reason.length > 0);
+});
+
+const planCtx = (over = {}) => ({
+  symbol: 'BTCUSDT', currentPrice: 100, atr: 2, tickSize: 0.1,
+  profile: { rangeVoids: [{ priceLow: 90, priceHigh: 94 }, { priceLow: 106, priceHigh: 110 }] },
+  ...over,
+});
+const okPlanner = (json, usage = { inputTokens: 1, outputTokens: 1, cacheRead: 0, cacheCreation: 0 }) =>
+  ({ consult: async () => ({ json, usage }) });
+
+test('planLevels: uses the AI pair when it validates', async () => {
+  const r = await planLevels({
+    planner: okPlanner({ decision: 'PLAN', bullLevel: 105, bearLevel: 95, rationale: 'because', confidence: 0.7 }),
+    context: planCtx(),
+  });
+  assert.equal(r.source, 'ai');
+  assert.equal(r.bullLevel, 105);
+  assert.equal(r.bearLevel, 95);
+  assert.equal(r.rationale, 'because');
+  assert.equal(r.usage.inputTokens, 1);
+});
+
+test('planLevels: falls back to the void edges when the AI throws', async () => {
+  const r = await planLevels({
+    planner: { consult: async () => { throw new Error('provider down'); } },
+    context: planCtx(),
+  });
+  assert.equal(r.source, 'fallback');
+  assert.equal(r.bullLevel, 106, 'inner edge of the upper void');
+  assert.equal(r.bearLevel, 94, 'inner edge of the lower void');
+  assert.ok(/provider down/.test(r.error));
+});
+
+test('planLevels: falls back when the AI pair FAILS validation', async () => {
+  // bull below current price — invalid, must not be trusted.
+  const r = await planLevels({
+    planner: okPlanner({ decision: 'PLAN', bullLevel: 99, bearLevel: 95 }),
+    context: planCtx(),
+  });
+  assert.equal(r.source, 'fallback');
+  assert.equal(r.bullLevel, 106);
+  assert.ok(/bullLevel/.test(r.error), `reason should name the failure: ${r.error}`);
+});
+
+test('planLevels: fallback is still validated, not trusted blindly', async () => {
+  // Voids exist but sit entirely above price, so no straddling pair.
+  const r = await planLevels({
+    planner: { consult: async () => { throw new Error('down'); } },
+    context: planCtx({ profile: { rangeVoids: [{ priceLow: 106, priceHigh: 110 }] } }),
+  });
+  assert.equal(r, null, 'no valid pair from either route must return null');
+});
+
+test('planLevels: AI usage is reported even when the pair is rejected', async () => {
+  const r = await planLevels({
+    planner: okPlanner({ decision: 'PLAN', bullLevel: 99, bearLevel: 95 }, { inputTokens: 9, outputTokens: 3, cacheRead: 0, cacheCreation: 0 }),
+    context: planCtx(),
+  });
+  assert.equal(r.source, 'fallback');
+  assert.equal(r.usage.inputTokens, 9, 'a rejected consult still cost money and must be billed');
+});
+
+test('planLevels: ask mode sends the ASK message and returns the proposal', async () => {
+  let seenUser = null;
+  const r = await planLevels({
+    planner: { consult: async (_s, u) => { seenUser = u; return { json: { bullLevel: 105, bearLevel: 95 }, usage: {} }; } },
+    context: planCtx(),
+    mode: 'ask',
+    question: 'tighter?',
+  });
+  assert.ok(seenUser.includes('CONTEXT: ASK'));
+  assert.ok(seenUser.includes('tighter?'));
+  assert.equal(r.source, 'ai');
+});
+
+test('planLevels: a missing planner goes straight to fallback rather than throwing', async () => {
+  const r = await planLevels({ planner: null, context: planCtx() });
+  assert.equal(r.source, 'fallback');
+  assert.equal(r.bullLevel, 106);
 });
