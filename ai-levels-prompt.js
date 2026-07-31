@@ -67,17 +67,34 @@ function marketSection(c) {
   ].filter(Boolean);
 
   const voids = Array.isArray(p.rangeVoids) ? p.rangeVoids : [];
-  if (voids.length) {
-    out.push(`Volume voids (rangeVoids): ${voids.map(v => `${v.priceLow}-${v.priceHigh}`).join(', ')}`);
+  const validVoids = voids.filter(v => typeof v.priceLow === 'number' && Number.isFinite(v.priceLow) && typeof v.priceHigh === 'number' && Number.isFinite(v.priceHigh));
+  if (validVoids.length) {
+    out.push(`Volume voids (rangeVoids): ${validVoids.map(v => `${v.priceLow}-${v.priceHigh}`).join(', ')}`);
   }
+
   const hvns = Array.isArray(p.hvns) ? p.hvns : [];
-  if (hvns.length) {
-    out.push(`High volume nodes: ${hvns.map(v => `${v.priceLow}-${v.priceHigh}`).join(', ')}`);
+  const validHvns = hvns.filter(v => typeof v.priceLow === 'number' && Number.isFinite(v.priceLow) && typeof v.priceHigh === 'number' && Number.isFinite(v.priceHigh));
+  if (validHvns.length) {
+    out.push(`High volume nodes: ${validHvns.map(v => `${v.priceLow}-${v.priceHigh}`).join(', ')}`);
   }
+
   if (c.voidPair && n(c.voidPair.bullLevel) !== null && n(c.voidPair.bearLevel) !== null) {
     out.push(`Straddling void pair (mechanical fallback): bull ${c.voidPair.bullLevel} / bear ${c.voidPair.bearLevel}`);
   }
-  if (c.depth) out.push(`Orderbook: ${JSON.stringify(c.depth)}`);
+
+  if (c.depth) {
+    const depthStr = JSON.stringify(c.depth, (key, val) => {
+      if (typeof val === 'number' && !Number.isFinite(val)) {
+        return undefined; // replacer returning undefined omits the key
+      }
+      return val;
+    });
+    // Only include the line if the stringified depth has content beyond just braces
+    if (depthStr !== '{}') {
+      out.push(`Orderbook: ${depthStr}`);
+    }
+  }
+
   if (typeof c.note === 'string' && c.note.trim()) out.push(`Note: ${c.note.trim()}`);
   return out;
 }
