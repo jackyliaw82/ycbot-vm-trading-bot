@@ -152,3 +152,52 @@ test('depth with all non-finite values omits the Orderbook line entirely', () =>
   });
   assert.ok(!m.includes('Orderbook'), 'Orderbook line must be omitted if all values are non-finite');
 });
+
+test('rangeVoids with malformed entries (null, undefined, primitives) does not throw and filters them', () => {
+  const m = buildPlanUserMessage({
+    symbol: 'BTCUSDT',
+    currentPrice: 100000,
+    profile: {
+      rangeVoids: [null, undefined, 5, 'foo', { priceLow: 97000, priceHigh: 97800 }],
+    },
+  });
+  assert.ok(!/undefined|NaN|null/.test(m), `leaked placeholder:\n${m}`);
+  assert.ok(m.includes('97000-97800'), 'valid void must appear');
+  assert.ok(!m.includes('Volume voids') || m.includes('97000-97800'), 'malformed entries must be filtered');
+});
+
+test('hvns with malformed entries (null, undefined, primitives) does not throw and filters them', () => {
+  const m = buildPlanUserMessage({
+    symbol: 'BTCUSDT',
+    currentPrice: 100000,
+    profile: {
+      hvns: [null, undefined, 'invalid', { priceLow: 100000, priceHigh: 101000 }],
+    },
+  });
+  assert.ok(!/undefined|NaN|null/.test(m), `leaked placeholder:\n${m}`);
+  assert.ok(m.includes('100000-101000'), 'valid HVN must appear');
+});
+
+test('depth with nested array containing non-finite values does not leak null', () => {
+  const m = buildPlanUserMessage({
+    symbol: 'BTCUSDT',
+    currentPrice: 100000,
+    depth: {
+      bids: [[100000, NaN], [99900, 5]],
+      asks: [[100100, 10]],
+    },
+  });
+  assert.ok(!/null/.test(m), `leaked null in nested array:\n${m}`);
+});
+
+test('depth with all null values omits the Orderbook line entirely', () => {
+  const m = buildPlanUserMessage({
+    symbol: 'BTCUSDT',
+    currentPrice: 100000,
+    depth: {
+      bidQty: null,
+      askQty: null,
+    },
+  });
+  assert.ok(!m.includes('Orderbook'), 'Orderbook line must be omitted if all values are null');
+});

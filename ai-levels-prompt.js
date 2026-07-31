@@ -52,6 +52,33 @@ Return JSON only. No markdown fences, no commentary outside the JSON object.`;
 const n = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 const line = (label, v, suffix = '') => (v === null ? null : `${label}: ${v}${suffix}`);
 
+// Recursively sanitise an object/array, dropping non-finite numbers and null/undefined values
+function sanitiseDepth(val) {
+  if (val === null || val === undefined) return undefined;
+  if (typeof val === 'number') {
+    return Number.isFinite(val) ? val : undefined;
+  }
+  if (Array.isArray(val)) {
+    // Filter array: drop nulls, undefined, non-finite numbers; keep only usable values
+    const filtered = val
+      .map(item => sanitiseDepth(item))
+      .filter(item => item !== undefined);
+    return filtered.length > 0 ? filtered : undefined;
+  }
+  if (typeof val === 'object') {
+    // Recursively sanitise object entries
+    const sanitised = {};
+    for (const [key, v] of Object.entries(val)) {
+      const sanitised_val = sanitiseDepth(v);
+      if (sanitised_val !== undefined) {
+        sanitised[key] = sanitised_val;
+      }
+    }
+    return Object.keys(sanitised).length > 0 ? sanitised : undefined;
+  }
+  return val; // strings, booleans, etc. pass through
+}
+
 function marketSection(c) {
   const p = c.profile || {};
   const out = [
@@ -67,13 +94,21 @@ function marketSection(c) {
   ].filter(Boolean);
 
   const voids = Array.isArray(p.rangeVoids) ? p.rangeVoids : [];
-  const validVoids = voids.filter(v => typeof v.priceLow === 'number' && Number.isFinite(v.priceLow) && typeof v.priceHigh === 'number' && Number.isFinite(v.priceHigh));
+  const validVoids = voids.filter(v =>
+    typeof v === 'object' && v !== null &&
+    typeof v.priceLow === 'number' && Number.isFinite(v.priceLow) &&
+    typeof v.priceHigh === 'number' && Number.isFinite(v.priceHigh)
+  );
   if (validVoids.length) {
     out.push(`Volume voids (rangeVoids): ${validVoids.map(v => `${v.priceLow}-${v.priceHigh}`).join(', ')}`);
   }
 
   const hvns = Array.isArray(p.hvns) ? p.hvns : [];
-  const validHvns = hvns.filter(v => typeof v.priceLow === 'number' && Number.isFinite(v.priceLow) && typeof v.priceHigh === 'number' && Number.isFinite(v.priceHigh));
+  const validHvns = hvns.filter(v =>
+    typeof v === 'object' && v !== null &&
+    typeof v.priceLow === 'number' && Number.isFinite(v.priceLow) &&
+    typeof v.priceHigh === 'number' && Number.isFinite(v.priceHigh)
+  );
   if (validHvns.length) {
     out.push(`High volume nodes: ${validHvns.map(v => `${v.priceLow}-${v.priceHigh}`).join(', ')}`);
   }
@@ -83,15 +118,12 @@ function marketSection(c) {
   }
 
   if (c.depth) {
-    const depthStr = JSON.stringify(c.depth, (key, val) => {
-      if (typeof val === 'number' && !Number.isFinite(val)) {
-        return undefined; // replacer returning undefined omits the key
+    const sanitised = sanitiseDepth(c.depth);
+    if (sanitised !== undefined) {
+      const depthStr = JSON.stringify(sanitised);
+      if (depthStr !== '{}') {
+        out.push(`Orderbook: ${depthStr}`);
       }
-      return val;
-    });
-    // Only include the line if the stringified depth has content beyond just braces
-    if (depthStr !== '{}') {
-      out.push(`Orderbook: ${depthStr}`);
     }
   }
 
