@@ -39,6 +39,13 @@ export function roundToTick(price, tickSize) {
  * Rounding happens BEFORE the invariant is re-checked, because rounding can
  * move a level onto or across current price — a bull 0.04 above price on a 0.1
  * tick rounds down onto it, and an order there fires instantly.
+ *
+ * `atr` is REQUIRED, not optional: a missing/non-finite/non-positive value
+ * REJECTS the pair rather than skipping the 1.5x ATR separation check. An
+ * absent ATR means the caller genuinely doesn't know current volatility —
+ * treating that as "no constraint" would let a pair with a dead zone
+ * narrower than ordinary noise through on exactly the tick a Binance hiccup
+ * makes verification impossible.
  */
 export function validateLevels(levels, { currentPrice, atr, tickSize } = {}) {
   if (!levels || typeof levels !== 'object') return { ok: false, reason: 'no levels object' };
@@ -68,12 +75,20 @@ export function validateLevels(levels, { currentPrice, atr, tickSize } = {}) {
     return { ok: false, reason: `bearLevel ${bearLevel} must be below current price ${currentPrice}` };
   }
 
-  if (finitePos(atr)) {
-    const minSep = ATR_SEPARATION_MULT * atr;
-    const sep = bullLevel - bearLevel;
-    if (sep < minSep) {
-      return { ok: false, reason: `separation ${sep.toFixed(6)} below ${ATR_SEPARATION_MULT}x ATR (${minSep.toFixed(6)})` };
-    }
+  // A missing/non-finite/non-positive ATR must REJECT, not silently skip the
+  // separation check. Treating "we don't know the ATR" as "no constraint"
+  // deletes the 1.5x ATR floor exactly when a Binance hiccup makes it most
+  // needed — the caller (buildLevelContext) already omits atr rather than
+  // ever sending 0, so anything that lands here unusable is genuinely
+  // unknown, not a real zero-volatility reading.
+  if (!finitePos(atr)) {
+    return { ok: false, reason: `atr is missing or not a positive finite number: ${atr}` };
+  }
+
+  const minSep = ATR_SEPARATION_MULT * atr;
+  const sep = bullLevel - bearLevel;
+  if (sep < minSep) {
+    return { ok: false, reason: `separation ${sep.toFixed(6)} below ${ATR_SEPARATION_MULT}x ATR (${minSep.toFixed(6)})` };
   }
 
   return { ok: true, bullLevel, bearLevel };

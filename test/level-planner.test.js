@@ -51,24 +51,30 @@ test('validateLevels: enforces the 1.5x ATR separation floor', () => {
   assert.equal(ATR_SEPARATION_MULT, 1.5);
 });
 
-test('validateLevels: a missing or non-finite ATR skips the separation check, not the invariant', () => {
-  const r = validateLevels({ bullLevel: 101, bearLevel: 99 }, opts({ atr: null }));
-  assert.equal(r.ok, true, 'unknown ATR must not block an otherwise valid pair');
-  assert.equal(validateLevels({ bullLevel: 99, bearLevel: 101 }, opts({ atr: null })).ok, false);
+test('validateLevels: a missing, non-finite, or non-positive ATR is REJECTED, not silently skipped', () => {
+  // Critical-1 fix: the old contract treated an unknown ATR as "no separation
+  // constraint", which let a pair with a dead zone inside ordinary noise
+  // through on exactly the tick a Binance hiccup made the ATR unavailable.
+  // An unknown ATR must now fail closed.
+  const bad = [null, undefined, NaN, 0, -1, Infinity, -Infinity, 'x'];
+  for (const atr of bad) {
+    const r = validateLevels({ bullLevel: 101, bearLevel: 99 }, opts({ atr }));
+    assert.equal(r.ok, false, `atr=${atr} must be rejected, not skip the separation check`);
+    assert.match(r.reason, /atr/i, `reason should name the missing ATR for atr=${atr}: ${r.reason}`);
+  }
+});
+
+test('validateLevels: atr key omitted entirely is rejected the same as atr: null', () => {
+  const { atr, ...rest } = opts();
+  const r = validateLevels({ bullLevel: 101, bearLevel: 99 }, rest);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /atr/i);
 });
 
 test('validateLevels: separation EXACTLY 1.5x ATR is accepted (boundary is >=)', () => {
   // atr 2 -> minSep 3 exactly. sep 3 must pass, not fail on a strict '<'.
   const r = validateLevels({ bullLevel: 101.5, bearLevel: 98.5 }, opts());
   assert.equal(r.ok, true, 'separation exactly at the 1.5x ATR floor must be accepted');
-});
-
-test('validateLevels: atr:Infinity skips the separation check rather than rejecting', () => {
-  // finitePos(Infinity) is false, so an infinite ATR must fall through to
-  // "no separation check", the same as a missing/null ATR — never treated
-  // as an impossible-to-satisfy minimum separation.
-  const r = validateLevels({ bullLevel: 101, bearLevel: 99 }, opts({ atr: Infinity }));
-  assert.equal(r.ok, true, 'an infinite ATR must not reject an otherwise valid pair');
 });
 
 test('validateLevels: rejects non-numeric, NaN and non-positive levels', () => {

@@ -75,6 +75,26 @@ test('buildLevelContext: never emits a non-finite number', async () => {
   }
 });
 
+test('buildLevelContext: an ATR flagged interpretation:"unknown" is omitted, not sent as 0', async () => {
+  // Critical-1 fix: computeATR's not-enough-data answer is
+  // { atr: 0, interpretation: 'unknown' }. The 0 is a sentinel, not a real
+  // reading — sending it through as ctx.atr = 0 would print "ATR: 0" into the
+  // prompt and delete the 1.5x ATR separation gate downstream (level-planner
+  // treats a present, finite, positive atr as the only usable case).
+  const mm = { ...okMm, getVolatility: async () => ({ atr: 0, atrPercent: 0, interpretation: 'unknown' }) };
+  const c = await buildLevelContext(args({ marketMetrics: mm }));
+  assert.equal(c.atr, undefined, 'an unknown-interpretation ATR must not reach the context, not even as 0');
+});
+
+test('buildLevelContext: atr: 0 without an "unknown" flag is still omitted, not treated as real zero volatility', async () => {
+  // Belt-and-suspenders: even absent the interpretation flag, a non-positive
+  // ATR is unusable for the separation check and must not survive into the
+  // context as a number the model or level-planner could act on.
+  const mm = { ...okMm, getVolatility: async () => ({ atr: 0, atrPercent: 0 }) };
+  const c = await buildLevelContext(args({ marketMetrics: mm }));
+  assert.equal(c.atr, undefined);
+});
+
 test('buildLevelContext: preserves legitimate zero and negative values', async () => {
   const mm = {
     ...okMm,
@@ -110,4 +130,23 @@ test('buildLevelContext: a source resolving to an array is treated as malformed,
   const mm = { ...okMm, getOrderbookDepth: async () => [1, 2, 3] };
   const c = await buildLevelContext(args({ marketMetrics: mm }));
   assert.equal(c.depth, undefined, 'an array must never survive as ctx.depth');
+});
+
+test('buildLevelContext: a source method that throws SYNCHRONOUSLY (not async) only omits its own field', async () => {
+  // A source whose method is a plain (non-async) function that throws never
+  // produces a rejected promise for Promise.allSettled to catch — the whole
+  // Promise.all/allSettled array construction would throw synchronously
+  // instead, failing every field, not just this one. call() in
+  // market-context.js wraps the invocation in its own try/catch specifically
+  // to convert that synchronous throw into a resolved-undefined entry. This
+  // guard was mutated away in a prior review pass with no test catching it —
+  // this pins it down.
+  const mm = {
+    ...okMm,
+    getVolatility: () => { throw new Error('sync boom'); },  // NOT async
+  };
+  const c = await buildLevelContext(args({ marketMetrics: mm }));
+  assert.equal(c.symbol, 'BTCUSDT', 'the whole context must still build');
+  assert.equal(c.atr, undefined, 'only the synchronously-throwing field is omitted');
+  assert.equal(c.cvd, -1200, 'other fields must be unaffected');
 });

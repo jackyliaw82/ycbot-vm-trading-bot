@@ -66,12 +66,21 @@ test('e2e: usage from a real consult prices through ai-cost', async () => {
 test('e2e: a degraded context (every source down) still reaches a verdict', async () => {
   const dead = new Proxy({}, { get: () => async () => { throw new Error('x'); } });
   const context = await buildLevelContext({ symbol: 'BTCUSDT', currentPrice: 101, volumeProfile: dead, marketMetrics: dead, precision });
+  // ATR is now a REQUIRED field for validateLevels (Critical-1 fix: a missing
+  // ATR REJECTS rather than skipping the 1.5x separation check), so this test
+  // supplies one directly on the built context. That is deliberate, not a
+  // weakening of the "degraded" scenario: the point under test is resilience
+  // to every OTHER source failing (volumeProfile + the rest of marketMetrics
+  // are still fully dead below), not resilience to a missing ATR — a missing
+  // ATR is now a hard "cannot start", covered separately in level-planner.test.js.
+  context.atr = 1;
   const r = await planLevels({
     planner: { consult: async () => ({ json: { bullLevel: 104, bearLevel: 98 }, usage: {} }) },
     context,
   });
   // No profile means no fallback, so the AI pair is the only route — and it is
-  // still validated: bull above price, bear below, separation unchecked (no ATR).
+  // still validated: bull above price, bear below, and now separation too
+  // (atr:1 -> minSep 1.5, actual separation 6 clears it easily).
   assert.equal(r.source, 'ai');
   assert.equal(r.bullLevel, 104);
 });
