@@ -4,7 +4,7 @@
 // one implementation feeding the chart histogram (binVolumes/priceMin/binWidth).
 
 const VP_CACHE_TTL_MS = 10 * 60 * 1000;      // 10 min volume profile cache
-const CANDLE_CACHE_TTL_MS = 5 * 60 * 1000;   // 5 min 1m-candle cache
+const CANDLE_CACHE_TTL_MS = 5 * 60 * 1000;   // 5 min candle cache — shared by every WINDOWS interval (1m/5m/1h)
 const VP_24H_1M_BARS = 1440;                 // 1m × 1440 = 24h (fine profile source)
 const VP_BIN_COUNT_24H = 200;                // 24h profile bins — supported by 1m data
 

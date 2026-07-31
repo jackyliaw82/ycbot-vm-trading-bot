@@ -165,7 +165,7 @@ test('_getCandles: caches per interval, so windows do not evict each other', asy
   assert.deepEqual(calls, ['1m', '5m']);
 });
 
-test('_getCandles: a failed fetch returns the stale cache, not an empty profile', async () => {
+test('_getCandles: invalidate purges the cache, so a later failed fetch has nothing to return', async () => {
   let fail = false;
   const vp = new VolumeProfile(fakeStrategy(async () => {
     if (fail) throw new Error('network');
@@ -177,4 +177,25 @@ test('_getCandles: a failed fetch returns the stale cache, not an empty profile'
   vp.invalidate('BTCUSDT');
   const second = await vp._getCandles('BTCUSDT', '1m', 1440);
   assert.deepEqual(second, [], 'invalidated cache + failure yields empty, never a throw');
+});
+
+test('_getCandles: a failed fetch returns the stale cache, not an empty profile', async () => {
+  let fail = false;
+  const vp = new VolumeProfile(fakeStrategy(async () => {
+    if (fail) throw new Error('network');
+    return [kline(7)];
+  }));
+  const first = await vp._getCandles('BTCUSDT', '1m', 1440);
+  assert.equal(first.length, 1);
+  // Force the cache entry to read as EXPIRED so the next call actually
+  // attempts (and fails) the fetch, instead of short-circuiting on the
+  // fresh-cache branch — otherwise this would pass for the wrong reason
+  // without ever touching the catch block's fallback.
+  vp._candleCache.get('BTCUSDT:1m:1440').ts = 0;
+  fail = true;
+  // No invalidate() here — the (now-expired) cache entry from the successful
+  // fetch above must still be present in the Map for the catch block's
+  // fallback to find.
+  const second = await vp._getCandles('BTCUSDT', '1m', 1440);
+  assert.deepEqual(second, first, 'a failed fetch must fall back to the stale cache, not go empty');
 });
