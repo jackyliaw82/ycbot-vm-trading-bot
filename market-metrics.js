@@ -20,6 +20,8 @@ const CVD_LOOKBACK_BARS = 24;                    // 24 × 5m = 2h CVD window
 const CVD_TREND_THRESHOLD_PCT = 0.05;            // 5% slope threshold for rising/falling
 const DEPTH_CACHE_TTL_MS = 30 * 1000;            // 30s depth snapshot cadence
 const DEPTH_LIMIT = 100;                         // top-100 levels each side
+const FUNDING_CACHE_TTL_MS = 5 * 60 * 1000;   // funding settles 8-hourly; 5 min is ample
+const OI_CACHE_TTL_MS = 60 * 1000;            // OI history is 5m-bucketed
 
 /**
  * ATR (Average True Range) over the last `period` candles, plus the same value
@@ -140,6 +142,8 @@ export class MarketMetrics {
     this._candle15mCache = new Map();  // symbol -> { candles, ts }
     this._candle5mCache = new Map();   // symbol -> { candles, ts }
     this._depthCache = new Map();      // symbol -> { depth, ts }
+    this._fundingCache = new Map();   // symbol -> { value, ts }
+    this._oiCache = new Map();        // symbol -> { value, ts }
   }
 
   // ——— Candle fetchers ————————————————————————————————————————————————
@@ -215,9 +219,86 @@ export class MarketMetrics {
     }
   }
 
+  /**
+   * Funding rate + time to next settlement. Restored from the deleted
+   * ai-market-context.js (_getFundingRate), minus the position-notional
+   * enrichment — the level planner reasons about the RATE, not this account's
+   * exposure, and passing exposure in would leak position state into a prompt
+   * that is supposed to describe the market.
+   *
+   * Returns null on any failure. Callers treat a null as "unknown" and omit the
+   * field; funding is one input among many and must never block a cycle start.
+   */
+  async getFundingRate(symbol) {
+    const now = Date.now();
+    const cached = this._fundingCache.get(symbol);
+    if (cached && (now - cached.ts) < FUNDING_CACHE_TTL_MS) return cached.value;
+    try {
+      const premiumIndex = await this.strategy.makeProxyRequest('/fapi/v1/premiumIndex', 'GET', { symbol }, false, 'futures');
+      const rate = parseFloat(premiumIndex?.lastFundingRate);
+      if (!Number.isFinite(rate)) return null;
+      const nextMs = parseInt(premiumIndex?.nextFundingTime, 10);
+      let nextFundingTime = null;
+      if (Number.isFinite(nextMs)) {
+        const hours = Math.max(0, (nextMs - now) / 3_600_000);
+        nextFundingTime = `in ${Math.floor(hours)}h ${Math.floor((hours % 1) * 60)}m`;
+      }
+      const value = { rate, nextFundingTime };
+      this._fundingCache.set(symbol, { value, ts: now });
+      return value;
+    } catch (error) {
+      console.error(`Failed to fetch funding rate: ${error.message}`);
+      return cached?.value ?? null;
+    }
+  }
+
+  /**
+   * Open-interest change over the last 5m and 1h, plus a coarse trend.
+   * Restored from the deleted ai-market-context.js (_getOIChange).
+   *
+   * Every percentage divides by an earlier reading, so a zero baseline is
+   * rejected outright rather than emitted as Infinity — an Infinity here would
+   * reach the prompt as market data.
+   */
+  async getOpenInterestChange(symbol) {
+    const now = Date.now();
+    const cached = this._oiCache.get(symbol);
+    if (cached && (now - cached.ts) < OI_CACHE_TTL_MS) return cached.value;
+    try {
+      const data = await this.strategy.makeProxyRequest('/futures/data/openInterestHist', 'GET', { symbol, period: '5m', limit: 12 }, false, 'futures');
+      if (!Array.isArray(data) || data.length < 3) return null;
+
+      const nums = data.map(d => parseFloat(d?.sumOpenInterestValue));
+      if (nums.some(v => !Number.isFinite(v))) return null;
+
+      const latest = nums[nums.length - 1];
+      const secondLatest = nums[nums.length - 2];
+      const oldest = nums[0];
+      if (secondLatest === 0 || oldest === 0) return null;   // no Infinity into a prompt
+
+      const last3 = nums.slice(-3);
+      let oiTrend = 'FLAT';
+      if (last3[2] > last3[1] && last3[1] > last3[0]) oiTrend = 'RISING';
+      else if (last3[2] < last3[1] && last3[1] < last3[0]) oiTrend = 'FALLING';
+
+      const value = {
+        oiChange5m: ((latest - secondLatest) / secondLatest) * 100,
+        oiChange1h: ((latest - oldest) / oldest) * 100,
+        oiTrend,
+      };
+      this._oiCache.set(symbol, { value, ts: now });
+      return value;
+    } catch (error) {
+      console.error(`Failed to fetch OI history: ${error.message}`);
+      return cached?.value ?? null;
+    }
+  }
+
   invalidate(symbol) {
     this._candle15mCache.delete(symbol);
     this._candle5mCache.delete(symbol);
     this._depthCache.delete(symbol);
+    this._fundingCache.delete(symbol);
+    this._oiCache.delete(symbol);
   }
 }
