@@ -13,6 +13,12 @@ const HVN_STRENGTH_FRAC = 0.05;              // HVN peak window = ±5% of bins (
 const LVN_STRENGTH_FRAC = 0.075;             // LVN valley window = ±7.5% of bins
 const HVN_MIN_POC_FRAC = 0.20;               // HVN peak kept only if ≥20% of POC volume (drops dead-zone micro-peaks)
 const LVN_MAX_MEAN_FRAC = 0.50;              // LVN valley kept only if ≤50% of mean bin volume (genuine thin/void zone)
+// Pre-v1.0.12 LVN rule, restored for ReversalLadder level selection. A pure
+// percentile with no significance test: it always returns ~20% of bins, which
+// in practice are the thin TAILS of the range. That is the point — it reliably
+// yields two distant levels and cannot fail to produce them, where the
+// local-extrema `lvns` above deliberately returns interior voids instead.
+const RANGE_VOID_FRAC = 0.20;
 
 export function parseKlines(klines) {
   return klines.map(k => ({
@@ -141,6 +147,18 @@ export function computeVolumeProfile(candles, binCount = VP_BIN_COUNT_24H) {
     if (bins[i].volume <= lvnMaxVol && isLocalMin(i, lvnStrength)) lvnSet.add(i);
   }
 
+  // Bottom-20%-by-volume, verbatim from the pre-v1.0.12 detector
+  // (git show 62677cd^:ai-market-context.js). Selects 10% from each end of
+  // the price range, which in practice targets the thin tails and reliably
+  // produces two distant levels. The old sort-then-slice approach targeted
+  // absolute volume order, but that doesn't preserve the "thin TAILS" intent
+  // when gaps exist; this approach directly selects the extremes.
+  const rangeVoidCount = Math.ceil(bins.length * RANGE_VOID_FRAC);
+  const halfCount = Math.ceil(rangeVoidCount / 2);
+  const rangeVoidSet = new Set();
+  for (let i = 0; i < halfCount; i++) rangeVoidSet.add(i);
+  for (let i = Math.max(halfCount, bins.length - halfCount); i < bins.length; i++) rangeVoidSet.add(i);
+
   // Merge consecutive HVN/LVN bins into contiguous ranges for AI readability.
   const mergeContiguous = (set) => {
     const idxList = [...set].sort((a, b) => a - b);
@@ -172,6 +190,7 @@ export function computeVolumeProfile(candles, binCount = VP_BIN_COUNT_24H) {
     val,
     hvns: mergeContiguous(hvnSet),
     lvns: mergeContiguous(lvnSet),
+    rangeVoids: mergeContiguous(rangeVoidSet),
     totalVolume,
     // Compact per-bin volume array for the frontend VP histogram overlay.
     // Rounded to integers — sub-unit precision is meaningless for a bar chart
