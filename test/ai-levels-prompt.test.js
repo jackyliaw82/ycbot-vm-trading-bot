@@ -201,3 +201,18 @@ test('depth with all null values omits the Orderbook line entirely', () => {
   });
   assert.ok(!m.includes('Orderbook'), 'Orderbook line must be omitted if all values are null');
 });
+
+test('circular reference in depth does not throw and does not leak placeholders', () => {
+  const circular = { bidQty: 5 };
+  circular.self = circular;
+  const m = buildPlanUserMessage({
+    symbol: 'BTCUSDT',
+    currentPrice: 100000,
+    depth: circular,
+  });
+  // Must not throw RangeError; must complete gracefully
+  assert.ok(typeof m === 'string', 'builder must return a string');
+  assert.ok(!/undefined|NaN|null/.test(m), `leaked placeholder:\n${m}`);
+  // bidQty: 5 should still appear, or the line should be omitted if circular refs cause the whole thing to be dropped
+  assert.ok(!m.includes('Orderbook') || m.includes('5'), 'either omit Orderbook or include the usable bidQty');
+});

@@ -52,24 +52,31 @@ Return JSON only. No markdown fences, no commentary outside the JSON object.`;
 const n = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 const line = (label, v, suffix = '') => (v === null ? null : `${label}: ${v}${suffix}`);
 
-// Recursively sanitise an object/array, dropping non-finite numbers and null/undefined values
-function sanitiseDepth(val) {
+// Recursively sanitise an object/array, dropping non-finite numbers and null/undefined values.
+// Uses a WeakSet to guard against circular references.
+function sanitiseDepth(val, visited = new WeakSet()) {
   if (val === null || val === undefined) return undefined;
   if (typeof val === 'number') {
     return Number.isFinite(val) ? val : undefined;
   }
   if (Array.isArray(val)) {
+    // Guard against circular array references
+    if (visited.has(val)) return undefined;
+    visited.add(val);
     // Filter array: drop nulls, undefined, non-finite numbers; keep only usable values
     const filtered = val
-      .map(item => sanitiseDepth(item))
+      .map(item => sanitiseDepth(item, visited))
       .filter(item => item !== undefined);
     return filtered.length > 0 ? filtered : undefined;
   }
   if (typeof val === 'object') {
+    // Guard against circular object references
+    if (visited.has(val)) return undefined;
+    visited.add(val);
     // Recursively sanitise object entries
     const sanitised = {};
     for (const [key, v] of Object.entries(val)) {
-      const sanitised_val = sanitiseDepth(v);
+      const sanitised_val = sanitiseDepth(v, visited);
       if (sanitised_val !== undefined) {
         sanitised[key] = sanitised_val;
       }
