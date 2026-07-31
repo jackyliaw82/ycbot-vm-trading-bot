@@ -72,12 +72,15 @@ test('computeVolumeProfile: rangeVoids land on the range EDGES', () => {
     return candle(price, price + 0.05, volume);
   });
   const vp = computeVolumeProfile(candles, 50);
-  assert.ok(vp.rangeVoids.length >= 1, `expected at least one void, got ${vp.rangeVoids.length}`);
+  assert.ok(vp.rangeVoids.length >= 2, `expected at least two voids, got ${vp.rangeVoids.length}`);
   // With continuous volume distribution and volume-order selection,
-  // rangeVoids should land on the thin regions (extremes in this shape).
+  // rangeVoids should land on the thin regions (both edges in this shape).
   const first = vp.rangeVoids[0];
-  assert.ok(first.priceLow >= vp.priceMin && first.priceLow <= vp.priceMin + vp.binWidth * 5,
+  assert.ok(first.priceLow >= vp.priceMin && first.priceLow <= vp.priceMin + vp.binWidth,
     `first void should be near range min, got ${first.priceLow}`);
+  const last = vp.rangeVoids[vp.rangeVoids.length - 1];
+  assert.ok(last.priceHigh <= vp.priceMax && last.priceHigh >= vp.priceMax - vp.binWidth,
+    `last void should be near range max, got ${last.priceHigh}`);
 });
 
 test('computeVolumeProfile: rangeVoids is ascending and non-overlapping', () => {
@@ -101,8 +104,9 @@ test('computeVolumeProfile: rangeVoids does NOT disturb the chart-facing fields'
   assert.ok(Array.isArray(vp.hvns));
   assert.ok(Number.isFinite(vp.vah) && Number.isFinite(vp.val));
   assert.ok(Number.isFinite(vp.poc.price));
-  // The whole point: the two rules disagree. rangeVoids hugs the edges,
-  // lvns (local-minimum + significance gate) does not.
+  // The whole point: the two rules disagree — rangeVoids (bottom-20%-by-volume)
+  // and lvns (local-minimum + significance gate) are different selections and
+  // need not agree on where the void/valley ranges are for a given fixture.
   assert.notDeepEqual(vp.rangeVoids, vp.lvns);
 });
 
