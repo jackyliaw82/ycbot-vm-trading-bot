@@ -1,9 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { computeVolumeProfile } from '../volume-profile.js';
+import { computeVolumeProfile, selectVoidPair } from '../volume-profile.js';
 
 // Candle shape per parseKlines: { open, high, low, close, volume, ... }
 const candle = (low, high, volume) => ({ open: low, high, low, close: high, volume });
+
+const profileWithVoids = (voids) => ({ rangeVoids: voids });
 
 test('computeVolumeProfile: POC lands on the heaviest price bin', () => {
   const candles = [
@@ -101,4 +103,40 @@ test('computeVolumeProfile: rangeVoids uses volume-order, not price-position', (
       `void at price [${void_.priceLow.toFixed(2)}, ${void_.priceHigh.toFixed(2)}] is at an extreme (priceMin=${vp.priceMin}, priceMax=${vp.priceMax}), but should be in the middle`
     );
   }
+});
+
+test('selectVoidPair: picks the outermost void on each side of price', () => {
+  const p = profileWithVoids([
+    { priceLow: 98.0,  priceHigh: 98.5,  volume: 1 },   // outer lower
+    { priceLow: 99.0,  priceHigh: 99.4,  volume: 1 },   // inner lower
+    { priceLow: 103.0, priceHigh: 103.4, volume: 1 },   // inner upper
+    { priceLow: 104.0, priceHigh: 104.6, volume: 1 },   // outer upper
+  ]);
+  const r = selectVoidPair(p, 101);
+  assert.equal(r.lower.priceLow, 98.0, 'lower must be the OUTERMOST below price');
+  assert.equal(r.upper.priceHigh, 104.6, 'upper must be the OUTERMOST above price');
+  assert.equal(r.bearLevel, 98.5, 'bear is the void INNER edge');
+  assert.equal(r.bullLevel, 104.0, 'bull is the void INNER edge');
+});
+
+test('selectVoidPair: returns null when every void is on one side', () => {
+  const p = profileWithVoids([
+    { priceLow: 98.0, priceHigh: 98.5, volume: 1 },
+    { priceLow: 99.0, priceHigh: 99.4, volume: 1 },
+  ]);
+  assert.equal(selectVoidPair(p, 101), null);
+});
+
+test('selectVoidPair: a void containing price counts for neither side', () => {
+  const p = profileWithVoids([
+    { priceLow: 98.0,  priceHigh: 98.5,  volume: 1 },
+    { priceLow: 100.5, priceHigh: 101.5, volume: 1 },   // straddles price
+  ]);
+  assert.equal(selectVoidPair(p, 101), null);
+});
+
+test('selectVoidPair: tolerates a missing or empty profile', () => {
+  assert.equal(selectVoidPair(null, 101), null);
+  assert.equal(selectVoidPair({ rangeVoids: [] }, 101), null);
+  assert.equal(selectVoidPair({}, 101), null);
 });

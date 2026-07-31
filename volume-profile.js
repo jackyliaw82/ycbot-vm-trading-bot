@@ -196,6 +196,35 @@ export function computeVolumeProfile(candles, binCount = VP_BIN_COUNT_24H) {
 }
 
 /**
+ * Pick the void pair that STRADDLES `price` — one wholly above, one wholly
+ * below. Returns null if either side is missing, which is the widen-chain's
+ * signal to try a longer window (see VolumeProfile.getVoidProfile).
+ *
+ * OUTERMOST on each side, not nearest: the bottom-20% rule puts the real tails
+ * at the extremes, and ReversalLadder wants bull and bear far apart — the
+ * distance between them is the dead zone that makes the strategy churn-free.
+ *
+ * The levels are the void INNER edges (the boundary price crosses on its way
+ * into the void), because that is where a breakout begins rather than where it
+ * has already run.
+ */
+export function selectVoidPair(profile, price) {
+  const voids = profile?.rangeVoids;
+  if (!Array.isArray(voids) || voids.length === 0) return null;
+  if (!Number.isFinite(price)) return null;
+
+  let lower = null;   // wholly below price — keep the LOWEST
+  let upper = null;   // wholly above price — keep the HIGHEST
+  for (const v of voids) {
+    if (v.priceHigh < price && (lower === null || v.priceLow < lower.priceLow)) lower = v;
+    if (v.priceLow > price && (upper === null || v.priceHigh > upper.priceHigh)) upper = v;
+  }
+  if (!lower || !upper) return null;
+
+  return { upper, lower, bullLevel: upper.priceLow, bearLevel: lower.priceHigh };
+}
+
+/**
  * VolumeProfile — 24h VPVR for the chart histogram overlay, keyed by symbol.
  * `strategy` supplies makeProxyRequest — the same duck-typed proxy transport
  * every strategy already has from TradingBase; this class does not invent a
