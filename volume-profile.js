@@ -148,16 +148,11 @@ export function computeVolumeProfile(candles, binCount = VP_BIN_COUNT_24H) {
   }
 
   // Bottom-20%-by-volume, verbatim from the pre-v1.0.12 detector
-  // (git show 62677cd^:ai-market-context.js). Selects 10% from each end of
-  // the price range, which in practice targets the thin tails and reliably
-  // produces two distant levels. The old sort-then-slice approach targeted
-  // absolute volume order, but that doesn't preserve the "thin TAILS" intent
-  // when gaps exist; this approach directly selects the extremes.
-  const rangeVoidCount = Math.ceil(bins.length * RANGE_VOID_FRAC);
-  const halfCount = Math.ceil(rangeVoidCount / 2);
-  const rangeVoidSet = new Set();
-  for (let i = 0; i < halfCount; i++) rangeVoidSet.add(i);
-  for (let i = Math.max(halfCount, bins.length - halfCount); i < bins.length; i++) rangeVoidSet.add(i);
+  // (git show 62677cd^:ai-market-context.js). Sorted DESCENDING then sliced
+  // from the tail, preserving the original tie-break order exactly.
+  const sortedByVol = bins.map((b, i) => ({ ...b, idx: i })).sort((a, b) => b.volume - a.volume);
+  const voidCutoffStart = bins.length - Math.ceil(bins.length * RANGE_VOID_FRAC);
+  const rangeVoidSet = new Set(sortedByVol.slice(voidCutoffStart).map(b => b.idx));
 
   // Merge consecutive HVN/LVN bins into contiguous ranges for AI readability.
   const mergeContiguous = (set) => {

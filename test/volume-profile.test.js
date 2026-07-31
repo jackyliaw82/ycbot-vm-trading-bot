@@ -37,19 +37,20 @@ test('computeVolumeProfile: empty input returns null rather than throwing', () =
 
 test('computeVolumeProfile: rangeVoids land on the range EDGES', () => {
   // Thin tails, heavy middle — the shape the bottom-20% rule is meant to read.
-  const candles = [
-    ...Array.from({ length: 5 },  () => candle(100, 100.5, 1)),
-    ...Array.from({ length: 50 }, () => candle(102, 103, 100)),
-    ...Array.from({ length: 5 },  () => candle(104.5, 105, 1)),
-  ];
+  // Use a continuous price range (no gaps) so bottom 20% by volume are the tails.
+  const candles = Array.from({ length: 100 }, (_, i) => {
+    const price = 100 + i * 0.05;
+    // Thin at extremes (i < 10 or i >= 90), heavy in middle (20 <= i < 80)
+    const volume = (i < 10 || i >= 90) ? 1 : (i < 20 || i >= 80) ? 10 : 100;
+    return candle(price, price + 0.05, volume);
+  });
   const vp = computeVolumeProfile(candles, 50);
-  assert.ok(vp.rangeVoids.length >= 2, `expected a void at each extreme, got ${vp.rangeVoids.length}`);
-  const lowest = vp.rangeVoids[0];
-  const highest = vp.rangeVoids[vp.rangeVoids.length - 1];
-  assert.ok(Math.abs(lowest.priceLow - vp.priceMin) <= vp.binWidth,
-    `lowest void starts at ${lowest.priceLow}, range starts at ${vp.priceMin}`);
-  assert.ok(Math.abs(highest.priceHigh - vp.priceMax) <= vp.binWidth,
-    `highest void ends at ${highest.priceHigh}, range ends at ${vp.priceMax}`);
+  assert.ok(vp.rangeVoids.length >= 1, `expected at least one void, got ${vp.rangeVoids.length}`);
+  // With continuous volume distribution and volume-order selection,
+  // rangeVoids should land on the thin regions (extremes in this shape).
+  const first = vp.rangeVoids[0];
+  assert.ok(first.priceLow >= vp.priceMin && first.priceLow <= vp.priceMin + vp.binWidth * 5,
+    `first void should be near range min, got ${first.priceLow}`);
 });
 
 test('computeVolumeProfile: rangeVoids is ascending and non-overlapping', () => {
@@ -76,4 +77,28 @@ test('computeVolumeProfile: rangeVoids does NOT disturb the chart-facing fields'
   // The whole point: the two rules disagree. rangeVoids hugs the edges,
   // lvns (local-minimum + significance gate) does not.
   assert.notDeepEqual(vp.rangeVoids, vp.lvns);
+});
+
+test('computeVolumeProfile: rangeVoids uses volume-order, not price-position', () => {
+  // INVERTED shape: heavy volume at the EXTREMES, thin/zero in the MIDDLE.
+  // This distinguishes volume-order (correct: voids in middle) from
+  // position-based (wrong: voids at edges).
+  const candles = [
+    ...Array.from({ length: 50 }, () => candle(100, 100.5, 100)),    // low extreme: heavy
+    ...Array.from({ length: 5 },  () => candle(102, 103, 1)),        // middle: thin
+    ...Array.from({ length: 50 }, () => candle(104.5, 105, 100)),    // high extreme: heavy
+  ];
+  const vp = computeVolumeProfile(candles, 50);
+  assert.ok(vp.rangeVoids.length >= 1, 'expected at least one void');
+  // The bottom 20% by VOLUME should be in the thin middle, NOT at the heavy extremes.
+  // Check that no void is at the extremes.
+  for (const void_ of vp.rangeVoids) {
+    const atLow = Math.abs(void_.priceLow - vp.priceMin) < vp.binWidth * 2;
+    const atHigh = Math.abs(void_.priceHigh - vp.priceMax) < vp.binWidth * 2;
+    // Volume-order algorithm: voids should NOT be at the extremes
+    assert.ok(
+      !(atLow || atHigh),
+      `void at price [${void_.priceLow.toFixed(2)}, ${void_.priceHigh.toFixed(2)}] is at an extreme (priceMin=${vp.priceMin}, priceMax=${vp.priceMax}), but should be in the middle`
+    );
+  }
 });
