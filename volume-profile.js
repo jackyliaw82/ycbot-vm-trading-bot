@@ -295,6 +295,34 @@ export class VolumeProfile {
     }
   }
 
+  /**
+   * Volume profile for LEVEL SELECTION — separate from get24h, which serves the
+   * chart and must never change shape. Walks WINDOWS until a void pair straddles
+   * `price`.
+   *
+   * Returns { window, profile, pair }. `pair: null` after the whole chain means
+   * no historical window has a void on one side of price — a genuine breakout,
+   * where by definition no volume exists beyond it. That is NOT an error: the
+   * widest profile is still returned so the caller can reason over it, and
+   * Phase 2 hands the AI an explicit "no void above/below price" flag rather
+   * than widening forever and manufacturing a worse level.
+   *
+   * Returns bare null only when no candles could be fetched at all.
+   */
+  async getVoidProfile(symbol, price) {
+    let last = null;
+    for (const w of WINDOWS) {
+      const candles = await this._getCandles(symbol, w.interval, w.bars);
+      if (!candles || candles.length === 0) continue;
+      const profile = computeVolumeProfile(candles, w.bins);
+      if (!profile) continue;
+      last = { window: w.key, profile, pair: null };
+      const pair = selectVoidPair(profile, price);
+      if (pair) return { window: w.key, profile, pair };
+    }
+    return last;
+  }
+
   invalidate(symbol) {
     this._vpCache.delete(symbol);
     for (const key of this._candleCache.keys()) {

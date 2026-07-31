@@ -11,6 +11,27 @@ const profileWithVoids = (voids) => ({ rangeVoids: voids });
 const fakeStrategy = (onCall) => ({ makeProxyRequest: onCall });
 const kline = (v) => [0, '100', '101', '99', '100.5', String(v), 0, '0', 0, '0', '0', '0'];
 
+// Raw kline index order per parseKlines: [openTime, open, high, low, close, volume, ...].
+// computeVolumeProfile only reads low/high, but keep open/close well-formed so
+// the fixture is not misleading to anyone who reads it later.
+const rawKline = (low, high, volume) =>
+  [0, String(low), String(high), String(low), String(high), String(volume), 0, '0', 0, '0', '0', '0'];
+
+// Heavy middle tapering to thin tails, centred wherever the caller asks — lets a
+// test place live price inside the range (straddled) or far outside it (breakout).
+//
+// CRITICAL: coverage must be CONTINUOUS with no zero-volume gaps. `rangeVoids` is
+// a bottom-20%-BY-VOLUME rule, so literal empty bins between clusters outrank
+// merely-thin tail bins and the voids land in the INTERIOR instead of at the
+// edges. A gapped fixture therefore tests the opposite of what it looks like it
+// tests. Volume here decreases monotonically with distance from centre and never
+// reaches zero, so the thinnest bins genuinely are the two tails.
+const tailedKlines = (centre) => Array.from({ length: 61 }, (_, i) => {
+  const lo = centre - 3 + i * 0.1;
+  const dist = Math.abs(lo + 0.05 - centre);
+  return rawKline(lo, lo + 0.1, Math.max(1, Math.round(100 - dist * 30)));
+});
+
 test('computeVolumeProfile: POC lands on the heaviest price bin', () => {
   const candles = [
     ...Array.from({ length: 10 }, () => candle(100, 100.5, 1)),
@@ -198,4 +219,37 @@ test('_getCandles: a failed fetch returns the stale cache, not an empty profile'
   // fallback to find.
   const second = await vp._getCandles('BTCUSDT', '1m', 1440);
   assert.deepEqual(second, first, 'a failed fetch must fall back to the stale cache, not go empty');
+});
+
+test('getVoidProfile: stops at 24h when it already straddles price', async () => {
+  const seen = [];
+  const vp = new VolumeProfile(fakeStrategy(async (_p, _m, params) => {
+    seen.push(params.interval);
+    return tailedKlines(100);
+  }));
+  const r = await vp.getVoidProfile('BTCUSDT', 100);
+  assert.equal(r.window, '24h');
+  assert.ok(r.pair, 'expected a straddling pair');
+  assert.ok(r.pair.bullLevel > 100 && r.pair.bearLevel < 100);
+  assert.deepEqual(seen, ['1m'], 'must not widen when 24h already works');
+});
+
+test('getVoidProfile: widens 24h -> 48h -> 7d in order', async () => {
+  const seen = [];
+  const vp = new VolumeProfile(fakeStrategy(async (_p, _m, params) => {
+    seen.push(params.interval);
+    // Every window is centred at 100, but price is far above every void,
+    // so no window can ever straddle it.
+    return tailedKlines(100);
+  }));
+  const r = await vp.getVoidProfile('BTCUSDT', 500);
+  assert.deepEqual(seen, ['1m', '5m', '1h'], 'must try all three, in order');
+  assert.equal(r.window, '7d', 'reports the last window tried');
+  assert.equal(r.pair, null, 'no straddling pair anywhere — the breakout case');
+  assert.ok(r.profile, 'still returns the widest profile for the AI to reason over');
+});
+
+test('getVoidProfile: returns null when no candles are available at all', async () => {
+  const vp = new VolumeProfile(fakeStrategy(async () => { throw new Error('down'); }));
+  assert.equal(await vp.getVoidProfile('BTCUSDT', 100), null);
 });
