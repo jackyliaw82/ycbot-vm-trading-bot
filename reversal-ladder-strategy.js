@@ -2567,6 +2567,152 @@ class ReversalLadderStrategy extends TradingBase {
     return { cancelled: true };
   }
 
+  // ——— Manual level control (§3, §10) ——————————————————————————————————
+
+  /**
+   * Manual edit of one or both levels (§3). The VM is the authority; the UI
+   * confirm is a convenience.
+   *
+   * Two hard refusals, both fail-CLOSED:
+   *  1. The §3 invariant `bearLevel < live price < bullLevel`. A level on the
+   *     wrong side of price is an order trigger that fires the instant it is
+   *     set.
+   *  2. A side with ANY filled leg cannot move. Rebuilding that ladder resets
+   *     its legs, and those POSITION_OPEN markings are the only record of what
+   *     is open (`_closeQuantity` sizes every close from them) — moving the
+   *     geometry under them orphans live inventory.
+   *
+   * Error shapes match `harvestNow`: input errors set `.invalidInput = true`
+   * (→ 400); state conflicts are untagged (→ 409).
+   */
+  async editLevels({ bullLevel = null, bearLevel = null } = {}) {
+    if (!this.isRunning) throw new Error('Strategy is not running.');
+    const invalidInput = (msg) => { const e = new Error(msg); e.invalidInput = true; return e; };
+
+    if (bullLevel == null && bearLevel == null) {
+      throw invalidInput('Supply bullLevel, bearLevel, or both.');
+    }
+    const price = this.currentPrice;
+    if (!Number.isFinite(price) || price <= 0) {
+      throw new Error('No live price yet — cannot validate a level edit.');
+    }
+
+    const nextBull = bullLevel == null ? this.bullLevel : this.roundPrice(Number(bullLevel));
+    const nextBear = bearLevel == null ? this.bearLevel : this.roundPrice(Number(bearLevel));
+    if (!Number.isFinite(nextBull) || nextBull <= 0) throw invalidInput('bullLevel must be a positive number.');
+    if (!Number.isFinite(nextBear) || nextBear <= 0) throw invalidInput('bearLevel must be a positive number.');
+
+    const movingBull = bullLevel != null && nextBull !== this.bullLevel;
+    const movingBear = bearLevel != null && nextBear !== this.bearLevel;
+
+    // The §3 invariant is checked ONLY against the side being moved. Once a
+    // position is scaled, price is legitimately OUTSIDE the band by
+    // construction (that is what TREND is), so re-validating the untouched side
+    // against live price would refuse every edit exactly when the user most
+    // wants one. The untouched side cannot have become invalid on its own — it
+    // has not moved — and the side price HAS run past is filled, which the
+    // filled-leg refusal below rejects anyway. `nextBull > nextBear` is checked
+    // unconditionally: an inverted pair has no dead zone at all.
+    if (movingBull && !(nextBull > price)) {
+      throw invalidInput(`bullLevel must be above the current price (${this._formatPrice(price)}).`);
+    }
+    if (movingBear && !(nextBear < price)) {
+      throw invalidInput(`bearLevel must be below the current price (${this._formatPrice(price)}).`);
+    }
+    if (!(nextBull > nextBear)) {
+      throw invalidInput(`bullLevel (${this._formatPrice(nextBull)}) must be above bearLevel (${this._formatPrice(nextBear)}).`);
+    }
+
+    const held = (dir) => this.ladderLines.some((l) => l.direction === dir && l.state === 'POSITION_OPEN');
+    if (movingBull && held('LONG')) {
+      throw new Error('The bull ladder has a filled leg — close the position before moving that level.');
+    }
+    if (movingBear && held('SHORT')) {
+      throw new Error('The bear ladder has a filled leg — close the position before moving that level.');
+    }
+    if (!movingBull && !movingBear) {
+      return { bullLevel: this.bullLevel, bearLevel: this.bearLevel, changed: false };
+    }
+
+    // Rebuild ONLY the moved side, preserving the other side's legs verbatim —
+    // the untouched ladder may hold inventory, and buildReversalLadder returns
+    // fresh EMPTY legs for both sides.
+    const rebuilt = buildReversalLadder(nextBull, nextBear, this.stepPct, this.levelsPerSide);
+    this.ladderLines = this.ladderLines.map((leg) => {
+      const moving = leg.direction === 'LONG' ? movingBull : movingBear;
+      if (!moving) return leg;
+      return rebuilt.find((r) => r.direction === leg.direction && r.index === leg.index) ?? leg;
+    });
+    this.bullLevel = nextBull;
+    this.bearLevel = nextBear;
+
+    // Carry-forward 3: the band just moved. The ratchet's stored value may now
+    // sit outside it, where Math.max/Math.min would let it win forever and the
+    // cap that keeps the exit out of the ladder would be silently dead.
+    if (Number.isFinite(this.trailExit)) {
+      this.trailExit = Math.min(this.bullLevel, Math.max(this.bearLevel, this.trailExit));
+    }
+    if (this.trailEnabled && this.ladderMode === 'TREND') {
+      // The distance is measured against the levels, so a moved level changes
+      // it. Re-arm from the current trend start rather than keeping a distance
+      // derived from a band that no longer exists.
+      const d = trailDistance(this.trendStartPrice, this.trendDirection, this.bullLevel, this.bearLevel);
+      this.trailDistanceValue = (d != null && d > 0) ? d : null;
+      if (this.trailDistanceValue == null) this.trailExit = null;
+    }
+
+    await this.addLog(
+      `[REVERSAL] levels edited — BULL ${this._formatPrice(this.bullLevel)} / ` +
+      `BEAR ${this._formatPrice(this.bearLevel)} (rebuilt: ` +
+      `${[movingBull && 'bull', movingBear && 'bear'].filter(Boolean).join(' + ')}).`,
+    );
+    await this._writeStrategyFlow('LEVELS_EDITED', {
+      bullLevel: this.bullLevel, bearLevel: this.bearLevel, movedBull: movingBull, movedBear: movingBear,
+    }).catch(() => {});
+    await this.saveState();
+    this._pushHeartbeatNow?.();
+    return { bullLevel: this.bullLevel, bearLevel: this.bearLevel, changed: true };
+  }
+
+  /**
+   * Ask the planner for a level proposal WITHOUT applying it (§10). Returns a
+   * proposal even with a position open; applying it is a separate, explicit
+   * user action through `editLevels`, which re-runs the §3 guard rails and the
+   * filled-leg refusal.
+   */
+  async askAi(question) {
+    if (!this.isRunning) throw new Error('Strategy is not running.');
+    if (!Number.isFinite(this.currentPrice) || this.currentPrice <= 0) {
+      throw new Error('No live price yet — cannot build a market context.');
+    }
+    const context = await buildLevelContext({
+      symbol: this.symbol,
+      currentPrice: this.currentPrice,
+      volumeProfile: this.volumeProfile,
+      marketMetrics: this.marketMetrics,
+    });
+    const result = await planLevels({
+      planner: this._aiPlanner ?? null,
+      context,
+      mode: 'ask',
+      question: typeof question === 'string' ? question : undefined,
+    });
+    if (!result) throw new Error('No valid level pair could be produced for this market right now.');
+    if (result.usage) {
+      this._aiUsage.add(result.usage);
+      this.aiCostUSD = this._aiUsage.costUsd(this.aiModel);
+      await this.saveState();
+    }
+    return {
+      bullLevel: result.bullLevel,
+      bearLevel: result.bearLevel,
+      source: result.source,
+      rationale: result.rationale,
+      confidence: result.confidence,
+      applied: false,
+    };
+  }
+
   // ——— Dynamic sizing ————————————————————————————————————————————————
 
   /**

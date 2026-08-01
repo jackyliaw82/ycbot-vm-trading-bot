@@ -3137,3 +3137,96 @@ test('the API key is never persisted or surfaced', async () => {
   assert.ok(!status.includes('sk-secret-value'), 'getStatus leaked the key');
   assert.ok(!beat.includes('sk-secret-value'), 'the heartbeat leaked the key');
 });
+
+// ——— Task 7: manual level edit and Ask AI (§3, §10) ——————————————————
+
+// §14.9 — an edit is refused while that side holds inventory.
+test('editLevels refuses to move a side that has a filled leg', async () => {
+  const s = reversalStrategy();
+  const L1 = s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1);
+  L1.state = 'POSITION_OPEN';
+  L1.quantity = 1;
+  await assert.rejects(
+    () => s.editLevels({ bullLevel: 105 }),
+    /filled/i,
+    'moving the geometry under a filled leg would orphan it',
+  );
+  assert.equal(s.bullLevel, 102, 'the level must be unchanged after a refusal');
+});
+
+// §14.9 — the §3 invariant is enforced VM-side.
+test('editLevels refuses a pair that violates bear < price < bull', async () => {
+  const s = reversalStrategy();
+  s.currentPrice = 100;
+  await assert.rejects(() => s.editLevels({ bullLevel: 99 }), /above/i);
+  await assert.rejects(() => s.editLevels({ bearLevel: 101 }), /below/i);
+});
+
+test('editLevels rebuilds only the edited side and keeps the other ladder', async () => {
+  const s = reversalStrategy();
+  await s.editLevels({ bullLevel: 105 });
+  assert.equal(s.bullLevel, 105);
+  assert.equal(s.bearLevel, 98);
+  const L1 = s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1);
+  const S1 = s.ladderLines.find(l => l.direction === 'SHORT' && l.index === 1);
+  assert.equal(L1.price, 105, 'L1 IS bullLevel');
+  assert.equal(S1.price, 98, 'the untouched side keeps its geometry');
+});
+
+// NOTE: the brief's original fixture moved BOTH bullLevel and bearLevel at
+// once against a single price (bull 101 / bear 101.5 @ price 100). That is
+// mathematically unreachable: the individual per-side checks require
+// nextBull > price > nextBear, which by transitivity already forces
+// nextBull > nextBear — so an inverted pair can never survive both moving at
+// once, and the "below current price" refusal fires first instead of the
+// unconditional inversion check this test means to exercise. Fixed by moving
+// only ONE side (mirroring the real scenario: price ran past the old level),
+// leaving the other side's un-moved value to collide with it.
+test('editLevels rejects an inverted pair', async () => {
+  const s = reversalStrategy();          // bull 102 / bear 98
+  s.currentPrice = 105;                  // price has run above the old bull level
+  await assert.rejects(() => s.editLevels({ bearLevel: 103 }), /above bearLevel/i);
+});
+
+// In TREND price is legitimately OUTSIDE the band, so the invariant must only
+// bind the side actually being moved — otherwise no edit is ever possible once
+// a position has scaled.
+test('editLevels allows moving the unfilled side while price sits outside the band', async () => {
+  const s = trendStrategy();       // LONG filled, price will be 106, bull 102
+  await s.handleRealtimePrice(106);
+  await s.editLevels({ bearLevel: 99 });
+  assert.equal(s.bearLevel, 99);
+  assert.equal(s.bullLevel, 102, 'the untouched side is not re-validated against price');
+});
+
+// Carry-forward 3 — a narrowed band must not strand the ratchet outside it.
+// Only the SHORT ladder is unfilled here, so bear is the movable side.
+test('editing a level while TREND is armed re-clamps the trail into the new band', async () => {
+  const s = trendStrategy();
+  s._armTrail();
+  await s.handleRealtimePrice(106);
+  assert.equal(s.trailExit, 100);
+  await s.editLevels({ bearLevel: 101 });
+  assert.ok(
+    s.trailExit >= 101 && s.trailExit <= 102,
+    `trail ${s.trailExit} must be re-clamped into the new [101, 102] band`,
+  );
+});
+
+test('askAi returns a proposal without applying it', async () => {
+  const s = reversalStrategy();
+  s.volumeProfile = { getVoidProfile: async () => ({ profile: { rangeVoids: [] }, pair: null, window: '24h' }) };
+  s.marketMetrics = {
+    getVolatility: async () => ({ atr: 1, interpretation: 'normal' }),
+    getCvd: async () => ({ cvd: 0 }),
+    getOrderbookDepth: async () => ({ bidVolume: 1, askVolume: 1 }),
+    getFundingRate: async () => ({ rate: 0 }),
+    getOpenInterestChange: async () => ({ oiChange1h: 0 }),
+  };
+  s._aiPlanner = {
+    consult: async () => ({ json: { bullLevel: 106, bearLevel: 94, rationale: 'wider' }, usage: null }),
+  };
+  const proposal = await s.askAi('go wider');
+  assert.equal(proposal.bullLevel, 106);
+  assert.equal(s.bullLevel, 102, 'a proposal must NOT be applied');
+});
