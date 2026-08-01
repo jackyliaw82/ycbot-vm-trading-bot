@@ -394,6 +394,15 @@ class ReversalLadderStrategy extends TradingBase {
    * the tick gate retries on the throttle. That is deliberate: trading without
    * levels has no entry trigger and no reversal boundary, so "we could not plan"
    * must never read as "proceed".
+   *
+   * `false` really does mean nothing was built, even on the unlikely path where
+   * `_buildLadders` throws AFTER assigning `this.ladderLines` (its own trailing
+   * addLog/saveState calls already self-catch, so this is defense in depth, not
+   * a realistic trigger today) — checked below via `this.ladderLines.length`
+   * rather than by whether the surrounding try completed, because BOTH callers
+   * (the empty-ladder gate and `_harvestToFlat`) guarantee `ladderLines` is `[]`
+   * before calling this, so a non-empty array after a throw can only mean
+   * `_buildLadders` itself already assigned it.
    */
   async _planAndBuildLevels(reason) {
     if (this._levelPlanInProgress) return false;
@@ -426,10 +435,37 @@ class ReversalLadderStrategy extends TradingBase {
         `bear ${this._formatPrice(result.bearLevel)}` +
         (result.rationale ? ` — ${result.rationale}` : ''),
       );
+
+      // The pair was validated against the price as it stood BEFORE
+      // buildLevelContext's six network fetches. Price can have left the band
+      // in that window, and _buildLadders stamps lastProcessedPrice from the
+      // LIVE price — so a ladder built now could sit entirely on one side of
+      // price, and the next tick back through the level would open a position
+      // in the wrong direction. Re-check against the live price rather than
+      // trusting a snapshot that is seconds old; the throttle re-plans.
+      const live = this.currentPrice;
+      if (!Number.isFinite(live) || !(result.bearLevel < live && live < result.bullLevel)) {
+        await this.addLog(
+          `[REVERSAL] level planning (${reason}) discarded — price moved to ` +
+          `${this._formatPrice(live)}, outside the proposed band ` +
+          `${this._formatPrice(result.bearLevel)}–${this._formatPrice(result.bullLevel)} ` +
+          `while the market context was being fetched. Re-planning.`,
+        );
+        return false;
+      }
+
       await this._buildLadders({ bullLevel: result.bullLevel, bearLevel: result.bearLevel, reason });
       this._levelPlanLastTs = null;   // succeeded: no throttle carried forward
       return true;
     } catch (err) {
+      // See the docstring above: a throw after _buildLadders already assigned
+      // the ladder must still report success, never the "nothing was built"
+      // false that every caller relies on.
+      if (this.ladderLines.length) {
+        await this.addLog(`WARNING: level planning (${reason}) built the ladder but a trailing step failed: ${err.message}`);
+        this._levelPlanLastTs = null;
+        return true;
+      }
       await this.addLog(`ERROR: level planning (${reason}) failed for ${this.symbol}: ${err.message}`);
       return false;
     } finally {
@@ -1195,10 +1231,18 @@ class ReversalLadderStrategy extends TradingBase {
       // Re-plan the levels: a harvest closes AT a level, so keeping the old pair
       // would leave price sitting on top of a trigger and refill it immediately.
       // A failed re-plan leaves the ladder EMPTY, which is safe — the tick gate
-      // retries on the throttle and nothing trades meanwhile.
+      // retries on the throttle and nothing trades meanwhile. Mode/trendDirection
+      // are reset here too — `_buildLadders` is their only OTHER writer, and it
+      // never runs on a failed re-plan, so a harvest out of TREND whose re-plan
+      // fails would otherwise persist ladderMode:'TREND' over an empty ladder:
+      // a flat account announcing TREND, which resume()'s _reconcileTrendInvariant
+      // reads as the invariant needing a self-heal and burns a REST refresh + a
+      // false-alarm log on the very next tick/restart.
       this.ladderLines = [];
       this.bullLevel = null;
       this.bearLevel = null;
+      this.ladderMode = 'SCALING';
+      this.trendDirection = null;
       await this._planAndBuildLevels(reason);
 
       // The audit label reflects what ACTUALLY happened (keyed off `closed`), not

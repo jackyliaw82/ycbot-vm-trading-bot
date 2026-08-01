@@ -201,6 +201,141 @@ test('saveState persists the level state and no anchor state', async () => {
   assert.ok(!('trailDirection' in written), 'Anchor Trailing must not be persisted');
 });
 
+// ——— _planAndBuildLevels: the real method, unstubbed ——————————————————
+//
+// Every OTHER test in this file that reaches _planAndBuildLevels stubs it
+// directly. These pin the real gate: the in-progress guard, the throttle, the
+// !result fail-closed branch, the catch, and (review finding 1) the stale-price
+// re-check against the LIVE price after buildLevelContext's awaited fetches.
+
+// A profile whose fallback void pair (via selectVoidPair) is bull 104 / bear
+// 97.8 against currentPrice 101 — pinned by test/level-context-e2e.test.js's
+// own e2e assertions, reused here rather than re-deriving the void math.
+const REAL_PLAN_PROFILE = {
+  poc: { price: 100.5 }, vah: 102, val: 99,
+  rangeVoids: [{ priceLow: 97, priceHigh: 97.8 }, { priceLow: 104, priceHigh: 105 }],
+};
+
+test('_planAndBuildLevels: the in-progress guard returns false without re-planning', async () => {
+  const s = reversalStrategy();
+  let called = false;
+  s.volumeProfile = { getVoidProfile: async () => { called = true; return null; } };
+  s._levelPlanInProgress = true;
+  const result = await s._planAndBuildLevels('cycle_start');
+  assert.equal(result, false);
+  assert.equal(called, false, 'no market-context fetch when a plan is already in flight');
+});
+
+test('_planAndBuildLevels: a call inside the throttle window returns false without re-planning, and succeeds once it elapses', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = reversalStrategy();
+  s.ladderLines = [];
+  s.currentPrice = 101;
+  let calls = 0;
+  s.volumeProfile = {
+    getVoidProfile: async () => {
+      calls++;
+      return { window: '24h', profile: REAL_PLAN_PROFILE, pair: { bullLevel: 104, bearLevel: 97.8 } };
+    },
+  };
+  s.marketMetrics = {
+    getVolatility: async () => ({ atr: 0.9 }),
+    getCvd: async () => ({ cvd: -1200 }),
+    getOrderbookDepth: async () => ({ bidVolume: 10, askVolume: 12 }),
+    getFundingRate: async () => ({ rate: 0.0001 }),
+    getOpenInterestChange: async () => ({ oiChange1h: 3.2 }),
+  };
+
+  s._levelPlanLastTs = Date.now(); // just planned a moment ago
+  const first = await s._planAndBuildLevels('cycle_start');
+  assert.equal(first, false, 'still inside the throttle window');
+  assert.equal(calls, 0, 'no re-plan attempt while throttled');
+
+  s._levelPlanLastTs = Date.now() - 31_000; // window elapsed
+  const second = await s._planAndBuildLevels('cycle_start');
+  assert.equal(second, true, 'throttle elapsed -> re-plans');
+  assert.equal(calls, 1);
+  assert.equal(s.bullLevel, 104);
+  assert.equal(s.bearLevel, 97.8);
+});
+
+test('_planAndBuildLevels: planLevels yielding no pair returns false and leaves ladderLines empty', async () => {
+  const s = reversalStrategy();
+  s.ladderLines = [];
+  s.currentPrice = 101;
+  // No void straddles price, and there is no AI planner (_aiPlanner is null by
+  // default) -> the mechanical fallback also comes up empty -> planLevels
+  // returns null.
+  s.volumeProfile = { getVoidProfile: async () => null };
+  s.marketMetrics = {};
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+
+  const result = await s._planAndBuildLevels('cycle_start');
+
+  assert.equal(result, false);
+  assert.equal(s.ladderLines.length, 0);
+  assert.ok(logs.some((m) => m.includes('produced no valid bull/bear pair')));
+});
+
+test('_planAndBuildLevels: a throwing context returns false and leaves ladderLines empty', async () => {
+  const s = reversalStrategy();
+  s.ladderLines = [];
+  s.currentPrice = NaN; // buildLevelContext throws outright on a non-finite currentPrice
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+
+  const result = await s._planAndBuildLevels('cycle_start');
+
+  assert.equal(result, false);
+  assert.equal(s.ladderLines.length, 0);
+  assert.ok(logs.some((m) => m.includes('ERROR: level planning') && m.includes('failed')));
+});
+
+// Review finding 1: planLevels validates the pair against `this.currentPrice`
+// as read BEFORE buildLevelContext's six awaited fetches. If price leaves the
+// band during that window, _buildLadders would otherwise build a ladder that
+// sits entirely on one side of the (now live) price, and the next tick back
+// through the level would open a position in the WRONG direction.
+test('_planAndBuildLevels: discards a pair validated against a now-stale price', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = reversalStrategy();
+  // Real empty-ladder-gate precondition (and what _harvestToFlat clears to
+  // before re-planning): no levels set yet.
+  s.ladderLines = [];
+  s.bullLevel = null;
+  s.bearLevel = null;
+  s.currentPrice = 101; // the snapshot planLevels will validate bull 104 / bear 97.8 against
+  s.volumeProfile = {
+    getVoidProfile: async () => {
+      // Simulate a fast move landing WHILE the (real, multi-fetch) context
+      // build is in flight — exactly the window the finding describes.
+      s.currentPrice = 106;
+      return { window: '24h', profile: REAL_PLAN_PROFILE, pair: { bullLevel: 104, bearLevel: 97.8 } };
+    },
+  };
+  s.marketMetrics = {
+    getVolatility: async () => ({ atr: 0.9 }),
+    getCvd: async () => ({ cvd: -1200 }),
+    getOrderbookDepth: async () => ({ bidVolume: 10, askVolume: 12 }),
+    getFundingRate: async () => ({ rate: 0.0001 }),
+    getOpenInterestChange: async () => ({ oiChange1h: 3.2 }),
+  };
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+
+  const result = await s._planAndBuildLevels('cycle_start');
+
+  assert.equal(result, false, 'a pair validated against a stale price must be discarded, not built');
+  assert.equal(s.ladderLines.length, 0, 'nothing may be built from a stale-validated pair');
+  assert.equal(s.bullLevel, null);
+  assert.equal(s.bearLevel, null);
+  assert.ok(
+    logs.some((m) => m.includes('discarded') && m.includes('106')),
+    'the reason names the live price that moved',
+  );
+});
+
 test('_legNotional splits the base evenly across 5 levels', () => {
   const s = reversalStrategy({ base: 10000 });
   assert.equal(s._legNotional(), 2000);
@@ -830,6 +965,24 @@ test('harvest clears the levels and re-plans, unlike a reversal', async () => {
     'the pair is cleared BEFORE the re-plan runs — unlike a reversal, which keeps the un-abandoned side standing',
   );
   assert.equal(s.ladderMode, 'SCALING');
+});
+
+// Review finding 2: _buildLadders is the only OTHER writer of ladderMode /
+// trendDirection, and it never runs when the re-plan fails — so a harvest out
+// of TREND whose re-plan fails (e.g. a 503) would otherwise persist
+// ladderMode:'TREND' over an empty ladder and a flat account. On a VM restart
+// resume()'s _reconcileTrendInvariant reads that as the invariant needing a
+// self-heal and burns a REST refresh plus a false alarm before the next tick
+// clears it.
+test('_harvestToFlat clears TREND state even when the re-plan itself fails', async () => {
+  const s = reversalStrategy({ mode: 'TREND' });
+  s.trendDirection = 'LONG';
+  s.finalTpPrice = 103;
+  s.activePosition = null; // flat: nothing to close, only the re-plan is under test
+  s._planAndBuildLevels = async () => false; // the re-plan fails
+  await s._harvestToFlat('manual_harvest');
+  assert.equal(s.ladderMode, 'SCALING', 'must not persist TREND over an empty, flat ladder');
+  assert.equal(s.trendDirection, null);
 });
 
 // ——— _harvestToFlat: a failed close must abort the rebuild, not orphan the position ———
