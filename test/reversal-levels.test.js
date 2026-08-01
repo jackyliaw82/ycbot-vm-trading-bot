@@ -75,3 +75,38 @@ test('outermostIndex: is the last rung, which is what arms TREND', () => {
   assert.equal(outermostIndex(5), 5);
   assert.equal(outermostIndex(10), 10);
 });
+
+test('buildReversalLadder: accepts the legal ceiling step (0.02)', () => {
+  const legs = buildReversalLadder(104000, 100000, 0.02, 5);
+  assert.equal(legs.length, 10);
+  const l1 = legs.find(l => l.direction === 'LONG' && l.index === 1);
+  const s1 = legs.find(l => l.direction === 'SHORT' && l.index === 1);
+  assert.equal(l1.price, 104000);
+  assert.equal(s1.price, 100000);
+  const l5 = legs.find(l => l.direction === 'LONG' && l.index === 5);
+  const s5 = legs.find(l => l.direction === 'SHORT' && l.index === 5);
+  assert.ok(near(l5.price, 104000 * (1 + 0.02 * 4)), 'L5 = 104000 × (1 + 0.02×4)');
+  assert.ok(near(s5.price, 100000 * (1 - 0.02 * 4)), 'S5 = 100000 × (1 − 0.02×4)');
+});
+
+test('buildReversalLadder: accepts the legal ceiling levels (10 per side)', () => {
+  const legs = buildReversalLadder(104000, 100000, 0.02, 10);
+  assert.equal(legs.length, 20);
+  const l1 = legs.find(l => l.direction === 'LONG' && l.index === 1);
+  const s1 = legs.find(l => l.direction === 'SHORT' && l.index === 1);
+  assert.equal(l1.price, 104000);
+  assert.equal(s1.price, 100000);
+  const l10 = legs.find(l => l.direction === 'LONG' && l.index === 10);
+  const s10 = legs.find(l => l.direction === 'SHORT' && l.index === 10);
+  assert.ok(near(l10.price, 104000 * (1 + 0.02 * 9)), 'L10 = 104000 × (1 + 0.02×9) = 122720');
+  assert.ok(near(s10.price, 100000 * (1 - 0.02 * 9)), 'S10 = 100000 × (1 − 0.02×9) = 82000');
+});
+
+test('buildReversalLadder: accepts the legal floor step (0.003)', () => {
+  const legs = buildReversalLadder(104000, 100000, 0.003, 3);
+  assert.equal(legs.length, 6);
+  const l1 = legs.find(l => l.direction === 'LONG' && l.index === 1);
+  const s1 = legs.find(l => l.direction === 'SHORT' && l.index === 1);
+  assert.equal(l1.price, 104000);
+  assert.equal(s1.price, 100000);
+});
