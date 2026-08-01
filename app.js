@@ -1841,8 +1841,8 @@ app.post('/reversal-ladder/trail', requireVmOwner, async (req, res) => {
 // strategyFlow audit trail for Reversal Ladder. Reads from
 // strategies/{strategyId}/strategyFlow subcollection populated by
 // ReversalLadderStrategy._writeStrategyFlow inside its post-execute bookkeeping
-// on every position event (open / reverse / harvest / anchor-flatten /
-// final_tp_hit). Used by the position chart to place TP segment boundaries
+// on every position event (LADDER_FILL / REVERSAL / TREND_ENTER / TRAILED_EXIT
+// / HARVEST / LEVELS_EDITED / FINAL_TP_HIT). Used by the position chart to place TP segment boundaries
 // at EXACT event moments instead of heartbeat-resolution timestamps.
 app.get('/reversal-ladder/strategy-flow', requireVmOwner, async (req, res) => {
   try {
