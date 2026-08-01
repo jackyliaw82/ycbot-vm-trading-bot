@@ -1775,6 +1775,69 @@ app.post('/reversal-ladder/adjust-profit-target', requireVmOwner, async (req, re
   }
 });
 
+// Manual edit of one or both levels (§3). Both bullLevel/bearLevel are
+// optional but at least one is required — editLevels() enforces that itself,
+// so this route does not duplicate the check. It also refuses a level on the
+// wrong side of live price and refuses to move a side that already holds a
+// filled leg (see editLevels' docstring in reversal-ladder-strategy.js).
+// Error shapes match harvestNow: input errors set .invalidInput = true
+// (→ 400); state conflicts are untagged (→ 409).
+app.post('/reversal-ladder/edit-levels', requireVmOwner, async (req, res) => {
+  try {
+    const { strategyId, bullLevel, bearLevel } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Reversal Ladder strategy with ID ${strategyId}` });
+    }
+    const result = await strategy.editLevels({ bullLevel: bullLevel ?? null, bearLevel: bearLevel ?? null });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(error.invalidInput ? 400 : 409).json({ error: error.message });
+  }
+});
+
+// Ask the planner for a level proposal WITHOUT applying it (§10). This makes
+// a LIVE AI round trip, so it is slower than the other action routes above —
+// callers should not assume harvest-now/adjust-*-style response latency
+// here. Returns a PROPOSAL ONLY; applying it is a separate, explicit
+// edit-levels call made by the user.
+app.post('/reversal-ladder/ask-ai', requireVmOwner, async (req, res) => {
+  try {
+    const { strategyId, question } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Reversal Ladder strategy with ID ${strategyId}` });
+    }
+    const result = await strategy.askAi(question);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(error.invalidInput ? 400 : 409).json({ error: error.message });
+  }
+});
+
+// Arm/disarm the TREND trailing exit. `enabled` is passed through to
+// setTrailEnabled() VERBATIM — do NOT coerce it (no !!enabled, no
+// enabled === 'true', no ?? false). setTrailEnabled() deliberately accepts
+// only real booleans and rejects everything else with .invalidInput = true,
+// so a malformed request surfaces as a visible 400 instead of silently
+// reading as "off" and disarming an exit the user believed was armed.
+app.post('/reversal-ladder/trail', requireVmOwner, async (req, res) => {
+  try {
+    const { strategyId, enabled } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Reversal Ladder strategy with ID ${strategyId}` });
+    }
+    const result = await strategy.setTrailEnabled(enabled);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(error.invalidInput ? 400 : 409).json({ error: error.message });
+  }
+});
+
 // strategyFlow audit trail for Reversal Ladder. Reads from
 // strategies/{strategyId}/strategyFlow subcollection populated by
 // ReversalLadderStrategy._writeStrategyFlow inside its post-execute bookkeeping
