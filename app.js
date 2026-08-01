@@ -1724,27 +1724,6 @@ app.post('/anchor-ladder/cancel-harvest-trigger', requireVmOwner, async (req, re
   }
 });
 
-// Turn Anchor Trailing on/off. `direction`: 'UP' | 'DOWN' | null (null = off).
-// Accepted whenever the strategy is running — including while ARMED or in
-// TREND, where it simply lies dormant. Error mapping matches harvest-now:
-// invalid direction → 400 (tagged invalidInput), not-running → 409; the
-// not-found guard returns 400 like its siblings.
-app.post('/anchor-ladder/trail', requireVmOwner, async (req, res) => {
-  try {
-    const { strategyId, direction } = req.body;
-    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
-    if (!('direction' in req.body)) return res.status(400).json({ error: 'direction is required.' });
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
-    }
-    const result = await strategy.setTrailDirection(direction ?? null);
-    res.json({ success: true, ...result });
-  } catch (error) {
-    res.status(error.invalidInput ? 400 : 409).json({ error: error.message });
-  }
-});
-
 // Manual user-driven edit of the cycle's desired-profit % while running. The
 // bot converts the % to USDT against initialCapital (the cycle-start basis),
 // recomputes Final TP, and persists. Allowed in any subState — no trade

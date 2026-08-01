@@ -11,8 +11,6 @@ import {
   LADDER_LEVELS_PER_SIDE,
   minInitialSizeUSDT,
   resolveLadderGeometry,
-  trailLevel,
-  suppressedSideFor,
 } from './ladder-levels.js';
 import { planLadderActions, averageOpenEntry } from './ladder-crossings.js';
 import { precisionFormatter } from './precisionUtils.js';
@@ -32,15 +30,6 @@ const TREND_ARM_RETRY_INTERVAL_MS = 15_000;
 // live price, so an armed trigger cannot accidentally fire on the very next
 // tick. Hard-enforced by harvestNow(); the frontend mirrors it for UX only.
 const TRIGGER_MIN_GAP_PCT = 0.001; // 0.1%
-// Minimum spacing between Anchor Trailing close attempts after an ABORTED
-// harvest. `_harvestToFlat` leaves the ladder INTACT when a close cannot be
-// verified while inventory remains (its tombstone) — so the anchor does not
-// move, the derived trail level does not move, price is still past it, and
-// trailing would re-fire EVERY TICK, each one another reduceOnly order at
-// Binance. This THROTTLES that retry; it does not suppress it. Retrying is
-// correct — the unclosed position genuinely needs another attempt and the retry
-// is what self-heals it. Matches the anchor-flatten retry latch's cadence.
-const TRAIL_RETRY_INTERVAL_MS = 5_000;
 
 function formatDuration(ms) {
   if (!ms || ms < 0) return 'N/A';
@@ -190,31 +179,6 @@ class ReversalLadderStrategy extends TradingBase {
     // 'stop'               = close + END the cycle, for banking a profit and
     //                        walking away rather than rebuilding the ladder.
     this.harvestTriggerAction = 'reanchor';   // 'reanchor' | 'stop'
-
-    // Anchor Trailing — the anchor follows price in ONE user-chosen direction,
-    // auto re-anchoring at ~S1 (DOWN) / ~L1 (UP) instead of opening that leg.
-    // PERSISTED: a redeploy that silently disarmed this would resume opening the
-    // very entries the user armed trailing to suppress — a textbook fail-open.
-    // The trail LEVEL is never stored; it is derived from the live anchor
-    // (see `_trailLevel`), so it tracks every re-anchor automatically.
-    this.trailDirection = null;          // 'UP' | 'DOWN' | null (null = off)
-    // How far trailing has walked the anchor, measured against the anchor as of
-    // the last NON-trail re-anchor. Trail fires are the only thing that moves the
-    // anchor AWAY from this baseline; every other re-anchor (cycle start, manual
-    // harvest, harvest-trigger) resets the baseline to the new anchor. That is
-    // what keeps "trail-attributed gain" and "anchor vs baseline" the SAME
-    // number — attribute it to trailing without the indicator ever being able to
-    // contradict the anchor on screen.
-    this.trailBaselineAnchor = null;     // number | null
-    this.trailMoveCount = 0;             // trail fires since the baseline was set
-    // The direction that produced the movement, kept so the sign still means
-    // "improvement" after trailing is switched OFF (there is no live direction
-    // to read then, but the anchor is still where trailing left it).
-    this.trailLastDirection = null;      // 'UP' | 'DOWN' | null
-    // Throttle timestamp for retrying an ABORTED trail harvest (Task 6).
-    // TRANSIENT — deliberately NOT persisted: a timestamp carried across a
-    // restart would wrongly suppress the first post-boot attempt.
-    this._trailRetryLastTs = null;
   }
 
   // ——— Lifecycle ——————————————————————————————————————————————————————
@@ -380,16 +344,8 @@ class ReversalLadderStrategy extends TradingBase {
    * anchor IS the current price and the step is fixed — so it cannot fail and
    * needs no retry throttle.
    */
-  async initializeLadder(currentPrice, { trailMove = false } = {}) {
+  async initializeLadder(currentPrice) {
     this.anchor = currentPrice;
-    // Baseline bookkeeping lives HERE, at the single site that writes the
-    // anchor, rather than at the call sites — a future caller cannot forget it.
-    if (trailMove) {
-      this.trailMoveCount = (this.trailMoveCount || 0) + 1;   // baseline deliberately untouched
-    } else {
-      this.trailBaselineAnchor = currentPrice;                // cycle start / manual harvest / trigger
-      this.trailMoveCount = 0;
-    }
     this.ladderLines = buildLadder(currentPrice, this.stepPct, this.levelsPerSide);
     this.ladderMode = 'RANGE';
     this.trendDirection = null;
@@ -681,43 +637,6 @@ class ReversalLadderStrategy extends TradingBase {
   _isGaugeFull() {
     return this.initialCapital > 0
       && this.cycleAccumulatedLoss >= this.harvestLossThreshold * this.initialCapital;
-  }
-
-  /**
-   * The live Anchor Trailing level, or null when trailing is off / the anchor
-   * is unusable. DERIVED every call — never cached, so it tracks re-anchors.
-   */
-  /**
-   * How far trailing has improved the anchor, as a percentage, or null when
-   * trailing has not moved it yet.
-   *
-   * SIGNED BY INTENT, not by price: trailing UP wants a HIGHER anchor (a better
-   * short entry later), trailing DOWN wants a LOWER one — so both read positive
-   * while trailing is working. Switching direction therefore flips the sign of
-   * the same untouched movement, which is the point: +2.4% of upward progress is
-   * -2.4% of progress once you have decided you wanted it lower.
-   *
-   * Computed from PRICES, never from `trailMoveCount * 0.1%` — the steps compound
-   * (24 moves is 2.43%, not 2.40%), and a count-derived figure would slowly drift
-   * away from the anchor it claims to describe.
-   */
-  _trailGainPct() {
-    const base = this.trailBaselineAnchor;
-    if (!Number.isFinite(base) || base <= 0) return null;
-    if (!Number.isFinite(this.anchor) || this.anchor <= 0) return null;
-    if (!(this.trailMoveCount > 0)) return null;          // nothing to report yet
-    // Armed -> the live direction (so a fresh switch flips the sign at once).
-    // Off   -> whichever direction actually produced the movement.
-    const dir = this.trailDirection || this.trailLastDirection;
-    if (dir !== 'UP' && dir !== 'DOWN') return null;
-    const raw = (this.anchor - base) / base;
-    return (dir === 'UP' ? raw : -raw) * 100;
-  }
-
-  _trailLevel() {
-    if (!this.trailDirection || !Number.isFinite(this.anchor) || this.anchor <= 0) return null;
-    if (!Number.isFinite(this.stepPct) || this.stepPct <= 0) return null;
-    return trailLevel(this.anchor, this.stepPct, this.trailDirection);
   }
 
   /**
@@ -1106,8 +1025,9 @@ class ReversalLadderStrategy extends TradingBase {
    *
    * @returns {Promise<boolean>} `true` only when the close + re-anchor completed
    *   (reached `initializeLadder`); `false` on the in-flight skip and on the
-   *   tombstone abort. Anchor Trailing uses this to decide whether to schedule a
-   *   bounded retry — it must NEVER infer the outcome from observed side effects.
+   *   tombstone abort. Callers that need a bounded retry on an aborted harvest
+   *   must key it off this return — never infer the outcome from observed side
+   *   effects.
    */
   async _harvestToFlat(reason) {
     if (this._tradingSeqInProgress) {
@@ -1130,17 +1050,7 @@ class ReversalLadderStrategy extends TradingBase {
       const closingPnl = (this.activePosition && Number.isFinite(this.activePosition.unrealizedPnl))
         ? this.activePosition.unrealizedPnl : 0;
       const kind = !hadInventory ? 'RE-ANCHOR' : (closingPnl >= 0 ? 'HARVEST' : 'RE-ANCHOR');
-      // For a trail fire, name the level that actually triggered. `_trailLevel()`
-      // derives off the CURRENT anchor, and `initializeLadder` has not run yet at
-      // this point, so it still reads the OLD anchor — i.e. exactly the level that
-      // was hit, not the one the next ladder will use. Reading it any later would
-      // silently log the wrong number.
       let detail = reason;
-      if (reason === 'trail' && this.trailDirection) {
-        const level = this._trailLevel();
-        detail = `trail ${this.trailDirection === 'UP' ? 'Up' : 'Down'}`
-          + (level != null ? ` @ ${this._formatPrice(level)}` : '');
-      }
       await this.addLog(`===== ${kind} (${detail}) — flatten + re-anchor =====`);
 
       // Self-gating and self-sizing (see `_closeQuantity`). This matters most
@@ -1209,10 +1119,7 @@ class ReversalLadderStrategy extends TradingBase {
       );
 
       // Re-anchor on the live price — THE difference from the anchor flatten.
-      // `reason` decides whether this counts as trailing walking the anchor or
-      // as a fresh baseline: a manual harvest or a fired trigger starts the
-      // measurement over from wherever it lands.
-      await this.initializeLadder(this.currentPrice, { trailMove: reason === 'trail' });
+      await this.initializeLadder(this.currentPrice);
 
       // The audit label reflects what ACTUALLY happened (keyed off `closed`), not
       // the pre-close `kind` guess — so a stale-open-but-actually-flat run records
@@ -1333,12 +1240,6 @@ class ReversalLadderStrategy extends TradingBase {
     this.harvestTriggerPrice = snapshot.harvestTriggerPrice ?? null;
     this.harvestTriggerAbove = snapshot.harvestTriggerAbove ?? null;
     this.harvestTriggerAction = snapshot.harvestTriggerAction === 'stop' ? 'stop' : 'reanchor';
-    this.trailDirection = snapshot.trailDirection ?? null;
-    // Legacy snapshots predate these: fall back to the restored anchor so the
-    // indicator reads 0% rather than inventing a gain against a null baseline.
-    this.trailBaselineAnchor = snapshot.trailBaselineAnchor ?? snapshot.anchor ?? null;
-    this.trailMoveCount = snapshot.trailMoveCount ?? 0;
-    this.trailLastDirection = snapshot.trailLastDirection ?? snapshot.trailDirection ?? null;
     this.cycleAccumulatedLoss = snapshot.cycleAccumulatedLoss || 0;
     this.flattenCount = snapshot.flattenCount || 0;
     this.harvestCount = snapshot.harvestCount || 0;
@@ -1465,13 +1366,6 @@ class ReversalLadderStrategy extends TradingBase {
     this._recomputeFinalTpPrice();
 
     await this.addLog(`[RECOVERY] subState=${this.subState} side=${this.currentSide || 'NONE'} flattens=${this.flattenCount} harvests=${this.harvestCount} accLoss=${this.cycleAccumulatedLoss.toFixed(4)} USDT`);
-
-    if (this.trailDirection) {
-      await this.addLog(
-        `[LADDER] trailing resumed (Trail ${this.trailDirection === 'UP' ? 'Up' : 'Down'}) — ` +
-        `the anchor keeps following price ${this.trailDirection === 'UP' ? 'up' : 'down'}.`,
-      );
-    }
 
     await this.saveState();
 
@@ -1659,8 +1553,6 @@ class ReversalLadderStrategy extends TradingBase {
     this.harvestTriggerPrice = null;
     this.harvestTriggerAbove = null;
     this.harvestTriggerAction = 'reanchor';
-    // Trailing dies with the cycle too — same rule as the harvest trigger.
-    this.trailDirection = null;
 
     // Final funding flush — capture any settlement that happened between
     // the last scheduled poll and stop. Non-critical: swallow errors.
@@ -1924,63 +1816,6 @@ class ReversalLadderStrategy extends TradingBase {
       }
     }
 
-    // ---- Anchor Trailing — auto re-anchor at ~S1 (DOWN) / ~L1 (UP). ----
-    // Placed with the other triggers, BEFORE _reconcileTrendInvariant and the
-    // RANGE/TREND dispatch, so the re-anchor PREEMPTS the level's leg fill on
-    // this tick. That ordering — not timing luck — is the whole guarantee that
-    // the trailed-past leg never opens; do not move this below planLadderActions.
-    //
-    // RANGE-only BY THE GUARD: this is what makes trailing dormant in TREND,
-    // preserving TREND's exactly-two passive exits (Final TP / anchor). It is
-    // dormant, NOT disarmed — an anchor flatten back to RANGE resumes it with
-    // no re-arm step, because the level derives from the live anchor.
-    //
-    // Threshold (>=/<=), not prev/current bracketing, so a gap-through and a
-    // resume-past-level both fire.
-    //
-    // `level` is deliberately UNROUNDED (ladder-levels.js), so it carries the
-    // ordinary binary floating-point rounding of the `anchor * (1 ± frac)`
-    // multiplication — e.g. anchor 100 yields a DOWN level a few 1e-14 BELOW
-    // the mathematical 99.73, not above it. A bare `<=`/`>=` would then miss a
-    // price landing exactly on the intended level. A relative epsilon many
-    // orders of magnitude below the 10%-of-a-step buffer (itself already
-    // orders of magnitude above one tick) absorbs that rounding without
-    // weakening the buffer's guarantee.
-    if (this.trailDirection && this.ladderMode === 'RANGE'
-        && this.ladderLines.length && Number.isFinite(this.anchor)) {
-      const level = this._trailLevel();
-      const eps = level != null ? Math.abs(level) * 1e-9 : 0;
-      const reached = level != null
-        && (this.trailDirection === 'UP' ? price >= level - eps : price <= level + eps);
-      if (reached) {
-        // A prior attempt ABORTED (unverified close, inventory still tracked).
-        // Wait out the cadence — and SUPPRESS this tick's ladder actions while
-        // waiting, because falling through to planLadderActions would fill the
-        // very leg trailing exists to prevent, right when the bot is already in
-        // a degraded close state.
-        const now = Date.now();
-        if (this._trailRetryLastTs != null && (now - this._trailRetryLastTs) < TRAIL_RETRY_INTERVAL_MS) {
-          // Do NOT advance lastProcessedPrice: nothing was processed this tick,
-          // so the band must be re-scanned next tick (same convention as the
-          // _tradingSeqInProgress guard above). Advancing it here would let
-          // the very leg trailing exists to suppress open on a later tick once
-          // the throttle clears past it.
-          return;
-        }
-        // Pessimistic: set BEFORE the call so a throw (e.g. Firestore failure
-        // in saveState/addLog after the close) still arms the throttle —
-        // otherwise the next tick re-fires immediately, the same per-tick
-        // storm this throttle exists to prevent, just via the throw path.
-        this._trailRetryLastTs = now;
-        const completed = await this._harvestToFlat('trail');
-        // Trailing stays ARMED on failure BY DESIGN: disarming would fail open,
-        // resuming the entries the user armed trailing to suppress.
-        if (completed) this._trailRetryLastTs = null;
-        this.lastProcessedPrice = price;
-        return;
-      }
-    }
-
     // ---- Derive the RANGE→TREND invariant BEFORE dispatching on mode. ----
     // Fully scaled (outermost leg POSITION_OPEN) always implies TREND — a
     // no-op once already TREND, and a self-heal on the first tick after a
@@ -2014,11 +1849,6 @@ class ReversalLadderStrategy extends TradingBase {
     // ---- RANGE ----
     const plan = planLadderActions({
       prevPrice: this.lastProcessedPrice, currentPrice: price, anchor: this.anchor, legs: this.ladderLines,
-      // Anchor Trailing suppresses the side it is walking into — the trail level
-      // was still losing the race to L1/S1 under real volatility, so the leg is
-      // removed from play entirely rather than out-margined. FILLS only: legs
-      // already holding inventory stay in the ledger and close normally.
-      suppressDirection: suppressedSideFor(this.trailDirection),
     });
 
     if (plan.flatten) {
@@ -2326,8 +2156,6 @@ class ReversalLadderStrategy extends TradingBase {
     this.harvestTriggerAbove = rounded > ref;
     this.harvestTriggerAction = action;
     this._manualHarvestRequested = false; // arming is NOT an immediate harvest
-    this.trailDirection = null;           // exclusive with Anchor Trailing (see setTrailDirection)
-    this._trailRetryLastTs = null;
     await this.saveState();
     this._pushHeartbeatNow?.();
     await this.addLog(
@@ -2353,73 +2181,6 @@ class ReversalLadderStrategy extends TradingBase {
       await this.addLog('[LADDER] harvest trigger cancelled.');
     }
     return { cancelled: true };
-  }
-
-  /**
-   * Turn Anchor Trailing on (with a direction) or off.
-   *
-   * Accepted at ANY time while running — including in TREND. It is a state
-   * change, not an action: with no RANGE ladder it simply lies dormant until
-   * one exists (see the tick guard in `handleRealtimePrice`).
-   *
-   * Direction is EXCLUSIVE — switching overwrites, so there is no separate
-   * "off first" step.
-   *
-   * STRICT, not coercing: only the exact strings 'UP'/'DOWN' or null are
-   * accepted. 'up', 0, true, and '' are NOT valid and are REJECTED, never
-   * silently defaulted — unknown input must read as invalid, never as safe
-   * (same philosophy as `resolveLadderGeometry`).
-   *
-   * Error shapes match `harvestNow` so the route can map them: a bad direction
-   * sets `.invalidInput = true` (→ 400); `!isRunning` is untagged (→ 409).
-   *
-   * @param {'UP'|'DOWN'|null} direction
-   * @returns {Promise<{trailDirection: 'UP'|'DOWN'|null}>}
-   */
-  async setTrailDirection(direction) {
-    if (!this.isRunning) throw new Error('Strategy is not running.');
-    if (direction !== 'UP' && direction !== 'DOWN' && direction !== null) {
-      const e = new Error("Trail direction must be 'UP', 'DOWN', or null.");
-      e.invalidInput = true;
-      throw e;
-    }
-
-    this.trailDirection = direction;
-    if (direction) this.trailLastDirection = direction;   // survives switching OFF
-    // A pending retry belongs to the direction that scheduled it.
-    this._trailRetryLastTs = null;
-
-    if (direction) {
-      // Trailing and the one-shot Trigger Price are one conceptual affordance,
-      // so they are mutually exclusive — and the BACKEND guarantees it, never
-      // the frontend (mirrors harvestNow() superseding a pending trigger).
-      this.harvestTriggerPrice = null;
-      this.harvestTriggerAbove = null;
-      this.harvestTriggerAction = 'reanchor';
-    }
-
-    await this.saveState();
-    this._pushHeartbeatNow?.();
-    // Log the LEVEL, not just the direction — "Trail Up" alone leaves the reader
-    // to recompute anchor*(1 ± 0.9*stepPct) by hand to know what was armed.
-    // `_trailLevel()` reads the live anchor, and `this.trailDirection` is already
-    // assigned above, so it resolves here. It returns null while ARMED (no ladder,
-    // hence no anchor yet) — say so rather than printing a bogus number, and flag
-    // the TREND pause so the line never reads as an imminent action it isn't.
-    if (direction) {
-      const level = this._trailLevel();
-      const side = direction === 'UP' ? 'Up' : 'Down';
-      const where = level != null
-        ? `@ ${this._formatPrice(level)}`
-        : '(level pending — no ladder yet)';
-      const when = this.ladderMode === 'TREND'
-        ? ' — PAUSED while in TREND; resumes on the next return to RANGE.'
-        : `; the anchor will follow price ${direction === 'UP' ? 'up' : 'down'}.`;
-      await this.addLog(`[LADDER] Anchor Trailing ON — Trail ${side} ${where}${when}`);
-    } else {
-      await this.addLog('[LADDER] Anchor Trailing OFF.');
-    }
-    return { trailDirection: this.trailDirection };
   }
 
   // ——— Dynamic sizing ————————————————————————————————————————————————
@@ -3094,12 +2855,6 @@ class ReversalLadderStrategy extends TradingBase {
       harvestTriggerPrice: this.harvestTriggerPrice ?? null,
       harvestTriggerAbove: this.harvestTriggerAbove ?? null,
       harvestTriggerAction: this.harvestTriggerAction ?? 'reanchor',
-      trailDirection: this.trailDirection ?? null,
-      trailBaselineAnchor: this.trailBaselineAnchor ?? null,
-      trailMoveCount: this.trailMoveCount ?? 0,
-      trailLastDirection: this.trailLastDirection ?? null,
-      trailGainPct: this._trailGainPct(),
-      trailSuppressedSide: suppressedSideFor(this.trailDirection),
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
@@ -3174,12 +2929,6 @@ class ReversalLadderStrategy extends TradingBase {
       harvestTriggerPrice: this.harvestTriggerPrice ?? null,
       harvestTriggerAbove: this.harvestTriggerAbove ?? null,
       harvestTriggerAction: this.harvestTriggerAction ?? 'reanchor',
-      trailDirection: this.trailDirection ?? null,
-      trailBaselineAnchor: this.trailBaselineAnchor ?? null,
-      trailMoveCount: this.trailMoveCount ?? 0,
-      trailLastDirection: this.trailLastDirection ?? null,
-      trailGainPct: this._trailGainPct(),
-      trailSuppressedSide: suppressedSideFor(this.trailDirection),
     };
   }
 
@@ -3285,14 +3034,6 @@ class ReversalLadderStrategy extends TradingBase {
         harvestTriggerPrice: this.harvestTriggerPrice ?? null,
         harvestTriggerAbove: this.harvestTriggerAbove ?? null,
         harvestTriggerAction: this.harvestTriggerAction ?? 'reanchor',
-        // Anchor Trailing — PERSISTED so a redeploy doesn't silently disarm it
-        // (see the constructor comment for the full fail-open rationale).
-        trailDirection: this.trailDirection ?? null,
-        trailBaselineAnchor: this.trailBaselineAnchor ?? null,
-        trailMoveCount: this.trailMoveCount ?? 0,
-        trailLastDirection: this.trailLastDirection ?? null,
-        trailGainPct: this._trailGainPct(),
-        trailSuppressedSide: suppressedSideFor(this.trailDirection),
         // Geometry is per-cycle config, not a constant — resume MUST rebuild the
         // ladder this cycle actually started with (see _applySnapshotGeometry).
         stepPct: this.stepPct,

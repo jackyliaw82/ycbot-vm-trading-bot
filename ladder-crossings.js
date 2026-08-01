@@ -24,19 +24,13 @@ const crossesAnchor = (anchor, prevPrice, currentPrice) =>
   prevPrice !== anchor && between(anchor, prevPrice, currentPrice);
 
 /**
- * @param {'LONG'|'SHORT'|null} [suppressDirection] Anchor Trailing: the side the
- *   trail is walking into (see `suppressedSideFor`). Its EMPTY legs are skipped,
- *   because a trail level seated 0.9 of a step inside L1/S1 was still losing the
- *   race to those legs under real volatility. Removing the leg is a STRUCTURAL
- *   guarantee where the buffer was only a margin — there is nothing left to race,
- *   even on a gap that would skip past L1 to L3.
+ * @param {'LONG'|'SHORT'|null} [suppressDirection] The side to skip when filling
+ *   EMPTY legs, if any. Currently unused — no caller passes a non-null value.
  *
  *   It suppresses FILLS ONLY; it never removes a leg. A leg already holding
  *   inventory stays in the ledger and closes normally — dropping it would orphan
  *   the position and hand `_closeConsolidated` a mixed-side ledger it explicitly
- *   assumes is impossible. It is a filter, not a rebuild, so arming and
- *   disarming trailing is instant and reversible with no ladder rebuild (which
- *   mid-cycle would orphan filled legs — see CLAUDE.md).
+ *   assumes is impossible. It is a filter, not a rebuild.
  *
  * @returns {{ flatten: boolean, fills: Array<object> }} `fills` holds leg
  *   OBJECT REFERENCES from `legs` — the caller mutates them after the fill is
@@ -55,8 +49,8 @@ export function planLadderActions({ prevPrice, currentPrice, anchor, legs, suppr
   if (crossesAnchor(anchor, prevPrice, currentPrice)) return { flatten: true, fills: [] };
 
   // Rule 2. Every empty leg in the band, ordered from the anchor outward so the
-  // fill sequence matches the price's actual path through the ladder — minus the
-  // side Anchor Trailing has suppressed, if any.
+  // fill sequence matches the price's actual path through the ladder — minus
+  // `suppressDirection`, if the caller passed one.
   const fills = (legs || [])
     .filter(l => l.state === 'EMPTY' && l.direction !== suppressDirection
       && between(l.price, prevPrice, currentPrice))
