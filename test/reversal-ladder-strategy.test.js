@@ -1893,6 +1893,27 @@ test('start() RESOLVES when the position API 503s — no bare detectCurrentPosit
   assert.equal(s._lastPositionRefreshFailed, true, 'flagged UNKNOWN, not flat');
 });
 
+// start() ends with an UNCONDITIONAL this._pushHeartbeatNow?.() after
+// saveState(). Without it, the freshly-started strategy would only reach the
+// WS-connected frontend (which disables its 3s REST poll) via the 30s
+// strategy_update safety net — up to 30s where the UI cannot even confirm the
+// strategy actually started. Was previously covered only incidentally by a
+// Start-Mode arming test (deleted with Start Mode); this pins the same
+// invariant directly against start()'s own ordinary path.
+test('start() pushes an immediate heartbeat after saving state', async () => {
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
+  stubBootInternals(s);
+  s.getWalletBalance = async () => 1000;
+  let heartbeatCalls = 0;
+  s._pushHeartbeatNow = () => { heartbeatCalls++; };
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, leverage: 10 });
+    assert.equal(heartbeatCalls, 1, 'start() must reach the frontend immediately, not wait on the 30s safety net');
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+});
+
 // ——— The close is sized from the WS-true legs, and stop() must never lie ———
 //
 // THE PIN FOR THE ROOT CAUSE. Every open books its filled qty from the
