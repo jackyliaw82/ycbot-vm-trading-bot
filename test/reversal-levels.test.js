@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildReversalLadder, outermostIndex } from '../reversal-levels.js';
+import { buildReversalLadder } from '../reversal-levels.js';
 
 const near = (a, b, eps = 1e-9) => Math.abs(a - b) < eps;
 
@@ -47,7 +47,6 @@ test('buildReversalLadder: no rung ever lands inside the dead zone', () => {
 test('buildReversalLadder: honours a different level count', () => {
   const legs = buildReversalLadder(104000, 100000, 0.003, 3);
   assert.equal(legs.length, 6);
-  assert.equal(outermostIndex(3), 3);
 });
 
 test('buildReversalLadder: rejects an inverted or equal level pair', () => {
@@ -69,11 +68,6 @@ test('buildReversalLadder: rejects a step outside the shared bounds', () => {
 test('buildReversalLadder: rejects a level count outside the shared bounds', () => {
   assert.throws(() => buildReversalLadder(104000, 100000, 0.003, 2), /level/i);
   assert.throws(() => buildReversalLadder(104000, 100000, 0.003, 11), /level/i);
-});
-
-test('outermostIndex: is the last rung, which is what arms TREND', () => {
-  assert.equal(outermostIndex(5), 5);
-  assert.equal(outermostIndex(10), 10);
 });
 
 test('buildReversalLadder: accepts the legal ceiling step (0.02)', () => {

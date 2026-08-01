@@ -65,6 +65,40 @@ test('trailExitLevel: a bad distance or side yields null, never a stray number',
   }
 });
 
+test('trailExitLevel: LONG clamps a previous that is above the bull level back into band', () => {
+  const d = trailDistance(105248, 'LONG', BULL, BEAR);
+  const stale = 110000; // out of band — e.g. bullLevel was edited down mid-cycle
+  const corrected = trailExitLevel({ price: 105000, distance: d, side: 'LONG', bullLevel: BULL, bearLevel: BEAR, previous: stale });
+  assert.equal(corrected, BULL, 'stale previous must be pulled back to the band ceiling, not preserved forever');
+});
+
+test('trailExitLevel: LONG ratchet stays one-way from the corrected value, not the stale one', () => {
+  const d = trailDistance(105248, 'LONG', BULL, BEAR);
+  const stale = 110000;
+  const corrected = trailExitLevel({ price: 105000, distance: d, side: 'LONG', bullLevel: BULL, bearLevel: BEAR, previous: stale });
+  assert.equal(corrected, BULL);
+  // Price dips afterward — must hold at the corrected value, never at the stale one.
+  const after = trailExitLevel({ price: 101000, distance: d, side: 'LONG', bullLevel: BULL, bearLevel: BEAR, previous: corrected });
+  assert.equal(after, BULL, 'one-way ratchet from the corrected value');
+});
+
+test('trailExitLevel: SHORT clamps a previous that is below the bear level back into band', () => {
+  const d = trailDistance(98750, 'SHORT', BULL, BEAR);
+  const stale = 95000; // out of band — e.g. bearLevel was edited up mid-cycle
+  const corrected = trailExitLevel({ price: 99000, distance: d, side: 'SHORT', bullLevel: BULL, bearLevel: BEAR, previous: stale });
+  assert.equal(corrected, BEAR, 'stale previous must be pulled back to the band floor, not preserved forever');
+});
+
+test('trailExitLevel: SHORT ratchet stays one-way from the corrected value, not the stale one', () => {
+  const d = trailDistance(98750, 'SHORT', BULL, BEAR);
+  const stale = 95000;
+  const corrected = trailExitLevel({ price: 99000, distance: d, side: 'SHORT', bullLevel: BULL, bearLevel: BEAR, previous: stale });
+  assert.equal(corrected, BEAR);
+  // Price rises afterward — must hold at the corrected value, never retreat upward.
+  const after = trailExitLevel({ price: 103000, distance: d, side: 'SHORT', bullLevel: BULL, bearLevel: BEAR, previous: corrected });
+  assert.equal(after, BEAR, 'one-way ratchet from the corrected value');
+});
+
 test('trailExitLevel: the level always sits inside the two levels', () => {
   const d = trailDistance(105248, 'LONG', BULL, BEAR);
   for (const price of [100000, 105248, 107000, 109248, 200000]) {

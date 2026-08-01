@@ -38,6 +38,7 @@ export function trailExitLevel({ price, distance, side, bullLevel, bearLevel, pr
   const clamped = Math.min(bullLevel, Math.max(bearLevel, raw));
 
   if (!finite(previous)) return clamped;
+  const clampedPrevious = Math.min(bullLevel, Math.max(bearLevel, previous));
   // One-way ratchet: LONG only ever rises, SHORT only ever falls.
-  return side === 'LONG' ? Math.max(previous, clamped) : Math.min(previous, clamped);
+  return side === 'LONG' ? Math.max(clampedPrevious, clamped) : Math.min(clampedPrevious, clamped);
 }

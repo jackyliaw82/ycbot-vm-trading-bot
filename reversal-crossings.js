@@ -1,10 +1,11 @@
 // Tick rules for ReversalLadder. Pure: no I/O, no state, nothing mutated.
 // The strategy applies the returned plan; this module only decides it.
 //
-// Two levels and a dead zone between them. A position is opened at a level,
-// held across the whole dead zone, and only ever changed at the OTHER level.
-// That is the entire anti-churn mechanism, so every rule below exists to keep
-// the dead zone inert.
+// Two levels and a dead zone between them. A position enters at a level
+// (RULE 1), is held while price stays inside the dead zone, scales in on the
+// entry side as price runs further away from it (RULE 3), and is only ever
+// reversed at the OTHER level (RULE 2). That is the entire anti-churn
+// mechanism, so every rule below exists to keep the dead zone inert.
 
 const between = (v, a, b) => (a <= b ? v >= a && v <= b : v >= b && v <= a);
 

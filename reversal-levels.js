@@ -15,11 +15,6 @@ import {
 // they are one policy (the 0.3% floor clears the round-trip fee floor), and a
 // second copy would drift from the first the moment either is tuned.
 
-/** The rung whose fill arms TREND. */
-export function outermostIndex(levelsPerSide) {
-  return levelsPerSide;
-}
-
 /**
  * Build both ladders.
  *
