@@ -4,6 +4,7 @@ import { ReversalLadderStrategy } from '../reversal-ladder-strategy.js';
 import { LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, LADDER_STEP_PCT_MAX, LADDER_LEVELS_MAX } from '../ladder-levels.js';
 import { buildReversalLadder } from '../reversal-levels.js';
 import { precisionFormatter } from '../precisionUtils.js';
+import { trailDistance, trailExitLevel } from '../reversal-trail.js';
 
 // A strategy with both ladders built and nothing open. All I/O stubbed, so a
 // tick exercises only the dispatch. bull 102 / bear 98 puts the dead zone at
@@ -2957,4 +2958,138 @@ test('a legacy snapshot without the field resumes as reanchor', async () => {
   });
   cleanupResumeTimers(dst);
   assert.equal(dst.harvestTriggerAction, 'reanchor');
+});
+
+// ——— Task 5: the trailing exit (§7) ——————————————————————————————————
+
+// Helper: a TREND-LONG strategy with trailing on, armed at 104.
+function trendStrategy() {
+  const s = reversalStrategy({ mode: 'TREND' });
+  s.trendDirection = 'LONG';
+  s.currentSide = 'LONG';
+  s.trendStartPrice = 104;
+  s.trailEnabled = true;
+  s.activePosition = { quantity: 5, entryPrice: 103, notional: 515, unrealizedPnl: 5 };
+  s.ladderLines.forEach(l => { if (l.direction === 'LONG') { l.state = 'POSITION_OPEN'; l.quantity = 1; l.fillPrice = l.price; } });
+  s.finalTpPrice = 200;   // far away, so it never fires in these tests
+  s.lastProcessedPrice = 104;
+  return s;
+}
+
+// §14.6 — the trail arms at exactly the opposite level.
+test('the trail arms at exactly bearLevel', async () => {
+  const s = trendStrategy();
+  s._armTrail();
+  assert.equal(s.trailDistanceValue, 6);   // 104 - 98
+  assert.equal(s.trailExit, 98);           // === bearLevel
+});
+
+// §14.6 — while trail === bearLevel a hit is a REVERSAL, not a trailed exit.
+test('a hit while the trail still sits at bearLevel reverses', async () => {
+  const s = trendStrategy();
+  s._armTrail();
+  const filled = captureFills(s);
+  let closes = 0;
+  s._closeConsolidated = async () => { closes++; return true; };
+  s._closeQuantity = () => 0;
+  await s.handleRealtimePrice(98);
+  assert.equal(closes, 1);
+  assert.deepEqual(filled, ['S1'], 'a reversal opens the new side on the same tick');
+  assert.equal(s.reversalCount, 1);
+});
+
+// §14.6 — after ratcheting, a hit CLOSES and fills nothing that tick.
+test('a hit after the trail has ratcheted closes and fills nothing', async () => {
+  const s = trendStrategy();
+  s._armTrail();
+  const filled = captureFills(s);
+  await s.handleRealtimePrice(106);                 // ratchet: 106 - 6 = 100
+  assert.equal(s.trailExit, 100);
+  let closes = 0;
+  s._closeConsolidated = async () => { closes++; return true; };
+  s._closeQuantity = () => 0;
+  await s.handleRealtimePrice(100);
+  assert.equal(closes, 1);
+  assert.deepEqual(filled, [], 'the two-tick rule applies to a trailed exit');
+  assert.equal(s.ladderMode, 'SCALING');
+  assert.equal(s.trailExit, null);
+  assert.equal(s.reversalCount, 0, 'a trailed exit is not a reversal');
+  assert.equal(
+    s.ladderLines.filter(l => l.state !== 'EMPTY').length, 0,
+    'BOTH ladders reset to EMPTY on a trailed exit',
+  );
+});
+
+// §14.7 — one-way ratchet, capped at the entry level.
+test('the trail never retreats and caps at bullLevel', async () => {
+  const s = trendStrategy();
+  s._armTrail();
+  await s.handleRealtimePrice(106);
+  assert.equal(s.trailExit, 100);
+  await s.handleRealtimePrice(105);          // pull back
+  assert.equal(s.trailExit, 100, 'the trail must not give ground');
+  await s.handleRealtimePrice(130);          // 130 - 6 = 124, way past bull
+  assert.equal(s.trailExit, 102, 'capped at bullLevel');
+});
+
+// Carry-forward 2 — the pure function has no cross-call side identity, so a
+// LONG-side `previous` left standing would ratchet a later SHORT trail the
+// wrong way. The reversal path (trail still AT bearLevel — once it has
+// ratcheted past, §7 gives the close to the trailed exit instead) must clear it.
+test('a reversal clears the trail so a LONG value cannot leak into a SHORT trail', async () => {
+  const s = trendStrategy();
+  s._armTrail();
+  assert.equal(s.trailExit, 98, 'un-ratcheted: still at bearLevel, so a hit reverses');
+  s._closeConsolidated = async () => true;
+  s._closeQuantity = () => 0;
+  captureFills(s);
+  await s.handleRealtimePrice(98);
+  assert.equal(s.reversalCount, 1, 'this must be the reversal path, not a trailed exit');
+  assert.equal(s.trailExit, null);
+  assert.equal(s.trailDistanceValue, null);
+  assert.equal(s.trendStartPrice, null);
+});
+
+// Carry-forward 1 — never trust a persisted exit level. The band can have
+// narrowed since it was written (a level edit or an applied Ask AI proposal),
+// and a stale value above the new bullLevel would win Math.max forever,
+// silently killing the cap whose only job is keeping the exit out of the ladder.
+test('_restoreTrailFromSnapshot re-clamps a stale exit into the restored band', () => {
+  const s = reversalStrategy();          // bull 102 / bear 98
+  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 6, trailExit: 140 });
+  assert.equal(s.trailExit, 102, 'clamped down to bullLevel');
+
+  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 6, trailExit: 12 });
+  assert.equal(s.trailExit, 98, 'clamped up to bearLevel');
+
+  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 6, trailExit: 100 });
+  assert.equal(s.trailExit, 100, 'an in-band value survives untouched');
+});
+
+test('_restoreTrailFromSnapshot refuses a non-finite exit rather than guessing', () => {
+  const s = reversalStrategy();
+  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 6, trailExit: 'oops' });
+  assert.equal(s.trailExit, null);
+  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 6 });
+  assert.equal(s.trailExit, null);
+});
+
+test('_restoreTrailFromSnapshot treats a missing trailEnabled as OFF', () => {
+  const s = reversalStrategy();
+  s._restoreTrailFromSnapshot({});
+  assert.equal(s.trailEnabled, false, "only an explicit true arms it — 'unknown' is not 'on'");
+  assert.equal(s.trailExit, null);
+});
+
+// Trailing off is genuinely off.
+test('trailing disabled never closes on a trail level', async () => {
+  const s = trendStrategy();
+  s.trailEnabled = false;
+  s._armTrail();
+  assert.equal(s.trailExit, null);
+  let closes = 0;
+  s._closeConsolidated = async () => { closes++; return true; };
+  await s.handleRealtimePrice(106);
+  await s.handleRealtimePrice(101);
+  assert.equal(closes, 0);
 });

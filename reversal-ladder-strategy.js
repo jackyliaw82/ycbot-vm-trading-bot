@@ -16,6 +16,7 @@ import { planReversalActions, averageOpenEntry } from './reversal-crossings.js';
 import { planLevels } from './level-planner.js';
 import { buildLevelContext } from './market-context.js';
 import { precisionFormatter } from './precisionUtils.js';
+import { trailDistance, trailExitLevel } from './reversal-trail.js';
 
 const MARGIN_HEADROOM_FLOOR_PCT = 30;              // free margin floor for sizing safety
 const HARVEST_LOSS_THRESHOLD_PCT = 0.08;           // 8% of initial capital — gate for HARVEST eligibility
@@ -181,6 +182,17 @@ class ReversalLadderStrategy extends TradingBase {
 
     // ---- TREND state ----
     this.trendDirection = null;         // origin breakout direction ('LONG'|'SHORT')
+
+    // ---- Trailing exit (§7) ----
+    // TREND-only give-back limiter. PERSISTED: a redeploy that silently
+    // disarmed it would resume holding a runaway position the user armed
+    // trailing to bound — a textbook fail-open. `trailExit` is persisted too
+    // (not re-derived) because the ratchet is path-dependent: re-deriving it
+    // from the live price after a restart would silently GIVE BACK every tick
+    // of progress the ratchet had already locked in.
+    this.trailEnabled = false;          // boolean — plain On/Off, direction comes from the position
+    this.trailDistanceValue = null;     // number|null — fixed at TREND arm
+    this.trailExit = null;              // number|null — the live ratcheted exit level
 
     // ---- Phase 3: harvest-gauge cap ----
     this._lastLadderSize = null;        // last dynamic ladder base size (for gauge-full freeze)
@@ -373,6 +385,8 @@ class ReversalLadderStrategy extends TradingBase {
     this.trendDirection = null;
     // Nulling finalTpPrice IS the disarm — `_trendFinalTpArmed` derives from it.
     this.finalTpPrice = null;
+    this.trendStartPrice = null;
+    this._clearTrail();
     this.lastProcessedPrice = this.currentPrice;
 
     await this.addLog(`===== LEVELS SET (${reason}) =====`);
@@ -856,6 +870,11 @@ class ReversalLadderStrategy extends TradingBase {
     this.ladderMode = 'SCALING';
     this.trendDirection = null;
     this.finalTpPrice = null;
+    // Carry-forward 2 — `trailExitLevel` is pure and has no memory of which
+    // side a `previous` came from, so a LONG-side value left standing would
+    // ratchet a later SHORT trail the wrong way.
+    this.trendStartPrice = null;
+    this._clearTrail();
     this.reversalCount = (this.reversalCount || 0) + 1;
 
     await this.addLog(
@@ -981,6 +1000,11 @@ class ReversalLadderStrategy extends TradingBase {
       this._recomputeFinalTpPrice();
     }
 
+    // Arm the trailing exit (§7) at the moment TREND arms — it measures from
+    // `trendStartPrice`, just set above. See `_armTrail`'s own doc for why the
+    // distance is fixed here and never recomputed.
+    this._armTrail();
+
     const avg = averageOpenEntry(this.ladderLines, direction);
     await this.addLog(
       `===== TREND ${direction} (fully scaled @ ${this._formatPrice(this.currentPrice)}) ===== ` +
@@ -1010,6 +1034,174 @@ class ReversalLadderStrategy extends TradingBase {
     // else pushes a heartbeat; broadcast now or the Levels & Targets panel +
     // chart wait for the next heartbeat (a later fill or the 30s safety net).
     this._pushHeartbeatNow?.();
+  }
+
+  /**
+   * Arm the trail at the moment TREND arms. The distance is fixed here and
+   * never recomputed, which is what makes the exit start exactly at the
+   * opposite level and move 1:1 with price — no tuning knob, self-scaling
+   * across symbols.
+   *
+   * A no-op when trailing is off, so `trailExit` stays null and every hit
+   * check below is dead. Safe to call twice.
+   */
+  _armTrail() {
+    if (!this.trailEnabled || this.ladderMode !== 'TREND') {
+      this.trailDistanceValue = null;
+      this.trailExit = null;
+      return;
+    }
+    const side = this.trendDirection;
+    const d = trailDistance(this.trendStartPrice, side, this.bullLevel, this.bearLevel);
+    if (d == null || !(d > 0)) {
+      // An unusable distance must leave the trail DISARMED, never guessed. A
+      // trail derived from a bad start price would sit at an arbitrary level
+      // and close a healthy position.
+      this.trailDistanceValue = null;
+      this.trailExit = null;
+      return;
+    }
+    this.trailDistanceValue = d;
+    this.trailExit = trailExitLevel({
+      price: this.trendStartPrice, distance: d, side,
+      bullLevel: this.bullLevel, bearLevel: this.bearLevel, previous: null,
+    });
+  }
+
+  /** Clear the trail. Called on every reversal, trailed exit and level rebuild. */
+  _clearTrail() {
+    this.trailDistanceValue = null;
+    this.trailExit = null;
+  }
+
+  /**
+   * Ratchet the exit level toward the entry level. Returns true when price has
+   * reached it AND the trail has actually moved off the opposite level.
+   *
+   * The strict inequality is the §7 collision rule: while `trailExit` still
+   * equals the opposite level, a hit there is a REVERSAL (Rule 2), not a
+   * trailed exit. Only once the ratchet has carried it past that level does the
+   * trail own the close.
+   */
+  _updateTrailAndCheckHit(price) {
+    if (!this.trailEnabled || this.ladderMode !== 'TREND') return false;
+    if (this.trailDistanceValue == null) return false;
+    const side = this.trendDirection;
+    const next = trailExitLevel({
+      price, distance: this.trailDistanceValue, side,
+      bullLevel: this.bullLevel, bearLevel: this.bearLevel, previous: this.trailExit,
+    });
+    if (next == null) return false;
+    this.trailExit = next;
+    if (side === 'LONG')  return next > this.bearLevel && price <= next;
+    if (side === 'SHORT') return next < this.bullLevel && price >= next;
+    return false;
+  }
+
+  /**
+   * §7 — the trailed exit. Close, reset BOTH ladders, return to SCALING flat,
+   * and fill NOTHING on this tick.
+   *
+   * The two-tick rule DOES apply here (unlike a reversal): the trail caps at the
+   * entry level, so closing there would leave price sitting on L1/S1 and the
+   * same tick would immediately refill the position just closed.
+   *
+   * Returns false when the caller must not advance `lastProcessedPrice`.
+   */
+  async _trailedExit() {
+    let closed = false;
+    try { closed = await this._closeConsolidated('trailed_exit'); }
+    catch (e) { await this.addLog(`ERROR trailed-exit close: ${e.message}`); }
+
+    if (!closed && this._closeQuantity() > 0) {
+      await this.addLog(
+        `WARNING: TRAILED EXIT aborted — the close could not be verified; the ladder was left INTACT ` +
+        `so the open position stays tracked. It will retry on the next tick.`,
+      );
+      await this.saveState();
+      this._pushHeartbeatNow?.();
+      return false;
+    }
+
+    const exitAt = this.trailExit;
+    for (const leg of this.ladderLines) {
+      leg.state = 'EMPTY';
+      leg.quantity = null;
+      leg.fillPrice = null;
+    }
+    this.ladderMode = 'SCALING';
+    this.trendDirection = null;
+    this.trendStartPrice = null;
+    this.finalTpPrice = null;
+    this._clearTrail();
+    this.cycleAccumulatedLoss = this._computeAccLoss();
+    this._ladderBaseSize = await this._computeLadderBaseSize();
+
+    await this.addLog(
+      `===== TRAILED EXIT @ ${this._formatPrice(exitAt)} ===== levels UNCHANGED ` +
+      `(bull ${this._formatPrice(this.bullLevel)} / bear ${this._formatPrice(this.bearLevel)}) | ` +
+      `accLoss ${this._formatNotional(this.cycleAccumulatedLoss)} USDT | ` +
+      `leg ${this._formatNotional(this._legNotional())} USDT`,
+    );
+    await this._writeStrategyFlow('TRAILED_EXIT', {
+      exitLevel: exitAt, bullLevel: this.bullLevel, bearLevel: this.bearLevel,
+      accLoss: this.cycleAccumulatedLoss,
+    }).catch(() => {});
+    await this.saveState();
+    this._pushHeartbeatNow?.();
+    return true;
+  }
+
+  /**
+   * Turn the trailing exit on or off. Accepted at any time while running: it is
+   * a state change, not an action. Switching it on mid-TREND arms it now;
+   * switching it off clears the ratchet so a later re-arm starts fresh rather
+   * than inheriting a stale level from a different position.
+   *
+   * STRICT, not coercing — only real booleans. Error shapes match `harvestNow`
+   * so the route can map them: bad input sets `.invalidInput = true` (→ 400);
+   * `!isRunning` is untagged (→ 409).
+   */
+  async setTrailEnabled(enabled) {
+    if (!this.isRunning) throw new Error('Strategy is not running.');
+    if (typeof enabled !== 'boolean') {
+      const e = new Error('Trailing must be true or false.');
+      e.invalidInput = true;
+      throw e;
+    }
+    this.trailEnabled = enabled;
+    if (enabled) this._armTrail(); else this._clearTrail();
+    await this.saveState();
+    this._pushHeartbeatNow?.();
+    await this.addLog(
+      `[REVERSAL] trailing exit ${enabled ? 'ON' : 'OFF'}` +
+      (enabled && this.trailExit != null ? ` — exit at ${this._formatPrice(this.trailExit)}` : ''),
+    );
+    return { trailEnabled: this.trailEnabled, trailExit: this.trailExit };
+  }
+
+  /**
+   * Restore the trail from a snapshot. Its own method because it holds an
+   * invariant worth testing, and `resume()` cannot be exercised in a unit test.
+   *
+   * Carry-forward 1: never TRUST the persisted exit — re-clamp it into the
+   * RESTORED band. The levels can have moved since it was written (a manual edit
+   * or an applied Ask AI proposal narrows the band), and a stale value outside
+   * that band would win the ratchet's Math.max/Math.min forever, silently
+   * defeating the cap whose only job is keeping the exit out of the ladder.
+   *
+   * `trailEnabled` restores from an EXPLICIT `=== true` only: a missing or
+   * malformed field is unknown, and unknown must never read as armed.
+   */
+  _restoreTrailFromSnapshot(snapshot = {}) {
+    this.trailEnabled = snapshot.trailEnabled === true;
+    this.trendStartPrice = Number.isFinite(snapshot.trendStartPrice) ? snapshot.trendStartPrice : null;
+    this.trailDistanceValue = Number.isFinite(snapshot.trailDistanceValue) ? snapshot.trailDistanceValue : null;
+    const exit = snapshot.trailExit;
+    this.trailExit = (Number.isFinite(exit)
+      && Number.isFinite(this.bullLevel) && Number.isFinite(this.bearLevel))
+      ? Math.min(this.bullLevel, Math.max(this.bearLevel, exit))
+      : null;
   }
 
   /**
@@ -1354,6 +1546,9 @@ class ReversalLadderStrategy extends TradingBase {
     this.ladderMode = snapshot.ladderMode || 'SCALING';
     this.bullLevel = snapshot.bullLevel ?? null;
     this.bearLevel = snapshot.bearLevel ?? null;
+    // Trailing exit (§7) — restored AFTER bullLevel/bearLevel: the restore
+    // re-clamps the persisted exit into the just-restored band (carry-forward 1).
+    this._restoreTrailFromSnapshot(snapshot);
     this.ladderLines = Array.isArray(snapshot.ladderLines) ? snapshot.ladderLines : [];
     this.trendDirection = snapshot.trendDirection ?? null;
     this.lastProcessedPrice = snapshot.lastProcessedPrice ?? null;
@@ -1507,6 +1702,12 @@ class ReversalLadderStrategy extends TradingBase {
     if (!reconciledToTrend && this.ladderMode === 'TREND' && this.activePosition && this.currentSide) {
       this._recomputeFinalTpPrice();
       await this.addLog(`Resumed in TREND ${this.currentSide}; Final TP ${this.finalTpPrice ? this._formatPrice(this.finalTpPrice) : 'n/a'}.`);
+    }
+
+    // A TREND that resumed with trailing on but no usable distance must re-arm
+    // rather than run untrailed — the user armed it to bound this position.
+    if (this.trailEnabled && this.ladderMode === 'TREND' && this.trailDistanceValue == null) {
+      this._armTrail();
     }
   }
 
@@ -1955,6 +2156,19 @@ class ReversalLadderStrategy extends TradingBase {
       try { await this.stop({ flatten: true, reason: 'final_tp' }); }
       finally { this._tradingSeqInProgress = false; }
       return;
+    }
+
+    // ---- TREND exit 2: the trailed exit (§7). Checked before the tick rules so
+    // a ratcheted trail owns the close; while it still sits AT the opposite
+    // level `_updateTrailAndCheckHit` returns false and the reversal below
+    // handles the hit instead.
+    if (this.ladderMode === 'TREND' && this._updateTrailAndCheckHit(price)) {
+      this._tradingSeqInProgress = true;
+      let ok = false;
+      try { ok = await this._trailedExit(); } finally { this._tradingSeqInProgress = false; }
+      if (!ok) return;              // aborted: re-scan this band next tick
+      this.lastProcessedPrice = price;
+      return;                       // two-tick rule: fill nothing on this tick
     }
 
     // ---- Tick rules 0-3 (§6). One call covers SCALING and TREND alike: the
@@ -2967,6 +3181,11 @@ class ReversalLadderStrategy extends TradingBase {
       stepPct: this.stepPct,
       legNotional: this._legNotional(),
       ladderBaseSize: this._ladderBaseSize,
+      // Trailing exit (§7).
+      trailEnabled: this.trailEnabled ?? false,
+      trailDistanceValue: this.trailDistanceValue ?? null,
+      trailExit: this.trailExit ?? null,
+      trendStartPrice: this.trendStartPrice ?? null,
       // Running config — surfaced so the frontend's Active Config panel
       // can show the values the bot is ACTUALLY using rather than the
       // form's DEFAULT_CONFIG (which is what reversal's frontend used
@@ -3053,6 +3272,11 @@ class ReversalLadderStrategy extends TradingBase {
       stepPct: this.stepPct,
       legNotional: this._legNotional(),
       ladderBaseSize: this._ladderBaseSize,
+      // Trailing exit (§7).
+      trailEnabled: this.trailEnabled ?? false,
+      trailDistanceValue: this.trailDistanceValue ?? null,
+      trailExit: this.trailExit ?? null,
+      trendStartPrice: this.trendStartPrice ?? null,
       harvestTriggerPrice: this.harvestTriggerPrice ?? null,
       harvestTriggerAbove: this.harvestTriggerAbove ?? null,
       harvestTriggerAction: this.harvestTriggerAction ?? 'reanchor',
@@ -3166,6 +3390,12 @@ class ReversalLadderStrategy extends TradingBase {
         // ladder this cycle actually started with (see _applySnapshotGeometry).
         stepPct: this.stepPct,
         levelsPerSide: this.levelsPerSide,
+        // Trailing exit (§7) — PERSISTED so a redeploy cannot silently disarm
+        // it (see the field's own doc in the constructor).
+        trailEnabled: this.trailEnabled ?? false,
+        trailDistanceValue: this.trailDistanceValue ?? null,
+        trailExit: this.trailExit ?? null,
+        trendStartPrice: this.trendStartPrice ?? null,
         config: {
           recoveryFactor: this.recoveryFactor,
           recoveryDistance: this.recoveryDistance,
