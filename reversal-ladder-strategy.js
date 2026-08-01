@@ -6,13 +6,15 @@ import { FEE_RATE } from './fees.js';
 import { VolumeProfile } from './volume-profile.js';
 import { MarketMetrics } from './market-metrics.js';
 import {
-  buildLadder,
-  LADDER_STEP_PCT,
-  LADDER_LEVELS_PER_SIDE,
   minInitialSizeUSDT,
   resolveLadderGeometry,
+  LADDER_STEP_PCT,
+  LADDER_LEVELS_PER_SIDE,
 } from './ladder-levels.js';
-import { planLadderActions, averageOpenEntry } from './ladder-crossings.js';
+import { buildReversalLadder } from './reversal-levels.js';
+import { planReversalActions, averageOpenEntry } from './reversal-crossings.js';
+import { planLevels } from './level-planner.js';
+import { buildLevelContext } from './market-context.js';
 import { precisionFormatter } from './precisionUtils.js';
 
 const MARGIN_HEADROOM_FLOOR_PCT = 30;              // free margin floor for sizing safety
@@ -26,6 +28,13 @@ const DEFAULT_RECOVERY_DISTANCE = 0.005;           // 0.5%
 // arm ASAP; Binance REST throttling on this VM's IP is a known live failure
 // mode, so we cannot hammer it per tick. 15s is the compromise.
 const TREND_ARM_RETRY_INTERVAL_MS = 15_000;
+// Backoff between level-planning attempts. Planning costs a volume-profile
+// build plus five market-data fetches (and, from Task 6, an AI round trip), and
+// it is driven from `handleRealtimePrice` — several ticks per second. A failed
+// plan leaves the strategy flat with no ladder, which is safe but idle, so the
+// retry must be frequent enough to recover quickly and slow enough not to storm
+// Binance. Same trade-off as the TREND arm retry, one notch longer.
+const LEVEL_PLAN_RETRY_INTERVAL_MS = 30_000;
 // Minimum distance a manual harvest/re-anchor Trigger Price must sit from the
 // live price, so an armed trigger cannot accidentally fire on the very next
 // tick. Hard-enforced by harvestNow(); the frontend mirrors it for UX only.
@@ -45,31 +54,36 @@ function formatDuration(ms) {
 }
 
 /**
- * ReversalLadderStrategy — fully mechanical reversal-ladder strategy.
+ * ReversalLadderStrategy — two-level reversal-ladder strategy.
  *
- * This file was copied from ai-dual-strategy.js and stripped: every AI consult
- * path (planner / risk-guard / market-context / plan-executor / the AI
- * provider client), the reversal machinery, and the whole UNWIND mode are
- * gone. What remains is infrastructure that already works and is reused
- * verbatim — Binance REST/WS plumbing, position reconciliation, fill
- * resolution, funding polling, Firestore persistence, bookkeeping, and the
- * unified stop()/Final-TP termination path.
+ * This file started as AnchorLadderStrategy (single anchor, LONG rungs above
+ * it / SHORT below, crossing the anchor flattened the position) and was
+ * rewritten on `feat/reversal-ladder-lvn` to replace that anchor with TWO
+ * independently-set levels — `bullLevel` above, `bearLevel` below — with a
+ * DEAD ZONE between them where nothing happens. A position opens at one
+ * level, is held across the whole dead zone, and only ever changes at the
+ * OTHER level: a REVERSAL that closes, resets the abandoned side's ledger,
+ * and opens the new side on the SAME tick (`_reverseTo`). The old anchor
+ * flatten's two-tick rule does not apply to a reversal — see
+ * `reversal-crossings.js`'s `planReversalActions` for the full rule set.
  *
- * TRADES CORRECTLY as of Task 7. Task 6 built the ladder geometry
- * (initializeLadder, _legNotional, one-way position mode, the size gate).
- * Task 7 replaced the tick dispatch and the trading actions it drives:
+ * The levels themselves are DERIVED, not fixed geometry: `_planAndBuildLevels`
+ * asks `planLevels` (level-planner.js) for a validated bull/bear pair, which
+ * tries an AI planner first (`this._aiPlanner` — null until a later task wires
+ * one in, so today it always falls through) and otherwise falls back to the
+ * mechanical volume-profile void edges. A failed plan builds nothing and the
+ * strategy stays flat with an empty ladder.
  *
- *   Task 6 — build the ladder on the anchor (buildLadder: 0.3% × 5 levels/side) [DONE]
- *   Task 7 — tick handling (planLadderActions), leg fills (_fillLeg), the
- *            anchor-flatten reset (_flattenAtAnchor), and the outermost-leg
- *            -> TREND transition (_enterTrend) [DONE]
+ * Everything else is infrastructure reused verbatim from the anchor era —
+ * Binance REST/WS plumbing, position reconciliation, fill resolution, funding
+ * polling, Firestore persistence, bookkeeping, dynamic sizing, the harvest
+ * gauge, the Trigger Price and Close & stop actions, the Final TP editor, and
+ * the unified stop()/Final-TP termination path.
  *
  * One-way mode means a "leg" is bookkeeping only — Binance nets every filled
  * leg into a single `activePosition`, so there are no partial closes anywhere
- * in this strategy. Every close (anchor flatten, Final TP, harvest) is a full
+ * in this strategy. Every close (reversal, Final TP, harvest) is a full
  * reduceOnly close of that one netted position, via `_closeConsolidated`.
- *
- * No AI is consulted anywhere: levels are pure geometry off the anchor.
  */
 class ReversalLadderStrategy extends TradingBase {
   constructor(gcfProxyUrl, profileId, sharedVmProxyGcfUrl) {
@@ -97,12 +111,11 @@ class ReversalLadderStrategy extends TradingBase {
     // drift out of step with `finalTpPrice`. Do not reintroduce the field.
     this.finalTpPrice = null;
     this.cycleAccumulatedLoss = 0;
-    this.flattenCount = 0;
     this.harvestCount = 0;
     this.reanchorCount = 0;              // every completed _harvestToFlat (flat reset OR position harvest); FE spinner watches this
     this.initialCapital = 0;
     this.currentInitialSize = 0;         // base for DYNAMIC trend sizing (original config size; never overwritten → no compounding)
-    this._ladderBaseSize = 0;            // base the LADDER is sized from: initial size, then the dynamically re-sized base after an anchor flatten / harvest
+    this._ladderBaseSize = 0;            // base the LADDER is sized from: initial size, then the dynamically re-sized base after a reversal / harvest
     this.cycleStartTime = null;
     // Execution lock. KEPT (not AI state): stop() uses the TERMINATED value
     // as the re-entry guard around termination. EXECUTING is not currently
@@ -152,13 +165,19 @@ class ReversalLadderStrategy extends TradingBase {
     this._lastFundingPollTs = null;
 
     // ---- Ladder state ----
-    this.ladderMode = 'RANGE';          // RANGE | TREND — mechanical geometry off the anchor, no AI
-    this.anchor = null;
-    this.ladderLines = [];              // [{levelIndex, direction, price, state, quantity}]
+    this.ladderMode = 'SCALING';        // SCALING | TREND
+    this.bullLevel = null;              // upper trigger — L1 IS this price
+    this.bearLevel = null;              // lower trigger — S1 IS this price
+    this.reversalCount = 0;             // committed reversals this cycle
+    this.trendStartPrice = null;        // the price TREND armed at; Task 5's trail measures from it
+    this.ladderLines = [];              // [{index, direction, price, state, quantity}]
     this.lastProcessedPrice = null;     // last tick price the ladder crossing logic saw
     this.stepPct = LADDER_STEP_PCT;     // DEFAULT geometry; start() overrides from config within bounds (see ladder-levels.js resolveLadderGeometry)
     this.levelsPerSide = LADDER_LEVELS_PER_SIDE; // DEFAULT; same override in start()
     this._tradingSeqInProgress = false; // ladder crossing reentrancy guard
+    this._levelPlanInProgress = false;
+    this._levelPlanLastTs = null;
+    this._aiPlanner = null;             // Task 6 supplies one; null = mechanical fallback
 
     // ---- TREND state ----
     this.trendDirection = null;         // origin breakout direction ('LONG'|'SHORT')
@@ -252,12 +271,13 @@ class ReversalLadderStrategy extends TradingBase {
 
     try {
       await this.setLeverage(this.symbol, this.leverage);
-      // One-way (single-side) mode. The ladder holds LONG legs ONLY above the
-      // anchor and SHORT legs ONLY below it, so it can never need both sides at
-      // once — hedge mode is unnecessary, and one-way lets Binance net the legs
-      // into a single position. Wrapped because Binance refuses the call while
-      // positions are open (harmless: an open position means the mode is
-      // already whatever it is).
+      // One-way (single-side) mode. The ladder holds LONG legs ONLY above
+      // bullLevel and SHORT legs ONLY below bearLevel, and Rule 2 resets the
+      // abandoned side before the new side fills, so it can never need both
+      // sides at once — hedge mode is unnecessary, and one-way lets Binance
+      // net the legs into a single position. Wrapped because Binance refuses
+      // the call while positions are open (harmless: an open position means
+      // the mode is already whatever it is).
       try {
         await this.setPositionMode(false);
       } catch (e) {
@@ -294,7 +314,7 @@ class ReversalLadderStrategy extends TradingBase {
     this.strategyStartTime = new Date();
     this.subState = 'INITIAL';
     this.executionState = 'IDLE';
-    this.ladderMode = 'RANGE';
+    this.ladderMode = 'SCALING';
     this.ladderLines = [];
 
     // WebSocket setup — listen key first, then user-data + realtime price.
@@ -328,54 +348,98 @@ class ReversalLadderStrategy extends TradingBase {
     this._lastFundingPollTs = this.strategyStartTime.getTime();
     this._scheduleNextFundingPoll();
 
-    await this.addLog('ReversalLadderStrategy running — awaiting first tick to build the ladder.');
+    await this.addLog('ReversalLadderStrategy running — awaiting the first tick to plan levels.');
     await this.saveState();
     // Push immediately — one harmless extra heartbeat moments before the
-    // first tick's own push from initializeLadder(). Synchronous + internally
+    // first tick's own push from _buildLadders(). Synchronous + internally
     // try/caught, so no await (see _pushHeartbeatNow's own doc).
     this._pushHeartbeatNow?.();
   }
 
   /**
-   * Anchor the ladder on the live mark price. Called from the empty-ladder gate
-   * on the first tick, and again after a manual harvest re-anchors.
+   * Build BOTH ladders around a validated level pair. The single writer of
+   * `bullLevel`/`bearLevel` and of `ladderLines` on a fresh build.
    *
-   * Unlike the old VP-derived grid this needs no market data at all — the
-   * anchor IS the current price and the step is fixed — so it cannot fail and
-   * needs no retry throttle.
+   * Callers must have validated the pair already (planLevels does, and refuses
+   * to return an invalid one). `buildReversalLadder` throws on bad geometry
+   * rather than silently building something unreachable — that throw is a real
+   * bug signal and must not be swallowed here.
    */
-  async initializeLadder(currentPrice) {
-    this.anchor = currentPrice;
-    this.ladderLines = buildLadder(currentPrice, this.stepPct, this.levelsPerSide);
-    this.ladderMode = 'RANGE';
+  async _buildLadders({ bullLevel, bearLevel, reason = 'cycle_start' }) {
+    this.ladderLines = buildReversalLadder(bullLevel, bearLevel, this.stepPct, this.levelsPerSide);
+    this.bullLevel = bullLevel;
+    this.bearLevel = bearLevel;
+    this.ladderMode = 'SCALING';
     this.trendDirection = null;
     // Nulling finalTpPrice IS the disarm — `_trendFinalTpArmed` derives from it.
     this.finalTpPrice = null;
-    this.lastProcessedPrice = currentPrice;
+    this.lastProcessedPrice = this.currentPrice;
 
-    const outer = currentPrice * this.stepPct * this.levelsPerSide;
-    await this.addLog(`===== LADDER ANCHORED =====`);
+    await this.addLog(`===== LEVELS SET (${reason}) =====`);
     await this.addLog(
-      `Anchor ${this._formatPrice(currentPrice)} | step ${(this.stepPct * 100).toFixed(2)}% | ` +
-      `${this.levelsPerSide} levels/side | LONG ${this._formatPrice(currentPrice + currentPrice * this.stepPct)}` +
-      `–${this._formatPrice(currentPrice + outer)} | SHORT ${this._formatPrice(currentPrice - outer)}` +
-      `–${this._formatPrice(currentPrice - currentPrice * this.stepPct)} | ` +
+      `BULL ${this._formatPrice(bullLevel)} | BEAR ${this._formatPrice(bearLevel)} | ` +
+      `dead zone ${(((bullLevel - bearLevel) / bearLevel) * 100).toFixed(2)}% | ` +
+      `step ${(this.stepPct * 100).toFixed(2)}% | ${this.levelsPerSide} levels/side | ` +
       `leg ${this._formatNotional(this._legNotional())} USDT`,
     );
     await this.saveState();
-    // Push immediately — with a healthy WS the frontend disables its REST
-    // poll and relies on the 30s strategy_update safety net. Without this,
-    // an ARMED start-trigger fire (ladder builds mid-run, not at strategy
-    // boot) can leave the UI showing ARMED — phantom start line, harvest
-    // control still hidden — for up to 30s, and no leg fill can heal it on
-    // the anchoring tick (price == anchor; legs sit at ±stepPct). Also
-    // tightens the existing harvest re-anchor path, which calls this too.
     this._pushHeartbeatNow?.();
   }
 
+  /**
+   * Plan a level pair and build both ladders from it.
+   *
+   * Returns false when no valid pair could be produced — and when it returns
+   * false NOTHING is built, so the strategy stays flat with an empty ladder and
+   * the tick gate retries on the throttle. That is deliberate: trading without
+   * levels has no entry trigger and no reversal boundary, so "we could not plan"
+   * must never read as "proceed".
+   */
+  async _planAndBuildLevels(reason) {
+    if (this._levelPlanInProgress) return false;
+    const now = Date.now();
+    if (this._levelPlanLastTs != null && (now - this._levelPlanLastTs) < LEVEL_PLAN_RETRY_INTERVAL_MS) {
+      return false;
+    }
+    this._levelPlanLastTs = now;
+    this._levelPlanInProgress = true;
+    try {
+      const context = await buildLevelContext({
+        symbol: this.symbol,
+        currentPrice: this.currentPrice,
+        volumeProfile: this.volumeProfile,
+        marketMetrics: this.marketMetrics,
+      });
+      const result = await planLevels({ planner: this._aiPlanner ?? null, context });
+      if (!result) {
+        await this.addLog(
+          `ERROR: level planning (${reason}) produced no valid bull/bear pair for ${this.symbol} — ` +
+          `NOT trading without levels. Retrying in ${LEVEL_PLAN_RETRY_INTERVAL_MS / 1000}s.`,
+        );
+        return false;
+      }
+      if (result.error) {
+        await this.addLog(`[REVERSAL] level planning note: ${result.error}`);
+      }
+      await this.addLog(
+        `[REVERSAL] levels from ${result.source} — bull ${this._formatPrice(result.bullLevel)} / ` +
+        `bear ${this._formatPrice(result.bearLevel)}` +
+        (result.rationale ? ` — ${result.rationale}` : ''),
+      );
+      await this._buildLadders({ bullLevel: result.bullLevel, bearLevel: result.bearLevel, reason });
+      this._levelPlanLastTs = null;   // succeeded: no throttle carried forward
+      return true;
+    } catch (err) {
+      await this.addLog(`ERROR: level planning (${reason}) failed for ${this.symbol}: ${err.message}`);
+      return false;
+    } finally {
+      this._levelPlanInProgress = false;
+    }
+  }
+
   // Each leg is an equal slice of the ladder base. The base is the initial size
-  // at cycle start, then whatever dynamic sizing produces at each anchor
-  // flatten and post-harvest.
+  // at cycle start, then whatever dynamic sizing produces at each reversal
+  // and post-harvest.
   _legNotional() {
     return (this._ladderBaseSize || this.currentInitialSize || 0) / this.levelsPerSide;
   }
@@ -438,8 +502,8 @@ class ReversalLadderStrategy extends TradingBase {
    * is no such thing as a per-leg close, so the old hedge-mode per-leg
    * `_closeGridLeg` loop is gone. This is now a thin "flatten whatever is
    * open" primitive, used only by `stop({flatten:true})`.
-   * (`_flattenAtAnchor` does NOT call this — it closes directly via
-   * `_closeConsolidated` and rebuilds the ladder from scratch.)
+   * (`_reverseTo` does NOT call this — it closes directly via
+   * `_closeConsolidated` and rebuilds only the abandoned side.)
    *
    * Returns whether a position was ACTUALLY closed, never merely whether legs
    * were marked open.
@@ -550,8 +614,8 @@ class ReversalLadderStrategy extends TradingBase {
     // The side comes from the legs for the same reason the quantity does:
     // `currentSide` is written only by `_refreshCurrentPosition` (REST), so it
     // is null in precisely the cases the legs still cover. Every open leg is
-    // the same direction — crossing the anchor flattens before the other side
-    // can open (ladder-crossings rule 1).
+    // the same direction — Rule 2 resets the abandoned side to EMPTY before
+    // the new side fills, so at most one direction is ever open at once.
     let side = this.currentSide
       || this.ladderLines.find((l) => l.state === 'POSITION_OPEN')?.direction
       || null;
@@ -641,14 +705,14 @@ class ReversalLadderStrategy extends TradingBase {
 
   /**
    * Dynamic re-basing of the ladder's per-leg notional, applied at every
-   * anchor flatten (formerly `_computeTrendSize`, the old grid's RANGE->TREND
+   * reversal (formerly `_computeTrendSize`, the old grid's RANGE->TREND
    * entry sizing — same recovery-formula + margin-headroom-cap + gauge-full
-   * freeze, repurposed: the ladder re-bases at every flatten instead of
+   * freeze, repurposed: the ladder re-bases at every reversal instead of
    * sizing a one-off consolidated TREND entry).
    *
    * Async: fetches the LIVE margin balance for the headroom cap rather than
-   * trusting a cached snapshot. Called only from `_flattenAtAnchor` /
-   * `_harvestToFlat` — both async, both at flatten points, a handful of
+   * trusting a cached snapshot. Called only from `_reverseTo` /
+   * `_harvestToFlat` — both async, both at reset points, a handful of
    * times per cycle, never in a hot loop — so the extra round trip is cheap
    * and buys a correct-during-drawdown headroom figure instead of a frozen
    * cycle-start one.
@@ -700,86 +764,92 @@ class ReversalLadderStrategy extends TradingBase {
     leg.fillPrice = fill.fillPrice;
 
     await this.addLog(
-      `${leg.direction} ${leg.direction === 'LONG' ? 'L' : 'S'}${leg.levelIndex} filled: ` +
+      `${leg.direction} ${leg.direction === 'LONG' ? 'L' : 'S'}${leg.index} filled: ` +
       `${fill.filledQty} @ ${this._formatPrice(fill.fillPrice)} (${this._formatNotional(notional)} USDT)`,
     );
     await this._refreshCurrentPosition(true);
-    await this._postExecuteBookkeeping('LADDER_FILL', { direction: leg.direction, levelIndex: leg.levelIndex });
+    await this._postExecuteBookkeeping('LADDER_FILL', { direction: leg.direction, index: leg.index });
   }
 
   /**
-   * The anchor flatten — the ONLY close in RANGE, and one of two in TREND.
+   * Rule 2 — the reversal. Close the whole netted position, reset the abandoned
+   * side's ledger, and hand control back so the caller can fill the new side ON
+   * THE SAME TICK. Unlike the deleted anchor flatten there is no two-tick rule
+   * here: the position is genuinely reversing, not oscillating around a centre.
    *
-   * Universal: identical in both modes. One reduceOnly market order closes the
-   * whole netted position (there are no partial closes in this design), then the
-   * ladder resets, dynamic sizing re-bases, and the legs are redistributed.
+   * Returns false when the caller must fill NOTHING.
    *
-   * The anchor does NOT move — price IS at the anchor when this fires, so the
-   * geometry is already correct.
-   *
-   * No-ops when there is nothing open AND every leg is already EMPTY: price
-   * oscillating across the anchor with a flat ladder otherwise re-triggers a
-   * flatten with no position on every crossing — harmless (no orders placed)
-   * but it would still re-run dynamic sizing, rebuild the ladder, and spam the
-   * log + strategyFlow audit trail on every oscillation.
+   * TOMBSTONE — an unverified close MUST abort before the leg reset below. Those
+   * POSITION_OPEN markings are the ONLY record of what this bot has open
+   * (`_closeQuantity` sizes every close from them). Resetting them after a close
+   * we could not verify ORPHANS a live position: it stays open on Binance while
+   * the books read flat and nothing ever tries to close it again. Do NOT
+   * rethrow — `handleRealtimePrice` awaits this without a catch, so a throw would escape
+   * the WS tick handler.
    */
-  async _flattenAtAnchor() {
-    const hasOpenLegs = this.ladderLines.some(l => l.state === 'POSITION_OPEN');
-    if (!hasOpenLegs && !(this.activePosition && this.activePosition.quantity > 0)) return;
+  async _reverseTo(newSide) {
+    const abandoned = newSide === 'LONG' ? 'SHORT' : 'LONG';
 
-    // `_closeConsolidated` self-gates and self-sizes off `_closeQuantity()` —
-    // no REST pre-decision about what is open, so a dead position API can
-    // neither shrink this close nor block it.
-    const closed = await this._closeConsolidated('anchor_flatten');
+    let closed = false;
+    try { closed = await this._closeConsolidated('reversal'); }
+    catch (e) { await this.addLog(`ERROR reversal close: ${e.message}`); }
 
-    // An unverified close must NOT reach the rebuild below — buildLadder() wipes
-    // the POSITION_OPEN leg ledger, the only record of open inventory. Same
-    // tombstone as _harvestToFlat. Do NOT rethrow: handleRealtimePrice awaits
-    // this without a catch, so a throw would escape the WS tick handler.
     if (!closed && this._closeQuantity() > 0) {
       await this.addLog(
-        `WARNING: ANCHOR FLATTEN aborted — the close could not be verified; the ladder was left ` +
-        `INTACT so the open position stays tracked. It will retry on the next anchor crossing.`,
+        `WARNING: REVERSAL to ${newSide} aborted — the close could not be verified; the ladder was left ` +
+        `INTACT so the open position stays tracked. It will retry on the next tick.`,
       );
       await this.saveState();
       this._pushHeartbeatNow?.();
-      return;
+      return false;
+    }
+
+    for (const leg of this.ladderLines) {
+      if (leg.direction !== abandoned) continue;
+      leg.state = 'EMPTY';
+      leg.quantity = null;
+      leg.fillPrice = null;
     }
 
     const prevBase = this._ladderBaseSize;
     this.cycleAccumulatedLoss = this._computeAccLoss();
     this._ladderBaseSize = await this._computeLadderBaseSize();
 
-    this.ladderLines = buildLadder(this.anchor, this.stepPct, this.levelsPerSide);
-    this.ladderMode = 'RANGE';
+    // Back to SCALING even if we came out of TREND (§6 Rule 2). Nulling
+    // finalTpPrice IS the disarm — `_trendFinalTpArmed` derives from it.
+    this.ladderMode = 'SCALING';
     this.trendDirection = null;
-    // Nulling finalTpPrice IS the disarm — `_trendFinalTpArmed` derives from it.
     this.finalTpPrice = null;
-
-    // Both abort paths above have returned, so the flatten is committed and is
-    // counted here rather than on entry. Counts every reset that reaches this
-    // point — including the legs-open-but-no-position case, which still
-    // re-sizes and rebuilds — so the tile matches the ANCHOR_FLATTEN
-    // strategyFlow trail one-for-one. Persisted by the saveState() below.
-    this.flattenCount = (this.flattenCount || 0) + 1;
+    this.reversalCount = (this.reversalCount || 0) + 1;
 
     await this.addLog(
-      `===== ANCHOR FLATTEN #${this.flattenCount} @ ${this._formatPrice(this.anchor)} ===== ` +
+      `===== REVERSAL #${this.reversalCount} ${abandoned} → ${newSide} @ ` +
+      `${this._formatPrice(this.currentPrice)} ===== ` +
       `accLoss ${this._formatNotional(this.cycleAccumulatedLoss)} USDT | ` +
       `base ${this._formatNotional(prevBase)} → ${this._formatNotional(this._ladderBaseSize)} USDT | ` +
-      `leg ${this._formatNotional(this._legNotional())} USDT | ladder reset`,
+      `leg ${this._formatNotional(this._legNotional())} USDT`,
     );
-    await this._writeStrategyFlow('ANCHOR_FLATTEN', {
-      anchor: this.anchor, accLoss: this.cycleAccumulatedLoss, baseSize: this._ladderBaseSize,
-      flattenCount: this.flattenCount,
+    await this._writeStrategyFlow('REVERSAL', {
+      from: abandoned, to: newSide, bullLevel: this.bullLevel, bearLevel: this.bearLevel,
+      accLoss: this.cycleAccumulatedLoss, baseSize: this._ladderBaseSize, reversalCount: this.reversalCount,
     }).catch(() => {});
     await this.saveState();
-    // A WS-connected UI disables its REST poll and updates status only from
-    // strategy_update heartbeats. This path rebuilds the ladder directly (not
-    // via initializeLadder, which pushes its own), so broadcast the RANGE
-    // rebuild now — otherwise the panels/chart stay stale until the next
-    // heartbeat from another event or the 30s safety net.
     this._pushHeartbeatNow?.();
+    return true;
+  }
+
+  /**
+   * Which side currently holds inventory, DERIVED from the leg ledger.
+   *
+   * Never stored. The legs are the WS-true record (`_fillLeg` books
+   * `leg.quantity` from the actual user-data fill), so this needs no network
+   * call and cannot go stale behind a failed REST refresh — unlike
+   * `currentSide`, which `_refreshCurrentPosition` leaves null on exactly the
+   * ticks it matters. Rule 2 resets the abandoned side to EMPTY before the new
+   * side fills, so at most one direction is ever open.
+   */
+  get heldSide() {
+    return this.ladderLines.find((l) => l.state === 'POSITION_OPEN')?.direction ?? null;
   }
 
   /**
@@ -831,12 +901,14 @@ class ReversalLadderStrategy extends TradingBase {
    *
    * Deliberately does NOT flatten and re-open (which is what the old
    * _triggerTrend did): the ladder has already built a favourable average entry
-   * — anchor+0.9% while price is at +1.5% — and re-opening would discard it and
-   * pay fees for the privilege.
+   * — the innermost rungs (near the trigger level) filled first, so the average
+   * sits closer to the trigger than the outermost rung price is — and
+   * re-opening would discard it and pay fees for the privilege.
    */
   async _enterTrend(direction) {
     this.ladderMode = 'TREND';
     this.trendDirection = direction;
+    this.trendStartPrice = this.currentPrice;
     // Disarm before arming: `_trendFinalTpArmed` derives from finalTpPrice, so
     // nulling it here means a failed arm below cannot leave the pre-TREND
     // value standing (that value was derived off the not-yet-reconciled
@@ -865,7 +937,7 @@ class ReversalLadderStrategy extends TradingBase {
         `exit target until _reconcileTrendInvariant self-heals it on a later tick/resume.`
       );
     } else {
-      // Armed HERE and only here on the happy path — RANGE never checks it.
+      // Armed HERE and only here on the happy path — SCALING never checks it.
       // The arm is the write itself: if the recompute cannot resolve a target
       // (flat / unresolved side), finalTpPrice stays null and
       // `_trendFinalTpArmed` stays false, so `_reconcileTrendInvariant`
@@ -880,11 +952,11 @@ class ReversalLadderStrategy extends TradingBase {
     );
 
     // A manually-raised profit target is a CYCLE-level goal: it survives every
-    // anchor flatten, including one that flips the cycle to the opposite side.
+    // reversal, including one that flips the cycle to the opposite side.
     // That is deliberate, but it is invisible — the level the user originally
-    // picked is long gone (the flatten nulls finalTpPrice), while the profit it
+    // picked is long gone (the reversal nulls finalTpPrice), while the profit it
     // implied silently keeps setting every subsequent target, on top of an
-    // accumulated loss that the flatten just grew. Say so at the moment it takes
+    // accumulated loss that the reversal just grew. Say so at the moment it takes
     // effect, so a distant target is explained rather than discovered.
     const floorUSDT = this.minDesiredProfitUSDT || 0;
     if ((this.desiredProfitUSDT || 0) > floorUSDT + 1e-9) {
@@ -898,41 +970,42 @@ class ReversalLadderStrategy extends TradingBase {
       direction, avgEntry: avg, finalTpPrice: this.finalTpPrice, armed: this._trendFinalTpArmed,
     }).catch(() => {});
     await this.saveState();
-    // Mode just flipped RANGE -> TREND with no leg fill on this tick, so nothing
+    // Mode just flipped SCALING -> TREND with no leg fill on this tick, so nothing
     // else pushes a heartbeat; broadcast now or the Levels & Targets panel +
     // chart wait for the next heartbeat (a later fill or the 30s safety net).
     this._pushHeartbeatNow?.();
   }
 
   /**
-   * Derive the RANGE→TREND invariant instead of chasing the fill event.
+   * Derive the SCALING→TREND invariant instead of chasing the fill event.
    *
    * `handleRealtimePrice`'s normal path already calls `_enterTrend` the
    * instant the outermost leg fills — but `_fillLeg` persists that leg's
    * POSITION_OPEN state (via `_postExecuteBookkeeping` -> `saveState`)
    * BEFORE that call runs. A process death in that ~0.5-2s window (a PM2
-   * restart or VM redeploy, both routine here) persists "RANGE + fully
+   * restart or VM redeploy, both routine here) persists "SCALING + fully
    * scaled" with no way back: `resume()` only re-arms Final TP when the
    * snapshot already says TREND, and every leg being open means the tick
    * loop's `plan.fills` is empty forever, so the event that drives
    * `_enterTrend` can never fire again. The ladder then sits fully exposed
-   * with NO exit target — the anchor flatten becomes the only remaining
-   * exit, which turns a winning move into a guaranteed loss.
+   * with NO exit target — the position stays open until price eventually
+   * reverses all the way through the dead zone and crosses the OTHER level,
+   * forcing a reversal instead of the clean Final TP exit it should have had.
    *
    * Called from `resume()` and from the top of every tick (before the
-   * TREND/RANGE dispatch) so the invariant self-heals on the very next
+   * TREND/SCALING dispatch) so the invariant self-heals on the very next
    * opportunity regardless of when the crash happened. Idempotent: a no-op
    * once `ladderMode` is already 'TREND'.
    */
   async _reconcileTrendInvariant() {
-    if (this.ladderMode === 'RANGE') {
+    if (this.ladderMode === 'SCALING') {
       const outermost = this.ladderLines.find(
-        (l) => l.levelIndex === this.levelsPerSide && l.state === 'POSITION_OPEN',
+        (l) => l.index === this.levelsPerSide && l.state === 'POSITION_OPEN',
       );
       if (!outermost) return false;
       await this.addLog(
-        `[LADDER] RANGE→TREND invariant reconcile: outermost ${outermost.direction} leg already ` +
-        `POSITION_OPEN with ladderMode still RANGE — arming TREND now (resume or a missed tick).`,
+        `[LADDER] SCALING→TREND invariant reconcile: outermost ${outermost.direction} leg already ` +
+        `POSITION_OPEN with ladderMode still SCALING — arming TREND now (resume or a missed tick).`,
       );
       await this._enterTrend(outermost.direction);
       return true;
@@ -980,7 +1053,7 @@ class ReversalLadderStrategy extends TradingBase {
       // "Final TP armed at N/A", reported success, and — back when the flag
       // was stored — short-circuited its own retry forever.
       //
-      // Reachable, not theoretical: a process death inside `_flattenAtAnchor`
+      // Reachable, not theoretical: a process death inside `_reverseTo`
       // between `_closeConsolidated()` and `saveState()` — a window that
       // contains `_computeLadderBaseSize()` -> `getTotalMarginBalance()`, a
       // real 100-500ms round trip — persists TREND + every leg POSITION_OPEN
@@ -995,7 +1068,7 @@ class ReversalLadderStrategy extends TradingBase {
             ? `qty ${this.activePosition.quantity}, side ${this.currentSide || 'UNRESOLVED'}`
             : 'FLAT on Binance'}` +
           `) — TREND ${this.trendDirection} with no position to exit is a contradiction; Final TP stays unarmed and ` +
-          `this will retry. Check whether an anchor flatten died before it could persist.`
+          `this will retry. Check whether a reversal died before it could persist.`
         );
         return false;
       }
@@ -1014,17 +1087,18 @@ class ReversalLadderStrategy extends TradingBase {
   }
 
   /**
-   * Manual harvest — flatten, RE-ANCHOR to the current price, dynamic-size,
-   * redistribute. Identical to the anchor flatten except for the re-anchor:
-   * the anchor flatten fires AT the anchor (so the geometry is already right),
-   * while a harvest fires wherever price happens to be. accLoss is NOT reset
-   * (real carried loss); the gauge only empties if realized PnL reduces
-   * cycleAccumulatedLoss on its own.
+   * Manual harvest — flatten, clear both levels, re-plan a fresh bull/bear
+   * pair, dynamic-size, redistribute. Unlike a reversal (which keeps the
+   * un-abandoned side's ladder standing) a harvest closes AT a level, so
+   * keeping the old pair would leave price sitting on top of a trigger and
+   * refill it immediately — both ladders are cleared and re-planned from
+   * scratch. accLoss is NOT reset (real carried loss); the gauge only empties
+   * if realized PnL reduces cycleAccumulatedLoss on its own.
    *
    * Manual only. There is no automatic harvest.
    *
-   * @returns {Promise<boolean>} `true` only when the close + re-anchor completed
-   *   (reached `initializeLadder`); `false` on the in-flight skip and on the
+   * @returns {Promise<boolean>} `true` only when the close + re-plan completed
+   *   (reached `_planAndBuildLevels`); `false` on the in-flight skip and on the
    *   tombstone abort. Callers that need a bounded retry on an aborted harvest
    *   must key it off this return — never infer the outcome from observed side
    *   effects.
@@ -1051,7 +1125,7 @@ class ReversalLadderStrategy extends TradingBase {
         ? this.activePosition.unrealizedPnl : 0;
       const kind = !hadInventory ? 'RE-ANCHOR' : (closingPnl >= 0 ? 'HARVEST' : 'RE-ANCHOR');
       let detail = reason;
-      await this.addLog(`===== ${kind} (${detail}) — flatten + re-anchor =====`);
+      await this.addLog(`===== ${kind} (${detail}) — flatten + re-plan levels =====`);
 
       // Self-gating and self-sizing (see `_closeQuantity`). This matters most
       // here of all the close paths: the harvest RE-ANCHORS, so anything left
@@ -1060,13 +1134,13 @@ class ReversalLadderStrategy extends TradingBase {
       try { closed = await this._closeConsolidated('harvest'); }
       catch (e) { await this.addLog(`ERROR ${kind} close: ${e.message}`); }
 
-      // TOMBSTONE — a failed close MUST abort the rebuild. `initializeLadder`
-      // below resets every leg to EMPTY, and those POSITION_OPEN markings are the
+      // TOMBSTONE — a failed close MUST abort the rebuild. The re-plan below
+      // resets every leg to EMPTY, and those POSITION_OPEN markings are the
       // ONLY record of what this bot has open (`_closeQuantity` sizes every close
       // from them). Rebuilding after a failed close ORPHANS a live position: it
       // stays open on Binance while the bot's books read "flat, fresh ladder" and
       // nothing ever tries to close it again. Leave the ladder INTACT instead, so
-      // the position stays tracked and the harvest can be retried. `_flattenAtAnchor`
+      // the position stays tracked and the harvest can be retried. `_reverseTo`
       // and `_flattenGrid` now carry this same guard — no close path may wipe its
       // leg ledger on a close it could not verify. Do NOT rethrow here:
       // `handleRealtimePrice` awaits this without a catch, so a throw would escape
@@ -1076,7 +1150,7 @@ class ReversalLadderStrategy extends TradingBase {
       // tiers WS fill marker -> full REST-ack qty -> REST position check before
       // returning true, and returns `false` on anything unverified. That `false`
       // is exactly what this guard catches, so an unconfirmed fill can no longer
-      // slip past it (shared contract with `_flattenAtAnchor`).
+      // slip past it (shared contract with `_reverseTo`).
       //
       // Check POST-close inventory, not a pre-close snapshot: in the `!closed`
       // branch, `_closeConsolidated` never reaches its leg-clearing /
@@ -1086,11 +1160,11 @@ class ReversalLadderStrategy extends TradingBase {
       // `_closeConsolidated` internally refreshed and found the account
       // genuinely flat (returns `false` with nothing actually open) — a
       // pre-close snapshot would have aborted on that stale reading and
-      // blocked the re-anchor for no reason. (This check would NOT be valid
-      // after a SUCCESSFUL close: legs stay POSITION_OPEN until
-      // `initializeLadder` rebuilds them below, so `_closeQuantity()` would
-      // still read positive even though the close is fine — do not
-      // "simplify" this to run unconditionally.)
+      // blocked the re-plan for no reason. (This check would NOT be valid
+      // after a SUCCESSFUL close: legs stay POSITION_OPEN until the re-plan
+      // rebuilds them below, so `_closeQuantity()` would still read positive
+      // even though the close is fine — do not "simplify" this to run
+      // unconditionally.)
       if (!closed && this._closeQuantity() > 0) {
         await this.addLog(
           `WARNING: ${kind} (${reason}) ABORTED — the close did not complete, so the ladder was left ` +
@@ -1118,15 +1192,24 @@ class ReversalLadderStrategy extends TradingBase {
         `leg ${this._formatNotional(this._legNotional())} USDT (accLoss ${this._formatNotional(this.cycleAccumulatedLoss)}).`,
       );
 
-      // Re-anchor on the live price — THE difference from the anchor flatten.
-      await this.initializeLadder(this.currentPrice);
+      // Re-plan the levels: a harvest closes AT a level, so keeping the old pair
+      // would leave price sitting on top of a trigger and refill it immediately.
+      // A failed re-plan leaves the ladder EMPTY, which is safe — the tick gate
+      // retries on the throttle and nothing trades meanwhile.
+      this.ladderLines = [];
+      this.bullLevel = null;
+      this.bearLevel = null;
+      await this._planAndBuildLevels(reason);
 
       // The audit label reflects what ACTUALLY happened (keyed off `closed`), not
       // the pre-close `kind` guess — so a stale-open-but-actually-flat run records
       // as a RE-ANCHOR here, consistent with the counter above. The opening log
       // above keeps the pre-close `kind` as a best-effort "attempting" label.
       const finalKind = closed ? kind : 'RE-ANCHOR';
-      await this._writeStrategyFlow('HARVEST', { reason, kind: finalKind, closingPnl, flat: !closed, reanchorCount: this.reanchorCount, anchor: this.anchor, baseSize: this._ladderBaseSize }).catch(() => {});
+      await this._writeStrategyFlow('HARVEST', {
+        reason, kind: finalKind, closingPnl, flat: !closed, reanchorCount: this.reanchorCount,
+        bullLevel: this.bullLevel, bearLevel: this.bearLevel, baseSize: this._ladderBaseSize,
+      }).catch(() => {});
       await this.saveState();
       return true;
     } finally {
@@ -1224,8 +1307,9 @@ class ReversalLadderStrategy extends TradingBase {
     this.currentInitialSize = snapshot.currentInitialSize || snapshot.config?.initialSize || 0;
 
     // ---- ladder state ----
-    this.ladderMode = snapshot.ladderMode || 'RANGE';
-    this.anchor = snapshot.anchor ?? null;
+    this.ladderMode = snapshot.ladderMode || 'SCALING';
+    this.bullLevel = snapshot.bullLevel ?? null;
+    this.bearLevel = snapshot.bearLevel ?? null;
     this.ladderLines = Array.isArray(snapshot.ladderLines) ? snapshot.ladderLines : [];
     this.trendDirection = snapshot.trendDirection ?? null;
     this.lastProcessedPrice = snapshot.lastProcessedPrice ?? null;
@@ -1241,7 +1325,7 @@ class ReversalLadderStrategy extends TradingBase {
     this.harvestTriggerAbove = snapshot.harvestTriggerAbove ?? null;
     this.harvestTriggerAction = snapshot.harvestTriggerAction === 'stop' ? 'stop' : 'reanchor';
     this.cycleAccumulatedLoss = snapshot.cycleAccumulatedLoss || 0;
-    this.flattenCount = snapshot.flattenCount || 0;
+    this.reversalCount = snapshot.reversalCount || 0;
     this.harvestCount = snapshot.harvestCount || 0;
     this.reanchorCount = snapshot.reanchorCount || 0;
     this.initialCapital = snapshot.initialCapital || 0;
@@ -1269,8 +1353,8 @@ class ReversalLadderStrategy extends TradingBase {
     try {
       await this.setLeverage(this.symbol, this.leverage);
       // One-way (single-side) mode — mirrors start(). The ladder holds LONG
-      // legs ONLY above the anchor and SHORT legs ONLY below it, so it can
-      // never need both sides at once; hedge mode is unnecessary. Wrap in
+      // legs ONLY above bullLevel and SHORT legs ONLY below bearLevel, and Rule
+      // 2 keeps only one side open at once; hedge mode is unnecessary. Wrap in
       // try/catch because Binance refuses the call while positions are open
       // (harmless: an open position means the mode is already whatever it is).
       // Critically it must NOT be setPositionMode(true) — on a restart while
@@ -1365,13 +1449,13 @@ class ReversalLadderStrategy extends TradingBase {
     // (Final TP is a derived value; never persisted).
     this._recomputeFinalTpPrice();
 
-    await this.addLog(`[RECOVERY] subState=${this.subState} side=${this.currentSide || 'NONE'} flattens=${this.flattenCount} harvests=${this.harvestCount} accLoss=${this.cycleAccumulatedLoss.toFixed(4)} USDT`);
+    await this.addLog(`[RECOVERY] subState=${this.subState} side=${this.currentSide || 'NONE'} reversals=${this.reversalCount} harvests=${this.harvestCount} accLoss=${this.cycleAccumulatedLoss.toFixed(4)} USDT`);
 
     await this.saveState();
 
-    // Mode-aware resume: RANGE re-derives the TREND invariant here (not just
+    // Mode-aware resume: SCALING re-derives the TREND invariant here (not just
     // on the next tick) so a process death between `_fillLeg(L5)` persisting
-    // and `_enterTrend` running can never strand the cycle in RANGE fully-
+    // and `_enterTrend` running can never strand the cycle in SCALING fully-
     // scaled with no exit target — see `_reconcileTrendInvariant`. TREND
     // (already armed on the snapshot) re-arms Final TP from the restored
     // consolidated position.
@@ -1627,7 +1711,7 @@ class ReversalLadderStrategy extends TradingBase {
           symbol: this.symbol,
           netPnL,
           profitPercentage: this.initialCapital ? (netPnL / this.initialCapital) * 100 : 0,
-          tradeCount: this.tradeCount || (this.flattenCount + this.harvestCount + (reason === 'final_tp' ? 1 : 0)),
+          tradeCount: this.tradeCount || (this.reversalCount + this.harvestCount + (reason === 'final_tp' ? 1 : 0)),
           timeTaken: elapsed,
           realizedPnL: this.accumulatedRealizedPnL || 0,
           tradingFees: this.accumulatedTradingFees || 0,
@@ -1648,8 +1732,8 @@ class ReversalLadderStrategy extends TradingBase {
 
   /**
    * True when this cycle never filled a position: no trading fees (every fill
-   * incurs a taker commission), no realized PnL, no funding, and no anchor
-   * flattens or harvests. All of these are persisted by saveState() and
+   * incurs a taker commission), no realized PnL, no funding, and no reversals
+   * or harvests. All of these are persisted by saveState() and
    * restored by resume(), so the check is crash-safe across a VM restart.
    * Conservative by design — any real trading activity leaves a non-zero
    * accumulatedTradingFees, so a strategy that actually traded can never be
@@ -1659,7 +1743,7 @@ class ReversalLadderStrategy extends TradingBase {
     return (this.accumulatedTradingFees || 0) === 0
       && (this.accumulatedRealizedPnL || 0) === 0
       && (this.accumulatedFundingFees || 0) === 0
-      && (this.flattenCount || 0) === 0
+      && (this.reversalCount || 0) === 0
       && (this.harvestCount || 0) === 0;
   }
 
@@ -1760,16 +1844,18 @@ class ReversalLadderStrategy extends TradingBase {
     // Cheap (multiplication + sign branch); needed so getStatus() and the
     // 30s heartbeat surface a live figure to the frontend.
     //
-    // MUST stay above the mode dispatch below: every RANGE/TREND branch
+    // MUST stay above the mode dispatch below: every SCALING/TREND branch
     // returns, so anything after them never runs. Parked here this covers
-    // TREND, where the consolidated position lives; RANGE clears
-    // activePosition when it flattens, a few lines down.
+    // TREND, where the consolidated position lives, and SCALING, where a
+    // reversal clears activePosition via `_closeConsolidated`, a few lines down.
     if (this.activePosition) this._updateUnrealizedPnL(price);
 
-    // ---- Ladder gate: anchor on the first tick (and after a harvest). ----
-    // No market data needed — the anchor IS the price — so no retry throttle.
+    // ---- Level gate: plan the pair and build both ladders. ----
+    // Unlike the deleted anchor, levels are DERIVED from market data, so this
+    // can fail. It returns false and builds nothing when it does; we then trade
+    // nothing this tick rather than guessing a level.
     if (!this.ladderLines.length) {
-      await this.initializeLadder(price);
+      await this._planAndBuildLevels('cycle_start');
       return;
     }
 
@@ -1784,7 +1870,7 @@ class ReversalLadderStrategy extends TradingBase {
     }
 
     // Armed price trigger — fire the manual harvest/re-anchor at a user-set
-    // level. Placed here with the manual latch, BEFORE the RANGE/TREND
+    // level. Placed here with the manual latch, BEFORE the SCALING/TREND
     // dispatch, so it takes precedence over the normal ladder action on this
     // tick (identical to the manual latch). One-shot: cleared BEFORE acting so
     // a throw mid-harvest can never leave a re-firing loop. Threshold (not
@@ -1816,46 +1902,42 @@ class ReversalLadderStrategy extends TradingBase {
       }
     }
 
-    // ---- Derive the RANGE→TREND invariant BEFORE dispatching on mode. ----
-    // Fully scaled (outermost leg POSITION_OPEN) always implies TREND — a
-    // no-op once already TREND, and a self-heal on the first tick after a
-    // resume that stalled in RANGE fully-scaled (see _reconcileTrendInvariant).
-    // Runs first so a transition here is picked up by the TREND branch on
-    // this SAME tick rather than waiting one more.
+    // ---- Derive the SCALING→TREND invariant BEFORE dispatching. ----
     await this._reconcileTrendInvariant();
 
-    // ---- TREND: passive. Two exits, and only two. ----
-    if (this.ladderMode === 'TREND') {
-      // 1) Final TP -> close + STOP. The cycle ends.
-      if (this.finalTpPrice && this._checkFinalTpHit(price)) {
-        this._tradingSeqInProgress = true;
-        try { await this.stop({ flatten: true, reason: 'final_tp' }); }
-        finally { this._tradingSeqInProgress = false; }
-        return;
-      }
-      // 2) Anchor reached -> flatten -> back to RANGE. Nothing else acts:
-      //    price moving back inside the ladder is deliberately a no-op.
-      const plan = planLadderActions({
-        prevPrice: this.lastProcessedPrice, currentPrice: price, anchor: this.anchor, legs: this.ladderLines,
-      });
-      if (plan.flatten) {
-        this._tradingSeqInProgress = true;
-        try { await this._flattenAtAnchor(); } finally { this._tradingSeqInProgress = false; }
-      }
-      this.lastProcessedPrice = price;
+    // ---- TREND exit 1: Final TP -> close + STOP. The cycle ends. ----
+    if (this.ladderMode === 'TREND' && this.finalTpPrice && this._checkFinalTpHit(price)) {
+      this._tradingSeqInProgress = true;
+      try { await this.stop({ flatten: true, reason: 'final_tp' }); }
+      finally { this._tradingSeqInProgress = false; }
       return;
     }
 
-    // ---- RANGE ----
-    const plan = planLadderActions({
-      prevPrice: this.lastProcessedPrice, currentPrice: price, anchor: this.anchor, legs: this.ladderLines,
+    // ---- Tick rules 0-3 (§6). One call covers SCALING and TREND alike: the
+    // rules are identical, and TREND differs only in already being fully
+    // scaled (so `fills` comes back empty) and in the two exits handled above
+    // and below.
+    const plan = planReversalActions({
+      prevPrice: this.lastProcessedPrice,
+      currentPrice: price,
+      bullLevel: this.bullLevel,
+      bearLevel: this.bearLevel,
+      legs: this.ladderLines,
+      heldSide: this.heldSide,
     });
 
-    if (plan.flatten) {
+    if (plan.reverse) {
       this._tradingSeqInProgress = true;
-      try { await this._flattenAtAnchor(); } finally { this._tradingSeqInProgress = false; }
+      try {
+        const ok = await this._reverseTo(plan.side);
+        if (!ok) return;  // aborted: fill nothing, do NOT advance lastProcessedPrice
+        for (const leg of plan.fills) {
+          if (leg.state === 'EMPTY') await this._fillLeg(leg);
+        }
+        if (plan.enterTrend) await this._enterTrend(plan.side);
+      } finally { this._tradingSeqInProgress = false; }
       this.lastProcessedPrice = price;
-      return; // two-tick rule: the opposite side opens on the NEXT tick
+      return;
     }
 
     if (plan.fills.length) {
@@ -1864,11 +1946,10 @@ class ReversalLadderStrategy extends TradingBase {
         for (const leg of plan.fills) {
           if (leg.state === 'EMPTY') await this._fillLeg(leg); // re-check: state may have moved since planning
         }
-        // Fully scaled -> TREND. The outermost leg filling IS the trigger.
-        const outermost = plan.fills.find(l => l.levelIndex === this.levelsPerSide);
-        if (outermost && outermost.state === 'POSITION_OPEN') {
-          await this._enterTrend(outermost.direction);
-        }
+        // Fully scaled -> TREND. `enterTrend` comes from planReversalActions,
+        // which derives the outermost index FROM THE LEGS — never from a rung
+        // count that could disagree with them.
+        if (plan.enterTrend) await this._enterTrend(plan.side);
       } finally { this._tradingSeqInProgress = false; }
     }
 
@@ -2009,7 +2090,7 @@ class ReversalLadderStrategy extends TradingBase {
     }
 
     // Set the TARGET directly, without a level. This is the path that works in
-    // RANGE — and while flat — where there is no position to back-solve a price
+    // SCALING — and while flat — where there is no position to back-solve a price
     // from, but the profit target still matters: it is what `_recomputeFinalTpPrice`
     // will derive the Final TP from the moment the outermost leg trips TREND.
     // Routed through this method rather than `adjustProfitTarget` so the config
@@ -2027,7 +2108,7 @@ class ReversalLadderStrategy extends TradingBase {
       }
       const prev = this.desiredProfitUSDT || 0;
       this.desiredProfitUSDT = want;
-      this._recomputeFinalTpPrice();   // null in RANGE/flat by design — armed later by _enterTrend
+      this._recomputeFinalTpPrice();   // null in SCALING/flat by design — armed later by _enterTrend
       await this.saveState();
       this._pushHeartbeatNow?.();
       await this.addLog(
@@ -2323,7 +2404,7 @@ class ReversalLadderStrategy extends TradingBase {
     }
   }
 
-  // TREND-only check (RANGE never calls this — see handleRealtimePrice). Keys
+  // TREND-only check (SCALING never calls this — see handleRealtimePrice). Keys
   // off `trendDirection`, the mechanical direction fixed the instant TREND was
   // entered, rather than `currentSide` — the latter is exchange-derived via
   // `_refreshCurrentPosition` and, on a boot-recovery race, could still be
@@ -2341,7 +2422,7 @@ class ReversalLadderStrategy extends TradingBase {
   /**
    * Post-execute bookkeeping hook. Called after a leg fill (_fillLeg) and
    * after the FINAL_TP_HIT close in stop(), once the order/close resolves
-   * on Binance. (_flattenAtAnchor / _harvestToFlat / _enterTrend do their
+   * on Binance. (_reverseTo / _harvestToFlat / _enterTrend do their
    * own inline bookkeeping — accLoss recompute + saveState + strategyFlow —
    * since they don't go through a single order/fill path.)
    *
@@ -2387,7 +2468,7 @@ class ReversalLadderStrategy extends TradingBase {
           `(side=${this.currentSide ?? 'FLAT'}, ` +
           `entry=${this.activePosition?.entryPrice ?? this.activePosition?.avgEntry ?? 'n/a'}, ` +
           `qty=${this.activePosition?.quantity ?? 'n/a'}, ` +
-          `flattens=${this.flattenCount}, harvests=${this.harvestCount}, ` +
+          `reversals=${this.reversalCount}, harvests=${this.harvestCount}, ` +
           `accLoss=${this.cycleAccumulatedLoss.toFixed(4)})`
         );
       }
@@ -2395,7 +2476,7 @@ class ReversalLadderStrategy extends TradingBase {
       this._writeMetricsSample().catch(() => {});
       this._writeStrategyFlow(actionType, extra).catch(() => {});
       // Immediate heartbeat — currentPosition / currentSide / cycleAccumLoss /
-      // flattenCount / harvestCount / accumulated*PnL just changed. Without
+      // reversalCount / harvestCount / accumulated*PnL just changed. Without
       // this push, frontend would see stale state for up to 30s (next safety-
       // net interval). _writeStrategyFlow above also fires its own flow_event
       // push with a slim per-event payload; this heartbeat carries the full
@@ -2455,7 +2536,7 @@ class ReversalLadderStrategy extends TradingBase {
           notional: this.activePosition.notional,
         } : null,
         cycleAccumulatedLoss: this.cycleAccumulatedLoss,
-        flattenCount: this.flattenCount,
+        reversalCount: this.reversalCount,
         harvestCount: this.harvestCount,
         finalTpPrice: this.finalTpPrice,
         ...extra,
@@ -2485,7 +2566,7 @@ class ReversalLadderStrategy extends TradingBase {
       t: Date.now(),
       accumulatedLoss: this.cycleAccumulatedLoss,
       currentSize: this.activePosition?.notional || 0,
-      flattenCount: this.flattenCount,
+      reversalCount: this.reversalCount,
       harvestCount: this.harvestCount,
       side: this.currentSide || null,
     };
@@ -2811,7 +2892,7 @@ class ReversalLadderStrategy extends TradingBase {
       strategyType: 'reversalLadder',
       symbol: this.symbol,
       // Price precision (decimals) from the cached exchange info, so the frontend
-      // formats ALL prices (ladder levels, anchor, trigger inputs) at the pair's
+      // formats ALL prices (ladder levels, bull/bear levels, trigger inputs) at the pair's
       // real tick precision instead of a magnitude heuristic. Static per symbol,
       // so it rides getStatus() (loaded once) rather than the slim heartbeat.
       pricePrecision: precisionFormatter.getPricePrecision(this.symbol),
@@ -2822,7 +2903,7 @@ class ReversalLadderStrategy extends TradingBase {
       currentPosition: this.activePosition,
       finalTpPrice: this.finalTpPrice,
       cycleAccumulatedLoss: this.cycleAccumulatedLoss,
-      flattenCount: this.flattenCount,
+      reversalCount: this.reversalCount,
       harvestCount: this.harvestCount,
       reanchorCount: this.reanchorCount,
       initialCapital: this.initialCapital,
@@ -2834,7 +2915,8 @@ class ReversalLadderStrategy extends TradingBase {
       // directly. `mode` is the alias the frontend actually reads
       // (status.mode, not status.ladderMode).
       mode: this.ladderMode,         // the frontend reads status.mode, not ladderMode
-      anchor: this.anchor,
+      bullLevel: this.bullLevel,
+      bearLevel: this.bearLevel,
       ladderLines: this.ladderLines,
       trendDirection: this.trendDirection,
       levelsPerSide: this.levelsPerSide,
@@ -2885,9 +2967,9 @@ class ReversalLadderStrategy extends TradingBase {
    *     orderbookDepth / volatility) — refreshed on its own interval, not
    *     worth a heartbeat push every time.
    *   - Derivable fields (cycleDuration = Date.now() - cycleStartTime).
-   * Ladder/mode fields (mode, anchor/ladderLines/etc., trendDirection,
-   * finalTpPrice, ...) ARE included here because RANGE/TREND transitions
-   * and anchor-flatten rebuilds happen mid-cycle, and the frontend merges
+   * Ladder/mode fields (mode, bullLevel/bearLevel/ladderLines/etc., trendDirection,
+   * finalTpPrice, ...) ARE included here because SCALING/TREND transitions
+   * and reversal rebuilds happen mid-cycle, and the frontend merges
    * this payload directly into `status`
    * (setStatus(prev => ({...prev, ...payload}))) so a value missing here
    * would only ever reach the frontend via the next full REST getStatus().
@@ -2907,7 +2989,7 @@ class ReversalLadderStrategy extends TradingBase {
       currentPosition: this.activePosition,
       finalTpPrice: this.finalTpPrice,
       cycleAccumulatedLoss: this.cycleAccumulatedLoss,
-      flattenCount: this.flattenCount,
+      reversalCount: this.reversalCount,
       harvestCount: this.harvestCount,
       reanchorCount: this.reanchorCount,
       initialCapital: this.initialCapital,
@@ -2919,7 +3001,8 @@ class ReversalLadderStrategy extends TradingBase {
       // Ladder state — see docstring: included here on every heartbeat
       // because mode/ladder transitions happen mid-cycle.
       mode: this.ladderMode,         // the frontend reads status.mode, not ladderMode
-      anchor: this.anchor,
+      bullLevel: this.bullLevel,
+      bearLevel: this.bearLevel,
       ladderLines: this.ladderLines,
       trendDirection: this.trendDirection,
       levelsPerSide: this.levelsPerSide,
@@ -2985,7 +3068,7 @@ class ReversalLadderStrategy extends TradingBase {
         currentPosition: this.activePosition,
         finalTpPrice: this.finalTpPrice,
         cycleAccumulatedLoss: this.cycleAccumulatedLoss,
-        flattenCount: this.flattenCount,
+        reversalCount: this.reversalCount,
         harvestCount: this.harvestCount,
         reanchorCount: this.reanchorCount,
         initialCapital: this.initialCapital,
@@ -3023,7 +3106,8 @@ class ReversalLadderStrategy extends TradingBase {
         harvestLossThreshold: this.harvestLossThreshold,
         // ---- ladder state ----
         ladderMode: this.ladderMode,
-        anchor: this.anchor,
+        bullLevel: this.bullLevel,
+        bearLevel: this.bearLevel,
         ladderLines: this.ladderLines,   // flat objects (Firestore-safe: no nested arrays)
         trendDirection: this.trendDirection,
         lastProcessedPrice: this.lastProcessedPrice,

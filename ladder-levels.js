@@ -34,28 +34,6 @@ export const MIN_LEG_USDT = 10;
 export const minInitialSizeUSDT = (levelsPerSide) => levelsPerSide * MIN_LEG_USDT;
 
 /**
- * Build the ladder as EMPTY legs around a fixed anchor.
- *
- * THE INVERSION: LONG levels sit ABOVE the anchor and SHORT levels BELOW —
- * the opposite of the old mean-reversion grid. This is what makes one-way
- * position mode viable: price is either above the anchor or below it, so only
- * one side can ever hold inventory. Do not "fix" this to match the old grid.
- */
-export function buildLadder(anchor, stepPct = LADDER_STEP_PCT, levelsPerSide = LADDER_LEVELS_PER_SIDE) {
-  if (!Number.isFinite(anchor) || anchor <= 0) {
-    throw new Error(`buildLadder: anchor must be a positive finite number (got ${anchor})`);
-  }
-  const step = stepPct * anchor;
-  const legs = [];
-  // k starts at 1 — the anchor itself is never a level; it is the FLATTEN price.
-  for (let k = 1; k <= levelsPerSide; k++) {
-    legs.push({ levelIndex: k, direction: 'LONG',  price: anchor + k * step, state: 'EMPTY', quantity: null, fillPrice: null });
-    legs.push({ levelIndex: k, direction: 'SHORT', price: anchor - k * step, state: 'EMPTY', quantity: null, fillPrice: null });
-  }
-  return legs;
-}
-
-/**
  * The SINGLE definition of valid ladder geometry. Both the HTTP route
  * (app.js, which must answer synchronously) and start() (which runs after the
  * 200 has gone out) validate through this — two copies of this rule drifted

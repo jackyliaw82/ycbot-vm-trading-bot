@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { planReversalActions } from '../reversal-crossings.js';
+import { planReversalActions, averageOpenEntry } from '../reversal-crossings.js';
 import { buildReversalLadder } from '../reversal-levels.js';
 
 const BULL = 104000, BEAR = 100000, STEP = 0.003, N = 5;
@@ -200,6 +200,26 @@ test('enterTrend uses the ACTING SIDE\'s own outermost rung, not a max across bo
   assert.deepEqual(ids(r), ['L3'], 'L3 is the only empty LONG rung inside the band');
   assert.equal(r.enterTrend, true,
     'L3 IS the LONG ladder\'s own outermost rung (3 LONG legs total), despite a SHORT rung carrying index 5');
+});
+
+// ——— averageOpenEntry (moved verbatim from ladder-crossings.test.js) ———
+
+test('averageOpenEntry uses the ACTUAL fill price, not the level price', () => {
+  const legs = fresh();
+  const l1 = legs.find(l => l.direction === 'LONG' && l.index === 1);
+  const l2 = legs.find(l => l.direction === 'LONG' && l.index === 2);
+  Object.assign(l1, { state: 'POSITION_OPEN', quantity: 10, fillPrice: 104010 }); // slipped
+  Object.assign(l2, { state: 'POSITION_OPEN', quantity: 10, fillPrice: 104322 });
+  const avg = averageOpenEntry(legs, 'LONG');
+  assert.ok(Math.abs(avg - 104166) < 1e-9, `expected the fill-weighted average, got ${avg}`);
+  assert.equal(averageOpenEntry(legs, 'SHORT'), null, 'no open SHORT legs');
+});
+
+test('averageOpenEntry falls back to the level price when fillPrice is missing', () => {
+  const legs = fresh();
+  const l1 = legs.find(l => l.direction === 'LONG' && l.index === 1);
+  Object.assign(l1, { state: 'POSITION_OPEN', quantity: 10, fillPrice: null });
+  assert.ok(Math.abs(averageOpenEntry(legs, 'LONG') - BULL) < 1e-9);
 });
 
 test('mirror: SHORT acting with fewer rungs than LONG still arms TREND off its own outermost', () => {

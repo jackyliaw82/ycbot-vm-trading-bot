@@ -91,3 +91,20 @@ export function planReversalActions({
 
   return { reverse, side, fills, enterTrend };
 }
+
+/**
+ * Fill-weighted average entry of the open legs on one side.
+ *
+ * Uses the ACTUAL fill price where the user-data WS gave us one, falling back
+ * to the level price only for a leg that somehow lacks it (an unavailable WS
+ * fill). Carried over from grid-crossings.js:100-108 — the one piece of that
+ * module that survives.
+ */
+export function averageOpenEntry(legs, direction) {
+  const open = (legs || []).filter(l => l.state === 'POSITION_OPEN' && l.direction === direction && l.quantity > 0);
+  if (!open.length) return null;
+  const px = (l) => (Number.isFinite(l.fillPrice) && l.fillPrice > 0 ? l.fillPrice : l.price);
+  const cost = open.reduce((s, l) => s + px(l) * l.quantity, 0);
+  const qty = open.reduce((s, l) => s + l.quantity, 0);
+  return qty > 0 ? cost / qty : null;
+}
