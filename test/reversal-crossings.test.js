@@ -178,3 +178,43 @@ test('heldSide: 0 is treated the same (not as flat) on a dead-zone tick and a cr
   const crossing = plan({ prevPrice: 103000, currentPrice: 104050, heldSide: 0 });
   assert.equal(crossing.reverse, true, 'heldSide=0 !== side, and both branches use the same != null test');
 });
+
+test('enterTrend uses the ACTING SIDE\'s own outermost rung, not a max across both sides', () => {
+  // Hand-built and deliberately ASYMMETRIC -- buildReversalLadder always gives
+  // both sides the same rung count, so it can never produce this shape. LONG
+  // has only 3 rungs; SHORT has 5. If the outermost derivation ever took the
+  // max index across ALL legs instead of filtering to `side` first, SHORT's
+  // index 5 would leak into LONG's result and TREND would never arm on LONG's
+  // real outermost rung (index 3).
+  const legs = [
+    { direction: 'LONG', index: 1, price: 104000, state: 'POSITION_OPEN' },
+    { direction: 'LONG', index: 2, price: 104312, state: 'POSITION_OPEN' },
+    { direction: 'LONG', index: 3, price: 104624, state: 'EMPTY' },
+    { direction: 'SHORT', index: 1, price: 100000, state: 'EMPTY' },
+    { direction: 'SHORT', index: 2, price: 99700, state: 'EMPTY' },
+    { direction: 'SHORT', index: 3, price: 99400, state: 'EMPTY' },
+    { direction: 'SHORT', index: 4, price: 99100, state: 'EMPTY' },
+    { direction: 'SHORT', index: 5, price: 98800, state: 'EMPTY' },
+  ];
+  const r = plan({ prevPrice: 104400, currentPrice: 104700, heldSide: 'LONG', legs });
+  assert.deepEqual(ids(r), ['L3'], 'L3 is the only empty LONG rung inside the band');
+  assert.equal(r.enterTrend, true,
+    'L3 IS the LONG ladder\'s own outermost rung (3 LONG legs total), despite a SHORT rung carrying index 5');
+});
+
+test('mirror: SHORT acting with fewer rungs than LONG still arms TREND off its own outermost', () => {
+  const legs = [
+    { direction: 'LONG', index: 1, price: 104000, state: 'EMPTY' },
+    { direction: 'LONG', index: 2, price: 104312, state: 'EMPTY' },
+    { direction: 'LONG', index: 3, price: 104624, state: 'EMPTY' },
+    { direction: 'LONG', index: 4, price: 104936, state: 'EMPTY' },
+    { direction: 'LONG', index: 5, price: 105248, state: 'EMPTY' },
+    { direction: 'SHORT', index: 1, price: 100000, state: 'POSITION_OPEN' },
+    { direction: 'SHORT', index: 2, price: 99700, state: 'POSITION_OPEN' },
+    { direction: 'SHORT', index: 3, price: 99400, state: 'EMPTY' },
+  ];
+  const r = plan({ prevPrice: 99500, currentPrice: 99300, heldSide: 'SHORT', legs });
+  assert.deepEqual(ids(r), ['S3'], 'S3 is the only empty SHORT rung inside the band');
+  assert.equal(r.enterTrend, true,
+    'S3 IS the SHORT ladder\'s own outermost rung (3 SHORT legs total), despite a LONG rung carrying index 5');
+});
