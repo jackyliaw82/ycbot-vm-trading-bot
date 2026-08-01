@@ -144,3 +144,37 @@ test('guards: an unchanged price never reverses', () => {
   const r = plan({ prevPrice: 99950, currentPrice: 99950, heldSide: 'LONG' });
   assert.equal(r.reverse, false);
 });
+
+test('enterTrend derives the outermost rung from legs, ignoring a stale/wrong levelsPerSide', () => {
+  const r = plan({
+    prevPrice: 104900, currentPrice: 105300, heldSide: 'LONG', legs: fill(fresh(), 'LONG', 1, 2, 3, 4),
+    levelsPerSide: 3, // deliberately wrong -- must not affect the result; legs actually have 5 rungs/side
+  });
+  assert.deepEqual(ids(r), ['L5']);
+  assert.equal(r.enterTrend, true, 'outermost must come from legs (index 5), not the levelsPerSide argument');
+});
+
+test('enterTrend is false and nothing throws when the acting side has no legs at all', () => {
+  const legsNoLong = fresh().filter(l => l.direction !== 'LONG'); // only SHORT legs present
+  assert.doesNotThrow(() => {
+    const r = plan({ prevPrice: 103000, currentPrice: 104050, legs: legsNoLong });
+    assert.equal(r.side, 'LONG');
+    assert.deepEqual(r.fills, []);
+    assert.equal(r.enterTrend, false);
+  });
+});
+
+test('heldSide: 0 is treated the same (not as flat) on a dead-zone tick and a crossing tick', () => {
+  // Dead zone: no level crossed. heldSide=0 must NOT be silently read as flat
+  // (the old `!heldSide` falsy check did exactly that) -- it must take the
+  // same "some held side" path any other non-null heldSide would.
+  const deadZone = plan({ prevPrice: 102000, currentPrice: 103000, heldSide: 0 });
+  assert.notDeepEqual(deadZone, { reverse: false, side: null, fills: [], enterTrend: false },
+    'heldSide=0 must not collapse to the flat sentinel on a dead-zone tick');
+
+  // Crossing tick: heldSide=0 must be read as "some held side" here too (the
+  // `heldSide != null` reverse check), consistent with the dead-zone tick --
+  // not flat in one branch and held in the other for the same input value.
+  const crossing = plan({ prevPrice: 103000, currentPrice: 104050, heldSide: 0 });
+  assert.equal(crossing.reverse, true, 'heldSide=0 !== side, and both branches use the same != null test');
+});

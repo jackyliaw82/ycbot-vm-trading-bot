@@ -1,5 +1,3 @@
-import { outermostIndex } from './reversal-levels.js';
-
 // Tick rules for ReversalLadder. Pure: no I/O, no state, nothing mutated.
 // The strategy applies the returned plan; this module only decides it.
 //
@@ -16,6 +14,19 @@ const between = (v, a, b) => (a <= b ? v >= a && v <= b : v >= b && v <= a);
  * Returns { reverse, side, fills, enterTrend } where `reverse: true` means the
  * caller must close the whole position and reset the ABANDONED side's legs to
  * EMPTY before applying `fills`.
+ *
+ * `enterTrend` is true exactly when `fills` includes the OUTERMOST rung of the
+ * acting `side` — i.e. every rung on that side is now filled and TREND should
+ * arm. The outermost index is derived from `legs` itself (the highest `index`
+ * present for `side`), never from a caller-supplied count: a separate
+ * `levelsPerSide` parameter would be a second copy of a fact `legs` already
+ * carries, and the two could drift out of sync — the same `_trendFinalTpArmed`
+ * lesson this codebase already learned once. A mismatched count would leave
+ * `enterTrend: false` on a fully-scaled position while silently returning a
+ * well-formed object — no throw, no warning — arming no exit, which is this
+ * codebase's named dominant failure mode (unknown reading as safe). If `side`
+ * has no legs at all, `enterTrend` is `false`: there is no rung to be
+ * outermost.
  */
 export function planReversalActions({
   prevPrice,
@@ -24,7 +35,6 @@ export function planReversalActions({
   bearLevel,
   legs,
   heldSide = null,
-  levelsPerSide,
 } = {}) {
   const none = { reverse: false, side: null, fills: [], enterTrend: false };
 
@@ -50,7 +60,7 @@ export function planReversalActions({
   } else {
     // No level crossed. Inside the dead zone nothing happens; outside it, this
     // is RULE 3 scaling on the side already held.
-    if (!heldSide) return none;
+    if (heldSide == null) return none;
     side = heldSide;
   }
 
@@ -68,7 +78,14 @@ export function planReversalActions({
       && between(l.price, prevPrice, currentPrice))
     .sort((a, b) => a.index - b.index);
 
-  const outermost = outermostIndex(levelsPerSide);
+  // Outermost rung of `side`, derived from `legs` itself — see JSDoc above.
+  // Math.max(0, ...) floors an empty side to 0 rather than -Infinity, so a
+  // `side` with no legs at all cleanly yields `enterTrend: false` instead of
+  // a NaN/-Infinity comparison or a throw.
+  const outermost = Math.max(
+    0,
+    ...legs.filter(l => l && l.direction === side && Number.isInteger(l.index)).map(l => l.index),
+  );
   const enterTrend = fills.some(l => l.index === outermost);
 
   return { reverse, side, fills, enterTrend };
