@@ -3093,3 +3093,47 @@ test('trailing disabled never closes on a trail level', async () => {
   await s.handleRealtimePrice(101);
   assert.equal(closes, 0);
 });
+
+// ——— Task 6: wire the AI level planner (§10) ——————————————————————————
+
+test('start() with no aiApiKey leaves the planner null — the mechanical fallback still works', () => {
+  const s = reversalStrategy();
+  s._aiPlanner = null;
+  assert.equal(s._aiPlanner, null);
+});
+
+test('an AI usage record accumulates into aiCostUSD', async () => {
+  const s = reversalStrategy();
+  s.ladderLines = [];
+  s.bullLevel = null;
+  s.bearLevel = null;
+  s.volumeProfile = { getVoidProfile: async () => ({ profile: { rangeVoids: [] }, pair: null, window: '24h' }) };
+  s.marketMetrics = {
+    getVolatility: async () => ({ atr: 1, interpretation: 'normal' }),
+    getCvd: async () => ({ cvd: 0 }),
+    getOrderbookDepth: async () => ({ bidVolume: 1, askVolume: 1 }),
+    getFundingRate: async () => ({ rate: 0 }),
+    getOpenInterestChange: async () => ({ oiChange1h: 0 }),
+  };
+  s.aiModel = 'deepseek-v4-flash';
+  s._aiPlanner = {
+    consult: async () => ({
+      json: { bullLevel: 102, bearLevel: 98, rationale: 'test' },
+      usage: { inputTokens: 1000, outputTokens: 500, cacheRead: 0, cacheCreation: 0 },
+    }),
+  };
+  const built = await s._planAndBuildLevels('cycle_start');
+  assert.equal(built, true);
+  assert.equal(s.bullLevel, 102);
+  assert.equal(s.bearLevel, 98);
+  assert.ok(s.aiCostUSD > 0, 'a consult with real token usage must cost something');
+});
+
+test('the API key is never persisted or surfaced', async () => {
+  const s = reversalStrategy();
+  s._aiApiKey = 'sk-secret-value';
+  const status = JSON.stringify(s.getStatus());
+  const beat = JSON.stringify(s.getHeartbeatPayload());
+  assert.ok(!status.includes('sk-secret-value'), 'getStatus leaked the key');
+  assert.ok(!beat.includes('sk-secret-value'), 'the heartbeat leaked the key');
+});

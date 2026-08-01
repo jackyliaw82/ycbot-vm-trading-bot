@@ -17,6 +17,8 @@ import { planLevels } from './level-planner.js';
 import { buildLevelContext } from './market-context.js';
 import { precisionFormatter } from './precisionUtils.js';
 import { trailDistance, trailExitLevel } from './reversal-trail.js';
+import { AiPlanner } from './ai-planner.js';
+import { AiUsageAccumulator } from './ai-cost.js';
 
 const MARGIN_HEADROOM_FLOOR_PCT = 30;              // free margin floor for sizing safety
 const HARVEST_LOSS_THRESHOLD_PCT = 0.08;           // 8% of initial capital — gate for HARVEST eligibility
@@ -178,7 +180,17 @@ class ReversalLadderStrategy extends TradingBase {
     this._tradingSeqInProgress = false; // ladder crossing reentrancy guard
     this._levelPlanInProgress = false;
     this._levelPlanLastTs = null;
-    this._aiPlanner = null;             // Task 6 supplies one; null = mechanical fallback
+
+    // ---- AI level planning (§10) ----
+    // The key is held in memory ONLY. It is never logged, never written to
+    // Firestore, and never returned by getStatus/getHeartbeatPayload — it comes
+    // from Secret Manager via the start request (Phase 0) and a persisted copy
+    // would put a live credential in a database the frontend can read.
+    this._aiApiKey = null;
+    this._aiPlanner = null;
+    this.aiModel = 'deepseek-v4-flash';
+    this._aiUsage = new AiUsageAccumulator();
+    this.aiCostUSD = 0;
 
     // ---- TREND state ----
     this.trendDirection = null;         // origin breakout direction ('LONG'|'SHORT')
@@ -254,6 +266,20 @@ class ReversalLadderStrategy extends TradingBase {
     }
     this.stepPct = geometry.stepPct;
     this.levelsPerSide = geometry.levelsPerSide;
+
+    // Absent key = mechanical levels from `rangeVoids`. That is a real,
+    // supported mode (§10's fallback), not a degraded start — so log it and
+    // continue rather than refusing.
+    this.aiModel = config.aiModel || this.aiModel;
+    if (typeof config.aiApiKey === 'string' && config.aiApiKey.trim() !== '') {
+      this._aiApiKey = config.aiApiKey.trim();
+      this._aiPlanner = new AiPlanner(this._aiApiKey, this.aiModel);
+      await this.addLog(`[REVERSAL] AI level planning enabled (${this.aiModel}).`);
+    } else {
+      await this.addLog(
+        `[REVERSAL] no AI key supplied — levels will come from the mechanical volume-void edges.`,
+      );
+    }
 
     // Gate on the trivially-known minimum BEFORE any network call — no point
     // burning a setLeverage/setPositionMode/exchangeInfo round trip on an
@@ -440,6 +466,13 @@ class ReversalLadderStrategy extends TradingBase {
           `NOT trading without levels. Retrying in ${LEVEL_PLAN_RETRY_INTERVAL_MS / 1000}s.`,
         );
         return false;
+      }
+      // Account the consult's cost regardless of what happens to the pair
+      // below — the AI call already happened and was billed, whether or not
+      // the price-staleness re-check that follows discards its proposal.
+      if (result.usage) {
+        this._aiUsage.add(result.usage);
+        this.aiCostUSD = this._aiUsage.costUsd(this.aiModel);
       }
       if (result.error) {
         await this.addLog(`[REVERSAL] level planning note: ${result.error}`);
@@ -1577,6 +1610,18 @@ class ReversalLadderStrategy extends TradingBase {
     this.accumulatedRealizedPnL = snapshot.accumulatedRealizedPnL || 0;
     this.accumulatedTradingFees = snapshot.accumulatedTradingFees || 0;
     this.accumulatedFundingFees = snapshot.accumulatedFundingFees || 0;
+    this.aiCostUSD = snapshot.aiCostUSD || 0;
+    this.aiModel = snapshot.aiModel || this.aiModel;
+
+    // The API key is deliberately NOT persisted, so a resumed cycle has no
+    // planner: any level re-plan after a restart (a harvest, a fired reanchor
+    // trigger) uses the mechanical void edges. Say so rather than letting the
+    // source silently change under the user. Phase 0 closes this by fetching
+    // the key from Secret Manager here.
+    await this.addLog(
+      `[RECOVERY] AI level planning is unavailable after a restart (the key is not persisted) — ` +
+      `any re-plan this cycle will use the mechanical volume-void edges.`,
+    );
 
     // Funding poll high-water mark. Fall back to strategyStartTime for
     // pre-v3.4.0 snapshots that didn't persist this field.
@@ -3168,6 +3213,10 @@ class ReversalLadderStrategy extends TradingBase {
       currentInitialSize: this.currentInitialSize,
       desiredProfitUSDT: this.desiredProfitUSDT,
       minDesiredProfitUSDT: this.minDesiredProfitUSDT,
+      // AI level planning (§10) — cost accounting only. The key itself
+      // (`_aiApiKey`) is NEVER surfaced here — see its constructor doc.
+      aiCostUSD: this.aiCostUSD ?? 0,
+      aiModel: this.aiModel,
 
       // Ladder state — the frontend's status/chart view renders these
       // directly. `mode` is the alias the frontend actually reads
@@ -3260,6 +3309,9 @@ class ReversalLadderStrategy extends TradingBase {
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
+      // AI level planning (§10) — cost accounting only; the key is never here.
+      aiCostUSD: this.aiCostUSD ?? 0,
+      aiModel: this.aiModel,
 
       // Ladder state — see docstring: included here on every heartbeat
       // because mode/ladder transitions happen mid-cycle.
@@ -3396,6 +3448,11 @@ class ReversalLadderStrategy extends TradingBase {
         trailDistanceValue: this.trailDistanceValue ?? null,
         trailExit: this.trailExit ?? null,
         trendStartPrice: this.trendStartPrice ?? null,
+        // AI level planning (§10) — cost accounting only. NEVER persist
+        // `_aiApiKey` here: that would put a live credential in a database the
+        // frontend can read (see the field's own doc in the constructor).
+        aiCostUSD: this.aiCostUSD ?? 0,
+        aiModel: this.aiModel,
         config: {
           recoveryFactor: this.recoveryFactor,
           recoveryDistance: this.recoveryDistance,
