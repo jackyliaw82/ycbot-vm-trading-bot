@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { AnchorLadderStrategy } from './anchor-ladder-strategy.js';
+import { ReversalLadderStrategy } from './reversal-ladder-strategy.js';
 import { resolveStartTrigger } from './start-trigger-gate.js';
 import {
   minInitialSizeUSDT,
@@ -820,7 +820,7 @@ async function recoverActiveStrategies() {
       if (!resumable.has(strategyId)) continue;
 
       try {
-        const strategy = new AnchorLadderStrategy(
+        const strategy = new ReversalLadderStrategy(
           data.gcfProxyUrl || null,
           data.profileId,
           data.sharedVmProxyGcfUrl || null
@@ -1497,7 +1497,7 @@ app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
       return res.status(400).json({ error: 'profileId, gcpProxyUrl, sharedVmProxyGcfUrl, and config are required.' });
     }
 
-    // Defence in depth — AnchorLadderStrategy.start() gates on the geometry
+    // Defence in depth — ReversalLadderStrategy.start() gates on the geometry
     // bounds (ladder-levels.js resolveLadderGeometry) too, but those checks
     // fire deep inside the non-blocking start() promise after the 200
     // response has already gone out. Reject here up front, via the SAME
@@ -1598,10 +1598,10 @@ app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
     // Reuse the instance the start-trigger validation above already built
     // (Immediate-mode requests never entered that branch, so `strategy` is
     // still null here for them — build it now, same as before this fix).
-    if (!strategy) strategy = new AnchorLadderStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
+    if (!strategy) strategy = new ReversalLadderStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
     strategy.userId = req.uid || userId;
 
-    const strategyId = `anchor_ladder_${profileId}_${Date.now()}`;
+    const strategyId = `reversal_ladder_${profileId}_${Date.now()}`;
     strategy.strategyId = strategyId;
     strategy.isRunning = true;
     activeStrategies.set(strategyId, strategy);
@@ -1661,7 +1661,7 @@ app.post('/anchor-ladder/stop', requireVmOwner, async (req, res) => {
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
 
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
       return res.status(400).json({ error: `No Anchor Ladder strategy running with ID ${strategyId}` });
     }
 
@@ -1680,7 +1680,7 @@ app.post('/anchor-ladder/stop', requireVmOwner, async (req, res) => {
   }
 });
 
-// AnchorLadderStrategy.getStatus() (Task 9) already returns the full ladder
+// ReversalLadderStrategy.getStatus() (Task 9) already returns the full ladder
 // shape directly — mode, anchor, ladderLines, trendDirection, levelsPerSide,
 // stepPct, legNotional, ladderBaseSize — alongside the base TradingBase
 // fields. Unlike the retired grid strategy's status route, no extra
@@ -1690,7 +1690,7 @@ app.get('/anchor-ladder/status', requireVmOwner, (req, res) => {
 
   if (strategyId) {
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AnchorLadderStrategy)) {
+    if (!strategy || !(strategy instanceof ReversalLadderStrategy)) {
       return res.status(404).json({ error: `Anchor Ladder strategy ${strategyId} not found.` });
     }
     return res.json(strategy.getStatus());
@@ -1698,7 +1698,7 @@ app.get('/anchor-ladder/status', requireVmOwner, (req, res) => {
 
   const ladderStrategies = {};
   activeStrategies.forEach((strategy, sId) => {
-    if (strategy instanceof AnchorLadderStrategy) {
+    if (strategy instanceof ReversalLadderStrategy) {
       ladderStrategies[sId] = strategy.getStatus();
     }
   });
@@ -1731,7 +1731,7 @@ app.post('/anchor-ladder/harvest-now', requireVmOwner, async (req, res) => {
     const { strategyId, triggerPrice, action } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
       return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
     }
     const result = await strategy.harvestNow(triggerPrice ?? null, { action: action ?? 'reanchor' });
@@ -1749,7 +1749,7 @@ app.post('/anchor-ladder/cancel-harvest-trigger', requireVmOwner, async (req, re
     const { strategyId } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
       return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
     }
     const result = await strategy.cancelHarvestTrigger();
@@ -1770,7 +1770,7 @@ app.post('/anchor-ladder/trail', requireVmOwner, async (req, res) => {
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
     if (!('direction' in req.body)) return res.status(400).json({ error: 'direction is required.' });
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
       return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
     }
     const result = await strategy.setTrailDirection(direction ?? null);
@@ -1791,7 +1791,7 @@ app.post('/anchor-ladder/update-start-trigger', requireVmOwner, async (req, res)
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
     if (triggerPrice == null) return res.status(400).json({ error: 'triggerPrice is required.' });
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
       return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
     }
     const result = await strategy.updateStartTrigger(triggerPrice);
@@ -1806,7 +1806,7 @@ app.post('/anchor-ladder/update-start-trigger', requireVmOwner, async (req, res)
 // recomputes Final TP, and persists. Allowed in any subState — no trade
 // fires here; the new Final TP target just takes effect on the next price
 // tick. Shipped user feature carried over from AI Reversal; adjustProfitTarget
-// survives unchanged on AnchorLadderStrategy.
+// survives unchanged on ReversalLadderStrategy.
 // Move the Final TP to a user-chosen LEVEL, or reset it to the config target.
 // Body: { strategyId, price } to set, or { strategyId, reset: true } to restore
 // the config view's desired profit. The bot back-solves the level into a profit
@@ -1822,7 +1822,7 @@ app.post('/anchor-ladder/adjust-final-tp', requireVmOwner, async (req, res) => {
       return res.status(400).json({ error: 'Provide a price, a profitUSDT, or reset: true.' });
     }
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
       return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
     }
     const result = await strategy.adjustFinalTp({ price: price ?? null, profitUSDT: profitUSDT ?? null, reset: reset === true });
@@ -1841,7 +1841,7 @@ app.post('/anchor-ladder/adjust-profit-target', requireVmOwner, async (req, res)
     }
 
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof AnchorLadderStrategy) || !strategy.isRunning) {
+    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
       return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
     }
 
@@ -1854,7 +1854,7 @@ app.post('/anchor-ladder/adjust-profit-target', requireVmOwner, async (req, res)
 
 // strategyFlow audit trail for Anchor Ladder. Reads from
 // strategies/{strategyId}/strategyFlow subcollection populated by
-// AnchorLadderStrategy._writeStrategyFlow inside its post-execute bookkeeping
+// ReversalLadderStrategy._writeStrategyFlow inside its post-execute bookkeeping
 // on every position event (open / reverse / harvest / anchor-flatten /
 // final_tp_hit). Used by the position chart to place TP segment boundaries
 // at EXACT event moments instead of heartbeat-resolution timestamps.

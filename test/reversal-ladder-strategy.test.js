@@ -1,15 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AnchorLadderStrategy, validateStartTrigger } from '../anchor-ladder-strategy.js';
+import { ReversalLadderStrategy, validateStartTrigger } from '../reversal-ladder-strategy.js';
 import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, LADDER_STEP_PCT_MAX, LADDER_LEVELS_MAX } from '../ladder-levels.js';
 import { precisionFormatter } from '../precisionUtils.js';
 
 // A strategy with an anchored ladder and nothing open. All I/O stubbed, so a
 // tick exercises only the dispatch. Every later task's tests reuse this.
 function ladderStrategy({ mode = 'RANGE', anchor = 100, base = 1000 } = {}) {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
   s.isRunning = true;
-  s.strategyId = 'anchor_ladder_test';
+  s.strategyId = 'reversal_ladder_test';
   s.symbol = 'BTCUSDT';
   s.stepPct = LADDER_STEP_PCT;
   s.levelsPerSide = LADDER_LEVELS_PER_SIDE;
@@ -93,7 +93,7 @@ test('_enterTrend pushes an immediate heartbeat on the RANGE -> TREND switch', a
 });
 
 test('start() rejects an initial size below the 50 USDT minimum', async () => {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   s.addLog = async () => {};
   await assert.rejects(
     () => s.start({ symbol: 'BTCUSDT', initialSize: 49 }),
@@ -105,7 +105,7 @@ test('start() rejects an initial size below the 50 USDT minimum', async () => {
 // ——— Configurable geometry: the VM is the authority on the bounds ———
 
 function geoStrategy() {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   s.addLog = async () => {};
   return s;
 }
@@ -1039,9 +1039,9 @@ test('a ladder round-trips through saveState/resume', async () => {
   // ladderStrategy() stubs saveState for the OTHER tests in this file (so a
   // trading-sequence test doesn't need a firestore double); this test is
   // specifically about persistence, so it calls the real prototype method.
-  await AnchorLadderStrategy.prototype.saveState.call(src);
+  await ReversalLadderStrategy.prototype.saveState.call(src);
 
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
   cleanupResumeTimers(dst);
@@ -1060,10 +1060,10 @@ test('flattenCount survives a save/restore round-trip', async () => {
   src.flattenCount = 7;
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(src);
+  await ReversalLadderStrategy.prototype.saveState.call(src);
   assert.equal(doc.flattenCount, 7, 'saveState must persist it');
 
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
   cleanupResumeTimers(dst);
@@ -1093,7 +1093,7 @@ test('getHeartbeatPayload reports the same ladder shape as getStatus', () => {
   assert.equal(hb.anchor, 100);
   assert.equal(hb.trendDirection, 'SHORT');
   assert.equal(hb.ladderLines.length, 10);
-  assert.equal(hb.strategyType, 'anchorLadder');
+  assert.equal(hb.strategyType, 'reversalLadder');
 });
 
 test('getStatus and the heartbeat both emit flattenCount for the Flattens tile', () => {
@@ -1111,13 +1111,13 @@ test('reversalCount is gone from the emitted payloads', () => {
   assert.equal('reversalCount' in s.getHeartbeatPayload(), false);
 });
 
-test('saveState writes the ANCHOR_LADDER type tags for boot recovery', async () => {
+test('saveState writes the REVERSAL_LADDER type tags for boot recovery', async () => {
   const s = ladderStrategy({ anchor: 100 });
   let written = null;
   s.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { written = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(s);
-  assert.equal(written.type, 'ANCHOR_LADDER');
-  assert.equal(written.strategyType, 'anchorLadder');
+  await ReversalLadderStrategy.prototype.saveState.call(s);
+  assert.equal(written.type, 'REVERSAL_LADDER');
+  assert.equal(written.strategyType, 'reversalLadder');
 });
 
 test('_lastLadderSize survives a save/resume round trip', async () => {
@@ -1126,9 +1126,9 @@ test('_lastLadderSize survives a save/resume round trip', async () => {
 
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(src);
+  await ReversalLadderStrategy.prototype.saveState.call(src);
 
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
   cleanupResumeTimers(dst);
@@ -1285,9 +1285,9 @@ test('Fix 2: resume() self-heals a snapshot stuck in RANGE fully-scaled — arms
 
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(src);
+  await ReversalLadderStrategy.prototype.saveState.call(src);
 
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   // detectCurrentPosition/_refreshCurrentPosition are stubbed no-ops by
   // stubResumeIO, so the restored snapshot fields (activePosition,
@@ -1338,7 +1338,7 @@ test('Fix 1: saveState() no longer persists maxPositionSizeUSDT', async () => {
   const s = ladderStrategy({ anchor: 100 });
   let written = null;
   s.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { written = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(s);
+  await ReversalLadderStrategy.prototype.saveState.call(s);
   assert.equal('maxPositionSizeUSDT' in written, false, 'the dead knob must not resurface in the persisted snapshot');
 });
 
@@ -1797,7 +1797,7 @@ function stubBootInternals(s) {
 
 function bootSnapshot() {
   return {
-    strategyId: 'anchor_ladder_boot_test',
+    strategyId: 'reversal_ladder_boot_test',
     profileId: 'test-profile',
     userId: 'test-user',
     gcfProxyUrl: 'http://proxy.invalid',
@@ -1826,7 +1826,7 @@ function bootSnapshot() {
 }
 
 test('resume() RESOLVES when the position API 503s — a transient boot failure must never abandon a live position', async () => {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
   const proxyCalls = stubBootInternals(s);
   const snapshot = bootSnapshot();
 
@@ -1873,7 +1873,7 @@ test('resume() RESOLVES when the position API 503s — a transient boot failure 
 });
 
 test('start() RESOLVES when the position API 503s — no bare detectCurrentPosition escapes start() either', async () => {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
   const proxyCalls = stubBootInternals(s);
   // getWalletBalance also throws on API error, but it is deliberately unguarded
   // in start() (user-initiated: the error is surfaced to the UI). Stub it so the
@@ -2056,21 +2056,21 @@ test('saveState persists the ladder geometry', async () => {
   // trading-sequence test doesn't need a firestore double); this test is
   // specifically about persistence, so it calls the real prototype method
   // (same pattern as the existing save/restore round-trip tests above).
-  await AnchorLadderStrategy.prototype.saveState.call(s);
+  await ReversalLadderStrategy.prototype.saveState.call(s);
   assert.ok(saved, 'saveState wrote a doc');
   assert.equal(saved.stepPct, 0.005, 'stepPct must round-trip');
   assert.equal(saved.levelsPerSide, 8, 'levelsPerSide must round-trip');
 });
 
 test('resume restores non-default geometry from the snapshot', () => {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   s._applySnapshotGeometry({ stepPct: 0.005, levelsPerSide: 8 });
   assert.equal(s.stepPct, 0.005, 'a cycle started at 0.5% must resume at 0.5%');
   assert.equal(s.levelsPerSide, 8, 'a cycle started at 8 levels must resume at 8');
 });
 
 test('resume falls back to the defaults for a legacy snapshot without geometry', () => {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   s._applySnapshotGeometry({});
   assert.equal(s.stepPct, LADDER_STEP_PCT, 'pre-change docs default to 0.3%');
   assert.equal(s.levelsPerSide, LADDER_LEVELS_PER_SIDE, 'pre-change docs default to 5');
@@ -2081,7 +2081,7 @@ test('resume THROWS on a present-but-invalid geometry instead of silently defaul
   // Silently coercing it to the default would read "unknown" as "safe" and
   // rebuild a ladder that does not match whatever is actually on the exchange
   // for this cycle — exactly the silent-fail-open shape this codebase forbids.
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   assert.throws(
     () => s._applySnapshotGeometry({ stepPct: LADDER_STEP_PCT_MAX + 1, levelsPerSide: 5 }),
     /step/i,
@@ -2089,7 +2089,7 @@ test('resume THROWS on a present-but-invalid geometry instead of silently defaul
 });
 
 test('resume THROWS on a present-but-invalid geometry instead of silently defaulting (out-of-bounds levels)', () => {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   assert.throws(
     () => s._applySnapshotGeometry({ stepPct: LADDER_STEP_PCT, levelsPerSide: LADDER_LEVELS_MAX + 1 }),
     /level/i,
@@ -2100,7 +2100,7 @@ test('resume THROWS on a non-numeric (e.g. stringified) geometry value rather th
   // resolveLadderGeometry is strict, not coercing (a numeric string is not a
   // number); _applySnapshotGeometry must inherit that, not re-introduce
   // Number(...) coercion via its own ad hoc checks.
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   assert.throws(() => s._applySnapshotGeometry({ stepPct: '0.005', levelsPerSide: 8 }));
 });
 
@@ -2671,7 +2671,7 @@ test('start trigger: with NO trigger armed the ladder builds on the first tick a
 // wrong signal for a reference-price fetch that's meant to succeed.
 
 function startModeStrategy() {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   stubBootInternals(s);
   s.getWalletBalance = async () => 1000;
   s._fetchReferencePrice = async () => 100; // reference price for every test below
@@ -2964,10 +2964,10 @@ test('trailDirection survives a saveState -> resume round trip', async () => {
   src.trailDirection = 'DOWN';
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(src);
+  await ReversalLadderStrategy.prototype.saveState.call(src);
   assert.equal(doc.trailDirection, 'DOWN', 'saveState must persist it');
 
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
   cleanupResumeTimers(dst);
@@ -2989,9 +2989,9 @@ test('a resumed trailing strategy logs that trailing is still armed', async () =
   src.trailDirection = 'UP';
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(src);
+  await ReversalLadderStrategy.prototype.saveState.call(src);
 
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   const logs = [];
   dst.addLog = async (m) => { logs.push(m); };
   await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
@@ -3011,7 +3011,7 @@ test('stop() clears trailing — a terminated cycle must not stay armed', async 
   const s = stubStopTail(ladderStrategy());
   s.trailDirection = 'DOWN';
   s._trailRetryLastTs = Date.now();
-  await AnchorLadderStrategy.prototype.stop.call(s, { flatten: false, reason: 'manual' });
+  await ReversalLadderStrategy.prototype.stop.call(s, { flatten: false, reason: 'manual' });
   assert.equal(s.trailDirection, null);
 });
 
@@ -3557,10 +3557,10 @@ test('an armed stop survives a save/resume round trip', async () => {
   src.harvestTriggerPrice = 98; src.harvestTriggerAbove = false; src.harvestTriggerAction = 'stop';
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(src);
+  await ReversalLadderStrategy.prototype.saveState.call(src);
   assert.equal(doc.harvestTriggerAction, 'stop');
 
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
   cleanupResumeTimers(dst);
@@ -3570,10 +3570,10 @@ test('an armed stop survives a save/resume round trip', async () => {
 // A snapshot written before this field existed was armed under the old
 // behaviour; resuming it as a cycle-ending stop would be a nasty surprise.
 test('a legacy snapshot without the field resumes as reanchor', async () => {
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   await dst.resume({
-    strategyId: 'anchor_ladder_legacy_test',   // resume() needs it for Firestore init
+    strategyId: 'reversal_ladder_legacy_test',   // resume() needs it for Firestore init
     isRunning: true, symbol: 'BTCUSDT',
     harvestTriggerPrice: 98, harvestTriggerAbove: false,   // note: no harvestTriggerAction
   });
@@ -3677,11 +3677,11 @@ test('the trail gain survives a save/resume round trip', async () => {
 
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(src);
+  await ReversalLadderStrategy.prototype.saveState.call(src);
   assert.equal(doc.trailBaselineAnchor, 85);
   assert.equal(doc.trailMoveCount, 1);
 
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
   cleanupResumeTimers(dst);
@@ -3691,10 +3691,10 @@ test('the trail gain survives a save/resume round trip', async () => {
 });
 
 test('a legacy snapshot falls back to its own anchor, never a bogus gain', async () => {
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   await dst.resume({
-    strategyId: 'anchor_ladder_legacy_gain', isRunning: true, symbol: 'BTCUSDT',
+    strategyId: 'reversal_ladder_legacy_gain', isRunning: true, symbol: 'BTCUSDT',
     // resume() aborts early without these, before reaching any restore line.
     gcfProxyUrl: 'http://proxy.invalid', sharedVmProxyGcfUrl: 'http://vm.invalid',
     anchor: 90, trailDirection: 'UP',      // note: no trailBaselineAnchor / trailMoveCount

@@ -60,7 +60,7 @@ function formatDuration(ms) {
  *
  * PURE — no I/O, no `this`. The same "one validator, two gates" pattern
  * `resolveLadderGeometry` (ladder-levels.js) uses for the ladder-geometry
- * bounds, and for the same reason: the /anchor-ladder/start route calls this
+ * bounds, and for the same reason: the /reversal-ladder/start route calls this
  * (after fetching its own reference price) so a bad start-trigger price is a
  * real 400 the user actually sees — today the 0.1%-gap/rounding check only
  * lives inside start(), which runs AFTER the non-blocking 200; a rejection
@@ -93,7 +93,7 @@ function validateStartTrigger(rawPrice, referencePrice, symbol) {
 }
 
 /**
- * AnchorLadderStrategy — fully mechanical anchor-ladder strategy.
+ * ReversalLadderStrategy — fully mechanical reversal-ladder strategy.
  *
  * This file was copied from ai-dual-strategy.js and stripped: every AI consult
  * path (planner / risk-guard / market-context / plan-executor / the AI
@@ -119,12 +119,12 @@ function validateStartTrigger(rawPrice, referencePrice, symbol) {
  *
  * No AI is consulted anywhere: levels are pure geometry off the anchor.
  */
-class AnchorLadderStrategy extends TradingBase {
+class ReversalLadderStrategy extends TradingBase {
   constructor(gcfProxyUrl, profileId, sharedVmProxyGcfUrl) {
     super(gcfProxyUrl, profileId, sharedVmProxyGcfUrl);
 
     // Cycle / position state
-    this.strategyType = 'anchorLadder';
+    this.strategyType = 'reversalLadder';
     this.currentSide = null;                // 'LONG' | 'SHORT' | null
     this.activePosition = null;            // { quantity, entryPrice, notional, unrealizedPnl }
     // Set by _refreshCurrentPosition(): true when the LAST Binance position
@@ -272,7 +272,7 @@ class AnchorLadderStrategy extends TradingBase {
   async start(config = {}) {
     // strategyId is set by app.js before calling start() (non-blocking pattern).
     if (!this.strategyId) {
-      this.strategyId = `anchor_ladder_${this.profileId}_${Date.now()}`;
+      this.strategyId = `reversal_ladder_${this.profileId}_${Date.now()}`;
     }
     this.initFirestoreCollections(this.strategyId);
 
@@ -287,10 +287,10 @@ class AnchorLadderStrategy extends TradingBase {
     this.currentInitialSize = config.initialSize || 0;
     this._ladderBaseSize = this.currentInitialSize; // initial ladder uses the initial size; a harvest later carries the last consolidated notional
 
-    if (!this.symbol) throw new Error('AnchorLadderStrategy.start: missing symbol');
+    if (!this.symbol) throw new Error('ReversalLadderStrategy.start: missing symbol');
     // Ladder geometry. DEFAULTS preserve the original fixed geometry; both are
     // user-configurable within bounds enforced HERE via resolveLadderGeometry
-    // (ladder-levels.js) — the SAME validator the /anchor-ladder/start route
+    // (ladder-levels.js) — the SAME validator the /reversal-ladder/start route
     // uses, so the two gates can never drift again. The UI is a convenience —
     // the VM is the authority, so an old frontend or a direct API call cannot
     // deploy a structurally lossy or unreachable ladder. Rejected BEFORE any
@@ -318,7 +318,7 @@ class AnchorLadderStrategy extends TradingBase {
       throw new Error(msg);
     }
 
-    await this.addLog(`Starting Anchor Ladder Strategy for ${this.symbol}...`);
+    await this.addLog(`Starting Reversal Ladder Strategy for ${this.symbol}...`);
     // Surface EVERY config field — used to verify the form values made it
     // through to the VM untouched. Three groups separated by `|` for
     // readability: identity/sizing | recovery knobs | advanced toggles.
@@ -366,7 +366,7 @@ class AnchorLadderStrategy extends TradingBase {
     // ── Start Mode ────────────────────────────────────────────────────────
     // Absent / null / '' = Immediate: anchor on the first tick, as always.
     // With a price, arm a one-shot start trigger. validateStartTrigger is the
-    // SAME validator the /anchor-ladder/start route runs (after fetching its
+    // SAME validator the /reversal-ladder/start route runs (after fetching its
     // own reference price) so a bad price is a real 400 the caller sees
     // instead of a start() rejection buried after the non-blocking 200. This
     // call is the authoritative backstop — the VM is the authority (same
@@ -493,7 +493,7 @@ class AnchorLadderStrategy extends TradingBase {
     this._lastFundingPollTs = this.strategyStartTime.getTime();
     this._scheduleNextFundingPoll();
 
-    await this.addLog('AnchorLadderStrategy running — awaiting first tick to build the ladder.');
+    await this.addLog('ReversalLadderStrategy running — awaiting first tick to build the ladder.');
     await this.saveState();
     // Push immediately — unconditional (not gated on a trigger being set):
     // an ARMED start pushes so the frontend can confirm it within the same
@@ -1428,7 +1428,7 @@ class AnchorLadderStrategy extends TradingBase {
       ladderLevelsPerSide: snapshot.levelsPerSide,
     });
     if (!geometry.ok) {
-      throw new Error(`AnchorLadderStrategy.resume: invalid persisted geometry — ${geometry.error}`);
+      throw new Error(`ReversalLadderStrategy.resume: invalid persisted geometry — ${geometry.error}`);
     }
     this.stepPct = geometry.stepPct;
     this.levelsPerSide = geometry.levelsPerSide;
@@ -1436,7 +1436,7 @@ class AnchorLadderStrategy extends TradingBase {
 
   /**
    * Resume a strategy from a Firestore snapshot. Called by app.js boot-scan
-   * (recoverActiveStrategies) when a `type: 'ANCHOR_LADDER'` doc has
+   * (recoverActiveStrategies) when a `type: 'REVERSAL_LADDER'` doc has
    * `isRunning: true` but no in-memory instance exists (i.e. PM2 restart
    * / VM force-update).
    *
@@ -1449,7 +1449,7 @@ class AnchorLadderStrategy extends TradingBase {
    *   - Reconcile current position from Binance (source of truth)
    */
   async resume(snapshot) {
-    if (!snapshot) throw new Error('AnchorLadderStrategy.resume: missing snapshot');
+    if (!snapshot) throw new Error('ReversalLadderStrategy.resume: missing snapshot');
 
     // Restore identifiers FIRST so addLog writes under the correct strategyId.
     this.strategyId = snapshot.strategyId;
@@ -1472,7 +1472,7 @@ class AnchorLadderStrategy extends TradingBase {
       return;
     }
 
-    await this.addLog(`[RECOVERY] Resuming Anchor Ladder Strategy after restart...`);
+    await this.addLog(`[RECOVERY] Resuming Reversal Ladder Strategy after restart...`);
 
     // Restore config
     this.symbol = snapshot.symbol;
@@ -1684,7 +1684,7 @@ class AnchorLadderStrategy extends TradingBase {
     const { flatten = false, reason = 'manual' } = options;
 
     // Concurrency + idempotency guard. stop() is reachable from both the
-    // /anchor-ladder/stop route AND the tick loop's Final TP check in
+    // /reversal-ladder/stop route AND the tick loop's Final TP check in
     // handleRealtimePrice; both could fire in quick succession. The
     // `!isRunning` check catches the concurrent
     // race (first call sets isRunning=false synchronously before any
@@ -2588,7 +2588,7 @@ class AnchorLadderStrategy extends TradingBase {
 
   /**
    * Cancel an armed harvest/re-anchor Trigger Price. No-op-safe (idempotent).
-   * Called by the /anchor-ladder/cancel-harvest-trigger route.
+   * Called by the /reversal-ladder/cancel-harvest-trigger route.
    */
   async cancelHarvestTrigger() {
     const had = this.harvestTriggerPrice != null;
@@ -3324,7 +3324,7 @@ class AnchorLadderStrategy extends TradingBase {
     }
   }
 
-  // ——— Status snapshot (consumed by /anchor-ladder/status) ——————————————
+  // ——— Status snapshot (consumed by /reversal-ladder/status) ——————————————
 
   getStatus() {
     // acc-loss is purely derived from the live (Binance-truth) accumulators, so
@@ -3333,7 +3333,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.cycleAccumulatedLoss = this._computeAccLoss();
     return {
       strategyId: this.strategyId,
-      strategyType: 'anchorLadder',
+      strategyType: 'reversalLadder',
       symbol: this.symbol,
       // Price precision (decimals) from the cached exchange info, so the frontend
       // formats ALL prices (ladder levels, anchor, trigger inputs) at the pair's
@@ -3432,7 +3432,7 @@ class AnchorLadderStrategy extends TradingBase {
     this.cycleAccumulatedLoss = this._computeAccLoss(); // keep derived acc-loss live (see getStatus)
     return {
       strategyId: this.strategyId,
-      strategyType: 'anchorLadder',
+      strategyType: 'reversalLadder',
       executionState: this.executionState,
       subState: this.subState,
       isRunning: this.isRunning,
@@ -3498,7 +3498,7 @@ class AnchorLadderStrategy extends TradingBase {
    * so all lifecycle sites have a single source-of-truth save method.
    *
    * Required fields for the bot's boot-time recovery scan:
-   *   - type: 'ANCHOR_LADDER' (queried by recoverActiveStrategies)
+   *   - type: 'REVERSAL_LADDER' (queried by recoverActiveStrategies)
    *   - isRunning: true while the strategy is alive
    *   - gcfProxyUrl + sharedVmProxyGcfUrl (C4 — without these resume()
    *     can't reconstruct the Binance proxy)
@@ -3510,8 +3510,8 @@ class AnchorLadderStrategy extends TradingBase {
     try {
       const doc = {
         // Type tag for the boot-recovery scan.
-        type: 'ANCHOR_LADDER',
-        strategyType: 'anchorLadder',
+        type: 'REVERSAL_LADDER',
+        strategyType: 'reversalLadder',
         strategyId: this.strategyId,
         userId: this.userId,
         profileId: this.profileId,
@@ -3613,5 +3613,5 @@ class AnchorLadderStrategy extends TradingBase {
 
 }
 
-export { AnchorLadderStrategy, validateStartTrigger };
-export default AnchorLadderStrategy;
+export { ReversalLadderStrategy, validateStartTrigger };
+export default ReversalLadderStrategy;

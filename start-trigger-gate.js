@@ -10,7 +10,7 @@
  * exercised via `node:test` the way a plain module can — the fix
  * for that, every time it has come up in this codebase, is to pull the
  * testable logic into its own side-effect-free file rather than importing
- * app.js in a test. Importing THIS file (or anchor-ladder-strategy.js, which
+ * app.js in a test. Importing THIS file (or reversal-ladder-strategy.js, which
  * it depends on) has no such side effects — no client is created and no
  * network call happens until a function here is actually invoked.
  *
@@ -24,7 +24,7 @@
  * fallback price — message quality only, but a wrong-looking number in a
  * rejection is exactly what makes a user distrust the gate), fetches a
  * reference price, then runs `validateStartTrigger` — the SAME pure
- * validator `AnchorLadderStrategy.start()` calls as its own authoritative
+ * validator `ReversalLadderStrategy.start()` calls as its own authoritative
  * backstop, so the route and start() can never silently re-diverge on what
  * counts as a valid trigger.
  *
@@ -46,14 +46,14 @@
  * @param {{gcpProxyUrl: string, profileId: string, sharedVmProxyGcfUrl: string, symbol: string}} opts
  * @param {(gcpProxyUrl: string, profileId: string, sharedVmProxyGcfUrl: string) => object} [makeStrategy]
  *   Strategy constructor, injectable for tests (default: a real
- *   AnchorLadderStrategy). Only ever called when a trigger price is present.
+ *   ReversalLadderStrategy). Only ever called when a trigger price is present.
  */
-import { AnchorLadderStrategy, validateStartTrigger } from './anchor-ladder-strategy.js';
+import { ReversalLadderStrategy, validateStartTrigger } from './reversal-ladder-strategy.js';
 
 export async function resolveStartTrigger(
   stp,
   { gcpProxyUrl, profileId, sharedVmProxyGcfUrl, symbol },
-  makeStrategy = (...args) => new AnchorLadderStrategy(...args),
+  makeStrategy = (...args) => new ReversalLadderStrategy(...args),
 ) {
   if (stp == null || stp === '') {
     return { ok: true, strategy: null };

@@ -179,7 +179,7 @@ test('resolveLadderGeometry: error results carry a code and a human-readable mes
 });
 
 // REGRESSION PIN for task-2's review Finding 1: app.js's route and
-// AnchorLadderStrategy.start() both call this exact function now, so there is
+// ReversalLadderStrategy.start() both call this exact function now, so there is
 // only one place a verdict can be computed — but pin the verdicts anyway so a
 // future edit that reintroduces `Number(...)` coercion at either call site
 // (instead of routing through here) gets caught by a table, not by a live

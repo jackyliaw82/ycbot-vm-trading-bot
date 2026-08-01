@@ -332,7 +332,7 @@ class TradingBase {
       // changed from this fill. Without this push, frontend would see
       // stale accumulators until the next 30s safety-net heartbeat.
       // Hook is optional — strategies that implement _pushHeartbeatNow
-      // (AnchorLadderStrategy) opt in; others no-op.
+      // (ReversalLadderStrategy) opt in; others no-op.
       if (typeof this._pushHeartbeatNow === 'function') {
         try { this._pushHeartbeatNow(); } catch (_) { /* non-fatal */ }
       }

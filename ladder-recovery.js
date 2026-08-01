@@ -12,7 +12,7 @@
 // The rule lives here, isolated from Express/Firestore, so it is unit-testable.
 
 const INSTANCE_NAME_PREFIX = 'vm-user-';
-const STRATEGY_ID_PREFIX = 'anchor_ladder_';
+const STRATEGY_ID_PREFIX = 'reversal_ladder_';
 
 /**
  * Derive the owner uid from a GCP instance name.
@@ -67,8 +67,9 @@ export function selectRecoverableStrategies(records, ownerUid) {
 
   for (const record of records || []) {
     const id = record && record.id;
-    // Retired ai_reversal_ / ai_dual_ / ai_hedge_ docs have a different persisted
-    // shape and cannot be resumed as a ladder. Excluded silently, as before.
+    // Retired ai_reversal_ / ai_dual_ / ai_hedge_ / anchor_ladder_ docs have a
+    // different persisted shape and cannot be resumed as a ladder. Excluded
+    // silently, as before.
     if (typeof id !== 'string' || !id.startsWith(STRATEGY_ID_PREFIX)) continue;
 
     const userId = record.userId;
