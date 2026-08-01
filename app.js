@@ -1,7 +1,6 @@
 import express from 'express';
 import cors from 'cors';
 import { ReversalLadderStrategy } from './reversal-ladder-strategy.js';
-import { resolveStartTrigger } from './start-trigger-gate.js';
 import {
   minInitialSizeUSDT,
   resolveLadderGeometry,
@@ -1520,38 +1519,7 @@ app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
       });
     }
 
-    // Start trigger price — validated in full here, not just shape, so a
-    // rejection is a real 400 the user actually sees. Before this fix the
-    // 0.1%-gap/rounding check lived ONLY inside start(), which runs AFTER
-    // the non-blocking 200: a rejection there just deletes the strategy from
-    // activeStrategies, the frontend 404s, takes its "strategy gone" branch,
-    // and calls setErrorMsg(null) — the user is bounced back to the config
-    // form with no reason shown. Start Mode is the first async-rejection
-    // reason a user can trigger just by typing a number, so this is now the
-    // feature's most likely failure. resolveStartTrigger (start-trigger-gate.js)
-    // owns the whole check — shape, exchange-info warm-up, reference-price
-    // fetch, and the shared validateStartTrigger gap/rounding rule — and is
-    // gated on the trigger being PRESENT, so Immediate mode takes none of
-    // this and pays zero extra latency. Extracted into its own module rather
-    // than left inline so it is independently unit-testable (this file opens
-    // a real Firestore client and hits GCP metadata at import time, so it
-    // cannot be exercised directly via node:test).
-    const triggerResult = await resolveStartTrigger(config.startTriggerPrice, {
-      gcpProxyUrl, profileId, sharedVmProxyGcfUrl, symbol: config.symbol,
-    });
-    if (!triggerResult.ok) {
-      return res.status(triggerResult.status).json(triggerResult.body);
-    }
-    // Reused below instead of building (and reference-price-fetching) a
-    // second instance. Still null here for Immediate mode — built at the
-    // usual spot further down.
-    let strategy = triggerResult.strategy;
-
     // One strategy per profile (matches existing model). User must stop the running strategy first.
-    // NOTE: named `running`, not `strategy` — the outer `let strategy` above
-    // (the start-trigger validation instance) is in scope for this whole
-    // handler, and shadowing it here would make `strategy` mean two
-    // different things inside one 60-line window.
     for (const [sId, running] of activeStrategies.entries()) {
       if (running.profileId === profileId) {
         return res.status(400).json({
@@ -1595,10 +1563,7 @@ app.post('/anchor-ladder/start', requireVmOwner, async (req, res) => {
     }
     // ──────────────────────────────────────────────────────────────────────
 
-    // Reuse the instance the start-trigger validation above already built
-    // (Immediate-mode requests never entered that branch, so `strategy` is
-    // still null here for them — build it now, same as before this fix).
-    if (!strategy) strategy = new ReversalLadderStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
+    const strategy = new ReversalLadderStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
     strategy.userId = req.uid || userId;
 
     const strategyId = `reversal_ladder_${profileId}_${Date.now()}`;
@@ -1774,27 +1739,6 @@ app.post('/anchor-ladder/trail', requireVmOwner, async (req, res) => {
       return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
     }
     const result = await strategy.setTrailDirection(direction ?? null);
-    res.json({ success: true, ...result });
-  } catch (error) {
-    res.status(error.invalidInput ? 400 : 409).json({ error: error.message });
-  }
-});
-
-// Edit the START trigger price while the strategy is ARMED (waiting for its
-// trigger, ladder not yet built). Re-validates the 0.1% gap + tick rounding
-// against the live price (the same gate /start enforces). 400 on bad/too-close
-// input, 409 if the strategy is running but no longer armed (trigger already
-// fired); the not-running/not-found guard here returns 400 like harvest-now.
-app.post('/anchor-ladder/update-start-trigger', requireVmOwner, async (req, res) => {
-  try {
-    const { strategyId, triggerPrice } = req.body;
-    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
-    if (triggerPrice == null) return res.status(400).json({ error: 'triggerPrice is required.' });
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running Anchor Ladder strategy with ID ${strategyId}` });
-    }
-    const result = await strategy.updateStartTrigger(triggerPrice);
     res.json({ success: true, ...result });
   } catch (error) {
     res.status(error.invalidInput ? 400 : 409).json({ error: error.message });

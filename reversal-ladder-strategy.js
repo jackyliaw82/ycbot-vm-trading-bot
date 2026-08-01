@@ -56,43 +56,6 @@ function formatDuration(ms) {
 }
 
 /**
- * Validate + round a proposed start-trigger price against a reference price.
- *
- * PURE — no I/O, no `this`. The same "one validator, two gates" pattern
- * `resolveLadderGeometry` (ladder-levels.js) uses for the ladder-geometry
- * bounds, and for the same reason: the /reversal-ladder/start route calls this
- * (after fetching its own reference price) so a bad start-trigger price is a
- * real 400 the user actually sees — today the 0.1%-gap/rounding check only
- * lives inside start(), which runs AFTER the non-blocking 200; a rejection
- * there just deletes the strategy from activeStrategies, the frontend 404s,
- * takes its "strategy gone" branch, and calls setErrorMsg(null) — the user is
- * bounced back to the config form with NO reason shown. start() calls this
- * SAME function too, as the authoritative backstop a direct API call cannot
- * bypass — the two call sites must never be able to silently re-diverge on
- * what counts as a valid trigger (see resolveLadderGeometry's own docstring
- * for the history of exactly that happening once already, for a different
- * gate).
- *
- * Returns { ok: true, rounded, above } or { ok: false, error }.
- */
-function validateStartTrigger(rawPrice, referencePrice, symbol) {
-  const px = Number(rawPrice);
-  if (!Number.isFinite(px) || px <= 0) {
-    return { ok: false, error: 'Start trigger price must be a positive number.' };
-  }
-  const rounded = precisionFormatter.roundPrice(px, symbol);
-  if (Math.abs(rounded - referencePrice) < referencePrice * TRIGGER_MIN_GAP_PCT) {
-    return {
-      ok: false,
-      error: `Start trigger price must be at least 0.1% away from the current price ` +
-        `(${precisionFormatter.formatPrice(referencePrice, symbol)}). ` +
-        `${precisionFormatter.formatPrice(rounded, symbol)} is too close to it.`,
-    };
-  }
-  return { ok: true, rounded, above: rounded > referencePrice };
-}
-
-/**
  * ReversalLadderStrategy — fully mechanical reversal-ladder strategy.
  *
  * This file was copied from ai-dual-strategy.js and stripped: every AI consult
@@ -252,15 +215,6 @@ class ReversalLadderStrategy extends TradingBase {
     // TRANSIENT — deliberately NOT persisted: a timestamp carried across a
     // restart would wrongly suppress the first post-boot attempt.
     this._trailRetryLastTs = null;
-
-    // ── Start Mode ────────────────────────────────────────────────────────
-    // Optional: defer building the ladder until the price reaches a level the
-    // user chose at deployment. null = Immediate (anchor on the first tick).
-    // Direction is captured at arm time in start(), exactly like the harvest
-    // trigger, so a level above the reference fires on a rise and below on a
-    // fall. Cleared the moment it fires — one-shot.
-    this.startTriggerPrice = null;   // number | null
-    this.startTriggerAbove = null;   // boolean | null
   }
 
   // ——— Lifecycle ——————————————————————————————————————————————————————
@@ -363,29 +317,6 @@ class ReversalLadderStrategy extends TradingBase {
       throw new Error(msg);
     }
 
-    // ── Start Mode ────────────────────────────────────────────────────────
-    // Absent / null / '' = Immediate: anchor on the first tick, as always.
-    // With a price, arm a one-shot start trigger. validateStartTrigger is the
-    // SAME validator the /reversal-ladder/start route runs (after fetching its
-    // own reference price) so a bad price is a real 400 the caller sees
-    // instead of a start() rejection buried after the non-blocking 200. This
-    // call is the authoritative backstop — the VM is the authority (same
-    // philosophy as the ladder-geometry bounds) — so a direct API call
-    // cannot bypass it and arm a level that is already satisfied.
-    if (config.startTriggerPrice != null && config.startTriggerPrice !== '') {
-      const ref = await this._fetchReferencePrice();
-      const check = validateStartTrigger(config.startTriggerPrice, ref, this.symbol);
-      if (!check.ok) {
-        throw new Error(check.error);
-      }
-      this.startTriggerPrice = check.rounded;
-      this.startTriggerAbove = check.above;
-      await this.addLog(
-        `[LADDER] START TRIGGER armed @ ${this._formatPrice(check.rounded)} — the ladder will build when price ` +
-        `${check.above ? 'rises to' : 'falls to'} it (reference ${this._formatPrice(ref)}).`,
-      );
-    }
-
     // Initial capital snapshot — drives the harvest gate and the sizing self-regulation loop.
     this.initialWalletBalance = await this.getWalletBalance();
     this.initialCapital = this.initialWalletBalance || this.currentInitialSize;
@@ -428,66 +359,6 @@ class ReversalLadderStrategy extends TradingBase {
     // unguarded throw escapes start() (see the note in resume()).
     await this._refreshCurrentPosition();
 
-    // Start Mode: REFUSE to arm a deferred start over an existing or
-    // unverifiable position. While ARMED, the empty-ladder gate returns
-    // before any RANGE/TREND dispatch, so a pre-existing position would have
-    // no anchor, no Final TP, and no stop-loss for an UNBOUNDED period —
-    // upgraded from a warning because that is not a state the user can
-    // reason about. Checked here rather than inline in the arming block
-    // above — `activePosition` isn't populated until the refresh just above
-    // runs, so `_closeQuantity()` would always read 0 at arm time.
-    //
-    // Two DISTINCT failure shapes, both refused:
-    //  - a CONFIRMED open position (`_closeQuantity() > 0`) — Binance was
-    //    reachable and answered "not flat".
-    //  - an UNVERIFIABLE one (`_lastPositionRefreshFailed`) — the refresh
-    //    itself failed, so "flat" cannot be trusted. `_closeQuantity()` alone
-    //    would read 0 here too (no legs recorded yet on a fresh cycle, no
-    //    REST-confirmed qty either) — exactly the "unknown reads as flat"
-    //    shape this codebase's tombstones warn against, not a genuine
-    //    all-clear, so it needs its own explicit check.
-    //
-    // cleanupWebSockets() first: this throw lands after the WS setup above,
-    // and start() has no other throw point this late in the sequence — the
-    // caller (app.js's non-blocking .catch()) does not tear down WebSockets
-    // on a start() rejection, so leaving them connected here would leak the
-    // sockets and their ping/reconnect timers. `_scheduleVolumeRefresh()`
-    // (also above) is the SAME shape — its 5-minute `_volumeRefreshInterval`
-    // isn't touched by cleanupWebSockets() either, so it needs its own clear;
-    // stop() already does this exact form for the same reason, mirrored here.
-    // Also null the trigger fields the arming block above already set — that
-    // same .catch() DOES call saveState(), and a failed/stopped doc must not
-    // persist a spurious still-armed trigger it never got the chance to honor.
-    if (this.startTriggerPrice != null) {
-      if (this._closeQuantity() > 0) {
-        const qty = this._closeQuantity();
-        this.cleanupWebSockets();
-        if (this._volumeRefreshInterval) {
-          clearInterval(this._volumeRefreshInterval);
-          this._volumeRefreshInterval = null;
-        }
-        this.startTriggerPrice = null;
-        this.startTriggerAbove = null;
-        throw new Error(
-          `Cannot arm a start trigger: an existing position (qty ${qty}) was detected on ` +
-          `${this.symbol}. Close it manually first, or start in Immediate mode so the ladder anchors around it now.`,
-        );
-      }
-      if (this._lastPositionRefreshFailed) {
-        this.cleanupWebSockets();
-        if (this._volumeRefreshInterval) {
-          clearInterval(this._volumeRefreshInterval);
-          this._volumeRefreshInterval = null;
-        }
-        this.startTriggerPrice = null;
-        this.startTriggerAbove = null;
-        throw new Error(
-          `Cannot arm a start trigger: the position check for ${this.symbol} did not complete, so it is not ` +
-          `known whether the account is flat. Try again once Binance is reachable.`,
-        );
-      }
-    }
-
     // Funding poll baseline + scheduler. Anchor at strategy start so the
     // first poll only catches entries from THIS cycle.
     this._lastFundingPollTs = this.strategyStartTime.getTime();
@@ -495,39 +366,10 @@ class ReversalLadderStrategy extends TradingBase {
 
     await this.addLog('ReversalLadderStrategy running — awaiting first tick to build the ladder.');
     await this.saveState();
-    // Push immediately — unconditional (not gated on a trigger being set):
-    // an ARMED start pushes so the frontend can confirm it within the same
-    // request/response cycle rather than waiting on the 30s strategy_update
-    // safety net (the WS-connected UI disables its 3s REST poll, so that
-    // safety net is the ONLY other path); an Immediate start pushes one
-    // harmless extra heartbeat moments before the first tick's own push from
-    // initializeLadder(). Gating this on startTriggerPrice would save that
-    // one harmless push at the cost of a branch to keep in sync with the
-    // arming logic above — not worth it. Synchronous + internally
+    // Push immediately — one harmless extra heartbeat moments before the
+    // first tick's own push from initializeLadder(). Synchronous + internally
     // try/caught, so no await (see _pushHeartbeatNow's own doc).
     this._pushHeartbeatNow?.();
-  }
-
-  /**
-   * A REST mark price for validating a start trigger.
-   *
-   * start() runs BEFORE the price WS has ticked, so `this.currentPrice` is null
-   * there and cannot be used the way harvestNow() uses it. Same endpoint the
-   * REST fallback polls (see trading-base.js's _restPollInterval).
-   *
-   * THROWS on failure — deliberately. We cannot check the 0.1% gap without a
-   * reference, and arming an unvalidated trigger could deploy capital at a
-   * moment the user never chose. Refuse the start instead.
-   */
-  async _fetchReferencePrice() {
-    const data = await this.makeProxyRequest(
-      '/fapi/v1/premiumIndex', 'GET', { symbol: this.symbol }, false, 'futures',
-    );
-    const px = parseFloat(data?.markPrice);
-    if (!Number.isFinite(px) || px <= 0) {
-      throw new Error('Could not read a reference price from Binance to validate the start trigger.');
-    }
-    return px;
   }
 
   /**
@@ -1066,17 +908,6 @@ class ReversalLadderStrategy extends TradingBase {
   }
 
   /**
-   * Is this strategy waiting for its start trigger?
-   *
-   * DERIVED, never stored. A stored copy would be a second source of truth for
-   * one fact and would drift — the same failure `_trendFinalTpArmed` documents.
-   * The ladder existing is what makes the strategy live, so that is the test.
-   */
-  get startArmed() {
-    return this.startTriggerPrice != null && !this.ladderLines.length;
-  }
-
-  /**
    * Fully scaled -> TREND. Passive from here: the position is KEPT EXACTLY AS-IS.
    *
    * Deliberately does NOT flatten and re-open (which is what the old
@@ -1502,8 +1333,6 @@ class ReversalLadderStrategy extends TradingBase {
     this.harvestTriggerPrice = snapshot.harvestTriggerPrice ?? null;
     this.harvestTriggerAbove = snapshot.harvestTriggerAbove ?? null;
     this.harvestTriggerAction = snapshot.harvestTriggerAction === 'stop' ? 'stop' : 'reanchor';
-    this.startTriggerPrice = snapshot.startTriggerPrice ?? null;
-    this.startTriggerAbove = snapshot.startTriggerAbove ?? null;
     this.trailDirection = snapshot.trailDirection ?? null;
     // Legacy snapshots predate these: fall back to the restored anchor so the
     // indicator reads 0% rather than inventing a gain against a null baseline.
@@ -1825,17 +1654,12 @@ class ReversalLadderStrategy extends TradingBase {
     this.activePosition = null;
     this.currentSide = null;
 
-    // Any armed trigger dies with the cycle (Final TP or manual Stop) — start
-    // and harvest triggers are the same rule: a terminated strategy must never
-    // keep reporting armed (startArmed derives off ladderLines.length, which
-    // stays empty for a cycle that stopped before its first tick).
+    // Any armed trigger dies with the cycle (Final TP or manual Stop): a
+    // terminated strategy must never keep reporting an armed feature.
     this.harvestTriggerPrice = null;
     this.harvestTriggerAbove = null;
     this.harvestTriggerAction = 'reanchor';
-    this.startTriggerPrice = null;
-    this.startTriggerAbove = null;
-    // Trailing dies with the cycle too — same rule as the start/harvest triggers:
-    // a terminated strategy must never keep reporting an armed feature.
+    // Trailing dies with the cycle too — same rule as the harvest trigger.
     this.trailDirection = null;
 
     // Final funding flush — capture any settlement that happened between
@@ -2053,57 +1877,6 @@ class ReversalLadderStrategy extends TradingBase {
     // ---- Ladder gate: anchor on the first tick (and after a harvest). ----
     // No market data needed — the anchor IS the price — so no retry throttle.
     if (!this.ladderLines.length) {
-      // Start Mode: hold the ladder until the armed level is reached. Returning
-      // here leaves the strategy running and ARMED — there is no position and no
-      // ladder to act on, so nothing else on this tick applies.
-      if (this.startTriggerPrice != null) {
-        // Direction must be a real boolean. `? :` treats null/undefined as
-        // falsy, which reads as "fires on a fall" — for a trigger armed ABOVE
-        // whose direction was lost, price is by definition already below it,
-        // so it would fire on the very next tick and deploy the full initial
-        // size at a moment the user never chose. Unknown must never read as
-        // actionable: disarm instead of guessing a direction.
-        if (typeof this.startTriggerAbove !== 'boolean') {
-          await this.addLog(
-            `ERROR: start trigger @ ${this._formatPrice(this.startTriggerPrice)} has no direction — ` +
-            `DISARMING rather than firing at an unchosen moment.`,
-          );
-          this.startTriggerPrice = null;
-          this.startTriggerAbove = null;
-          await this.saveState();
-          return;
-        }
-        const hit = this.startTriggerAbove
-          ? price >= this.startTriggerPrice
-          : price <= this.startTriggerPrice;
-        if (!hit) return;
-        const armedAt = this.startTriggerPrice;
-        this.startTriggerPrice = null;
-        this.startTriggerAbove = null;
-        // Belt-and-braces: harvestNow() already refuses while startArmed (see
-        // its own guard), so this latch should never be set here — but that
-        // safety would then rest on an invariant enforced only by a DIFFERENT
-        // method, which is exactly the shape this codebase's tombstones warn
-        // about. A harvest requested before the ladder existed must not be
-        // replayed against the ladder that is about to be built.
-        this._manualHarvestRequested = false;
-        await this.addLog(
-          `[LADDER] START TRIGGER hit @ ${this._formatPrice(price)} ` +
-          `(armed ${this._formatPrice(armedAt)}) — building the ladder.`,
-        );
-        // Sizing was captured at arm time (start()) but is spent NOW, at fire
-        // time — that gap is unbounded (the trigger can sit for hours or
-        // days). Not re-derived here — that would change sizing semantics
-        // and is out of scope — just surfaced so a size that may now look
-        // stale is visible in the log rather than silently deployed.
-        await this.addLog(
-          `[LADDER] Deploying ${this._formatNotional(this._ladderBaseSize || this.currentInitialSize || 0)} USDT ` +
-          `total (${this._formatNotional(this._legNotional())} USDT/leg) — sized when the strategy started.`,
-        );
-      }
-      // The anchor is the LIVE price, not the trigger level — price can gap
-      // through the level, and the ladder must be built around where the market
-      // actually is.
       await this.initializeLadder(price);
       return;
     }
@@ -2173,7 +1946,7 @@ class ReversalLadderStrategy extends TradingBase {
     // orders of magnitude below the 10%-of-a-step buffer (itself already
     // orders of magnitude above one tick) absorbs that rounding without
     // weakening the buffer's guarantee.
-    if (this.trailDirection && this.ladderMode === 'RANGE' && !this.startArmed
+    if (this.trailDirection && this.ladderMode === 'RANGE'
         && this.ladderLines.length && Number.isFinite(this.anchor)) {
       const level = this._trailLevel();
       const eps = level != null ? Math.abs(level) * 1e-9 : 0;
@@ -2512,28 +2285,7 @@ class ReversalLadderStrategy extends TradingBase {
    * price) set `error.invalidInput = true` → the route maps those to 400.
    */
   async harvestNow(triggerPrice = null, { action = 'reanchor' } = {}) {
-    // isRunning FIRST: a stopped strategy must report "not running", not
-    // "waiting for its start trigger" — stop() clears the trigger, so a
-    // stopped-but-still-armed state shouldn't be reachable, but the ORDER
-    // still matters for which message a caller sees if that invariant is
-    // ever wrong. Both map to 409, so this is wording only.
     if (!this.isRunning) throw new Error('Strategy is not running.');
-
-    // Start Mode: while ARMED there is no ladder and no position — the empty-
-    // ladder gate in handleRealtimePrice returns before any RANGE/TREND
-    // dispatch, so a harvest requested now would just sit on the
-    // `_manualHarvestRequested` latch until the trigger fires and consume it
-    // on the very next tick, flattening the ladder that had just been built a
-    // moment earlier. Refuse before any other gate. This is a state conflict
-    // (untagged → the route maps it to 409), not a client-input error — the
-    // request itself may be perfectly well-formed, it is just meaningless
-    // before the trigger fires.
-    if (this.startArmed) {
-      throw new Error(
-        `This strategy is waiting for its start trigger at ${this._formatPrice(this.startTriggerPrice)} — ` +
-        `there is no ladder or position to harvest yet. Stop the strategy to cancel the trigger.`,
-      );
-    }
 
     // No price → immediate harvest on the next free tick (today's behavior).
     // Clear any armed trigger so an immediate Harvest-now always supersedes a
@@ -2606,9 +2358,9 @@ class ReversalLadderStrategy extends TradingBase {
   /**
    * Turn Anchor Trailing on (with a direction) or off.
    *
-   * Accepted at ANY time while running — including while `startArmed` or in
-   * TREND. It is a state change, not an action: with no RANGE ladder it simply
-   * lies dormant until one exists (see the tick guard in `handleRealtimePrice`).
+   * Accepted at ANY time while running — including in TREND. It is a state
+   * change, not an action: with no RANGE ladder it simply lies dormant until
+   * one exists (see the tick guard in `handleRealtimePrice`).
    *
    * Direction is EXCLUSIVE — switching overwrites, so there is no separate
    * "off first" step.
@@ -2668,44 +2420,6 @@ class ReversalLadderStrategy extends TradingBase {
       await this.addLog('[LADDER] Anchor Trailing OFF.');
     }
     return { trailDirection: this.trailDirection };
-  }
-
-  /**
-   * Edit the START trigger price while the strategy is ARMED (waiting for its
-   * trigger, ladder not yet built). Backend for the "edit trigger" pencil in the
-   * frontend's Waiting-to-Start panel.
-   *
-   * Only valid while `startArmed`. Error shapes are tagged like harvestNow so the
-   * route can split them: a state conflict (not running / not armed — already
-   * fired) is untagged -> 409; trigger-price validation failures set
-   * `error.invalidInput = true` -> 400. Re-uses validateStartTrigger — the SAME
-   * gate start() enforces — against the live mark price, so a direct API call can
-   * never diverge from the UI on what counts as a valid trigger.
-   */
-  async updateStartTrigger(rawPrice) {
-    if (!this.isRunning) throw new Error('Strategy is not running.');
-    if (!this.startArmed) {
-      throw new Error(
-        'This strategy is no longer waiting for a start trigger — the ladder has ' +
-        'already started, so there is nothing to edit.',
-      );
-    }
-    const invalidInput = (msg) => { const e = new Error(msg); e.invalidInput = true; return e; };
-    const ref = this.currentPrice;
-    if (!Number.isFinite(ref) || ref <= 0) {
-      throw invalidInput('No live price yet — cannot validate the new trigger.');
-    }
-    const check = validateStartTrigger(rawPrice, ref, this.symbol);
-    if (!check.ok) throw invalidInput(check.error);
-    this.startTriggerPrice = check.rounded;
-    this.startTriggerAbove = check.above;
-    await this.saveState();
-    this._pushHeartbeatNow?.();
-    await this.addLog(
-      `[LADDER] start trigger updated @ ${this._formatPrice(check.rounded)} ` +
-      `(anchors when price ${check.above ? 'rises to' : 'falls to'} ${this._formatPrice(check.rounded)}).`,
-    );
-    return { startTriggerPrice: check.rounded, startTriggerAbove: check.above };
   }
 
   // ——— Dynamic sizing ————————————————————————————————————————————————
@@ -3380,15 +3094,12 @@ class ReversalLadderStrategy extends TradingBase {
       harvestTriggerPrice: this.harvestTriggerPrice ?? null,
       harvestTriggerAbove: this.harvestTriggerAbove ?? null,
       harvestTriggerAction: this.harvestTriggerAction ?? 'reanchor',
-      startTriggerPrice: this.startTriggerPrice ?? null,
-      startTriggerAbove: this.startTriggerAbove ?? null,
       trailDirection: this.trailDirection ?? null,
       trailBaselineAnchor: this.trailBaselineAnchor ?? null,
       trailMoveCount: this.trailMoveCount ?? 0,
       trailLastDirection: this.trailLastDirection ?? null,
       trailGainPct: this._trailGainPct(),
       trailSuppressedSide: suppressedSideFor(this.trailDirection),
-      startArmed: this.startArmed,
       accumulatedRealizedPnL: this.accumulatedRealizedPnL || 0,
       accumulatedTradingFees: this.accumulatedTradingFees || 0,
       accumulatedFundingFees: this.accumulatedFundingFees || 0,
@@ -3463,15 +3174,12 @@ class ReversalLadderStrategy extends TradingBase {
       harvestTriggerPrice: this.harvestTriggerPrice ?? null,
       harvestTriggerAbove: this.harvestTriggerAbove ?? null,
       harvestTriggerAction: this.harvestTriggerAction ?? 'reanchor',
-      startTriggerPrice: this.startTriggerPrice ?? null,
-      startTriggerAbove: this.startTriggerAbove ?? null,
       trailDirection: this.trailDirection ?? null,
       trailBaselineAnchor: this.trailBaselineAnchor ?? null,
       trailMoveCount: this.trailMoveCount ?? 0,
       trailLastDirection: this.trailLastDirection ?? null,
       trailGainPct: this._trailGainPct(),
       trailSuppressedSide: suppressedSideFor(this.trailDirection),
-      startArmed: this.startArmed,
     };
   }
 
@@ -3577,11 +3285,6 @@ class ReversalLadderStrategy extends TradingBase {
         harvestTriggerPrice: this.harvestTriggerPrice ?? null,
         harvestTriggerAbove: this.harvestTriggerAbove ?? null,
         harvestTriggerAction: this.harvestTriggerAction ?? 'reanchor',
-        // Armed Start Mode trigger (one-shot price level deferring the FIRST
-        // ladder build). Persist so a VM restart / resume doesn't silently
-        // disarm it and fall back to Immediate on the next tick.
-        startTriggerPrice: this.startTriggerPrice ?? null,
-        startTriggerAbove: this.startTriggerAbove ?? null,
         // Anchor Trailing — PERSISTED so a redeploy doesn't silently disarm it
         // (see the constructor comment for the full fail-open rationale).
         trailDirection: this.trailDirection ?? null,
@@ -3613,5 +3316,5 @@ class ReversalLadderStrategy extends TradingBase {
 
 }
 
-export { ReversalLadderStrategy, validateStartTrigger };
+export { ReversalLadderStrategy };
 export default ReversalLadderStrategy;
