@@ -1,13 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildLadder,
   LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE,
   LADDER_STEP_PCT_MIN, LADDER_STEP_PCT_MAX,
   LADDER_LEVELS_MIN, LADDER_LEVELS_MAX,
   MIN_LEG_USDT, minInitialSizeUSDT,
   resolveLadderGeometry,
-  trailLevel, TRAIL_BUFFER_FRAC,
 } from '../ladder-levels.js';
 
 test('defaults are the spec values', () => {
@@ -27,53 +25,6 @@ test('minInitialSizeUSDT scales with the level count', () => {
   assert.equal(minInitialSizeUSDT(5), 50);  // identical to the old flat minimum
   assert.equal(minInitialSizeUSDT(3), 30);
   assert.equal(minInitialSizeUSDT(10), 100);
-});
-
-test('buildLadder: LONG above the anchor, SHORT below — the inversion', () => {
-  const legs = buildLadder(100, 0.003, 5);
-  assert.equal(legs.length, 10);
-  for (const leg of legs) {
-    if (leg.direction === 'LONG') assert.ok(leg.price > 100, `LONG leg at ${leg.price} must be ABOVE the anchor`);
-    if (leg.direction === 'SHORT') assert.ok(leg.price < 100, `SHORT leg at ${leg.price} must be BELOW the anchor`);
-  }
-});
-
-test('buildLadder: level prices are anchor +/- k * stepPct * anchor', () => {
-  const legs = buildLadder(100, 0.003, 5);
-  const L = (k) => legs.find(l => l.direction === 'LONG' && l.levelIndex === k);
-  const S = (k) => legs.find(l => l.direction === 'SHORT' && l.levelIndex === k);
-  assert.ok(Math.abs(L(1).price - 100.3) < 1e-9);
-  assert.ok(Math.abs(L(5).price - 101.5) < 1e-9); // outermost = anchor + 1.5%
-  assert.ok(Math.abs(S(1).price - 99.7) < 1e-9);
-  assert.ok(Math.abs(S(5).price - 98.5) < 1e-9);  // outermost = anchor - 1.5%
-});
-
-test('buildLadder: every leg starts EMPTY with no fill data', () => {
-  for (const leg of buildLadder(4321.5, 0.003, 5)) {
-    assert.equal(leg.state, 'EMPTY');
-    assert.equal(leg.quantity, null);
-    assert.equal(leg.fillPrice, null);
-  }
-});
-
-test('buildLadder: no leg sits on the anchor', () => {
-  // k starts at 1, so the anchor is never a level. The anchor is the FLATTEN
-  // price — a leg there would open and close on the same tick.
-  assert.ok(buildLadder(100, 0.003, 5).every(l => l.price !== 100));
-});
-
-test('buildLadder: the ladder is symmetric about the anchor', () => {
-  const legs = buildLadder(68000, 0.003, 5);
-  for (let k = 1; k <= 5; k++) {
-    const up = legs.find(l => l.direction === 'LONG' && l.levelIndex === k).price;
-    const dn = legs.find(l => l.direction === 'SHORT' && l.levelIndex === k).price;
-    assert.ok(Math.abs((up - 68000) - (68000 - dn)) < 1e-6, `level ${k} is asymmetric`);
-  }
-});
-
-test('buildLadder: rejects a non-positive anchor', () => {
-  assert.throws(() => buildLadder(0, 0.003, 5), /anchor/i);
-  assert.throws(() => buildLadder(NaN, 0.003, 5), /anchor/i);
 });
 
 // ——— resolveLadderGeometry: the SINGLE gate app.js's route and start() ———
@@ -179,7 +130,7 @@ test('resolveLadderGeometry: error results carry a code and a human-readable mes
 });
 
 // REGRESSION PIN for task-2's review Finding 1: app.js's route and
-// AnchorLadderStrategy.start() both call this exact function now, so there is
+// ReversalLadderStrategy.start() both call this exact function now, so there is
 // only one place a verdict can be computed — but pin the verdicts anyway so a
 // future edit that reintroduces `Number(...)` coercion at either call site
 // (instead of routing through here) gets caught by a table, not by a live
@@ -201,66 +152,4 @@ test('resolveLadderGeometry: regression pin — inputs that used to diverge betw
     const verdictAgain = resolveLadderGeometry(input);
     assert.deepEqual(verdict, verdictAgain, 'the verdict must be identical regardless of which caller invokes it');
   }
-});
-
-test('buildLadder: honours non-default geometry', () => {
-  const legs = buildLadder(200, 0.005, 8);
-  assert.equal(legs.length, 16, '8 per side');
-  const longs = legs.filter(l => l.direction === 'LONG').map(l => l.price).sort((a, b) => a - b);
-  const shorts = legs.filter(l => l.direction === 'SHORT').map(l => l.price).sort((a, b) => b - a);
-  assert.equal(longs.length, 8);
-  assert.equal(shorts.length, 8);
-  assert.equal(longs[0], 201);    // 200 + 1 * 0.005 * 200
-  assert.equal(longs[7], 208);    // 200 + 8 * 0.005 * 200
-  assert.equal(shorts[0], 199);
-  assert.equal(shorts[7], 192);
-  // The inversion holds at any geometry: LONG above, SHORT below.
-  assert.ok(longs.every(p => p > 200));
-  assert.ok(shorts.every(p => p < 200));
-});
-
-test('trailLevel DOWN sits between the anchor and the raw S1 price', () => {
-  const anchor = 100, stepPct = 0.003;
-  const rawS1 = anchor - stepPct * anchor;          // 99.7
-  const level = trailLevel(anchor, stepPct, 'DOWN');
-  assert.ok(level < anchor, 'must be below the anchor');
-  assert.ok(level > rawS1, 'must sit INSIDE S1 (anchor side)');
-  assert.ok(Math.abs(level - 99.73) < 1e-9, `expected 99.73, got ${level}`);
-});
-
-test('trailLevel UP sits between the anchor and the raw L1 price', () => {
-  const anchor = 100, stepPct = 0.003;
-  const rawL1 = anchor + stepPct * anchor;          // 100.3
-  const level = trailLevel(anchor, stepPct, 'UP');
-  assert.ok(level > anchor);
-  assert.ok(level < rawL1, 'must sit INSIDE L1 (anchor side)');
-  assert.ok(Math.abs(level - 100.27) < 1e-9, `expected 100.27, got ${level}`);
-});
-
-// PROPORTIONAL, not a fixed percentage — this is the property that keeps the
-// trail on the same scale as the ladder. If it ever decouples, widening the step
-// stops widening the trail and the anchor starts out-running the ladder.
-test('trailLevel scales with the step at both bounds of the supported range', () => {
-  for (const stepPct of [LADDER_STEP_PCT_MIN, 0.01, LADDER_STEP_PCT_MAX]) {
-    for (const direction of ['UP', 'DOWN']) {
-      const anchor = 100;
-      const raw = direction === 'UP' ? anchor * (1 + stepPct) : anchor * (1 - stepPct);
-      const level = trailLevel(anchor, stepPct, direction);
-      const gap = Math.abs(raw - level);
-      assert.ok(
-        Math.abs(gap - TRAIL_BUFFER_FRAC * stepPct * anchor) < 1e-9,
-        `${direction} @ ${stepPct}: gap ${gap}`,
-      );
-    }
-  }
-});
-
-test('trailLevel rejects an invalid anchor, step, or direction', () => {
-  assert.throws(() => trailLevel(0, 0.003, 'UP'), /anchor/);
-  assert.throws(() => trailLevel(-5, 0.003, 'UP'), /anchor/);
-  assert.throws(() => trailLevel(NaN, 0.003, 'UP'), /anchor/);
-  assert.throws(() => trailLevel(100, 0, 'UP'), /stepPct/);
-  assert.throws(() => trailLevel(100, NaN, 'UP'), /stepPct/);
-  assert.throws(() => trailLevel(100, 0.003, 'SIDEWAYS'), /direction/);
-  assert.throws(() => trailLevel(100, 0.003, null), /direction/);
 });

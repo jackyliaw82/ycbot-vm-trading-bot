@@ -197,3 +197,149 @@ test('MarketMetrics: candles are cached per symbol, not shared across them', asy
   await mm.getVolatility('ETHUSDT');   // different symbol — must fetch
   assert.deepEqual(seen, ['BTCUSDT', 'ETHUSDT']);
 });
+
+const fakeStrategy = (impl) => ({ makeProxyRequest: impl, currentPrice: 100 });
+
+test('getFundingRate: parses the premium index', async () => {
+  const mm = new MarketMetrics(fakeStrategy(async () => ({
+    lastFundingRate: '0.0001', nextFundingTime: String(Date.now() + 3 * 3600 * 1000),
+  })));
+  const r = await mm.getFundingRate('BTCUSDT');
+  assert.equal(r.rate, 0.0001);
+  assert.match(r.nextFundingTime, /^in \d+h \d+m$/);
+});
+
+test('getFundingRate: caches, so a second call does not refetch', async () => {
+  let calls = 0;
+  const mm = new MarketMetrics(fakeStrategy(async () => {
+    calls++;
+    return { lastFundingRate: '0.0002', nextFundingTime: String(Date.now() + 3600000) };
+  }));
+  await mm.getFundingRate('BTCUSDT');
+  await mm.getFundingRate('BTCUSDT');
+  assert.equal(calls, 1);
+});
+
+test('getFundingRate: a failed fetch returns null, never throws', async () => {
+  const mm = new MarketMetrics(fakeStrategy(async () => { throw new Error('502'); }));
+  assert.equal(await mm.getFundingRate('BTCUSDT'), null);
+});
+
+test('getFundingRate: a malformed payload yields null rather than NaN', async () => {
+  const mm = new MarketMetrics(fakeStrategy(async () => ({ lastFundingRate: 'abc' })));
+  assert.equal(await mm.getFundingRate('BTCUSDT'), null);
+});
+
+test('getFundingRate: a failed refetch within the 3x-TTL bound still serves the stale cache', async () => {
+  let calls = 0;
+  const mm = new MarketMetrics(fakeStrategy(async () => {
+    calls++;
+    if (calls === 1) return { lastFundingRate: '0.0003', nextFundingTime: String(Date.now() + 3600000) };
+    throw new Error('502');
+  }));
+  const first = await mm.getFundingRate('BTCUSDT');
+  assert.equal(first.rate, 0.0003);
+  // Age the cache past its own TTL (forces a refetch attempt on the next
+  // call) but still inside the 3x-TTL stale-serving bound.
+  mm._fundingCache.get('BTCUSDT').ts = Date.now() - (5 * 60 * 1000 * 1.5);
+  const second = await mm.getFundingRate('BTCUSDT');
+  assert.equal(calls, 2, 'an expired-TTL cache must still trigger a refetch attempt');
+  assert.equal(second.rate, 0.0003, 'a failed refetch within the stale bound must still serve the old value');
+});
+
+test('getFundingRate: a reading older than 3x TTL is no longer served on a failed refetch', async () => {
+  let calls = 0;
+  const mm = new MarketMetrics(fakeStrategy(async () => {
+    calls++;
+    if (calls === 1) return { lastFundingRate: '0.0003', nextFundingTime: String(Date.now() + 3600000) };
+    throw new Error('502');
+  }));
+  await mm.getFundingRate('BTCUSDT');
+  mm._fundingCache.get('BTCUSDT').ts = Date.now() - (5 * 60 * 1000 * 3 + 1000);  // just past 3x TTL
+  const second = await mm.getFundingRate('BTCUSDT');
+  assert.equal(second, null, 'a reading older than 3x TTL must not be served as current on a failed refetch');
+});
+
+const oiRow = (v) => ({ sumOpenInterestValue: String(v) });
+
+test('getOpenInterestChange: computes 5m/1h change and trend', async () => {
+  const mm = new MarketMetrics(fakeStrategy(async () => [
+    oiRow(100), oiRow(101), oiRow(102), oiRow(103), oiRow(104), oiRow(105),
+    oiRow(106), oiRow(107), oiRow(108), oiRow(109), oiRow(110), oiRow(120),
+  ]));
+  const r = await mm.getOpenInterestChange('BTCUSDT');
+  assert.ok(Math.abs(r.oiChange1h - 20) < 1e-9, `1h change was ${r.oiChange1h}`);
+  assert.ok(r.oiChange5m > 0);
+  assert.equal(r.oiTrend, 'RISING');
+});
+
+test('getOpenInterestChange: detects a falling trend', async () => {
+  const mm = new MarketMetrics(fakeStrategy(async () => [
+    oiRow(120), oiRow(118), oiRow(110), oiRow(105), oiRow(100),
+  ]));
+  assert.equal((await mm.getOpenInterestChange('BTCUSDT')).oiTrend, 'FALLING');
+});
+
+test('getOpenInterestChange: too few rows yields null, not a divide-by-zero', async () => {
+  const mm = new MarketMetrics(fakeStrategy(async () => [oiRow(100), oiRow(101)]));
+  assert.equal(await mm.getOpenInterestChange('BTCUSDT'), null);
+});
+
+test('getOpenInterestChange: a zero baseline yields null rather than Infinity', async () => {
+  const mm = new MarketMetrics(fakeStrategy(async () => [oiRow(0), oiRow(0), oiRow(5)]));
+  const r = await mm.getOpenInterestChange('BTCUSDT');
+  assert.equal(r, null, 'dividing by a zero baseline must not produce Infinity');
+});
+
+test('getOpenInterestChange: only the oldest reading is zero yields null', async () => {
+  // secondLatest (10) is nonzero here, isolating the `oldest === 0` half of the
+  // guard — a regressed check of only `secondLatest === 0` would wrongly pass.
+  const mm = new MarketMetrics(fakeStrategy(async () => [oiRow(0), oiRow(10), oiRow(12)]));
+  const r = await mm.getOpenInterestChange('BTCUSDT');
+  assert.equal(r, null, 'dividing by a zero oldest reading must not produce Infinity');
+});
+
+test('getOpenInterestChange: only the second-latest reading is zero yields null', async () => {
+  // oldest (10) is nonzero here, isolating the `secondLatest === 0` half of the
+  // guard — a regressed check of only `oldest === 0` would wrongly pass.
+  const mm = new MarketMetrics(fakeStrategy(async () => [oiRow(10), oiRow(0), oiRow(12)]));
+  const r = await mm.getOpenInterestChange('BTCUSDT');
+  assert.equal(r, null, 'dividing by a zero second-latest reading must not produce Infinity');
+});
+
+test('getOpenInterestChange: a failed fetch returns null, never throws', async () => {
+  const mm = new MarketMetrics(fakeStrategy(async () => { throw new Error('down'); }));
+  assert.equal(await mm.getOpenInterestChange('BTCUSDT'), null);
+});
+
+test('getOpenInterestChange: a failed refetch within the 3x-TTL bound still serves the stale cache', async () => {
+  let calls = 0;
+  const rows = [oiRow(100), oiRow(101), oiRow(102), oiRow(103), oiRow(104), oiRow(105)];
+  const mm = new MarketMetrics(fakeStrategy(async () => {
+    calls++;
+    if (calls === 1) return rows;
+    throw new Error('down');
+  }));
+  const first = await mm.getOpenInterestChange('BTCUSDT');
+  assert.ok(first);
+  mm._oiCache.get('BTCUSDT').ts = Date.now() - (5 * 60 * 1000 * 1.5);
+  const second = await mm.getOpenInterestChange('BTCUSDT');
+  assert.equal(calls, 2, 'an expired-TTL cache must still trigger a refetch attempt');
+  assert.deepEqual(second, first, 'a failed refetch within the stale bound must still serve the old reading');
+});
+
+test('getOpenInterestChange: OI staleness is bounded — beyond 3x TTL a failed fetch returns null, not an hours-old reading', async () => {
+  // OI's whole meaning is "change over the last 5m/1h" — unlike funding,
+  // serving an hours-old reading as current would misrepresent it as fresh.
+  let calls = 0;
+  const rows = [oiRow(100), oiRow(101), oiRow(102), oiRow(103), oiRow(104), oiRow(105)];
+  const mm = new MarketMetrics(fakeStrategy(async () => {
+    calls++;
+    if (calls === 1) return rows;
+    throw new Error('down');
+  }));
+  await mm.getOpenInterestChange('BTCUSDT');
+  mm._oiCache.get('BTCUSDT').ts = Date.now() - (5 * 60 * 1000 * 3 + 1000);  // just past 3x TTL
+  const second = await mm.getOpenInterestChange('BTCUSDT');
+  assert.equal(second, null, 'a reading older than 3x TTL must not be served as current on a failed refetch');
+});

@@ -1,37 +1,33 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AnchorLadderStrategy, validateStartTrigger } from '../anchor-ladder-strategy.js';
-import { buildLadder, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, LADDER_STEP_PCT_MAX, LADDER_LEVELS_MAX } from '../ladder-levels.js';
+import { ReversalLadderStrategy } from '../reversal-ladder-strategy.js';
+import { LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE, LADDER_STEP_PCT_MAX, LADDER_LEVELS_MAX } from '../ladder-levels.js';
+import { buildReversalLadder } from '../reversal-levels.js';
 import { precisionFormatter } from '../precisionUtils.js';
+import { trailDistance, trailExitLevel } from '../reversal-trail.js';
 
-// A strategy with an anchored ladder and nothing open. All I/O stubbed, so a
-// tick exercises only the dispatch. Every later task's tests reuse this.
-function ladderStrategy({ mode = 'RANGE', anchor = 100, base = 1000 } = {}) {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
+// A strategy with both ladders built and nothing open. All I/O stubbed, so a
+// tick exercises only the dispatch. bull 102 / bear 98 puts the dead zone at
+// 98..102 with price parked at 100 in the middle of it.
+function reversalStrategy({ mode = 'SCALING', bull = 102, bear = 98, base = 1000 } = {}) {
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
   s.isRunning = true;
-  s.strategyId = 'anchor_ladder_test';
+  s.strategyId = 'reversal_ladder_test';
   s.symbol = 'BTCUSDT';
   s.stepPct = LADDER_STEP_PCT;
   s.levelsPerSide = LADDER_LEVELS_PER_SIDE;
   s.ladderMode = mode;
-  s.anchor = anchor;
-  s.ladderLines = buildLadder(anchor, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE);
-  s.currentPrice = anchor;
-  s.lastProcessedPrice = null;
+  s.bullLevel = bull;
+  s.bearLevel = bear;
+  s.ladderLines = buildReversalLadder(bull, bear, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE);
+  s.currentPrice = 100;
+  s.lastProcessedPrice = 100;
   s.minNotional = 5;
   s._ladderBaseSize = base;
   s.currentInitialSize = base;
   s.initialCapital = base;
   s.activePosition = null;
   s.finalTpPrice = null;
-  // NOTE: there is deliberately no `_trendFinalTpArmed` seed here any more.
-  // It is now DERIVED (ladderMode === 'TREND' && finalTpPrice != null), and
-  // assigning it throws by design. This fixture used to seed it to
-  // `mode === 'TREND'`, which was a trap: it defaulted every TREND fixture to
-  // "armed" independently of finalTpPrice, so a test could assert against the
-  // seed rather than the code. A TREND fixture that sets a finalTpPrice is now
-  // armed by construction; one that leaves it null genuinely IS unarmed and
-  // SHOULD be self-healed by `_reconcileTrendInvariant`.
   s._tradingSeqInProgress = false;
   s._manualHarvestRequested = false;
   s.addLog = async () => {};
@@ -39,45 +35,349 @@ function ladderStrategy({ mode = 'RANGE', anchor = 100, base = 1000 } = {}) {
   s._writeStrategyFlow = async () => {};
   s._refreshCurrentPosition = async () => {};
   s._postExecuteBookkeeping = async () => {};
+  s._pushHeartbeatNow = () => {};
+  s._computeLadderBaseSize = async () => s._ladderBaseSize;
   return s;
 }
 
+// Record fills instead of trading. Returns the array the test asserts on.
+function captureFills(s) {
+  const filled = [];
+  s._fillLeg = async (leg) => {
+    leg.state = 'POSITION_OPEN';
+    leg.quantity = 1;
+    leg.fillPrice = leg.price;
+    filled.push(`${leg.direction === 'LONG' ? 'L' : 'S'}${leg.index}`);
+  };
+  return filled;
+}
+
+// §14.1 — the dead zone is the whole anti-churn mechanism.
+test('dead zone: no fill anywhere strictly between the levels', async () => {
+  const s = reversalStrategy();
+  const filled = captureFills(s);
+  await s.handleRealtimePrice(99);
+  await s.handleRealtimePrice(101);
+  await s.handleRealtimePrice(99.5);
+  assert.deepEqual(filled, []);
+  assert.equal(s.heldSide, null);
+});
+
+// §14.2 — entry at bull fills L1 only; L1 IS bullLevel.
+test('crossing bull fills L1 only, and a continued rise fills L2', async () => {
+  const s = reversalStrategy();
+  const filled = captureFills(s);
+  await s.handleRealtimePrice(102);
+  assert.deepEqual(filled, ['L1']);
+  assert.equal(s.heldSide, 'LONG');
+  await s.handleRealtimePrice(102.31);   // L2 = 102 * 1.003 = 102.306
+  assert.deepEqual(filled, ['L1', 'L2']);
+});
+
+// §14.3 — a reversal closes, resets the abandoned ledger, and opens the other
+// side on the SAME tick. The two-tick rule does NOT apply to a reversal.
+test('reversal closes, resets the abandoned side, and opens S1 on the same tick', async () => {
+  const s = reversalStrategy();
+  const filled = captureFills(s);
+  await s.handleRealtimePrice(102);
+  assert.deepEqual(filled, ['L1']);
+
+  let closes = 0;
+  s._closeConsolidated = async () => { closes++; return true; };
+  s._closeQuantity = () => 0;
+  await s.handleRealtimePrice(98);
+
+  assert.equal(closes, 1, 'the held LONG must be closed');
+  assert.deepEqual(filled, ['L1', 'S1'], 'S1 opens on the same tick');
+  assert.equal(s.heldSide, 'SHORT');
+  assert.equal(
+    s.ladderLines.filter(l => l.direction === 'LONG' && l.state !== 'EMPTY').length, 0,
+    'every abandoned LONG leg must be reset to EMPTY',
+  );
+  assert.equal(s.reversalCount, 1);
+});
+
+// §14.4 — a gap that straddles both levels resolves to the LANDING side only.
+test('straddle gap opens only the side price landed on', async () => {
+  const s = reversalStrategy();
+  const filled = captureFills(s);
+  s.lastProcessedPrice = 97;   // below bear, but nothing held
+  await s.handleRealtimePrice(103);
+  assert.ok(filled.every(f => f.startsWith('L')), `expected LONG-only fills, got ${filled}`);
+  assert.equal(s.heldSide, 'LONG');
+});
+
+// §14.5 — the outermost leg filling is what arms Final TP.
+test('filling the outermost leg enters TREND and arms Final TP', async () => {
+  const s = reversalStrategy();
+  captureFills(s);
+  s.activePosition = { quantity: 5, entryPrice: 103, notional: 515, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  await s.handleRealtimePrice(103.5);  // L5 = 102 * 1.012 = 103.224
+  assert.equal(s.ladderMode, 'TREND');
+  assert.equal(s.trendDirection, 'LONG');
+  assert.ok(s.finalTpPrice > 103, 'Final TP must be armed above entry');
+});
+
+// An unverified close must never wipe the ledger — the tombstone.
+test('reversal aborts and fills nothing when the close cannot be verified', async () => {
+  const s = reversalStrategy();
+  const filled = captureFills(s);
+  await s.handleRealtimePrice(102);
+  filled.length = 0;
+
+  s._closeConsolidated = async () => false;
+  s._closeQuantity = () => 1;            // inventory still open
+  await s.handleRealtimePrice(98);
+
+  assert.deepEqual(filled, [], 'no leg may open while a close is unverified');
+  assert.equal(
+    s.ladderLines.filter(l => l.direction === 'LONG' && l.state === 'POSITION_OPEN').length, 1,
+    'the open LONG leg must stay tracked',
+  );
+  assert.equal(s.reversalCount, 0, 'an aborted reversal is not counted');
+});
+
+// The band must be re-scanned next tick after an abort.
+test('an aborted reversal does not advance lastProcessedPrice', async () => {
+  const s = reversalStrategy();
+  captureFills(s);
+  await s.handleRealtimePrice(102);
+  s._closeConsolidated = async () => false;
+  s._closeQuantity = () => 1;
+  await s.handleRealtimePrice(98);
+  assert.equal(s.lastProcessedPrice, 102, 'the unprocessed band must be re-scanned');
+});
+
+// The empty-ladder gate must never trade without levels.
+test('no levels planned: the tick gate builds nothing and opens nothing', async () => {
+  const s = reversalStrategy();
+  const filled = captureFills(s);
+  s.ladderLines = [];
+  s.bullLevel = null;
+  s.bearLevel = null;
+  s._planAndBuildLevels = async () => false;   // planning failed
+  await s.handleRealtimePrice(102);
+  assert.deepEqual(filled, []);
+  assert.equal(s.ladderLines.length, 0);
+});
+
+// §14.8 — every close accumulates, INCLUDING profitable ones, which reduce the
+// figure. A reduced accumulated loss lowers the Final TP the next TREND must
+// reach and relaxes dynamic sizing, so this must not floor at the running max.
+test('a profitable close REDUCES cycleAccumulatedLoss', () => {
+  const s = reversalStrategy();
+  s.accumulatedRealizedPnL = -100;
+  s.accumulatedTradingFees = 10;
+  s.accumulatedFundingFees = 0;
+  assert.equal(s._computeAccLoss(), 110);
+
+  s.accumulatedRealizedPnL = -40;    // a later close banked +60
+  assert.equal(s._computeAccLoss(), 50, 'profit must pay the accumulated loss down');
+
+  s.accumulatedRealizedPnL = 200;    // net positive overall
+  assert.equal(s._computeAccLoss(), 0, 'accLoss floors at 0, never goes negative');
+});
+
+// §14.12 (part 1) — the persisted shape. The anchor-era fields must be gone and
+// the level-era fields present, or resume() silently restores nothing.
+test('saveState persists the level state and no anchor state', async () => {
+  const s = reversalStrategy();
+  s.reversalCount = 3;
+  let written = null;
+  s.saveState = ReversalLadderStrategy.prototype.saveState;   // un-stub
+  s.firestore = {
+    collection: () => ({ doc: () => ({ set: async (doc) => { written = doc; } }) }),
+  };
+  await s.saveState();
+  assert.equal(written.type, 'REVERSAL_LADDER');
+  assert.equal(written.strategyType, 'reversalLadder');
+  assert.equal(written.bullLevel, 102);
+  assert.equal(written.bearLevel, 98);
+  assert.equal(written.ladderMode, 'SCALING');
+  assert.equal(written.reversalCount, 3);
+  assert.ok(!('anchor' in written), 'the anchor must not be persisted');
+  assert.ok(!('flattenCount' in written), 'flattenCount must not be persisted');
+  assert.ok(!('startTriggerPrice' in written), 'Start Mode must not be persisted');
+  assert.ok(!('trailDirection' in written), 'Anchor Trailing must not be persisted');
+});
+
+// ——— _planAndBuildLevels: the real method, unstubbed ——————————————————
+//
+// Every OTHER test in this file that reaches _planAndBuildLevels stubs it
+// directly. These pin the real gate: the in-progress guard, the throttle, the
+// !result fail-closed branch, the catch, and (review finding 1) the stale-price
+// re-check against the LIVE price after buildLevelContext's awaited fetches.
+
+// A profile whose fallback void pair (via selectVoidPair) is bull 104 / bear
+// 97.8 against currentPrice 101 — pinned by test/level-context-e2e.test.js's
+// own e2e assertions, reused here rather than re-deriving the void math.
+const REAL_PLAN_PROFILE = {
+  poc: { price: 100.5 }, vah: 102, val: 99,
+  rangeVoids: [{ priceLow: 97, priceHigh: 97.8 }, { priceLow: 104, priceHigh: 105 }],
+};
+
+test('_planAndBuildLevels: the in-progress guard returns false without re-planning', async () => {
+  const s = reversalStrategy();
+  let called = false;
+  s.volumeProfile = { getVoidProfile: async () => { called = true; return null; } };
+  s._levelPlanInProgress = true;
+  const result = await s._planAndBuildLevels('cycle_start');
+  assert.equal(result, false);
+  assert.equal(called, false, 'no market-context fetch when a plan is already in flight');
+});
+
+test('_planAndBuildLevels: a call inside the throttle window returns false without re-planning, and succeeds once it elapses', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = reversalStrategy();
+  s.ladderLines = [];
+  s.currentPrice = 101;
+  let calls = 0;
+  s.volumeProfile = {
+    getVoidProfile: async () => {
+      calls++;
+      return { window: '24h', profile: REAL_PLAN_PROFILE, pair: { bullLevel: 104, bearLevel: 97.8 } };
+    },
+  };
+  s.marketMetrics = {
+    getVolatility: async () => ({ atr: 0.9 }),
+    getCvd: async () => ({ cvd: -1200 }),
+    getOrderbookDepth: async () => ({ bidVolume: 10, askVolume: 12 }),
+    getFundingRate: async () => ({ rate: 0.0001 }),
+    getOpenInterestChange: async () => ({ oiChange1h: 3.2 }),
+  };
+
+  s._levelPlanLastTs = Date.now(); // just planned a moment ago
+  const first = await s._planAndBuildLevels('cycle_start');
+  assert.equal(first, false, 'still inside the throttle window');
+  assert.equal(calls, 0, 'no re-plan attempt while throttled');
+
+  s._levelPlanLastTs = Date.now() - 31_000; // window elapsed
+  const second = await s._planAndBuildLevels('cycle_start');
+  assert.equal(second, true, 'throttle elapsed -> re-plans');
+  assert.equal(calls, 1);
+  assert.equal(s.bullLevel, 104);
+  assert.equal(s.bearLevel, 97.8);
+});
+
+test('_planAndBuildLevels: planLevels yielding no pair returns false and leaves ladderLines empty', async () => {
+  const s = reversalStrategy();
+  s.ladderLines = [];
+  s.currentPrice = 101;
+  // No void straddles price, and there is no AI planner (_aiPlanner is null by
+  // default) -> the mechanical fallback also comes up empty -> planLevels
+  // returns null.
+  s.volumeProfile = { getVoidProfile: async () => null };
+  s.marketMetrics = {};
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+
+  const result = await s._planAndBuildLevels('cycle_start');
+
+  assert.equal(result, false);
+  assert.equal(s.ladderLines.length, 0);
+  assert.ok(logs.some((m) => m.includes('produced no valid bull/bear pair')));
+});
+
+test('_planAndBuildLevels: a throwing context returns false and leaves ladderLines empty', async () => {
+  const s = reversalStrategy();
+  s.ladderLines = [];
+  s.currentPrice = NaN; // buildLevelContext throws outright on a non-finite currentPrice
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+
+  const result = await s._planAndBuildLevels('cycle_start');
+
+  assert.equal(result, false);
+  assert.equal(s.ladderLines.length, 0);
+  assert.ok(logs.some((m) => m.includes('ERROR: level planning') && m.includes('failed')));
+});
+
+// Review finding 1: planLevels validates the pair against `this.currentPrice`
+// as read BEFORE buildLevelContext's six awaited fetches. If price leaves the
+// band during that window, _buildLadders would otherwise build a ladder that
+// sits entirely on one side of the (now live) price, and the next tick back
+// through the level would open a position in the WRONG direction.
+test('_planAndBuildLevels: discards a pair validated against a now-stale price', async () => {
+  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
+  const s = reversalStrategy();
+  // Real empty-ladder-gate precondition (and what _harvestToFlat clears to
+  // before re-planning): no levels set yet.
+  s.ladderLines = [];
+  s.bullLevel = null;
+  s.bearLevel = null;
+  s.currentPrice = 101; // the snapshot planLevels will validate bull 104 / bear 97.8 against
+  s.volumeProfile = {
+    getVoidProfile: async () => {
+      // Simulate a fast move landing WHILE the (real, multi-fetch) context
+      // build is in flight — exactly the window the finding describes.
+      s.currentPrice = 106;
+      return { window: '24h', profile: REAL_PLAN_PROFILE, pair: { bullLevel: 104, bearLevel: 97.8 } };
+    },
+  };
+  s.marketMetrics = {
+    getVolatility: async () => ({ atr: 0.9 }),
+    getCvd: async () => ({ cvd: -1200 }),
+    getOrderbookDepth: async () => ({ bidVolume: 10, askVolume: 12 }),
+    getFundingRate: async () => ({ rate: 0.0001 }),
+    getOpenInterestChange: async () => ({ oiChange1h: 3.2 }),
+  };
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+
+  const result = await s._planAndBuildLevels('cycle_start');
+
+  assert.equal(result, false, 'a pair validated against a stale price must be discarded, not built');
+  assert.equal(s.ladderLines.length, 0, 'nothing may be built from a stale-validated pair');
+  assert.equal(s.bullLevel, null);
+  assert.equal(s.bearLevel, null);
+  assert.ok(
+    logs.some((m) => m.includes('discarded') && m.includes('106')),
+    'the reason names the live price that moved',
+  );
+});
+
 test('_legNotional splits the base evenly across 5 levels', () => {
-  const s = ladderStrategy({ base: 10000 });
+  const s = reversalStrategy({ base: 10000 });
   assert.equal(s._legNotional(), 2000);
 });
 
-// FIX round 3's FIX 2: without this, an ARMED start-trigger fire (the ladder
-// builds mid-run, not at strategy boot) can leave the frontend showing ARMED
-// for up to 30s — the WS-connected UI disables its REST poll and relies on
-// the 30s strategy_update safety net, and no leg fill can heal it on the
-// anchoring tick (price == anchor). Also tightens the harvest re-anchor path,
-// which calls initializeLadder() too.
-test('initializeLadder pushes an immediate heartbeat after saving state', async () => {
-  const s = ladderStrategy();
+// FIX round 3's FIX 2: without this, a ladder rebuild mid-run (e.g. a harvest
+// re-plan, which calls _planAndBuildLevels() too) can leave the frontend
+// showing stale state for up to 30s — the WS-connected UI disables its REST
+// poll and relies on the 30s strategy_update safety net.
+test('_buildLadders pushes an immediate heartbeat after saving state', async () => {
+  const s = reversalStrategy();
   let heartbeatCalls = 0;
   s._pushHeartbeatNow = () => { heartbeatCalls++; };
-  await s.initializeLadder(105);
-  assert.equal(heartbeatCalls, 1, 'the ARMED (or harvest re-anchor) -> live transition must push immediately');
+  await s._buildLadders({ bullLevel: 105, bearLevel: 95 });
+  assert.equal(heartbeatCalls, 1, 'a fresh level build must push immediately');
 });
 
-// Same WS-poll-disabled rationale: anchor flatten rebuilds the ladder DIRECTLY
-// (not via initializeLadder), so it must push its own heartbeat or the panels/
-// chart show the pre-flatten ladder until the next heartbeat / 30s safety net.
-test('_flattenAtAnchor pushes an immediate heartbeat after the RANGE rebuild', async () => {
-  const s = flattenReady();
+// Same WS-poll-disabled rationale: a reversal rebuilds the abandoned side's
+// ladder DIRECTLY (not via _buildLadders), so it must push its own heartbeat
+// or the panels/chart show the pre-reversal ladder until the next heartbeat /
+// 30s safety net.
+test('_reverseTo pushes an immediate heartbeat after a committed reversal', async () => {
+  const s = reversalStrategy();
+  s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1).state = 'POSITION_OPEN';
+  s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1).quantity = 1;
+  s.activePosition = { quantity: 1, notional: 1000, entryPrice: 100 };
+  s.currentSide = 'LONG';
+  s._closeConsolidated = async () => true;
+  s._computeAccLoss = () => 0;
   let heartbeatCalls = 0;
   s._pushHeartbeatNow = () => { heartbeatCalls++; };
-  await s._flattenAtAnchor();
-  assert.equal(s.ladderMode, 'RANGE', 'sanity: the committed-flatten (not abort) path ran');
-  assert.equal(heartbeatCalls, 1, 'the anchor-flatten rebuild must reach the frontend immediately');
+  const ok = await s._reverseTo('SHORT');
+  assert.equal(ok, true, 'sanity: the committed reversal (not abort) path ran');
+  assert.equal(heartbeatCalls, 1, 'the reversal must reach the frontend immediately');
 });
 
-// _enterTrend flips ladderMode RANGE -> TREND mid-cycle with no leg fill on the
+// _enterTrend flips ladderMode SCALING -> TREND mid-cycle with no leg fill on the
 // tick, so nothing else pushes — the mode switch must broadcast itself or the
 // Levels & Targets panel waits up to 30s for the safety-net heartbeat.
-test('_enterTrend pushes an immediate heartbeat on the RANGE -> TREND switch', async () => {
-  const s = ladderStrategy({ anchor: 100 });
+test('_enterTrend pushes an immediate heartbeat on the SCALING -> TREND switch', async () => {
+  const s = reversalStrategy();
   s.ladderLines.filter(l => l.direction === 'LONG').forEach(l => { l.state = 'POSITION_OPEN'; l.quantity = 20; l.fillPrice = l.price; });
   s.currentSide = 'LONG';
   s.desiredProfitUSDT = 100;
@@ -89,11 +389,11 @@ test('_enterTrend pushes an immediate heartbeat on the RANGE -> TREND switch', a
   s._pushHeartbeatNow = () => { heartbeatCalls++; };
   await s._enterTrend('LONG');
   assert.equal(s.ladderMode, 'TREND', 'sanity: the transition ran');
-  assert.equal(heartbeatCalls, 1, 'the RANGE -> TREND switch must reach the frontend immediately');
+  assert.equal(heartbeatCalls, 1, 'the SCALING -> TREND switch must reach the frontend immediately');
 });
 
 test('start() rejects an initial size below the 50 USDT minimum', async () => {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   s.addLog = async () => {};
   await assert.rejects(
     () => s.start({ symbol: 'BTCUSDT', initialSize: 49 }),
@@ -105,7 +405,7 @@ test('start() rejects an initial size below the 50 USDT minimum', async () => {
 // ——— Configurable geometry: the VM is the authority on the bounds ———
 
 function geoStrategy() {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   s.addLog = async () => {};
   return s;
 }
@@ -182,176 +482,113 @@ test('start() sizes the minNotional gate from the CHOSEN level count, not the de
   }
 });
 
-// ——— Task 7: tick dispatch ——————————————————————————————————————————
+// ——— Tick dispatch (beyond Step 1's §14 coverage) ——————————————————————
 
-test('RANGE: crossing L1 fills it and opens LONG', async () => {
-  const s = ladderStrategy();
+test('SCALING: a gap fills every level it jumped', async () => {
+  const s = reversalStrategy();   // bull 102 / bear 98
   const orders = [];
   s._fillLeg = async (leg) => { orders.push(leg); leg.state = 'POSITION_OPEN'; };
   s.lastProcessedPrice = 100;
-  await s.handleRealtimePrice(100.35);
-  assert.equal(orders.length, 1);
-  assert.equal(orders[0].direction, 'LONG');
-  assert.equal(s.lastProcessedPrice, 100.35);
-});
-
-test('RANGE: a gap fills every level it jumped', async () => {
-  const s = ladderStrategy();
-  const orders = [];
-  s._fillLeg = async (leg) => { orders.push(leg); leg.state = 'POSITION_OPEN'; };
-  s.lastProcessedPrice = 100;
-  await s.handleRealtimePrice(100.95);
+  await s.handleRealtimePrice(102.7); // past L3=102.612, before L4=102.918
   assert.equal(orders.length, 3);
 });
 
-test('RANGE: filling the outermost leg switches to TREND', async () => {
-  const s = ladderStrategy();
-  s._fillLeg = async (leg) => { leg.state = 'POSITION_OPEN'; };
-  s._recomputeFinalTpPrice = () => { s.finalTpPrice = 999; };
-  s.lastProcessedPrice = 100;
-  await s.handleRealtimePrice(101.6); // past L5 at 101.5
-  assert.equal(s.ladderMode, 'TREND');
-  assert.equal(s.trendDirection, 'LONG');
-  assert.equal(s.finalTpPrice, 999, 'Final TP is armed on entering TREND');
-});
-
-test('RANGE: crossing the anchor flattens', async () => {
-  const s = ladderStrategy();
-  let flattened = false;
-  s._flattenAtAnchor = async () => { flattened = true; };
-  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
-  s.lastProcessedPrice = 100.35;
-  await s.handleRealtimePrice(99.9);
-  assert.equal(flattened, true);
-});
-
-test('TREND is passive: retreating inside the ladder does nothing', async () => {
-  const s = ladderStrategy({ mode: 'TREND' });
+test('TREND is passive: retreating inside the dead zone does nothing', async () => {
+  const s = reversalStrategy({ mode: 'TREND' });
   s.trendDirection = 'LONG';
   s.finalTpPrice = 105;
+  // Fully scaled — the realistic TREND precondition, and it means every LONG
+  // rung is already POSITION_OPEN, so retreating back through them cannot be
+  // mistaken for a fresh (re-)fill.
+  s.ladderLines.filter(l => l.direction === 'LONG').forEach(l => { l.state = 'POSITION_OPEN'; l.quantity = 1; });
   let acted = false;
   s._fillLeg = async () => { acted = true; };
-  s._flattenAtAnchor = async () => { acted = true; };
-  s.lastProcessedPrice = 101.6;
-  await s.handleRealtimePrice(100.4); // back inside, but not to the anchor
+  s._reverseTo = async () => { acted = true; };
+  s.lastProcessedPrice = 103;
+  await s.handleRealtimePrice(100); // back inside the dead zone, not past bear
   assert.equal(acted, false);
-  assert.equal(s.ladderMode, 'TREND', 'mode holds until the anchor or Final TP');
+  assert.equal(s.ladderMode, 'TREND', 'mode holds until the opposite level or Final TP');
 });
 
-test('TREND: reaching the anchor flattens and returns to RANGE', async () => {
-  const s = ladderStrategy({ mode: 'TREND' });
+test('TREND: reaching the opposite level triggers a reversal and returns to SCALING', async () => {
+  const s = reversalStrategy({ mode: 'TREND' });
   s.trendDirection = 'LONG';
-  s.ladderLines.filter(l => l.direction === 'LONG').forEach(l => { l.state = 'POSITION_OPEN'; });
-  let flattened = false;
-  s._flattenAtAnchor = async () => { flattened = true; s.ladderMode = 'RANGE'; };
-  s.lastProcessedPrice = 100.4;
-  await s.handleRealtimePrice(99.95);
-  assert.equal(flattened, true);
-  assert.equal(s.ladderMode, 'RANGE');
+  s.ladderLines.filter(l => l.direction === 'LONG').forEach(l => { l.state = 'POSITION_OPEN'; l.quantity = 1; });
+  s.activePosition = { quantity: 5, entryPrice: 103, notional: 515, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s._closeConsolidated = async () => true;
+  s._computeAccLoss = () => 0;
+  s._fillLeg = async (leg) => { leg.state = 'POSITION_OPEN'; leg.quantity = 1; leg.fillPrice = leg.price; };
+  s.lastProcessedPrice = 100;
+  await s.handleRealtimePrice(98); // crosses bear -> reverses
+  assert.equal(s.heldSide, 'SHORT');
+  assert.equal(s.ladderMode, 'SCALING');
+  assert.equal(s.reversalCount, 1);
 });
 
-test('RANGE never checks Final TP', async () => {
-  const s = ladderStrategy();
-  s.finalTpPrice = 100.2; // would fire if RANGE checked it
+test('SCALING never checks Final TP', async () => {
+  const s = reversalStrategy();
+  s.finalTpPrice = 100.2; // would fire if SCALING checked it
   let stopped = false;
   s.stop = async () => { stopped = true; };
   s._fillLeg = async (leg) => { leg.state = 'POSITION_OPEN'; };
   s.lastProcessedPrice = 100;
-  await s.handleRealtimePrice(100.35);
+  await s.handleRealtimePrice(102);
   assert.equal(stopped, false, 'Final TP is a TREND-only exit');
 });
 
 test('TREND: Final TP hit stops the cycle', async () => {
-  const s = ladderStrategy({ mode: 'TREND' });
+  const s = reversalStrategy({ mode: 'TREND' });
   s.trendDirection = 'LONG';
-  s.finalTpPrice = 101;
+  s.finalTpPrice = 105;
   let reason = null;
   s.stop = async (opts) => { reason = opts.reason; };
-  s.lastProcessedPrice = 100.9;
-  await s.handleRealtimePrice(101.05);
+  s.lastProcessedPrice = 104.9;
+  await s.handleRealtimePrice(105.05);
   assert.equal(reason, 'final_tp');
 });
 
-test('the empty-ladder gate anchors on the first tick', async () => {
-  const s = ladderStrategy();
-  s.ladderLines = [];
-  s.anchor = null;
-  await s.handleRealtimePrice(250);
-  assert.equal(s.anchor, 250);
-  assert.equal(s.ladderLines.length, 10);
-  assert.equal(s.ladderMode, 'RANGE');
-});
+// ——— Task 13: reversalCount ——————————————————————————————————————————————
 
-test('_flattenAtAnchor no-ops when there is nothing open and the ladder is all-EMPTY', async () => {
-  const s = ladderStrategy();
-  let closeCalled = false;
-  s._closeConsolidated = async () => { closeCalled = true; };
-  let sizingCalled = false;
-  s._computeLadderBaseSize = () => { sizingCalled = true; return s._ladderBaseSize; };
-  await s._flattenAtAnchor();
-  assert.equal(closeCalled, false, 'no close order for a position that does not exist');
-  assert.equal(sizingCalled, false, 'no re-sizing/rebuild churn on a no-op oscillation');
-});
-
-// ——— Task 13: flattenCount ——————————————————————————————————————————————
-
-// A strategy sitting on an open position at the anchor, ready to flatten.
-function flattenReady() {
-  const s = ladderStrategy();
+// A strategy holding a LONG position (L1 filled), ready to reverse.
+function reverseReady() {
+  const s = reversalStrategy();
   s.activePosition = { quantity: 1, notional: 1000, entryPrice: 100 };
   s.currentSide = 'LONG';
   s.ladderLines[0].state = 'POSITION_OPEN';
+  s.ladderLines[0].quantity = 1;
   s._closeConsolidated = async () => true;
   s._computeLadderBaseSize = async () => s._ladderBaseSize;
   s._computeAccLoss = () => 0;
   return s;
 }
 
-test('_flattenAtAnchor increments flattenCount on every committed flatten', async () => {
-  const s = flattenReady();
-  assert.equal(s.flattenCount, 0, 'a fresh cycle starts at zero');
+test('_reverseTo increments reversalCount on every committed reversal', async () => {
+  const s = reverseReady();
+  assert.equal(s.reversalCount, 0, 'a fresh cycle starts at zero');
 
-  await s._flattenAtAnchor();
-  assert.equal(s.flattenCount, 1);
+  await s._reverseTo('SHORT');
+  assert.equal(s.reversalCount, 1);
 
-  // Re-arm and flatten again — the count accumulates across a cycle.
-  s.activePosition = { quantity: 1, notional: 1000, entryPrice: 100 };
-  s.currentSide = 'LONG';
-  s.ladderLines[0].state = 'POSITION_OPEN';
-  await s._flattenAtAnchor();
-  assert.equal(s.flattenCount, 2);
+  // Re-arm and reverse again — the count accumulates across a cycle.
+  s.activePosition = { quantity: 1, notional: 1000, entryPrice: 98 };
+  s.currentSide = 'SHORT';
+  s.ladderLines.find(l => l.direction === 'SHORT').state = 'POSITION_OPEN';
+  await s._reverseTo('LONG');
+  assert.equal(s.reversalCount, 2);
 });
 
-test('_flattenAtAnchor counts a legs-open-but-flat reset, matching the ANCHOR_FLATTEN trail', async () => {
-  // No position, but a leg is still marked open: this path skips the close yet
-  // still re-sizes, rebuilds and writes ANCHOR_FLATTEN — so it must count.
-  const s = flattenReady();
-  s.activePosition = null;
-  s.currentSide = null;
-  let flows = 0;
-  s._writeStrategyFlow = async (t) => { if (t === 'ANCHOR_FLATTEN') flows += 1; };
-  await s._flattenAtAnchor();
-  assert.equal(s.flattenCount, 1);
-  assert.equal(flows, 1, 'flattenCount must track ANCHOR_FLATTEN one-for-one');
-});
-
-test('_flattenAtAnchor does NOT count a no-op oscillation', async () => {
-  const s = ladderStrategy();   // nothing open, every leg EMPTY
-  await s._flattenAtAnchor();
-  assert.equal(s.flattenCount, 0, 'an early return is not a flatten');
-});
-
-test('_hasNoTradingActivity: a flatten alone marks the cycle as having traded', () => {
-  const s = ladderStrategy();
+test('_hasNoTradingActivity: a reversal alone marks the cycle as having traded', () => {
+  const s = reversalStrategy();
   assert.equal(s._hasNoTradingActivity(), true, 'an untouched cycle is no-trade');
-  s.flattenCount = 1;
-  assert.equal(s._hasNoTradingActivity(), false, 'a flatten is trading activity');
+  s.reversalCount = 1;
+  assert.equal(s._hasNoTradingActivity(), false, 'a reversal is trading activity');
 });
 
 // ——— _closeConsolidated: currentSide state-drift guard ——————————————————
 
 test('_closeConsolidated: currentSide missing is repopulated by a refresh from Binance before closing', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 0.5 };
   s.currentSide = null;
   s._refreshCurrentPosition = async () => { s.currentSide = 'LONG'; };
@@ -368,7 +605,7 @@ test('_closeConsolidated: currentSide missing is repopulated by a refresh from B
 });
 
 test('_closeConsolidated: currentSide still missing after refresh logs a WARNING and does not close', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 0.5 };
   s.currentSide = null;
   s._refreshCurrentPosition = async () => {}; // Binance refresh does not resolve a side either
@@ -383,7 +620,7 @@ test('_closeConsolidated: currentSide still missing after refresh logs a WARNING
 });
 
 test('_closeConsolidated: nothing open returns false quietly, no order, no warning', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = null;
   s.currentSide = null;
   let orderCalled = false;
@@ -404,7 +641,7 @@ test('_closeConsolidated: nothing open returns false quietly, no order, no warni
 // three-tier contract mirroring _resolveFill's tiering on the open path.
 
 test('_closeConsolidated: unverifiable close (WS times out, no REST ack, refresh still shows it open) returns false and leaves state intact', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
   s.currentSide = 'LONG';
   s.placeMarketOrder = async () => ({ orderId: 1 }); // no executedQty in the ack
@@ -430,7 +667,7 @@ test('_closeConsolidated: unverifiable close (WS times out, no REST ack, refresh
 });
 
 test('_closeConsolidated: tier 2 — a full REST-ack executedQty verifies the close when WS times out', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
   s.currentSide = 'LONG';
   s.placeMarketOrder = async () => ({ orderId: 1, executedQty: '0.5' });
@@ -447,7 +684,7 @@ test('_closeConsolidated: tier 2 — a full REST-ack executedQty verifies the cl
 });
 
 test('_closeConsolidated: tier 3 — a REST refresh confirming flat verifies the close when WS and the ack both miss', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
   s.currentSide = 'LONG';
   s.placeMarketOrder = async () => ({ orderId: 1 }); // no executedQty
@@ -466,7 +703,7 @@ test('_closeConsolidated: tier 3 — a REST refresh confirming flat verifies the
 });
 
 test('_closeConsolidated: tier 3 — a FAILED refresh must NOT read as verified (unknown must never read as closed)', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
   s.currentSide = 'LONG';
   s.placeMarketOrder = async () => ({ orderId: 1 });
@@ -483,64 +720,15 @@ test('_closeConsolidated: tier 3 — a FAILED refresh must NOT read as verified 
   assert.ok(logs.some((m) => m.includes('WARNING')), 'a loud warning is logged, never a silent drop');
 });
 
-// ——— _flattenAtAnchor / _flattenGrid: an unverified close must abort the leg-ledger rebuild ———
+// ——— _flattenGrid: an unverified close must abort the leg-ledger rebuild ———
 //
-// buildLadder()/the EMPTY-reset loop wipe the POSITION_OPEN leg ledger — the
-// ONLY record of open inventory (_closeQuantity sizes every close from it).
-// Rebuilding after an unverified close would orphan a live position: it stays
-// open on Binance while the bot's own books read "flat, fresh ladder" and
-// nothing ever tries to close it again.
-
-test('_flattenAtAnchor: an unverified close aborts the rebuild — flattenCount unchanged, ladder left intact', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  const longLegs = s.ladderLines.filter(l => l.direction === 'LONG').slice(0, 2);
-  longLegs.forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
-  s.activePosition = { quantity: 1, entryPrice: 100.3, avgEntry: 100.3, notional: 100.3, unrealizedPnl: 0 };
-  s.currentSide = 'LONG';
-  // Seed a live TREND state — the anchor flatten is reachable from TREND too
-  // (it is one of TREND's two exits). If the abort skipped only the rebuild
-  // but not the mode reset above it, these would still get clobbered to
-  // RANGE/null/null even though the close was never verified.
-  s.ladderMode = 'TREND';
-  s.trendDirection = 'LONG';
-  s.finalTpPrice = 12345;
-  s._closeConsolidated = async () => false; // the close could not be verified
-  let sizingCalled = false;
-  s._computeLadderBaseSize = async () => { sizingCalled = true; return s._ladderBaseSize; };
-  const logs = [];
-  s.addLog = async (msg) => { logs.push(msg); };
-
-  await s._flattenAtAnchor();
-
-  assert.equal(s.flattenCount, 0, 'an aborted flatten must not count as committed');
-  // Vacuous by design (the anchor never moves in `_flattenAtAnchor` even on a
-  // committed flatten) — kept only as a cheap guard against a future regression.
-  assert.equal(s.anchor, 100, 'the anchor must not move on an aborted flatten');
-  assert.equal(sizingCalled, false, 'no re-sizing churn when the close was never verified');
-  // The abort must skip the WHOLE reset block, not just the ladder rebuild —
-  // otherwise TREND state gets silently discarded even though the position
-  // stayed open and untracked.
-  assert.equal(s.ladderMode, 'TREND', 'ladderMode must not be reset on an aborted flatten');
-  assert.equal(s.trendDirection, 'LONG', 'trendDirection must not be reset on an aborted flatten');
-  assert.equal(s.finalTpPrice, 12345, 'finalTpPrice must not be nulled on an aborted flatten');
-  // Read off the LIVE array, not the captured `longLegs` references —
-  // buildLadder allocates NEW leg objects and _flattenAtAnchor replaces
-  // `this.ladderLines` wholesale, so the captured objects would stay
-  // POSITION_OPEN even if the ladder WAS rebuilt underneath them — asserting
-  // on `longLegs` would prove nothing.
-  assert.equal(
-    s.ladderLines.filter((l) => l.state === 'POSITION_OPEN').length, 2,
-    'the open-leg ledger must survive — it is the only record of the live position',
-  );
-  assert.ok(
-    logs.some((m) => m.includes('WARNING') && m.includes('ANCHOR FLATTEN aborted')),
-    'a loud warning is logged instead of a silent rebuild',
-  );
-});
+// The `_reverseTo` equivalent is covered by Step 1's §14 tombstone tests
+// above. `_flattenGrid` is still used by `stop({flatten:true})`, so its own
+// tombstone guard needs its own pin.
 
 test('_flattenGrid: an unverified close keeps the leg ledger intact and returns false', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  const openLeg = s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1);
+  const s = reversalStrategy();
+  const openLeg = s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1);
   openLeg.state = 'POSITION_OPEN';
   openLeg.quantity = 0.5;
   s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
@@ -554,9 +742,9 @@ test('_flattenGrid: an unverified close keeps the leg ledger intact and returns 
   assert.equal(result, false, 'an unverified flatten must report failure, not success');
   // Read off the LIVE array, not the captured `openLeg` reference. This works
   // today only because `_flattenGrid` mutates legs in place — if it ever
-  // reallocated (as `buildLadder` does) a stale reference would keep reading
-  // POSITION_OPEN even after a wipe underneath it. Same discipline as the
-  // `_flattenAtAnchor` test above.
+  // reallocated (as `buildReversalLadder` does) a stale reference would keep
+  // reading POSITION_OPEN even after a wipe underneath it. Same discipline as
+  // the `_reverseTo` tombstone tests above.
   const stillOpen = s.ladderLines.filter((l) => l.state === 'POSITION_OPEN');
   assert.equal(stillOpen.length, 1, 'the leg ledger must survive an unverified close');
   assert.equal(stillOpen[0].quantity, 0.5);
@@ -569,7 +757,8 @@ test('_flattenGrid: an unverified close keeps the leg ledger intact and returns 
 // ——— Task 8: dynamic sizing, harvest, Final TP ———————————————————————
 
 test('_computeLadderBaseSize: the formula floors at initialSize', async () => {
-  const s = ladderStrategy({ base: 10000 });
+  const s = reversalStrategy({ base: 10000 });
+  delete s._computeLadderBaseSize; // reversalStrategy() stubs this for the tick-dispatch tests; use the REAL method
   s.currentInitialSize = 10000;
   s.cycleAccumulatedLoss = 0;
   s.recoveryFactor = 0.20;
@@ -579,7 +768,8 @@ test('_computeLadderBaseSize: the formula floors at initialSize', async () => {
 });
 
 test('_computeLadderBaseSize: a 50 USDT loss grows a 10k base to 12k', async () => {
-  const s = ladderStrategy({ base: 10000 });
+  const s = reversalStrategy({ base: 10000 });
+  delete s._computeLadderBaseSize; // use the REAL method
   s.currentInitialSize = 10000;
   s.cycleAccumulatedLoss = 50;
   s.recoveryFactor = 0.20;
@@ -594,7 +784,8 @@ test('_computeLadderBaseSize: a 50 USDT loss grows a 10k base to 12k', async () 
 });
 
 test('_computeLadderBaseSize: a full gauge freezes escalation (returns the locked _lastLadderSize)', async () => {
-  const s = ladderStrategy({ base: 10000 });
+  const s = reversalStrategy({ base: 10000 });
+  delete s._computeLadderBaseSize; // use the REAL method
   s.currentInitialSize = 10000;
   s.initialCapital = 10000;
   s.harvestLossThreshold = 0.30;
@@ -609,7 +800,8 @@ test('_computeLadderBaseSize: a full gauge freezes escalation (returns the locke
 });
 
 test('_computeLadderBaseSize: a NOT-full gauge re-sizes fresh, ignoring any locked _lastLadderSize sentinel', async () => {
-  const s = ladderStrategy({ base: 10000 });
+  const s = reversalStrategy({ base: 10000 });
+  delete s._computeLadderBaseSize; // use the REAL method
   s.currentInitialSize = 10000;
   s.initialCapital = 10000;
   s.harvestLossThreshold = 0.30;    // full at 3000
@@ -625,7 +817,8 @@ test('_computeLadderBaseSize: a NOT-full gauge re-sizes fresh, ignoring any lock
 });
 
 test('_computeLadderBaseSize: uses the LIVE margin balance, not a stale one — a small live balance makes the cap bite', async () => {
-  const s = ladderStrategy({ base: 10000 });
+  const s = reversalStrategy({ base: 10000 });
+  delete s._computeLadderBaseSize; // use the REAL method
   s.currentInitialSize = 10000;
   s.initialCapital = 1e9; // frozen cycle-start balance is huge (would NOT trigger the cap)
   s.cycleAccumulatedLoss = 50;
@@ -650,7 +843,8 @@ test('_computeLadderBaseSize: uses the LIVE margin balance, not a stale one — 
 });
 
 test('_computeLadderBaseSize: getTotalMarginBalance() throwing fails CLOSED — capped to currentInitialSize, never left uncapped', async () => {
-  const s = ladderStrategy({ base: 10000 });
+  const s = reversalStrategy({ base: 10000 });
+  delete s._computeLadderBaseSize; // use the REAL method
   s.currentInitialSize = 10000;
   s.cycleAccumulatedLoss = 50;
   s.recoveryFactor = 0.20;
@@ -664,7 +858,8 @@ test('_computeLadderBaseSize: getTotalMarginBalance() throwing fails CLOSED — 
 });
 
 test('FIX C: getTotalMarginBalance() resolving to NaN (a 200 with a missing/malformed field, no throw) still fails CLOSED — capped, never uncapped', async () => {
-  const s = ladderStrategy({ base: 10000 });
+  const s = reversalStrategy({ base: 10000 });
+  delete s._computeLadderBaseSize; // use the REAL method
   s.currentInitialSize = 10000;
   s.cycleAccumulatedLoss = 50;
   s.recoveryFactor = 0.20;
@@ -679,7 +874,7 @@ test('FIX C: getTotalMarginBalance() resolving to NaN (a 200 with a missing/malf
 });
 
 test('FIX C: _applyMarginHeadroomCap directly — a non-finite wallet caps to currentInitialSize instead of returning proposedSize uncapped', () => {
-  const s = ladderStrategy({ base: 10000 });
+  const s = reversalStrategy({ base: 10000 });
   s.currentInitialSize = 10000;
   s.addLog = async () => {};
   assert.equal(s._applyMarginHeadroomCap(12000, NaN), 10000, 'NaN wallet must fail closed');
@@ -688,7 +883,7 @@ test('FIX C: _applyMarginHeadroomCap directly — a non-finite wallet caps to cu
 });
 
 test('_recomputeFinalTpPrice: no AI cost term', () => {
-  const s = ladderStrategy({ mode: 'TREND' });
+  const s = reversalStrategy({ mode: 'TREND' });
   s.activePosition = { quantity: 100, avgEntry: 100.9, entryPrice: 100.9, notional: 10090 };
   s.currentSide = 'LONG';
   s.cycleAccumulatedLoss = 89;
@@ -699,7 +894,7 @@ test('_recomputeFinalTpPrice: no AI cost term', () => {
 });
 
 test('_recomputeFinalTpPrice: null with no position', () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = null;
   s._recomputeFinalTpPrice();
   assert.equal(s.finalTpPrice, null);
@@ -709,7 +904,7 @@ test('_closeQuantity rounds the summed leg qty to stepSize (guards Binance -1111
   // stepSize 0.01 → quantityPrecision 2, so 0.28×3 = 0.8400000000000001 must
   // come back as 0.84, not the raw float (which Binance rejects on close).
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.ladderLines
     .filter((l) => l.direction === 'LONG')
     .slice(0, 3)
@@ -728,7 +923,7 @@ test('_closeQuantity rounds the summed leg qty to stepSize (guards Binance -1111
 
 test('placeMarketOrder rounds the quantity to stepSize before sending (order-layer -1111 guard)', async () => {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   let sentQty = null;
   s.makeProxyRequest = async (_path, _method, params) => { sentQty = params.quantity; return { orderId: 1, status: 'FILLED' }; };
   await s.placeMarketOrder('BTCUSDT', 'SELL', 0.8400000000000001, undefined, { reduceOnly: true });
@@ -736,7 +931,7 @@ test('placeMarketOrder rounds the quantity to stepSize before sending (order-lay
 });
 
 test('harvestNow queues when a position is open and the gauge is NOT full (gauge no longer gates)', async () => {
-  const s = ladderStrategy();                        // initialCapital 1000, 8% threshold => full at 80
+  const s = reversalStrategy();                        // initialCapital 1000, 8% threshold => full at 80
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
   s.cycleAccumulatedLoss = 40;                        // well below the 80 gate → gauge NOT full
   assert.equal(s._isGaugeFull(), false, 'precondition: the gauge is genuinely not full');
@@ -746,7 +941,7 @@ test('harvestNow queues when a position is open and the gauge is NOT full (gauge
 });
 
 test('harvestNow queues when a position is open AND the gauge is full', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
   s.cycleAccumulatedLoss = 100;                       // >= 80 => gauge full
   const res = await s.harvestNow();
@@ -754,63 +949,89 @@ test('harvestNow queues when a position is open AND the gauge is full', async ()
   assert.equal(s._manualHarvestRequested, true, 'latch set once eligible');
 });
 
-test('harvest re-anchors to the CURRENT price, unlike the anchor flatten', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
+test('harvest clears the levels and re-plans, unlike a reversal', async () => {
+  const s = reversalStrategy();
+  s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1).state = 'POSITION_OPEN';
   s.activePosition = { quantity: 10, avgEntry: 100.3, entryPrice: 100.3, notional: 1003 };
+  s.currentSide = 'LONG';
   s.currentPrice = 103;
   s._closeConsolidated = async () => { s.activePosition = null; return true; };
   s._computeAccLoss = () => 0;
   s.getTotalMarginBalance = async () => 1e9;
+  let bullAtPlanTime = 'unset';
+  s._planAndBuildLevels = async () => { bullAtPlanTime = s.bullLevel; return true; };
   await s._harvestToFlat('manual_harvest');
-  assert.equal(s.anchor, 103, 'the harvest re-anchors; the anchor flatten does not');
-  assert.equal(s.ladderMode, 'RANGE');
-  assert.ok(s.ladderLines.every(l => l.state === 'EMPTY'));
+  assert.equal(
+    bullAtPlanTime, null,
+    'the pair is cleared BEFORE the re-plan runs — unlike a reversal, which keeps the un-abandoned side standing',
+  );
+  assert.equal(s.ladderMode, 'SCALING');
+});
+
+// Review finding 2: _buildLadders is the only OTHER writer of ladderMode /
+// trendDirection, and it never runs when the re-plan fails — so a harvest out
+// of TREND whose re-plan fails (e.g. a 503) would otherwise persist
+// ladderMode:'TREND' over an empty ladder and a flat account. On a VM restart
+// resume()'s _reconcileTrendInvariant reads that as the invariant needing a
+// self-heal and burns a REST refresh plus a false alarm before the next tick
+// clears it.
+test('_harvestToFlat clears TREND state even when the re-plan itself fails', async () => {
+  const s = reversalStrategy({ mode: 'TREND' });
+  s.trendDirection = 'LONG';
+  s.finalTpPrice = 103;
+  s.activePosition = null; // flat: nothing to close, only the re-plan is under test
+  s._planAndBuildLevels = async () => false; // the re-plan fails
+  await s._harvestToFlat('manual_harvest');
+  assert.equal(s.ladderMode, 'SCALING', 'must not persist TREND over an empty, flat ladder');
+  assert.equal(s.trendDirection, null);
 });
 
 // ——— _harvestToFlat: a failed close must abort the rebuild, not orphan the position ———
 //
-// initializeLadder() resets every leg to EMPTY, and POSITION_OPEN is the ONLY
+// The re-plan resets every leg to EMPTY, and POSITION_OPEN is the ONLY
 // record of what this bot has open (_closeQuantity sizes every close off it).
 // Rebuilding after a failed close would leave a real position open on Binance
 // while the bot's own books read "flat, fresh ladder" — nothing would ever try
 // to close it again. These three tests pin: (1) a close that THROWS with
 // inventory open aborts and leaves the ladder intact, (2) a close that
-// SUCCEEDS still re-anchors and rebuilds exactly as before, (3) genuinely
-// nothing-to-close still re-anchors — the abort must not fire on a real no-op.
+// SUCCEEDS still re-plans and rebuilds exactly as before, (3) genuinely
+// nothing-to-close still re-plans — the abort must not fire on a real no-op.
 
 test('_harvestToFlat: close throws with inventory open -> aborts, ladder left intact, position still tracked', async () => {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy({ anchor: 100 });
+  const s = reversalStrategy();
   const longLegs = s.ladderLines.filter(l => l.direction === 'LONG').slice(0, 2);
   longLegs.forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
   s.activePosition = { quantity: 1, avgEntry: 100.3, entryPrice: 100.3, notional: 100.3, unrealizedPnl: 0 };
   s.currentSide = 'LONG';
-  s.currentPrice = 110; // distinct from the anchor — must NOT be adopted
+  s.currentPrice = 110;
   s.placeMarketOrder = async () => { throw new Error('-1001 Internal error'); };
+  let planCalled = false;
+  s._planAndBuildLevels = async () => { planCalled = true; return true; };
 
   await s._harvestToFlat('manual_harvest');
 
   assert.equal(s.harvestCount, 0, 'harvestCount must not increment on an aborted close');
-  assert.equal(s.anchor, 100, 'anchor must stay put — no re-anchor on a failed close');
+  assert.equal(planCalled, false, 'no re-plan on a failed close — the levels must stay put');
+  assert.equal(s.bullLevel, 102, 'bullLevel must stay put — no re-plan on a failed close');
 
-  // Read off the LIVE array, not the captured `longLegs` references: buildLadder
-  // allocates NEW leg objects and initializeLadder replaces `this.ladderLines`
-  // wholesale, so the captured objects would stay POSITION_OPEN even if the
-  // ladder WAS rebuilt underneath them — asserting on `longLegs` proves nothing.
+  // Read off the LIVE array, not the captured `longLegs` references: a re-plan
+  // allocates NEW leg objects and replaces `this.ladderLines` wholesale, so the
+  // captured objects would stay POSITION_OPEN even if the ladder WAS rebuilt
+  // underneath them — asserting on `longLegs` proves nothing.
   assert.equal(s.ladderLines.filter((l) => l.state === 'POSITION_OPEN').length, 2,
     'the open-leg ledger must survive — it is the only record of the live position');
   assert.equal(s._tradingSeqInProgress, false, 'the seq lock must still release on the abort path');
 });
 
-test('_harvestToFlat: close succeeds -> harvestCount increments and re-anchors on the live price (unchanged behavior)', async () => {
+test('_harvestToFlat: close succeeds -> harvestCount increments and re-plans the levels (unchanged behavior)', async () => {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy({ anchor: 100 });
+  const s = reversalStrategy();
   const longLegs = s.ladderLines.filter(l => l.direction === 'LONG').slice(0, 2);
   longLegs.forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
   s.activePosition = { quantity: 1, avgEntry: 100.3, entryPrice: 100.3, notional: 100.3, unrealizedPnl: 0 };
   s.currentSide = 'LONG';
-  s.currentPrice = 110; // distinct from the anchor — the re-anchor target
+  s.currentPrice = 110;
   s.placeMarketOrder = async () => ({ orderId: 1, status: 'FILLED' });
   // The close succeeds (WS confirms the fill) — tier 1 of _closeConsolidated's
   // verification. Was `async () => {}` (falsy/unverified), which under the
@@ -818,55 +1039,61 @@ test('_harvestToFlat: close succeeds -> harvestCount increments and re-anchors o
   // success explicitly instead.
   s._waitForOrderFillConfirmation = async () => true;
   s.getTotalMarginBalance = async () => 1e9;
+  let planCalled = false;
+  s._planAndBuildLevels = async () => { planCalled = true; return true; };
 
   await s._harvestToFlat('manual_harvest');
 
   assert.equal(s.harvestCount, 1, 'harvestCount increments on a genuine close');
-  assert.equal(s.anchor, 110, 're-anchored on the live price');
-  assert.ok(s.ladderLines.every((l) => l.state !== 'POSITION_OPEN'), 'ladder rebuilt — no leg left open');
+  assert.equal(planCalled, true, 're-plans the levels on a verified close');
+  assert.ok(s.ladderLines.every((l) => l.state !== 'POSITION_OPEN'), 'ladder cleared — no leg left open');
 });
 
-test('_harvestToFlat: genuinely flat -> still re-anchors — the abort must not fire when nothing was open', async () => {
-  const s = ladderStrategy({ anchor: 100 });
+test('_harvestToFlat: genuinely flat -> still re-plans — the abort must not fire when nothing was open', async () => {
+  const s = reversalStrategy();
   s.activePosition = null;
   s.currentPrice = 105;
   s.getTotalMarginBalance = async () => 1e9;
+  let planCalled = false;
+  s._planAndBuildLevels = async () => { planCalled = true; return true; };
 
   await s._harvestToFlat('manual_harvest');
 
-  // A no-op close must not be mistaken for a failed one (the anchor still
-  // moves), but per the accounting split it is a RE-ANCHOR, not a HARVEST —
+  // A no-op close must not be mistaken for a failed one (the re-plan still
+  // runs), but per the accounting split it is a RE-ANCHOR, not a HARVEST —
   // see the dedicated "accounting split" tests below for the counters.
-  assert.equal(s.harvestCount, 0, 'a flat re-anchor must not be counted as a harvest');
-  assert.equal(s.reanchorCount, 1, 'a flat re-anchor still bumps reanchorCount');
-  assert.equal(s.anchor, 105, 're-anchors normally when there was nothing to close');
+  assert.equal(s.harvestCount, 0, 'a flat re-plan must not be counted as a harvest');
+  assert.equal(s.reanchorCount, 1, 'a flat re-plan still bumps reanchorCount');
+  assert.equal(planCalled, true, 're-plans normally when there was nothing to close');
 });
 
 test('_harvestToFlat: close returns false WITHOUT throwing (side unresolved) -> aborts, ladder left intact', async () => {
-  const s = ladderStrategy({ anchor: 100 });
+  const s = reversalStrategy();
   // No legs are marked open, so _closeConsolidated's leg-direction fallback
   // finds nothing; combined with currentSide null, the initial side lookup
   // fails outright. Only `activePosition` carries the (drifted) inventory —
   // exactly the "no legs behind it, no side in memory" case the code calls out.
   s.currentSide = null;
   s.activePosition = { quantity: 1, avgEntry: 100.3, entryPrice: 100.3, notional: 100.3, unrealizedPnl: 0 };
-  s.currentPrice = 110; // distinct from the anchor — must NOT be adopted
-  // `_refreshCurrentPosition` is stubbed to a no-op by the `ladderStrategy()`
+  s.currentPrice = 110;
+  // `_refreshCurrentPosition` is stubbed to a no-op by the `reversalStrategy()`
   // fixture — it leaves `currentSide` null while the inventory (activePosition)
   // remains, so `_closeConsolidated`'s post-refresh side check ALSO fails and
   // it logs the "side could not be resolved" warning and returns `false`
   // WITHOUT throwing (as opposed to the earlier throw-based abort test above).
+  let planCalled = false;
+  s._planAndBuildLevels = async () => { planCalled = true; return true; };
 
   await s._harvestToFlat('manual_harvest');
 
   assert.equal(s.harvestCount, 0, 'harvestCount must not increment on an aborted close');
-  assert.equal(s.anchor, 100, 'anchor must stay put — no re-anchor on an unresolved-side abort');
+  assert.equal(planCalled, false, 'no re-plan on an unresolved-side abort');
   assert.ok(s.activePosition && s.activePosition.quantity > 0, 'the position must still be tracked, not silently dropped');
   assert.equal(s._tradingSeqInProgress, false, 'the seq lock must still release on the abort path');
 });
 
-test('_harvestToFlat: _closeConsolidated refreshes mid-close and proves genuinely flat -> does NOT abort, re-anchors', async () => {
-  const s = ladderStrategy({ anchor: 100 });
+test('_harvestToFlat: _closeConsolidated refreshes mid-close and proves genuinely flat -> does NOT abort, re-plans', async () => {
+  const s = reversalStrategy();
   // Stale PRE-close reading, same shape as the previous test: no legs marked
   // open, currentSide null, so the initial side lookup fails and
   // `_closeConsolidated` refreshes internally — but THIS time the refresh
@@ -880,113 +1107,71 @@ test('_harvestToFlat: _closeConsolidated refreshes mid-close and proves genuinel
   };
   s.currentPrice = 105;
   s.getTotalMarginBalance = async () => 1e9;
+  let planCalled = false;
+  s._planAndBuildLevels = async () => { planCalled = true; return true; };
 
   await s._harvestToFlat('manual_harvest');
 
   assert.equal(s.harvestCount, 0, 'the refresh proved flat — nothing was actually closed, so it is a RE-ANCHOR, not a harvest');
   assert.equal(s.reanchorCount, 1, 'but it still counts as a re-anchor');
-  assert.equal(s.anchor, 105, 're-anchors on the live price — the abort must not fire on a stale pre-close reading');
+  assert.equal(planCalled, true, 're-plans on the live price — the abort must not fire on a stale pre-close reading');
 });
 
 // ——— _harvestToFlat completion signal ———
 
 test('_harvestToFlat returns false when a trading sequence is already in flight', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s._tradingSeqInProgress = true;
-  assert.equal(await s._harvestToFlat('trail'), false);
+  assert.equal(await s._harvestToFlat('manual_harvest'), false);
 });
 
 test('_harvestToFlat returns false when the close is unverified and inventory remains', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.ladderLines.filter((l) => l.direction === 'LONG').slice(0, 2)
     .forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
   // _closeQuantity() reads restQty off activePosition first (see its own
   // "REST reachable and reported flat" short-circuit) — without this, a null
   // activePosition reads as "genuinely flat" regardless of the leg ledger, so
   // the tombstone's `_closeQuantity() > 0` check would never fire. Same
-  // "inventory open" precondition the sibling tombstone test above (line 787)
-  // uses.
+  // "inventory open" precondition the sibling tombstone test above uses.
   s.activePosition = { quantity: 1, avgEntry: 100.3, entryPrice: 100.3, notional: 100.3, unrealizedPnl: 0 };
   s._closeConsolidated = async () => false;        // unverified close
   let rebuilt = false;
-  s.initializeLadder = async () => { rebuilt = true; };
-  assert.equal(await s._harvestToFlat('trail'), false);
+  s._planAndBuildLevels = async () => { rebuilt = true; return true; };
+  assert.equal(await s._harvestToFlat('manual_harvest'), false);
   assert.equal(rebuilt, false, 'the tombstone must still abort the rebuild');
 });
 
-test('_harvestToFlat returns true after a completed re-anchor', async () => {
-  const s = ladderStrategy();
+test('_harvestToFlat returns true after a completed re-plan', async () => {
+  const s = reversalStrategy();
   s._closeConsolidated = async () => true;
   s._computeAccLoss = () => 0;
   s._computeLadderBaseSize = async () => 1000;
-  s.initializeLadder = async () => {};
-  assert.equal(await s._harvestToFlat('trail'), true);
+  s._planAndBuildLevels = async () => true;
+  assert.equal(await s._harvestToFlat('manual_harvest'), true);
 });
 
-// ——— Anchor Trailing: the fire log names the level that triggered ———
-
-test('a trail fire logs the direction and the level that was hit', async () => {
-  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy({ anchor: 100 });          // Trail Down level = 99.73
-  s.trailDirection = 'DOWN';
+test('the harvest header always shows the bare reason label', async () => {
+  const s = reversalStrategy();
   const logs = [];
   s.addLog = async (m) => { logs.push(m); };
   s._closeConsolidated = async () => true;
   s._computeAccLoss = () => 0;
   s._computeLadderBaseSize = async () => 1000;
-  s.initializeLadder = async () => {};
-
-  await s._harvestToFlat('trail');
-  const header = logs.find((m) => /flatten \+ re-anchor/.test(m));
-  assert.match(header, /trail Down @ 99\.73/, `got: ${header}`);
-});
-
-// The level MUST be read before initializeLadder moves the anchor — otherwise the
-// log would name the NEXT ladder's level instead of the one that actually fired.
-test('the trail fire log names the OLD level, not the post-re-anchor one', async () => {
-  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  const logs = [];
-  s.addLog = async (m) => { logs.push(m); };
-  s._closeConsolidated = async () => true;
-  s._computeAccLoss = () => 0;
-  s._computeLadderBaseSize = async () => 1000;
-  // Simulate the real re-anchor: the anchor moves to the live price — i.e. to the
-  // level that just fired (99.73). The NEW anchor's own trail level is then
-  // 99.73 * (1 - 0.9*0.003) = 99.46, and that is the number the log must NOT show.
-  s.currentPrice = 99.73;
-  s.initializeLadder = async (px) => { s.anchor = px; };
-
-  await s._harvestToFlat('trail');
-  const header = logs.find((m) => /flatten \+ re-anchor/.test(m));
-  assert.match(header, /99\.73/, 'must be the level that fired (old anchor 100)');
-  assert.doesNotMatch(header, /99\.46/, 'must NOT be the NEXT ladder level (new anchor 99.73)');
-});
-
-test('a non-trail reason keeps its bare label', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';                          // armed, but not the trigger
-  const logs = [];
-  s.addLog = async (m) => { logs.push(m); };
-  s._closeConsolidated = async () => true;
-  s._computeAccLoss = () => 0;
-  s._computeLadderBaseSize = async () => 1000;
-  s.initializeLadder = async () => {};
+  s._planAndBuildLevels = async () => true;
 
   await s._harvestToFlat('manual_harvest');
-  const header = logs.find((m) => /flatten \+ re-anchor/.test(m));
+  const header = logs.find((m) => /flatten \+ re-plan levels/.test(m));
   assert.match(header, /\(manual_harvest\)/, `got: ${header}`);
-  assert.doesNotMatch(header, /trail/, 'only a trail fire names a trail level');
 });
 
-test('_harvestToFlat returns true for a flat re-anchor (nothing to close)', async () => {
-  const s = ladderStrategy();                       // no legs open, activePosition null
+test('_harvestToFlat returns true for a flat re-plan (nothing to close)', async () => {
+  const s = reversalStrategy();                       // no legs open, activePosition null
   s._closeConsolidated = async () => false;         // nothing closed because nothing was open
   s._computeAccLoss = () => 0;
   s._computeLadderBaseSize = async () => 1000;
-  s.initializeLadder = async () => {};
-  assert.equal(await s._harvestToFlat('trail'), true, 'a flat re-anchor completes; it never aborts');
+  s._planAndBuildLevels = async () => true;
+  assert.equal(await s._harvestToFlat('price_trigger'), true, 'a flat re-plan completes; it never aborts');
 });
 
 // ——— Task 9: persistence, status, and resume ——————————————————————————
@@ -1025,7 +1210,7 @@ function cleanupResumeTimers(s) {
 }
 
 test('a ladder round-trips through saveState/resume', async () => {
-  const src = ladderStrategy({ anchor: 100, base: 12000 });
+  const src = reversalStrategy({ base: 12000 });
   src.ladderMode = 'TREND';
   src.trendDirection = 'LONG';
   src.ladderLines.filter(l => l.direction === 'LONG').forEach((l, i) => {
@@ -1036,17 +1221,18 @@ test('a ladder round-trips through saveState/resume', async () => {
 
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  // ladderStrategy() stubs saveState for the OTHER tests in this file (so a
+  // reversalStrategy() stubs saveState for the OTHER tests in this file (so a
   // trading-sequence test doesn't need a firestore double); this test is
   // specifically about persistence, so it calls the real prototype method.
-  await AnchorLadderStrategy.prototype.saveState.call(src);
+  await ReversalLadderStrategy.prototype.saveState.call(src);
 
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
   cleanupResumeTimers(dst);
 
-  assert.equal(dst.anchor, 100);
+  assert.equal(dst.bullLevel, 102);
+  assert.equal(dst.bearLevel, 98);
   assert.equal(dst.ladderMode, 'TREND');
   assert.equal(dst.trendDirection, 'LONG');
   assert.equal(dst.ladderLines.length, 10);
@@ -1055,80 +1241,76 @@ test('a ladder round-trips through saveState/resume', async () => {
   assert.equal(dst._ladderBaseSize, 12000);
 });
 
-test('flattenCount survives a save/restore round-trip', async () => {
-  const src = ladderStrategy();
-  src.flattenCount = 7;
+test('reversalCount survives a save/restore round-trip', async () => {
+  const src = reversalStrategy();
+  src.reversalCount = 7;
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(src);
-  assert.equal(doc.flattenCount, 7, 'saveState must persist it');
+  await ReversalLadderStrategy.prototype.saveState.call(src);
+  assert.equal(doc.reversalCount, 7, 'saveState must persist it');
 
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
   cleanupResumeTimers(dst);
 
   // Without this the count silently resets to 0 on every VM restart, and
   // _hasNoTradingActivity would then delete a real cycle's doc as "no-trade".
-  assert.equal(dst.flattenCount, 7, 'resume must restore it');
+  assert.equal(dst.reversalCount, 7, 'resume must restore it');
 });
 
 test('getStatus reports the ladder shape the frontend needs', () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.ladderMode = 'RANGE';
+  const s = reversalStrategy();
+  s.ladderMode = 'SCALING';
   const st = s.getStatus();
-  assert.equal(st.mode, 'RANGE', 'the frontend reads status.mode, not status.ladderMode');
-  assert.equal(st.anchor, 100);
+  assert.equal(st.mode, 'SCALING', 'the frontend reads status.mode, not status.ladderMode');
+  assert.equal(st.bullLevel, 102);
+  assert.equal(st.bearLevel, 98);
   assert.equal(st.ladderLines.length, 10);
   assert.equal(st.levelsPerSide, 5);
   assert.equal(st.stepPct, 0.003);
 });
 
 test('getHeartbeatPayload reports the same ladder shape as getStatus', () => {
-  const s = ladderStrategy({ anchor: 100 });
+  const s = reversalStrategy();
   s.ladderMode = 'TREND';
   s.trendDirection = 'SHORT';
   const hb = s.getHeartbeatPayload();
   assert.equal(hb.mode, 'TREND', 'the frontend reads status.mode, not status.ladderMode');
-  assert.equal(hb.anchor, 100);
+  assert.equal(hb.bullLevel, 102);
+  assert.equal(hb.bearLevel, 98);
   assert.equal(hb.trendDirection, 'SHORT');
   assert.equal(hb.ladderLines.length, 10);
-  assert.equal(hb.strategyType, 'anchorLadder');
+  assert.equal(hb.strategyType, 'reversalLadder');
 });
 
-test('getStatus and the heartbeat both emit flattenCount for the Flattens tile', () => {
+test('getStatus and the heartbeat both emit reversalCount for the Reversals tile', () => {
   // The frontend types itself off this payload: a field the backend never
   // emits is a silent `undefined` at runtime with no type error.
-  const s = ladderStrategy({ anchor: 100 });
-  s.flattenCount = 3;
-  assert.equal(s.getStatus().flattenCount, 3);
-  assert.equal(s.getHeartbeatPayload().flattenCount, 3);
+  const s = reversalStrategy();
+  s.reversalCount = 3;
+  assert.equal(s.getStatus().reversalCount, 3);
+  assert.equal(s.getHeartbeatPayload().reversalCount, 3);
 });
 
-test('reversalCount is gone from the emitted payloads', () => {
-  const s = ladderStrategy({ anchor: 100 });
-  assert.equal('reversalCount' in s.getStatus(), false, 'the ladder has no reversal concept');
-  assert.equal('reversalCount' in s.getHeartbeatPayload(), false);
-});
-
-test('saveState writes the ANCHOR_LADDER type tags for boot recovery', async () => {
-  const s = ladderStrategy({ anchor: 100 });
+test('saveState writes the REVERSAL_LADDER type tags for boot recovery', async () => {
+  const s = reversalStrategy();
   let written = null;
   s.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { written = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(s);
-  assert.equal(written.type, 'ANCHOR_LADDER');
-  assert.equal(written.strategyType, 'anchorLadder');
+  await ReversalLadderStrategy.prototype.saveState.call(s);
+  assert.equal(written.type, 'REVERSAL_LADDER');
+  assert.equal(written.strategyType, 'reversalLadder');
 });
 
 test('_lastLadderSize survives a save/resume round trip', async () => {
-  const src = ladderStrategy({ anchor: 100, base: 12000 });
+  const src = reversalStrategy({ base: 12000 });
   src._lastLadderSize = 15000;
 
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(src);
+  await ReversalLadderStrategy.prototype.saveState.call(src);
 
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
   cleanupResumeTimers(dst);
@@ -1137,7 +1319,7 @@ test('_lastLadderSize survives a save/resume round trip', async () => {
 });
 
 test('_recomputeFinalTpPrice keys off trendDirection, not just currentSide (resume race)', () => {
-  const s = ladderStrategy({ mode: 'TREND' });
+  const s = reversalStrategy({ mode: 'TREND' });
   s.trendDirection = 'LONG';
   s.currentSide = null; // simulates the boot-recovery race: not yet resolved from Binance
   s.activePosition = { quantity: 100, avgEntry: 100.9, entryPrice: 100.9, notional: 10090 };
@@ -1172,8 +1354,8 @@ function stubStopTail(s) {
 }
 
 test('Fix 1(a): legs POSITION_OPEN + activePosition null in-memory, Binance still reports a position -> stop({flatten:true}) closes it and runs the residual check', async () => {
-  const s = stubStopTail(ladderStrategy());
-  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
+  const s = stubStopTail(reversalStrategy());
+  s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1).state = 'POSITION_OPEN';
   s.activePosition = null; // in-memory drift: legs say open, position says flat
   s.currentSide = null;
 
@@ -1206,8 +1388,8 @@ test('Fix 1(a): legs POSITION_OPEN + activePosition null in-memory, Binance stil
 });
 
 test('Fix 1(b): the close order throws -> stop() still runs the residual verification and logs a WARNING', async () => {
-  const s = stubStopTail(ladderStrategy());
-  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
+  const s = stubStopTail(reversalStrategy());
+  s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1).state = 'POSITION_OPEN';
   s.activePosition = { quantity: 0.8 };
   s.currentSide = 'LONG';
 
@@ -1230,8 +1412,8 @@ test('Fix 1(b): the close order throws -> stop() still runs the residual verific
 });
 
 test('Fix 1: the normal path (legs open, position known, close succeeds) now runs the residual verification (it previously did not)', async () => {
-  const s = stubStopTail(ladderStrategy());
-  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
+  const s = stubStopTail(reversalStrategy());
+  s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1).state = 'POSITION_OPEN';
   s.activePosition = { quantity: 0.5 };
   s.currentSide = 'LONG';
 
@@ -1253,8 +1435,8 @@ test('Fix 1: the normal path (legs open, position known, close succeeds) now run
 });
 
 test('reduceOnly invariant (live-money): the close order carries reduceOnly:true and no positionSide', async () => {
-  const s = stubStopTail(ladderStrategy());
-  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
+  const s = stubStopTail(reversalStrategy());
+  s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1).state = 'POSITION_OPEN';
   s.activePosition = { quantity: 0.7 };
   s.currentSide = 'LONG';
   s._refreshCurrentPosition = async () => {}; // leaves state as-is; irrelevant to this assertion
@@ -1269,11 +1451,11 @@ test('reduceOnly invariant (live-money): the close order carries reduceOnly:true
   assert.equal(orderArgs.opts.positionSide, undefined, 'one-way mode MUST NOT send positionSide — that is a hedge-mode concept');
 });
 
-// ——— FIX 2: the RANGE→TREND invariant is derived, not chased —————————————
+// ——— FIX 2: the SCALING→TREND invariant is derived, not chased —————————————
 
-test('Fix 2: resume() self-heals a snapshot stuck in RANGE fully-scaled — arms TREND + Final TP', async () => {
-  const src = ladderStrategy({ anchor: 100, base: 12000 });
-  src.ladderMode = 'RANGE'; // the bug: process died between _fillLeg(L5) persisting and _enterTrend running
+test('Fix 2: resume() self-heals a snapshot stuck in SCALING fully-scaled — arms TREND + Final TP', async () => {
+  const src = reversalStrategy({ base: 12000 });
+  src.ladderMode = 'SCALING'; // the bug: process died between _fillLeg(L5) persisting and _enterTrend running
   src.ladderLines.filter(l => l.direction === 'LONG').forEach((l, i) => {
     Object.assign(l, { state: 'POSITION_OPEN', quantity: 10 + i, fillPrice: 100.3 + i * 0.3 });
   });
@@ -1285,9 +1467,9 @@ test('Fix 2: resume() self-heals a snapshot stuck in RANGE fully-scaled — arms
 
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(src);
+  await ReversalLadderStrategy.prototype.saveState.call(src);
 
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   // detectCurrentPosition/_refreshCurrentPosition are stubbed no-ops by
   // stubResumeIO, so the restored snapshot fields (activePosition,
@@ -1306,7 +1488,7 @@ test('Fix 2: resume() self-heals a snapshot stuck in RANGE fully-scaled — arms
 });
 
 test('Fix 2 regression: filling the outermost leg via the REAL _fillLeg path (not a stub) still transitions to TREND with Final TP armed', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 40, entryPrice: 100.9, avgEntry: 100.9, notional: 4036 };
   s.currentSide = 'LONG';
   s.cycleAccumulatedLoss = 0;
@@ -1315,7 +1497,7 @@ test('Fix 2 regression: filling the outermost leg via the REAL _fillLeg path (no
   s._quantityFor = async (symbol, notional, price) => notional / price; // skip the real exchange-info/network sizing call
   s.lastProcessedPrice = 100;
 
-  await s.handleRealtimePrice(101.6); // past L5 at 101.5
+  await s.handleRealtimePrice(103.5); // past L5 = 102 * 1.012 = 103.224
 
   assert.ok(
     s.ladderLines.filter((l) => l.direction === 'LONG').every((l) => l.state === 'POSITION_OPEN'),
@@ -1329,16 +1511,16 @@ test('Fix 2 regression: filling the outermost leg via the REAL _fillLeg path (no
 // ——— FIX 1 (maxPositionSizeUSDT removal): a dead knob must not resurface ——
 
 test('Fix 1: getStatus() no longer emits maxPositionSizeUSDT', () => {
-  const s = ladderStrategy({ anchor: 100 });
+  const s = reversalStrategy();
   const st = s.getStatus();
   assert.equal('maxPositionSizeUSDT' in st, false, 'the dead knob must not resurface in the status payload');
 });
 
 test('Fix 1: saveState() no longer persists maxPositionSizeUSDT', async () => {
-  const s = ladderStrategy({ anchor: 100 });
+  const s = reversalStrategy();
   let written = null;
   s.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { written = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(s);
+  await ReversalLadderStrategy.prototype.saveState.call(s);
   assert.equal('maxPositionSizeUSDT' in written, false, 'the dead knob must not resurface in the persisted snapshot');
 });
 
@@ -1348,13 +1530,13 @@ test('Fix 1: saveState() no longer persists maxPositionSizeUSDT', async () => {
 // state on a 5xx.)
 
 test('Fix 2: getCurrentPositions() throws when the API call fails, instead of swallowing to []', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.makeProxyRequest = async () => { throw new Error('-1001 Internal error'); };
   await assert.rejects(() => s.getCurrentPositions(), /-1001/);
 });
 
 test('Fix 2: a position refresh failure does NOT wipe activePosition / currentPosition — stale beats falsely flat', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   delete s._refreshCurrentPosition; // use the REAL implementation, not the test-helper no-op stub
   // Seed "last known" state as if a real position had already been confirmed.
   s.activePosition = { quantity: 2.5, entryPrice: 100, avgEntry: 100, notional: 250, unrealizedPnl: 0 };
@@ -1380,10 +1562,10 @@ test('stop({flatten:true}) closes the legs when the position API is down and mem
   // only writer is the REST refresh, which is failing), and Binance cannot be
   // reached. The guard closed NOTHING and left the position stranded. The legs
   // know both the size and the side, so the close proceeds on their word.
-  const s = stubStopTail(ladderStrategy());
+  const s = stubStopTail(reversalStrategy());
   delete s._refreshCurrentPosition; // use the REAL implementation
 
-  const openLeg = s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1);
+  const openLeg = s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1);
   openLeg.state = 'POSITION_OPEN';
   openLeg.quantity = 1.4;
   s.activePosition = null;
@@ -1419,8 +1601,8 @@ test('stop({flatten:true}): an unverified _flattenGrid close makes stop() retry 
   // open), so if the retry were ever turned into an unbounded loop this test
   // must catch it — hence counting EVERY call in an array rather than
   // capturing only the last one into a single variable.
-  const s = stubStopTail(ladderStrategy());
-  const openLeg = s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1);
+  const s = stubStopTail(reversalStrategy());
+  const openLeg = s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1);
   openLeg.state = 'POSITION_OPEN';
   openLeg.quantity = 0.6;
   s.activePosition = { quantity: 0.6, entryPrice: 100, avgEntry: 100, notional: 60, unrealizedPnl: 0 };
@@ -1457,7 +1639,7 @@ test('stop({flatten:true}): an unverified _flattenGrid close makes stop() retry 
 // HERE — no later leg fills occur in TREND to correct it).
 
 test('FIX B: _enterTrend does NOT arm Final TP when the arming refresh fails (twice) — clears the stale value and logs loudly', async () => {
-  const s = ladderStrategy({ anchor: 100 });
+  const s = reversalStrategy();
   s.ladderLines.filter(l => l.direction === 'LONG').forEach(l => { l.state = 'POSITION_OPEN'; l.quantity = 20; l.fillPrice = l.price; });
   s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024, unrealizedPnl: 0 }; // stale: only 4 legs' worth
   s.currentSide = 'LONG';
@@ -1482,7 +1664,7 @@ test('FIX B: _enterTrend does NOT arm Final TP when the arming refresh fails (tw
 });
 
 test('FIX B: _enterTrend arms Final TP normally when the refresh succeeds on the first try', async () => {
-  const s = ladderStrategy({ anchor: 100 });
+  const s = reversalStrategy();
   s.ladderLines.filter(l => l.direction === 'LONG').forEach(l => { l.state = 'POSITION_OPEN'; l.quantity = 20; l.fillPrice = l.price; });
   s.currentSide = 'LONG';
   s.cycleAccumulatedLoss = 89;
@@ -1503,7 +1685,7 @@ test('FIX B: _enterTrend arms Final TP normally when the refresh succeeds on the
 });
 
 test('FIX B: _reconcileTrendInvariant self-heals Final TP once the refresh recovers — not permanently stuck unarmed', async () => {
-  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  const s = reversalStrategy({ mode: 'TREND' });
   s.trendDirection = 'LONG';
   s.finalTpPrice = null; // arming failed at the original TREND transition => derived unarmed
   s.currentSide = 'LONG';
@@ -1529,7 +1711,7 @@ test('FIX B: _reconcileTrendInvariant self-heals Final TP once the refresh recov
 });
 
 test('FIX B: _reconcileTrendInvariant keeps retrying (does not crash or wedge) while the refresh keeps failing', async () => {
-  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  const s = reversalStrategy({ mode: 'TREND' });
   s.trendDirection = 'LONG';
   s.finalTpPrice = null; // derived unarmed
   s.currentSide = 'LONG';
@@ -1554,14 +1736,14 @@ test('FIX B: _reconcileTrendInvariant keeps retrying (does not crash or wedge) w
 // returned success, and (while the armed flag was still stored state)
 // short-circuited its own retry forever.
 //
-// Reachable via a process death inside `_flattenAtAnchor` between
+// Reachable via a process death inside `_reverseTo` between
 // `_closeConsolidated()` and `saveState()` — a window containing a real
 // 100-500ms `getTotalMarginBalance()` round trip — which persists
 // TREND + every leg POSITION_OPEN while Binance is already flat.
 
 // The persisted contradiction that window leaves behind.
 function trendButFlatOnBinance() {
-  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  const s = reversalStrategy({ mode: 'TREND' });
   s.trendDirection = 'LONG';
   s.ladderLines.filter(l => l.direction === 'LONG').forEach((l) => {
     l.state = 'POSITION_OPEN'; l.quantity = 20; l.fillPrice = l.price;
@@ -1658,7 +1840,7 @@ test('I2: the unarmed retry is rate-limited — it does not hit Binance on every
 // The shared setup: TREND, arming refused (finalTpPrice null), but a STALE
 // non-null activePosition still in memory from before the refresh failed.
 function unarmedTrendWithStalePosition() {
-  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  const s = reversalStrategy({ mode: 'TREND' });
   s.trendDirection = 'LONG';
   s.currentSide = 'LONG';
   s.activePosition = { quantity: 80, entryPrice: 100.3, avgEntry: 100.3, notional: 8024, unrealizedPnl: 0 };
@@ -1709,7 +1891,7 @@ test('I1: adjustProfitTarget cannot resurrect the target _enterTrend refused to 
 });
 
 test('I1: _trendFinalTpArmed is derived, not stored — it cannot drift from finalTpPrice', () => {
-  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  const s = reversalStrategy({ mode: 'TREND' });
   s.finalTpPrice = null;
   assert.equal(s._trendFinalTpArmed, false, 'null target => unarmed, always');
   s.finalTpPrice = 104.08;
@@ -1724,7 +1906,7 @@ test('I1: _trendFinalTpArmed is derived, not stored — it cannot drift from fin
 });
 
 test('I1: nothing persists _trendFinalTpArmed — a TREND resume derives it from the restored target', () => {
-  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  const s = reversalStrategy({ mode: 'TREND' });
   s.finalTpPrice = 104.08;
   s.activePosition = { quantity: 100, entryPrice: 100.4, avgEntry: 100.4, notional: 10040, unrealizedPnl: 0 };
   // saveState's doc is the contract with resume(); armed must not appear in it
@@ -1753,7 +1935,7 @@ test('I1: nothing persists _trendFinalTpArmed — a TREND resume derives it from
 //
 // These tests stub at the NETWORK boundary (makeProxyRequest) so the real
 // getCurrentPositions -> detectCurrentPosition -> _refreshCurrentPosition
-// chain executes. They deliberately do NOT use ladderStrategy(), whose
+// chain executes. They deliberately do NOT use reversalStrategy(), whose
 // `_refreshCurrentPosition` no-op stub is exactly why this bug was invisible
 // to a fully green suite.
 
@@ -1771,6 +1953,13 @@ function stubBootInternals(s) {
   s.initFirestoreCollections = () => {};
   s.addLog = async () => {};
   s.saveState = async () => {};
+  // Phase 0a: start()/resume() now call _resolveAiApiKey(), which reads
+  // users/{userId}/profiles/{profileId} off `this.firestore`. bootSnapshot()
+  // sets a real `userId`, which would otherwise make this reach the LIVE
+  // Firestore client the constructor built. Stub the resolver directly so
+  // these boot-recovery tests (about the position-refresh chain, not AI
+  // planning) never touch the network for it.
+  s._resolveAiApiKey = async () => null;
   s._writeStrategyFlow = async () => {};
   s.setLeverage = async () => {};
   s.setPositionMode = async () => {};
@@ -1797,17 +1986,18 @@ function stubBootInternals(s) {
 
 function bootSnapshot() {
   return {
-    strategyId: 'anchor_ladder_boot_test',
+    strategyId: 'reversal_ladder_boot_test',
     profileId: 'test-profile',
     userId: 'test-user',
     gcfProxyUrl: 'http://proxy.invalid',
     sharedVmProxyGcfUrl: 'http://vm.invalid',
     symbol: 'BTCUSDT',
     leverage: 10,
-    ladderMode: 'RANGE',
-    anchor: 100,
-    ladderLines: buildLadder(100, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE).map((l) =>
-      (l.direction === 'LONG' && l.levelIndex === 1)
+    ladderMode: 'SCALING',
+    bullLevel: 102,
+    bearLevel: 98,
+    ladderLines: buildReversalLadder(102, 98, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE).map((l) =>
+      (l.direction === 'LONG' && l.index === 1)
         ? { ...l, state: 'POSITION_OPEN', quantity: 2 }
         : l,
     ),
@@ -1826,7 +2016,7 @@ function bootSnapshot() {
 }
 
 test('resume() RESOLVES when the position API 503s — a transient boot failure must never abandon a live position', async () => {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
   const proxyCalls = stubBootInternals(s);
   const snapshot = bootSnapshot();
 
@@ -1873,7 +2063,7 @@ test('resume() RESOLVES when the position API 503s — a transient boot failure 
 });
 
 test('start() RESOLVES when the position API 503s — no bare detectCurrentPosition escapes start() either', async () => {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
   const proxyCalls = stubBootInternals(s);
   // getWalletBalance also throws on API error, but it is deliberately unguarded
   // in start() (user-initiated: the error is surfaced to the UI). Stub it so the
@@ -1894,6 +2084,27 @@ test('start() RESOLVES when the position API 503s — no bare detectCurrentPosit
   assert.equal(s._lastPositionRefreshFailed, true, 'flagged UNKNOWN, not flat');
 });
 
+// start() ends with an UNCONDITIONAL this._pushHeartbeatNow?.() after
+// saveState(). Without it, the freshly-started strategy would only reach the
+// WS-connected frontend (which disables its 3s REST poll) via the 30s
+// strategy_update safety net — up to 30s where the UI cannot even confirm the
+// strategy actually started. Was previously covered only incidentally by a
+// Start-Mode arming test (deleted with Start Mode); this pins the same
+// invariant directly against start()'s own ordinary path.
+test('start() pushes an immediate heartbeat after saving state', async () => {
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
+  stubBootInternals(s);
+  s.getWalletBalance = async () => 1000;
+  let heartbeatCalls = 0;
+  s._pushHeartbeatNow = () => { heartbeatCalls++; };
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, leverage: 10 });
+    assert.equal(heartbeatCalls, 1, 'start() must reach the frontend immediately, not wait on the 30s safety net');
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+});
+
 // ——— The close is sized from the WS-true legs, and stop() must never lie ———
 //
 // THE PIN FOR THE ROOT CAUSE. Every open books its filled qty from the
@@ -1911,10 +2122,10 @@ test('start() RESOLVES when the position API 503s — no bare detectCurrentPosit
 //
 // Stubbed at the NETWORK boundary so the real getCurrentPositions ->
 // detectCurrentPosition -> _refreshCurrentPosition chain genuinely runs and
-// genuinely fails: `ladderStrategy()`'s no-op `_refreshCurrentPosition` stub
+// genuinely fails: `reversalStrategy()`'s no-op `_refreshCurrentPosition` stub
 // is exactly why this class of bug was invisible to a green suite.
 function stopFixtureWithFailingRefresh() {
-  const s = ladderStrategy({ anchor: 100, base: 1000 });
+  const s = reversalStrategy({ base: 1000 });
   const longLegs = s.ladderLines.filter(l => l.direction === 'LONG');
   longLegs.forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 20; l.fillPrice = l.price; });
   // The legs (WS) know 5 x 20 = 100. activePosition (REST) is stale at 80 —
@@ -2008,7 +2219,7 @@ test('C3: stop({flatten:true}) reports FINAL STATE UNKNOWN — never "confirmed 
 test('C3: stop({flatten:true}) still reports "confirmed flat" when the refresh actually SUCCEEDS and confirms flat', async () => {
   // The honest-path counterpart: the fix must not turn every stop into a
   // FINAL STATE UNKNOWN cry-wolf.
-  const s = ladderStrategy({ anchor: 100, base: 1000 });
+  const s = reversalStrategy({ base: 1000 });
   s.ladderLines.filter(l => l.direction === 'LONG').forEach((l) => { l.state = 'POSITION_OPEN'; l.quantity = 20; });
   s.activePosition = { quantity: 100, entryPrice: 100.3, avgEntry: 100.3, notional: 10030, unrealizedPnl: 0 };
   s.currentSide = 'LONG';
@@ -2045,32 +2256,32 @@ test('C3: stop({flatten:true}) still reports "confirmed flat" when the refresh a
 // ——— Geometry persistence: resume must rebuild the SAME ladder ———
 
 test('saveState persists the ladder geometry', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.stepPct = 0.005;
   s.levelsPerSide = 8;
   let saved = null;
   // saveState writes via this.firestore.collection('strategies').doc(id).set(doc, {merge:true})
   s.firestore = { collection: () => ({ doc: () => ({ set: async (doc) => { saved = doc; } }) }) };
   s.addLog = async () => {};
-  // ladderStrategy() stubs saveState for the OTHER tests in this file (so a
+  // reversalStrategy() stubs saveState for the OTHER tests in this file (so a
   // trading-sequence test doesn't need a firestore double); this test is
   // specifically about persistence, so it calls the real prototype method
   // (same pattern as the existing save/restore round-trip tests above).
-  await AnchorLadderStrategy.prototype.saveState.call(s);
+  await ReversalLadderStrategy.prototype.saveState.call(s);
   assert.ok(saved, 'saveState wrote a doc');
   assert.equal(saved.stepPct, 0.005, 'stepPct must round-trip');
   assert.equal(saved.levelsPerSide, 8, 'levelsPerSide must round-trip');
 });
 
 test('resume restores non-default geometry from the snapshot', () => {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   s._applySnapshotGeometry({ stepPct: 0.005, levelsPerSide: 8 });
   assert.equal(s.stepPct, 0.005, 'a cycle started at 0.5% must resume at 0.5%');
   assert.equal(s.levelsPerSide, 8, 'a cycle started at 8 levels must resume at 8');
 });
 
 test('resume falls back to the defaults for a legacy snapshot without geometry', () => {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   s._applySnapshotGeometry({});
   assert.equal(s.stepPct, LADDER_STEP_PCT, 'pre-change docs default to 0.3%');
   assert.equal(s.levelsPerSide, LADDER_LEVELS_PER_SIDE, 'pre-change docs default to 5');
@@ -2081,7 +2292,7 @@ test('resume THROWS on a present-but-invalid geometry instead of silently defaul
   // Silently coercing it to the default would read "unknown" as "safe" and
   // rebuild a ladder that does not match whatever is actually on the exchange
   // for this cycle — exactly the silent-fail-open shape this codebase forbids.
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   assert.throws(
     () => s._applySnapshotGeometry({ stepPct: LADDER_STEP_PCT_MAX + 1, levelsPerSide: 5 }),
     /step/i,
@@ -2089,7 +2300,7 @@ test('resume THROWS on a present-but-invalid geometry instead of silently defaul
 });
 
 test('resume THROWS on a present-but-invalid geometry instead of silently defaulting (out-of-bounds levels)', () => {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   assert.throws(
     () => s._applySnapshotGeometry({ stepPct: LADDER_STEP_PCT, levelsPerSide: LADDER_LEVELS_MAX + 1 }),
     /level/i,
@@ -2100,7 +2311,7 @@ test('resume THROWS on a non-numeric (e.g. stringified) geometry value rather th
   // resolveLadderGeometry is strict, not coercing (a numeric string is not a
   // number); _applySnapshotGeometry must inherit that, not re-introduce
   // Number(...) coercion via its own ad hoc checks.
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
+  const s = new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
   assert.throws(() => s._applySnapshotGeometry({ stepPct: '0.005', levelsPerSide: 8 }));
 });
 
@@ -2108,7 +2319,7 @@ test('resume THROWS on a non-numeric (e.g. stringified) geometry value rather th
 
 test('harvestNow(triggerPrice) arms an ABOVE trigger and rounds to tick size', async () => {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy();                       // currentPrice 100
+  const s = reversalStrategy();                       // currentPrice 100
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
   const res = await s.harvestNow(101.239);          // ~1.2% above → rounds to 101.24
   assert.equal(res.armed, true);
@@ -2118,7 +2329,7 @@ test('harvestNow(triggerPrice) arms an ABOVE trigger and rounds to tick size', a
 });
 
 test('harvestNow(triggerPrice) rejects arming with no live price yet', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
   s.currentPrice = null;                            // no live price yet
   await assert.rejects(() => s.harvestNow(101), (err) => {
@@ -2130,7 +2341,7 @@ test('harvestNow(triggerPrice) rejects arming with no live price yet', async () 
 
 test('harvestNow(triggerPrice) infers a BELOW trigger from the current price', async () => {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
   await s.harvestNow(98.5);
   assert.equal(s.harvestTriggerPrice, 98.5);
@@ -2139,7 +2350,7 @@ test('harvestNow(triggerPrice) infers a BELOW trigger from the current price', a
 
 test('harvestNow(triggerPrice) rejects a level within the 0.1% gap', async () => {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy();                       // currentPrice 100 → band 99.9..100.1
+  const s = reversalStrategy();                       // currentPrice 100 → band 99.9..100.1
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
   await assert.rejects(() => s.harvestNow(100.05), (err) => {
     assert.match(err.message, /0\.1%|current price/i);
@@ -2150,7 +2361,7 @@ test('harvestNow(triggerPrice) rejects a level within the 0.1% gap', async () =>
 });
 
 test('harvestNow(triggerPrice) rejects a non-positive price', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
   await assert.rejects(() => s.harvestNow(0), (err) => {
     assert.match(err.message, /positive/i);
@@ -2160,7 +2371,7 @@ test('harvestNow(triggerPrice) rejects a non-positive price', async () => {
 });
 
 test('harvestNow() with no price latches immediately AND clears any armed trigger', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003 };
   s.harvestTriggerPrice = 105; s.harvestTriggerAbove = true;   // pre-armed
   const res = await s.harvestNow();
@@ -2170,7 +2381,7 @@ test('harvestNow() with no price latches immediately AND clears any armed trigge
 });
 
 test('cancelHarvestTrigger clears an armed trigger', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.harvestTriggerPrice = 105; s.harvestTriggerAbove = true;
   const res = await s.cancelHarvestTrigger();
   assert.equal(res.cancelled, true);
@@ -2178,117 +2389,10 @@ test('cancelHarvestTrigger clears an armed trigger', async () => {
   assert.equal(s.harvestTriggerAbove, null);
 });
 
-// ——— Anchor Trailing: activation ———
-
-test('setTrailDirection accepts UP, DOWN and null', async () => {
-  const s = ladderStrategy();
-  assert.deepEqual(await s.setTrailDirection('UP'), { trailDirection: 'UP' });
-  assert.equal(s.trailDirection, 'UP');
-  await s.setTrailDirection('DOWN');
-  assert.equal(s.trailDirection, 'DOWN', 'switching overwrites — direction is exclusive');
-  await s.setTrailDirection(null);
-  assert.equal(s.trailDirection, null, 'null turns trailing off');
-});
-
-// The level is the whole point of the line — "Trail Up" alone forces the reader to
-// recompute anchor*(1 ± 0.9*stepPct) by hand to know what was actually armed.
-test('setTrailDirection logs the trail LEVEL, not just the direction', async () => {
-  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy({ anchor: 100 });      // step 0.3% -> up 100.27, down 99.73
-  const logs = [];
-  s.addLog = async (m) => { logs.push(m); };
-
-  await s.setTrailDirection('UP');
-  assert.match(logs.at(-1), /Trail Up @ 100\.27/, `got: ${logs.at(-1)}`);
-
-  await s.setTrailDirection('DOWN');
-  assert.match(logs.at(-1), /Trail Down @ 99\.73/, `got: ${logs.at(-1)}`);
-
-  await s.setTrailDirection(null);
-  assert.match(logs.at(-1), /Anchor Trailing OFF/);
-});
-
-test('the armed log flags the TREND pause instead of promising an imminent re-anchor', async () => {
-  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
-  const logs = [];
-  s.addLog = async (m) => { logs.push(m); };
-
-  await s.setTrailDirection('UP');
-  assert.match(logs.at(-1), /100\.27/, 'the level still shows while paused');
-  assert.match(logs.at(-1), /PAUSED while in TREND/, `got: ${logs.at(-1)}`);
-  assert.doesNotMatch(
-    logs.at(-1), /will follow price/,
-    'must not read as an active follow while trailing is dormant',
-  );
-});
-
-// Armed via Start Mode: no ladder yet, so there is no anchor to derive a level from.
-// Printing a bogus number (or "NaN") would be worse than saying it is pending.
-test('setTrailDirection says the level is pending when there is no ladder yet', async () => {
-  const s = ladderStrategy();
-  s.ladderLines = [];
-  s.anchor = null;
-  s.startTriggerPrice = 105;                      // startArmed
-  const logs = [];
-  s.addLog = async (m) => { logs.push(m); };
-
-  await s.setTrailDirection('DOWN');
-  assert.match(logs.at(-1), /level pending/, `got: ${logs.at(-1)}`);
-  assert.doesNotMatch(logs.at(-1), /NaN|undefined|null/, 'never print a bogus level');
-});
-
-test('setTrailDirection rejects an invalid direction as client input (400)', async () => {
-  const s = ladderStrategy();
-  for (const bad of ['up', 'SIDEWAYS', 0, true, {}, 'UP ']) {
-    await assert.rejects(() => s.setTrailDirection(bad), (err) => {
-      assert.equal(err.invalidInput, true, `${JSON.stringify(bad)} must tag invalidInput`);
-      return true;
-    });
-  }
-  assert.equal(s.trailDirection, null, 'a rejected call must leave trailing untouched');
-});
-
-test('setTrailDirection refuses when the strategy is not running (409)', async () => {
-  const s = ladderStrategy();
-  s.isRunning = false;
-  await assert.rejects(() => s.setTrailDirection('UP'), (err) => {
-    assert.equal(err.invalidInput, undefined, 'a state conflict must NOT be tagged as input error');
-    return /not running/i.test(err.message);
-  });
-});
-
-test('activating trailing clears an armed one-shot trigger', async () => {
-  const s = ladderStrategy();
-  s.harvestTriggerPrice = 105; s.harvestTriggerAbove = true;
-  await s.setTrailDirection('DOWN');
-  assert.equal(s.harvestTriggerPrice, null, 'the two are mutually exclusive');
-  assert.equal(s.harvestTriggerAbove, null);
-});
-
-test('arming a one-shot trigger clears trailing', async () => {
-  const s = ladderStrategy();
-  s.currentPrice = 100;
-  s.trailDirection = 'DOWN';
-  await s.harvestNow(101.5);
-  assert.equal(s.trailDirection, null, 'the backend, not the frontend, enforces exclusion');
-  assert.equal(s.harvestTriggerPrice, 101.5);
-});
-
-test('turning trailing off is accepted even while ARMED or in TREND (it just lies dormant)', async () => {
-  const armed = ladderStrategy();
-  armed.ladderLines = [];                   // startArmed derives off an empty ladder
-  armed.startTriggerPrice = 105;
-  assert.deepEqual(await armed.setTrailDirection('UP'), { trailDirection: 'UP' });
-
-  const trend = ladderStrategy({ mode: 'TREND' });
-  assert.deepEqual(await trend.setTrailDirection('DOWN'), { trailDirection: 'DOWN' });
-});
-
 // ——— Trigger price: tick-loop firing ———
 
 test('an armed ABOVE trigger fires _harvestToFlat when price reaches the level', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: 5 };
   s.harvestTriggerPrice = 101; s.harvestTriggerAbove = true;
   let fired = null;
@@ -2300,7 +2404,7 @@ test('an armed ABOVE trigger fires _harvestToFlat when price reaches the level',
 });
 
 test('an armed ABOVE trigger does NOT fire while price is below the level', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: 5 };
   s.harvestTriggerPrice = 101; s.harvestTriggerAbove = true;
   let fired = false;
@@ -2311,7 +2415,7 @@ test('an armed ABOVE trigger does NOT fire while price is below the level', asyn
 });
 
 test('an armed BELOW trigger fires when price gaps through the level', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: -3 };
   s.harvestTriggerPrice = 99; s.harvestTriggerAbove = false;
   let fired = null;
@@ -2323,7 +2427,7 @@ test('an armed BELOW trigger fires when price gaps through the level', async () 
 
 test('a trigger reached while position state is UNKNOWN still harvests (never reads unknown as flat)', async () => {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   // Legs are the WS-true ledger: a leg filled, but the REST refresh that would
   // populate activePosition failed. That is UNKNOWN, not flat.
   s.ladderLines.filter((l) => l.direction === 'LONG').slice(0, 2)
@@ -2338,40 +2442,42 @@ test('a trigger reached while position state is UNKNOWN still harvests (never re
   assert.equal(s.harvestTriggerPrice, null);
 });
 
-test('an armed trigger NOT yet reached survives a real anchor flatten', async () => {
-  // Precondition: the tick must genuinely flatten (not merely "make one up") —
-  // stub _flattenAtAnchor and assert it fired, exactly like the plain
-  // "RANGE: crossing the anchor flattens" test above. Otherwise a tick that
-  // never flattens would pass this test while proving nothing.
-  const s = ladderStrategy();
-  let flattened = false;
-  s._flattenAtAnchor = async () => { flattened = true; };
-  s.ladderLines.find(l => l.direction === 'LONG' && l.levelIndex === 1).state = 'POSITION_OPEN';
-  s.lastProcessedPrice = 100.35;
+test('an armed trigger NOT yet reached survives a real reversal', async () => {
+  // Precondition: the tick must genuinely reverse (not merely "make one up") —
+  // stub _reverseTo and assert it fired. Otherwise a tick that never reverses
+  // would pass this test while proving nothing.
+  const s = reversalStrategy();               // bull 102 / bear 98
+  let reversed = false;
+  s._reverseTo = async () => { reversed = true; return true; };
+  s._fillLeg = async (leg) => { leg.state = 'POSITION_OPEN'; };
+  s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1).state = 'POSITION_OPEN';
+  s.lastProcessedPrice = 103;
   s.harvestTriggerPrice = 105; s.harvestTriggerAbove = true;   // armed, nowhere near this tick
-  await s.handleRealtimePrice(99.9);                           // crosses back below the anchor
-  assert.equal(flattened, true, 'precondition: the anchor flatten actually ran');
-  assert.equal(s.harvestTriggerPrice, 105, 'the trigger must survive an anchor flatten untouched');
+  await s.handleRealtimePrice(98);                             // crosses bear -> reverses
+  assert.equal(reversed, true, 'precondition: the reversal actually ran');
+  assert.equal(s.harvestTriggerPrice, 105, 'the trigger must survive a reversal untouched');
   assert.equal(s.harvestTriggerAbove, true);
 });
 
-test('the trigger fires BEFORE the anchor-flatten dispatch on the same tick', async () => {
-  const s = ladderStrategy();                // anchor 100
-  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: 2 };
-  s.lastProcessedPrice = 100.5;
-  s.harvestTriggerPrice = 100; s.harvestTriggerAbove = false;  // trigger AT the anchor
-  let harvested = false, flattened = false;
+test('the trigger fires BEFORE the reversal dispatch on the same tick', async () => {
+  const s = reversalStrategy();                // bull 102 / bear 98
+  s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1).state = 'POSITION_OPEN';
+  s.activePosition = { quantity: 10, entryPrice: 102, avgEntry: 102, notional: 1020, unrealizedPnl: -2 };
+  s.currentSide = 'LONG';
+  s.lastProcessedPrice = 100;
+  s.harvestTriggerPrice = 98; s.harvestTriggerAbove = false;  // trigger AT bear
+  let harvested = false, reversed = false;
   s._harvestToFlat = async () => { harvested = true; };
-  s._flattenAtAnchor = async () => { flattened = true; };
-  await s.handleRealtimePrice(100);          // crosses anchor AND hits trigger
+  s._reverseTo = async () => { reversed = true; return true; };
+  await s.handleRealtimePrice(98);          // crosses bear AND hits trigger
   assert.equal(harvested, true, 'trigger wins');
-  assert.equal(flattened, false, 'anchor flatten did not run this tick');
+  assert.equal(reversed, false, 'reversal dispatch did not run this tick');
 });
 
 // ——— Trigger price: persistence + status ———
 
 test('getStatus surfaces the armed trigger', () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.harvestTriggerPrice = 105.5; s.harvestTriggerAbove = true;
   const st = s.getStatus();
   assert.equal(st.harvestTriggerPrice, 105.5);
@@ -2379,7 +2485,7 @@ test('getStatus surfaces the armed trigger', () => {
 });
 
 test('getHeartbeatPayload surfaces the armed trigger', () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.harvestTriggerPrice = 98; s.harvestTriggerAbove = false;
   const hb = s.getHeartbeatPayload();
   assert.equal(hb.harvestTriggerPrice, 98);
@@ -2387,7 +2493,7 @@ test('getHeartbeatPayload surfaces the armed trigger', () => {
 });
 
 test('saveState persists the armed trigger fields', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   delete s.saveState;                        // restore the real prototype method (fixture stubs it)
   let captured = null;
   s.firestore = { collection: () => ({ doc: () => ({ set: async (doc) => { captured = doc; } }) }) };
@@ -2401,18 +2507,20 @@ test('saveState persists the armed trigger fields', async () => {
 
 test('_harvestToFlat while FLAT re-anchors, bumps reanchorCount, NOT harvestCount', async () => {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy();                 // flat: activePosition null, no open legs
-  s.currentPrice = 110;                        // re-anchor target (live price)
+  const s = reversalStrategy();                 // flat: activePosition null, no open legs
+  s.currentPrice = 110;
   s.harvestCount = 3;
+  let planCalled = false;
+  s._planAndBuildLevels = async () => { planCalled = true; return true; };
   await s._harvestToFlat('manual_harvest');
-  assert.equal(s.harvestCount, 3, 'a flat re-anchor must NOT count as a harvest');
-  assert.equal(s.reanchorCount, 1, 'reanchorCount bumps on every re-anchor');
-  assert.equal(s.anchor, 110, 're-anchored on the live price');
+  assert.equal(s.harvestCount, 3, 'a flat re-plan must NOT count as a harvest');
+  assert.equal(s.reanchorCount, 1, 'reanchorCount bumps on every re-plan');
+  assert.equal(planCalled, true, 're-plans on the live price');
 });
 
 test('_harvestToFlat while HOLDING bumps BOTH harvestCount and reanchorCount', async () => {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.ladderLines.filter(l => l.direction === 'LONG').slice(0, 2)
     .forEach(l => { l.state = 'POSITION_OPEN'; l.quantity = 0.5; });
   s.activePosition = { quantity: 1, entryPrice: 100.3, avgEntry: 100.3, notional: 100, unrealizedPnl: 5 };
@@ -2427,7 +2535,7 @@ test('_harvestToFlat while HOLDING bumps BOTH harvestCount and reanchorCount', a
 // ——— Flat re-anchor: enablement (gate + trigger fire) ———
 
 test('harvestNow() no longer throws when flat — it latches an immediate re-anchor', async () => {
-  const s = ladderStrategy();                 // flat
+  const s = reversalStrategy();                 // flat
   const res = await s.harvestNow();
   assert.equal(res.queued, true);
   assert.equal(s._manualHarvestRequested, true);
@@ -2435,14 +2543,14 @@ test('harvestNow() no longer throws when flat — it latches an immediate re-anc
 
 test('harvestNow(triggerPrice) arms a trigger while flat', async () => {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy();                 // flat, currentPrice 100
+  const s = reversalStrategy();                 // flat, currentPrice 100
   const res = await s.harvestNow(101.2);
   assert.equal(res.armed, true);
   assert.equal(s.harvestTriggerPrice, 101.2);
 });
 
 test('a trigger that fires while FLAT re-anchors (no longer disarms quietly)', async () => {
-  const s = ladderStrategy();                 // flat
+  const s = reversalStrategy();                 // flat
   s.harvestTriggerPrice = 101; s.harvestTriggerAbove = true;
   let fired = null;
   s._harvestToFlat = async (reason) => { fired = reason; };
@@ -2454,14 +2562,14 @@ test('a trigger that fires while FLAT re-anchors (no longer disarms quietly)', a
 // ——— Flat re-anchor: persistence + status ———
 
 test('getStatus and getHeartbeatPayload surface reanchorCount', () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.reanchorCount = 7;
   assert.equal(s.getStatus().reanchorCount, 7);
   assert.equal(s.getHeartbeatPayload().reanchorCount, 7);
 });
 
 test('saveState persists reanchorCount', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   delete s.saveState;                          // restore the real prototype method
   let captured = null;
   s.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { captured = d; } }) }) };
@@ -2480,7 +2588,7 @@ test('saveState persists reanchorCount', async () => {
 // "there is nothing to reduce" — it must reach tier 3, which reconciles.
 
 test('_isReduceOnlyRejected matches the proxy-flattened -2022 message and a raw code', () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   assert.equal(s._isReduceOnlyRejected(new Error('Proxy Error: 500 - Binance API Error: -2022 - ReduceOnly Order is rejected.')), true);
   assert.equal(s._isReduceOnlyRejected(Object.assign(new Error('rejected'), { code: -2022 })), true);
   assert.equal(s._isReduceOnlyRejected(new Error('Binance API Error: -1021 - Timestamp for this request')), false);
@@ -2488,7 +2596,7 @@ test('_isReduceOnlyRejected matches the proxy-flattened -2022 message and a raw 
 });
 
 test('_isReduceOnlyRejected matches the real makeProxyRequest shape (binanceErrorCode)', () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   assert.equal(
     s._isReduceOnlyRejected(Object.assign(new Error('Binance API Error: -2022 - ReduceOnly Order is rejected.'), { binanceErrorCode: -2022 })),
     true,
@@ -2500,7 +2608,7 @@ test('_isReduceOnlyRejected matches the real makeProxyRequest shape (binanceErro
 });
 
 test('_closeConsolidated: -2022 + Binance confirms flat verifies the close and clears state', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 0.26, entryPrice: 100, avgEntry: 100, notional: 26, unrealizedPnl: 0 };
   s.currentSide = 'SHORT';
   s.finalTpPrice = 95;
@@ -2528,7 +2636,7 @@ test('_closeConsolidated: -2022 + Binance confirms flat verifies the close and c
 });
 
 test('_closeConsolidated: -2022 + a FAILED refresh leaves state INTACT (unknown never reads as flat)', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 0.26, entryPrice: 100, avgEntry: 100, notional: 26, unrealizedPnl: 0 };
   s.currentSide = 'SHORT';
   s.placeMarketOrder = async () => {
@@ -2547,7 +2655,7 @@ test('_closeConsolidated: -2022 + a FAILED refresh leaves state INTACT (unknown 
 });
 
 test('_closeConsolidated: -2022 while the position is still OPEN returns false and keeps state', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 0.26, entryPrice: 100, avgEntry: 100, notional: 26, unrealizedPnl: 0 };
   s.currentSide = 'SHORT';
   s.placeMarketOrder = async () => {
@@ -2568,7 +2676,7 @@ test('_closeConsolidated: -2022 while the position is still OPEN returns false a
 });
 
 test('_closeConsolidated: a NON-reduceOnly order error still propagates (no blanket swallowing)', async () => {
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
   s.currentSide = 'LONG';
   s.placeMarketOrder = async () => {
@@ -2587,745 +2695,21 @@ test('_closeConsolidated: a NON-reduceOnly order error still propagates (no blan
   assert.ok(s.activePosition, 'state untouched');
 });
 
-// ——— Start Mode: an armed start trigger defers the ladder ———
-//
-// start() validates the level against a freshly fetched reference price (the
-// WS has not ticked yet at that point), stores it, and the tick gate holds the
-// ladder until the price reaches it. The anchor is then the LIVE price, not the
-// trigger level.
-
-test('startArmed is DERIVED: true only while a trigger is set AND no ladder exists', () => {
-  const s = ladderStrategy();
-  s.ladderLines = [];
-  s.startTriggerPrice = null;
-  assert.equal(s.startArmed, false, 'no trigger = not armed');
-  s.startTriggerPrice = 90;
-  assert.equal(s.startArmed, true, 'trigger + no ladder = armed');
-  s.ladderLines = buildLadder(100, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE);
-  assert.equal(s.startArmed, false, 'once the ladder exists the strategy is live, not armed');
-  // Getter-only — no setter was defined, so ESM strict mode throws on
-  // assignment. Free regression lock against someone later turning this back
-  // into a stored field (the exact drift `_trendFinalTpArmed` tombstones).
-  assert.throws(() => { s.startArmed = true; });
-});
-
-test('start trigger: a tick that has NOT reached the level does not build the ladder', async () => {
-  const s = ladderStrategy();
-  s.ladderLines = [];
-  s.startTriggerPrice = 90;
-  s.startTriggerAbove = false;      // armed below → fires on a fall
-  let built = false;
-  s.initializeLadder = async () => { built = true; };
-  await s.handleRealtimePrice(95);
-  assert.equal(built, false, 'price has not fallen to the trigger — the ladder must stay unbuilt');
-  assert.equal(s.startTriggerPrice, 90, 'the trigger stays armed');
-});
-
-test('start trigger: reaching the level clears it and anchors on the LIVE price', async () => {
-  const s = ladderStrategy();
-  s.ladderLines = [];
-  s.startTriggerPrice = 90;
-  s.startTriggerAbove = false;
-  let anchoredAt = null;
-  s.initializeLadder = async (p) => { anchoredAt = p; };
-  await s.handleRealtimePrice(89.7);   // gapped THROUGH the trigger
-  assert.equal(anchoredAt, 89.7, 'the anchor is the live price, not the 90 trigger level');
-  assert.equal(s.startTriggerPrice, null, 'one-shot — the trigger is cleared');
-  assert.equal(s.startTriggerAbove, null);
-});
-
-test('start trigger: an upward trigger fires on a rise', async () => {
-  const s = ladderStrategy();
-  s.ladderLines = [];
-  s.startTriggerPrice = 110;
-  s.startTriggerAbove = true;
-  let anchoredAt = null;
-  s.initializeLadder = async (p) => { anchoredAt = p; };
-  await s.handleRealtimePrice(105);
-  assert.equal(anchoredAt, null, 'not yet reached');
-  await s.handleRealtimePrice(110.4);
-  assert.equal(anchoredAt, 110.4);
-});
-
-test('start trigger: with NO trigger armed the ladder builds on the first tick as before', async () => {
-  const s = ladderStrategy();
-  s.ladderLines = [];
-  s.startTriggerPrice = null;
-  let anchoredAt = null;
-  s.initializeLadder = async (p) => { anchoredAt = p; };
-  await s.handleRealtimePrice(100);
-  assert.equal(anchoredAt, 100, 'Immediate mode is unchanged');
-});
-
-// ——— Start Mode: arm-time validation in start() ———
-//
-// Mirrors harvestNow(triggerPrice)'s dedicated arm-time tests above: rounding,
-// both directions, the 0.1% gap, and bad input — but through start(), which is
-// where the brief's central safety rule lives ("an already-satisfied or
-// too-close level must be REJECTED"). Reuses stubBootInternals() (the same
-// harness the existing "sizes the minNotional gate" start()-test drives) so
-// start() can run all the way through its network-touching setup in tests.
-// _fetchReferencePrice is stubbed directly rather than through
-// makeProxyRequest — stubBootInternals' makeProxyRequest always throws (it
-// exists to prove _refreshCurrentPosition fails safely), which would be the
-// wrong signal for a reference-price fetch that's meant to succeed.
-
-function startModeStrategy() {
-  const s = new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid');
-  stubBootInternals(s);
-  s.getWalletBalance = async () => 1000;
-  s._fetchReferencePrice = async () => 100; // reference price for every test below
-  // Genuinely flat by default (mirrors ladderStrategy()'s own no-op stub) —
-  // stubBootInternals' makeProxyRequest always throws, which would otherwise
-  // make _refreshCurrentPosition fail and trip the FIX-3 refusal below for
-  // every test here, not just the ones that mean to exercise it.
-  s._refreshCurrentPosition = async () => {};
-  return s;
-}
-
-test('start(): a start trigger inside the 0.1% gap is rejected and nothing is armed', async () => {
-  const s = startModeStrategy();
-  await assert.rejects(
-    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 100.05 }),
-    /0\.1%/,
-  );
-  assert.equal(s.startTriggerPrice, null, 'a rejected arm leaves no trigger set');
-  assert.equal(s.startTriggerAbove, null);
-});
-
-test('start(): a trigger ABOVE the reference arms startTriggerAbove=true', async () => {
-  const s = startModeStrategy();
-  try {
-    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 });
-    assert.equal(s.startTriggerPrice, 110);
-    assert.equal(s.startTriggerAbove, true);
-  } finally {
-    clearInterval(s.listenKeyRefreshInterval);
-  }
-});
-
-test('start(): a trigger BELOW the reference arms startTriggerAbove=false', async () => {
-  const s = startModeStrategy();
-  try {
-    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 90 });
-    assert.equal(s.startTriggerPrice, 90);
-    assert.equal(s.startTriggerAbove, false);
-  } finally {
-    clearInterval(s.listenKeyRefreshInterval);
-  }
-});
-
-test('start(): a non-positive start trigger price is rejected', async () => {
-  const s = startModeStrategy();
-  await assert.rejects(
-    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 0 }),
-    /positive number/,
-  );
-  assert.equal(s.startTriggerPrice, null);
-});
-
-test('start(): a non-finite start trigger price is rejected', async () => {
-  const s = startModeStrategy();
-  await assert.rejects(
-    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 'not-a-number' }),
-    /positive number/,
-  );
-  assert.equal(s.startTriggerPrice, null);
-});
-
-test('start(): a failed reference-price fetch refuses the start and arms nothing', async () => {
-  const s = startModeStrategy();
-  s._fetchReferencePrice = async () => {
-    throw new Error('Could not read a reference price from Binance to validate the start trigger.');
-  };
-  await assert.rejects(
-    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 }),
-    /reference price/,
-    'an unknown reference must refuse the start, never arm on a guess',
-  );
-  assert.equal(s.startTriggerPrice, null, 'unknown must never read as armed');
-  assert.equal(s.startTriggerAbove, null);
-});
-
-// ——— Start Mode: refuse to arm over an existing/unverifiable position ———
-//
-// While ARMED, the tick returns before any RANGE/TREND dispatch, so a
-// pre-existing position would have no anchor, no Final TP, and no stop-loss
-// for an unbounded period. Two distinct failure shapes, both refused.
-
-test('start(): refuses to arm a start trigger over an existing position', async () => {
-  const s = startModeStrategy();
-  s._refreshCurrentPosition = async () => {
-    s._lastPositionRefreshFailed = false; // Binance WAS reachable...
-    s.activePosition = { quantity: 0.5, entryPrice: 100, avgEntry: 100, notional: 50, unrealizedPnl: 0 };
-    s.currentSide = 'LONG'; // ...and answered "not flat"
-  };
-  await assert.rejects(
-    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 }),
-    /existing position/i,
-  );
-  assert.equal(s.startTriggerPrice, null, 'a refused arm must not persist a spurious armed trigger');
-  assert.equal(s.startTriggerAbove, null);
-});
-
-test('start(): refuses to arm a start trigger when the position check could not complete', async () => {
-  const s = startModeStrategy();
-  s._refreshCurrentPosition = async () => {
-    s._lastPositionRefreshFailed = true; // Binance was NOT reachable — "flat" cannot be trusted
-  };
-  await assert.rejects(
-    () => s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 }),
-    /did not complete|not known whether/i,
-  );
-  assert.equal(s.startTriggerPrice, null);
-  assert.equal(s.startTriggerAbove, null);
-});
-
-test('start(): arms fine when the account is confirmed genuinely flat', async () => {
-  const s = startModeStrategy(); // default stub: _lastPositionRefreshFailed stays false, activePosition stays null
-  try {
-    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 });
-    assert.equal(s.startTriggerPrice, 110);
-    assert.equal(s.startTriggerAbove, true);
-  } finally {
-    clearInterval(s.listenKeyRefreshInterval);
-  }
-});
-
-// FIX round 5: initializeLadder() pushes on the FIRING path, but nothing
-// pushed on ARMING — start() ended with a bare saveState(). During ARMED,
-// nothing else pushes either (saveTrade / initializeLadder / flatten-harvest
-// paths all sit idle while waiting), and the WS-connected frontend disables
-// its 3s REST poll, so the freshly-armed state would otherwise only reach the
-// UI via the 30s safety-net broadcast — up to 30s where the app cannot even
-// confirm the arm succeeded.
-test('start() pushes an immediate heartbeat once armed', async () => {
-  const s = startModeStrategy();
-  let heartbeatCalls = 0;
-  s._pushHeartbeatNow = () => { heartbeatCalls++; };
-  try {
-    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, startTriggerPrice: 110 });
-    assert.equal(heartbeatCalls, 1, 'the freshly-armed state must reach the frontend immediately, not wait on the 30s safety net');
-  } finally {
-    clearInterval(s.listenKeyRefreshInterval);
-  }
-});
-
-// ——— updateStartTrigger: edit the armed start trigger (Waiting-to-Start pencil) ———
-
-// An ARMED strategy: a start trigger is set and no ladder has been built yet.
-function armedStrategy() {
-  const s = ladderStrategy();
-  s.ladderLines = [];          // no ladder yet -> startArmed === true
-  s.startTriggerPrice = 110;
-  s.startTriggerAbove = true;
-  s.currentPrice = 100;        // live reference for validation
-  return s;
-}
-
-test('updateStartTrigger revalidates against the live price, updates, and pushes a heartbeat', async () => {
-  const s = armedStrategy();
-  assert.equal(s.startArmed, true, 'sanity: the fixture is armed');
-  let heartbeatCalls = 0;
-  s._pushHeartbeatNow = () => { heartbeatCalls++; };
-  const res = await s.updateStartTrigger(90);   // 10% below the live 100 -> valid, below
-  assert.equal(s.startTriggerPrice, 90);
-  assert.equal(s.startTriggerAbove, false);
-  assert.equal(res.startTriggerPrice, 90);
-  assert.equal(heartbeatCalls, 1, 'the edited trigger must reach the frontend immediately');
-});
-
-test('updateStartTrigger rejects a price inside the 0.1% gap as client input (400-mapped)', async () => {
-  const s = armedStrategy();
-  await assert.rejects(
-    () => s.updateStartTrigger(100.05),         // 0.05% from the live 100
-    (e) => e.invalidInput === true && /0\.1%/.test(e.message),
-  );
-  assert.equal(s.startTriggerPrice, 110, 'a rejected edit leaves the armed trigger untouched');
-});
-
-test('updateStartTrigger refuses once the ladder has started (state conflict, 409-mapped)', async () => {
-  const s = armedStrategy();
-  s.ladderLines = buildLadder(100, LADDER_STEP_PCT, LADDER_LEVELS_PER_SIDE); // built -> no longer armed
-  await assert.rejects(
-    () => s.updateStartTrigger(90),
-    (e) => e.invalidInput !== true && /no longer waiting/.test(e.message),
-  );
-});
-
 // getStatus carries the pair's real price precision so the frontend formats
 // every price at tick precision instead of a magnitude heuristic.
 test('getStatus surfaces the pair price precision from the cached exchange info', () => {
   precisionFormatter.cachePrecision('TESTUSDT', 0.001, 0.01, 5); // tickSize 0.001 -> 3 decimals
-  const s = ladderStrategy();
+  const s = reversalStrategy();
   s.symbol = 'TESTUSDT';
   s._computeAccLoss = () => 0;
   assert.equal(s.getStatus().pricePrecision, 3);
-});
-
-// ——— validateStartTrigger: the shared pure validator (FIX round 3) ———
-//
-// The SAME function both the /anchor-ladder/start route and start() call —
-// "one validator, two gates", mirroring resolveLadderGeometry's pattern.
-// Tested directly since it is a pure, exported function: the most honest
-// surface, no strategy fixture needed.
-
-test('validateStartTrigger: rejects a level inside the 0.1% gap', () => {
-  const result = validateStartTrigger(100.05, 100, 'BTCUSDT');
-  assert.equal(result.ok, false);
-  assert.match(result.error, /0\.1%/);
-});
-
-test('validateStartTrigger: a level ABOVE the reference is valid with above=true', () => {
-  const result = validateStartTrigger(110, 100, 'BTCUSDT');
-  assert.equal(result.ok, true);
-  assert.equal(result.above, true);
-  assert.equal(result.rounded, 110);
-});
-
-test('validateStartTrigger: a level BELOW the reference is valid with above=false', () => {
-  const result = validateStartTrigger(90, 100, 'BTCUSDT');
-  assert.equal(result.ok, true);
-  assert.equal(result.above, false);
-  assert.equal(result.rounded, 90);
-});
-
-test('validateStartTrigger: rejects a non-numeric price', () => {
-  const result = validateStartTrigger('not-a-number', 100, 'BTCUSDT');
-  assert.equal(result.ok, false);
-  assert.match(result.error, /positive number/);
-});
-
-test('validateStartTrigger: rejects zero', () => {
-  const result = validateStartTrigger(0, 100, 'BTCUSDT');
-  assert.equal(result.ok, false);
-  assert.match(result.error, /positive number/);
-});
-
-test('validateStartTrigger: rejects a negative price', () => {
-  const result = validateStartTrigger(-50, 100, 'BTCUSDT');
-  assert.equal(result.ok, false);
-  assert.match(result.error, /positive number/);
-});
-
-test('validateStartTrigger: rejects Infinity', () => {
-  const result = validateStartTrigger(Infinity, 100, 'BTCUSDT');
-  assert.equal(result.ok, false);
-  assert.match(result.error, /positive number/);
-});
-
-// ——— Start Mode: a pending harvest is refused / cleared, not replayed ———
-//
-// While ARMED there is no ladder and no position — a harvest requested now
-// would sit on the `_manualHarvestRequested` latch until the trigger fires,
-// then fire on the very next tick and flatten the ladder that had just been
-// built. harvestNow() refuses up front (FIX A); the fire path also clears the
-// latch belt-and-braces (FIX B) so that safety never rests on an invariant
-// enforced only by a different method.
-
-test('harvestNow() while the start trigger is armed refuses and never sets the latch', async () => {
-  const s = ladderStrategy();
-  s.ladderLines = [];
-  s.startTriggerPrice = 90;
-  s.startTriggerAbove = false;
-  await assert.rejects(() => s.harvestNow(), (err) => {
-    assert.match(err.message, /start trigger/i);
-    assert.equal(err.invalidInput, undefined, 'a state conflict must NOT be tagged invalidInput (route maps to 409, not 400)');
-    return true;
-  });
-  assert.equal(s._manualHarvestRequested, false, 'a meaningless request must never arm the latch');
-});
-
-test('start trigger fire path clears any harvest latch that slipped through (belt-and-braces)', async () => {
-  const s = ladderStrategy();
-  s.ladderLines = [];
-  s.startTriggerPrice = 90;
-  s.startTriggerAbove = false;
-  s._manualHarvestRequested = true; // forced on, as if it had slipped past harvestNow()'s guard
-  let built = false;
-  s.initializeLadder = async () => { built = true; };
-  await s.handleRealtimePrice(89.7); // crosses the trigger
-  assert.equal(built, true, 'the ladder still builds');
-  assert.equal(
-    s._manualHarvestRequested, false,
-    'a harvest requested before the ladder existed must not be replayed against the ladder that just built',
-  );
-});
-
-// ——— Anchor Trailing: persistence ———
-
-test('trailDirection defaults to null (trailing off)', () => {
-  const s = ladderStrategy();
-  assert.equal(s.trailDirection, null);
-});
-
-test('trailDirection survives a saveState -> resume round trip', async () => {
-  const src = ladderStrategy();
-  src.trailDirection = 'DOWN';
-  let doc = null;
-  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(src);
-  assert.equal(doc.trailDirection, 'DOWN', 'saveState must persist it');
-
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
-  dst.addLog = async () => {};
-  await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
-  cleanupResumeTimers(dst);
-
-  // Without this, a forced VM redeploy silently disarms trailing and the bot
-  // resumes opening the very entries the user armed it to suppress.
-  assert.equal(dst.trailDirection, 'DOWN', 'resume must restore it');
-});
-
-test('getStatus and getHeartbeatPayload both expose trailDirection', () => {
-  const s = ladderStrategy();
-  s.trailDirection = 'UP';
-  assert.equal(s.getStatus().trailDirection, 'UP');
-  assert.equal(s.getHeartbeatPayload().trailDirection, 'UP');
-});
-
-test('a resumed trailing strategy logs that trailing is still armed', async () => {
-  const src = ladderStrategy();
-  src.trailDirection = 'UP';
-  let doc = null;
-  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(src);
-
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
-  const logs = [];
-  dst.addLog = async (m) => { logs.push(m); };
-  await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
-  cleanupResumeTimers(dst);
-
-  assert.ok(
-    logs.some((m) => /trailing resumed/i.test(m)),
-    `restored state must never be silent; got: ${JSON.stringify(logs)}`,
-  );
-});
-
-test('stop() clears trailing — a terminated cycle must not stay armed', async () => {
-  // ladderStrategy() alone doesn't stub the rest of stop()'s I/O (funding
-  // poll, WS cleanup, no-trade doc delete, hero-profit); reuse stubStopTail,
-  // the same helper the file's other direct stop()-prototype tests use, so
-  // this exercises the real clear without needing a firestore double.
-  const s = stubStopTail(ladderStrategy());
-  s.trailDirection = 'DOWN';
-  s._trailRetryLastTs = Date.now();
-  await AnchorLadderStrategy.prototype.stop.call(s, { flatten: false, reason: 'manual' });
-  assert.equal(s.trailDirection, null);
-});
-
-// ——— Anchor Trailing: tick firing ———
-
-test('_trailLevel derives from the LIVE anchor and returns null when off', () => {
-  const s = ladderStrategy({ anchor: 100 });
-  assert.equal(s._trailLevel(), null, 'off → no level');
-  s.trailDirection = 'DOWN';
-  assert.ok(Math.abs(s._trailLevel() - 99.73) < 1e-9);
-  s.anchor = 200;
-  assert.ok(Math.abs(s._trailLevel() - 199.46) < 1e-9, 'must track the new anchor with no re-arm');
-});
-
-test('Trail Down fires _harvestToFlat when price reaches the trail level', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  let fired = null;
-  s._harvestToFlat = async (reason) => { fired = reason; return true; };
-  await s.handleRealtimePrice(99.73);
-  assert.equal(fired, 'trail');
-  assert.equal(s.trailDirection, 'DOWN', 'trailing is NOT one-shot — it stays armed');
-});
-
-test('Trail Up fires when price reaches the upside trail level', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'UP';
-  let fired = null;
-  s._harvestToFlat = async (reason) => { fired = reason; return true; };
-  await s.handleRealtimePrice(100.27);
-  assert.equal(fired, 'trail');
-});
-
-test('trailing does NOT fire before the level is reached', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  let fired = false;
-  s._harvestToFlat = async () => { fired = true; return true; };
-  await s.handleRealtimePrice(99.8);          // still inside the 99.73 level
-  assert.equal(fired, false);
-});
-
-test('trailing fires when price GAPS through the level', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  let fired = null;
-  s._harvestToFlat = async (r) => { fired = r; return true; };
-  await s.handleRealtimePrice(95);            // jumped well past 99.73
-  assert.equal(fired, 'trail', 'threshold test, not band-crossing');
-});
-
-test('trailing is DORMANT in TREND — it never fires and never disarms', async () => {
-  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
-  s.trendDirection = 'SHORT';
-  s.finalTpPrice = 95;
-  s.trailDirection = 'DOWN';
-  let fired = false;
-  s._harvestToFlat = async () => { fired = true; return true; };
-  s._flattenAtAnchor = async () => {};
-  s._checkFinalTpHit = () => false;
-  s._reconcileTrendInvariant = async () => {};
-  await s.handleRealtimePrice(99.7);
-  assert.equal(fired, false, 'TREND keeps exactly its two passive exits — no third');
-  assert.equal(s.trailDirection, 'DOWN', 'dormant, NOT disarmed — it must resume in RANGE');
-});
-
-test('trailing does not fire while the strategy is ARMED (no ladder yet)', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.ladderLines = [];                          // startArmed
-  s.startTriggerPrice = 95;
-  s.trailDirection = 'DOWN';
-  let fired = false;
-  s._harvestToFlat = async () => { fired = true; return true; };
-  s.initializeLadder = async () => {};
-  await s.handleRealtimePrice(99.5);
-  assert.equal(fired, false);
-});
-
-// THE CORE INVARIANT — the entire point of the feature and of the §3 buffer.
-test('with trailing ON, the S1 leg NEVER opens — the anchor moves instead', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  const filled = [];
-  s._fillLeg = async (leg) => { filled.push(leg); };
-  // Simulate a REAL re-anchor: move the anchor to the live price and rebuild.
-  s._harvestToFlat = async () => {
-    s.anchor = s.currentPrice;
-    s.ladderLines = buildLadder(s.anchor, s.stepPct, s.levelsPerSide);
-    return true;
-  };
-  // Walk price down through several would-be S1 levels.
-  for (const px of [99.9, 99.73, 99.5, 99.2, 98.9]) {
-    s.currentPrice = px;
-    await s.handleRealtimePrice(px);
-  }
-  assert.equal(filled.length, 0, `no leg may fill while trailing; filled: ${filled.length}`);
-  assert.equal(
-    s.ladderLines.some((l) => l.state === 'POSITION_OPEN'), false,
-    'the S1 leg must never reach POSITION_OPEN',
-  );
-  assert.ok(s.anchor < 100, `the anchor must have trailed down, got ${s.anchor}`);
-});
-
-// Spec §4.3 / §8.2: after a restart, price may ALREADY be past the level.
-// Because direction comes from trailDirection (never from a current-vs-price
-// comparison, which is what inverts harvestNow's one-shot direction), this
-// correctly fires rather than arming backwards.
-test('a resumed trail whose level is already passed fires on the next tick', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  s.lastProcessedPrice = null;              // fresh post-resume state
-  let fired = null;
-  s._harvestToFlat = async (r) => { fired = r; return true; };
-  await s.handleRealtimePrice(97);          // already well below the 99.73 level
-  assert.equal(fired, 'trail');
-});
-
-test('a trail re-anchor moves the level so the NEXT level tracks the new anchor', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  s._harvestToFlat = async () => {
-    s.anchor = s.currentPrice;
-    s.ladderLines = buildLadder(s.anchor, s.stepPct, s.levelsPerSide);
-    return true;
-  };
-  s.currentPrice = 99.73;
-  await s.handleRealtimePrice(99.73);
-  assert.ok(Math.abs(s.anchor - 99.73) < 1e-9);
-  assert.ok(Math.abs(s._trailLevel() - 99.73 * (1 - 0.9 * 0.003)) < 1e-9);
-});
-
-// ——— Anchor Trailing: retry throttle on an aborted harvest ———
-
-test('an aborted trail harvest does NOT re-attempt on the very next tick', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  let attempts = 0;
-  s._harvestToFlat = async () => { attempts++; return false; };   // aborted (unverified close)
-  await s.handleRealtimePrice(99.7);
-  await s.handleRealtimePrice(99.6);
-  await s.handleRealtimePrice(99.5);
-  assert.equal(attempts, 1, 'three ticks past the level must yield ONE close attempt, not three');
-  assert.equal(s.trailDirection, 'DOWN', 'must stay ARMED — disarming here would fail open');
-});
-
-test('an aborted trail harvest SUPPRESSES ladder fills during the retry window', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  s._harvestToFlat = async () => false;
-  const filled = [];
-  s._fillLeg = async (leg) => { filled.push(leg); };
-  await s.handleRealtimePrice(99.7);
-  await s.handleRealtimePrice(99.4);        // would otherwise cross S1 (99.7) and fill
-  assert.equal(filled.length, 0, 'the leg trailing exists to prevent must not fill mid-retry');
-});
-
-test('a trail harvest retries once the 5s window has elapsed', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  let attempts = 0;
-  s._harvestToFlat = async () => { attempts++; return false; };
-  await s.handleRealtimePrice(99.7);
-  assert.equal(attempts, 1);
-  s._trailRetryLastTs = Date.now() - 5_001;   // pretend 5s passed
-  await s.handleRealtimePrice(99.7);
-  assert.equal(attempts, 2, 'the retry must actually self-heal, not stay stuck forever');
-});
-
-// ——— Final-review Finding 1: the throttled branch must NOT advance
-// lastProcessedPrice — nothing was processed, so the band must be re-scanned
-// next tick (same convention as the _tradingSeqInProgress guard). Advancing
-// it silently swallows the band, letting a later tick fill the very leg
-// trailing exists to suppress. This bug was invisible to per-task review.
-
-test('a throttled trail retry does NOT advance lastProcessedPrice', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  s._harvestToFlat = async () => false;   // aborted every attempt (unverified close)
-  await s.handleRealtimePrice(99.7);      // fires (first attempt, not throttled yet)
-  assert.equal(s.lastProcessedPrice, 99.7, 'the firing tick DOES advance lastProcessedPrice — fire-path behavior is unchanged');
-  await s.handleRealtimePrice(99.6);      // throttled: nothing processed this tick
-  assert.equal(s.lastProcessedPrice, 99.7, 'a throttled tick must NOT advance lastProcessedPrice — the band must be re-scanned, not swallowed');
-  await s.handleRealtimePrice(99.5);      // still throttled
-  assert.equal(s.lastProcessedPrice, 99.7, 'lastProcessedPrice must stay pinned for the whole throttle window');
-});
-
-test('a throttled retry does not let a later bounce-back tick fill the suppressed leg', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  s._harvestToFlat = async () => false;   // every attempt aborts (unverified close)
-  const filled = [];
-  s._fillLeg = async (leg) => { filled.push(leg); };
-
-  // First-ever tick lands right at the trail level (~99.73) — strictly above
-  // S1 (99.7) by the 10%-of-a-step buffer. Fires, aborts, arms the throttle.
-  await s.handleRealtimePrice(99.73);
-  assert.equal(s.lastProcessedPrice, 99.73);
-
-  // Throttled ticks drop well past S1. Under the bug these would advance
-  // lastProcessedPrice past S1 without ever scanning it for a fill.
-  await s.handleRealtimePrice(99.5);
-  await s.handleRealtimePrice(99.4);
-
-  // Bounce back above the trail level: trailing does not re-fire (reached is
-  // false), so this tick falls through to planLadderActions. With the fix,
-  // prevPrice is still pinned at 99.73 (never swallowed S1); with the bug it
-  // would be ~99.4, and the band [99.4, 99.8] would fill S1.
-  await s.handleRealtimePrice(99.8);
-  assert.equal(filled.length, 0, 'S1 must not fill: trailing exists specifically to suppress this leg');
-});
-
-test('a SUCCESSFUL trail harvest leaves no retry throttle pending', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  s._harvestToFlat = async () => {
-    s.anchor = s.currentPrice;
-    s.ladderLines = buildLadder(s.anchor, s.stepPct, s.levelsPerSide);
-    return true;
-  };
-  s.currentPrice = 99.7;
-  await s.handleRealtimePrice(99.7);
-  assert.equal(s._trailRetryLastTs, null, 'success must clear the throttle');
-});
-
-test('turning trailing off clears a pending retry throttle', async () => {
-  const s = ladderStrategy();
-  s._trailRetryLastTs = Date.now();
-  await s.setTrailDirection(null);
-  assert.equal(s._trailRetryLastTs, null);
-});
-
-// ——— Final-review Finding 3: the throttle must be armed pessimistically, so
-// a THROW from _harvestToFlat (e.g. a Firestore failure in saveState/addLog
-// after the close) still throttles the retry — not just a returned `false`.
-// The exception must still propagate; it is not swallowed.
-
-test('a throwing _harvestToFlat still arms the throttle', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  s._harvestToFlat = async () => { throw new Error('firestore boom'); };
-  await assert.rejects(() => s.handleRealtimePrice(99.7), /firestore boom/);
-  assert.ok(s._trailRetryLastTs != null, 'a throw must arm the throttle just like a returned false would');
-  assert.equal(s.trailDirection, 'DOWN', 'trailing must stay ARMED even when the close attempt throws — disarming would fail open');
-});
-
-test('after a throwing _harvestToFlat, the very next tick is throttled, not re-fired', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'DOWN';
-  let attempts = 0;
-  s._harvestToFlat = async () => { attempts++; throw new Error('firestore boom'); };
-  await assert.rejects(() => s.handleRealtimePrice(99.7));
-  assert.equal(attempts, 1);
-  await s.handleRealtimePrice(99.6);   // would re-fire immediately (the same per-tick storm Task 6 prevents) if the throw failed to arm the throttle
-  assert.equal(attempts, 1, 'the throttle armed by the throw must suppress the very next tick');
-});
-
-// ——— Anchor Trailing: the trailed side is removed from play ———
-
-// The reason this exists: a trail level seated 0.9 of a step inside L1 was STILL
-// losing the race to L1 under real volatility. Removing the leg is structural —
-// there is nothing left to race, even on a gap that would skip past L1 to L3.
-test('with Trail Up armed, no LONG leg fills even on a gap past several levels', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'UP';
-  const filled = [];
-  s._fillLeg = async (leg) => { filled.push(leg); };
-  s._harvestToFlat = async () => { s.anchor = s.currentPrice; s.ladderLines = buildLadder(s.anchor, s.stepPct, s.levelsPerSide); return true; };
-  s.lastProcessedPrice = 100;
-  s.currentPrice = 101.2;
-  await s.handleRealtimePrice(101.2);            // gaps past L1..L4 in one tick
-  assert.equal(filled.length, 0, `no LONG leg may fill; filled ${filled.length}`);
-});
-
-test('the SHORT side still fills normally while Trail Up is armed', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  s.trailDirection = 'UP';                        // suppresses LONG only
-  const filled = [];
-  s._fillLeg = async (leg) => { filled.push(leg); leg.state = 'POSITION_OPEN'; };
-  s.lastProcessedPrice = 99.9;                    // stay below the anchor: no cross
-  await s.handleRealtimePrice(99.6);
-  assert.ok(filled.length > 0, 'the untrailed side must keep trading');
-  assert.ok(filled.every((l) => l.direction === 'SHORT'));
-});
-
-// Suppression must NEVER drop a leg that holds inventory — that would orphan the
-// position and hand _closeConsolidated a mixed-side ledger it assumes is impossible.
-test('arming trailing never removes a leg that already holds inventory', async () => {
-  const s = ladderStrategy({ anchor: 100 });
-  const l1 = s.ladderLines.find((l) => l.direction === 'LONG' && l.levelIndex === 1);
-  l1.state = 'POSITION_OPEN'; l1.quantity = 0.5;
-  s.trailDirection = 'UP';                        // suppress LONG *after* it filled
-  s._harvestToFlat = async () => true;
-  s.lastProcessedPrice = 100;
-  await s.handleRealtimePrice(100.1);
-  const still = s.ladderLines.find((l) => l.direction === 'LONG' && l.levelIndex === 1);
-  assert.equal(still.state, 'POSITION_OPEN', 'open inventory must survive suppression');
-  assert.equal(still.quantity, 0.5);
-});
-
-test('getStatus surfaces trailSuppressedSide so the UI never re-derives the inversion', () => {
-  const s = ladderStrategy();
-  assert.equal(s.getStatus().trailSuppressedSide, null);
-  s.trailDirection = 'UP';
-  assert.equal(s.getStatus().trailSuppressedSide, 'LONG', 'LONG levels sit ABOVE the anchor');
-  s.trailDirection = 'DOWN';
-  assert.equal(s.getStatus().trailSuppressedSide, 'SHORT');
-  assert.equal(s.getHeartbeatPayload().trailSuppressedSide, 'SHORT');
 });
 
 // ——— Final TP manual level ———
 
 function tpStrategy({ side = 'LONG', entry = 100, qty = 10, accLoss = 0, minProfit = 5 } = {}) {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy({ mode: 'TREND', anchor: 100 });
+  const s = reversalStrategy({ mode: 'TREND' });
   s.trendDirection = side;
   s.activePosition = { quantity: qty, entryPrice: entry, avgEntry: entry, notional: entry * qty, unrealizedPnl: 0 };
   s.cycleAccumulatedLoss = accLoss;
@@ -3403,13 +2787,13 @@ test('adjustFinalTp rejects a non-positive level', async () => {
   await assert.rejects(() => s.adjustFinalTp({ price: 0 }), (err) => err.invalidInput === true);
 });
 
-// ——— Final TP: the % path must work in RANGE / while flat ———
+// ——— Final TP: the % path must work in SCALING / while flat ———
 
 // Regression: gating the editor on TREND removed the ability to set the profit
-// target during RANGE, where it still matters — it is what _recomputeFinalTpPrice
+// target during SCALING, where it still matters — it is what _recomputeFinalTpPrice
 // derives from the moment the outermost leg trips TREND.
-test('profitUSDT sets the target while FLAT in RANGE (no position to price off)', async () => {
-  const s = ladderStrategy({ anchor: 100 });      // RANGE, activePosition null
+test('profitUSDT sets the target while FLAT in SCALING (no position to price off)', async () => {
+  const s = reversalStrategy();      // SCALING, activePosition null
   s.minDesiredProfitUSDT = 5;
   s.desiredProfitUSDT = 5;
   const r = await s.adjustFinalTp({ profitUSDT: 12 });
@@ -3418,7 +2802,7 @@ test('profitUSDT sets the target while FLAT in RANGE (no position to price off)'
 });
 
 test('the profitUSDT path enforces the same config floor as the price path', async () => {
-  const s = ladderStrategy({ anchor: 100 });
+  const s = reversalStrategy();
   s.minDesiredProfitUSDT = 5;
   s.desiredProfitUSDT = 5;
   await assert.rejects(() => s.adjustFinalTp({ profitUSDT: 4 }), (err) => {
@@ -3428,9 +2812,9 @@ test('the profitUSDT path enforces the same config floor as the price path', asy
   assert.equal(s.desiredProfitUSDT, 5, 'a rejected target must not move');
 });
 
-test('a profitUSDT set in RANGE arms the expected Final TP once TREND begins', async () => {
+test('a profitUSDT set in SCALING arms the expected Final TP once TREND begins', async () => {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy({ anchor: 100 });
+  const s = reversalStrategy();
   s.minDesiredProfitUSDT = 5; s.desiredProfitUSDT = 5;
   await s.adjustFinalTp({ profitUSDT: 20 });
   // Now the cycle scales out and enters TREND with a real position.
@@ -3441,14 +2825,14 @@ test('a profitUSDT set in RANGE arms the expected Final TP once TREND begins', a
   s._recomputeFinalTpPrice();
   const back = s.projectProfitAtPrice(s.finalTpPrice);
   assert.ok(Math.abs(back.projectedProfitUSDT - 20) < 1e-6,
-    `the RANGE-set target must survive into TREND; got ${back.projectedProfitUSDT}`);
+    `the SCALING-set target must survive into TREND; got ${back.projectedProfitUSDT}`);
 });
 
-// ——— A manual profit target carries across an anchor flatten — loudly ———
+// ——— A manual profit target carries across a reversal — loudly ———
 
 function trendEntryStrategy({ desired = 5, floor = 5 } = {}) {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy({ anchor: 100 });
+  const s = reversalStrategy();
   s.desiredProfitUSDT = desired;
   s.minDesiredProfitUSDT = floor;
   s.activePosition = { quantity: 10, entryPrice: 97, avgEntry: 97, notional: 970, unrealizedPnl: 0 };
@@ -3480,18 +2864,20 @@ test('_enterTrend stays quiet when the target is still the config one', async ()
 });
 
 // The behaviour the notice explains: the target itself must NOT reset.
-test('an anchor flatten disarms the price but keeps the profit target', async () => {
-  const s = ladderStrategy({ anchor: 100 });
+test('a reversal disarms the price but keeps the profit target', async () => {
+  const s = reversalStrategy();
   s.desiredProfitUSDT = 29.2;
   s.minDesiredProfitUSDT = 5;
   s.ladderMode = 'TREND';
   s.trendDirection = 'LONG';
   s.finalTpPrice = 103;
+  s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1).state = 'POSITION_OPEN';
   s.activePosition = { quantity: 10, entryPrice: 100, avgEntry: 100, notional: 1000, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
   s._closeConsolidated = async () => true;
   s._computeAccLoss = () => 20;
   s._computeLadderBaseSize = async () => 1000;
-  await s._flattenAtAnchor();
+  await s._reverseTo('SHORT');
   assert.equal(s.finalTpPrice, null, 'the level dies with the position');
   assert.equal(s.desiredProfitUSDT, 29.2, 'the cycle-level goal survives');
   assert.equal(s.minDesiredProfitUSDT, 5, 'and the config floor is untouched');
@@ -3501,7 +2887,7 @@ test('an anchor flatten disarms the price but keeps the profit target', async ()
 
 function triggerActionStrategy({ action = 'reanchor' } = {}) {
   precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy({ anchor: 100 });
+  const s = reversalStrategy();
   s.activePosition = { quantity: 10, entryPrice: 98, avgEntry: 98, notional: 980, unrealizedPnl: 20 };
   s.harvestTriggerPrice = 99;
   s.harvestTriggerAbove = false;          // set BELOW price -> fires on a fall
@@ -3540,7 +2926,7 @@ test('firing clears the action back to reanchor', async () => {
 });
 
 test('harvestNow arms the stop action and rejects an unknown one', async () => {
-  const s = ladderStrategy({ anchor: 100 });
+  const s = reversalStrategy();
   s.currentPrice = 100;
   const r = await s.harvestNow(98, { action: 'stop' });
   assert.equal(r.action, 'stop');
@@ -3553,14 +2939,14 @@ test('harvestNow arms the stop action and rejects an unknown one', async () => {
 });
 
 test('an armed stop survives a save/resume round trip', async () => {
-  const src = ladderStrategy({ anchor: 100 });
+  const src = reversalStrategy();
   src.harvestTriggerPrice = 98; src.harvestTriggerAbove = false; src.harvestTriggerAction = 'stop';
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(src);
+  await ReversalLadderStrategy.prototype.saveState.call(src);
   assert.equal(doc.harvestTriggerAction, 'stop');
 
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
   cleanupResumeTimers(dst);
@@ -3570,10 +2956,10 @@ test('an armed stop survives a save/resume round trip', async () => {
 // A snapshot written before this field existed was armed under the old
 // behaviour; resuming it as a cycle-ending stop would be a nasty surprise.
 test('a legacy snapshot without the field resumes as reanchor', async () => {
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   await dst.resume({
-    strategyId: 'anchor_ladder_legacy_test',   // resume() needs it for Firestore init
+    strategyId: 'reversal_ladder_legacy_test',   // resume() needs it for Firestore init
     isRunning: true, symbol: 'BTCUSDT',
     harvestTriggerPrice: 98, harvestTriggerAbove: false,   // note: no harvestTriggerAction
   });
@@ -3581,126 +2967,653 @@ test('a legacy snapshot without the field resumes as reanchor', async () => {
   assert.equal(dst.harvestTriggerAction, 'reanchor');
 });
 
-// ——— Anchor Trailing: how far the anchor has been walked ———
+// ——— Task 5: the trailing exit (§7) ——————————————————————————————————
 
-function gainStrategy() {
-  precisionFormatter.cachePrecision('BTCUSDT', 0.01, 0.01, 5);
-  const s = ladderStrategy({ anchor: 85 });
-  s.saveState = async () => {};
-  s._pushHeartbeatNow = () => {};
+// Helper: a TREND-LONG strategy with trailing on, armed at 104.
+function trendStrategy() {
+  const s = reversalStrategy({ mode: 'TREND' });
+  s.trendDirection = 'LONG';
+  s.currentSide = 'LONG';
+  s.trendStartPrice = 104;
+  s.trailEnabled = true;
+  s.activePosition = { quantity: 5, entryPrice: 103, notional: 515, unrealizedPnl: 5 };
+  s.ladderLines.forEach(l => { if (l.direction === 'LONG') { l.state = 'POSITION_OPEN'; l.quantity = 1; l.fillPrice = l.price; } });
+  s.finalTpPrice = 200;   // far away, so it never fires in these tests
+  s.lastProcessedPrice = 104;
   return s;
 }
 
-test('a fresh cycle reports no trail gain until trailing actually moves the anchor', async () => {
-  const s = gainStrategy();
-  await s.initializeLadder(85);
-  assert.equal(s.trailBaselineAnchor, 85);
-  assert.equal(s.trailMoveCount, 0);
-  assert.equal(s._trailGainPct(), null, '0 moves must read as nothing to report, not 0%');
+// §14.6 — the trail arms at exactly the opposite level.
+test('the trail arms at exactly bearLevel', async () => {
+  const s = trendStrategy();
+  s._armTrail();
+  assert.equal(s.trailDistanceValue, 6);   // 104 - 98
+  assert.equal(s.trailExit, 98);           // === bearLevel
 });
 
-test('trail moves accumulate against a FIXED baseline and compound', async () => {
-  const s = gainStrategy();
-  await s.initializeLadder(85);
-  s.trailDirection = 'UP';
-  let px = 85;
-  for (let i = 0; i < 24; i++) { px *= 1.001; await s.initializeLadder(px, { trailMove: true }); }
-  assert.equal(s.trailBaselineAnchor, 85, 'the baseline must NOT move on a trail fire');
-  assert.equal(s.trailMoveCount, 24);
-  // 24 compounding 0.1% steps is 2.43%, NOT 24 x 0.1% = 2.40%.
-  assert.ok(Math.abs(s._trailGainPct() - 2.4287) < 0.001, `got ${s._trailGainPct()}`);
+// §14.6 — while trail === bearLevel a hit is a REVERSAL, not a trailed exit.
+test('a hit while the trail still sits at bearLevel reverses', async () => {
+  const s = trendStrategy();
+  s._armTrail();
+  const filled = captureFills(s);
+  let closes = 0;
+  s._closeConsolidated = async () => { closes++; return true; };
+  s._closeQuantity = () => 0;
+  await s.handleRealtimePrice(98);
+  assert.equal(closes, 1);
+  assert.deepEqual(filled, ['S1'], 'a reversal opens the new side on the same tick');
+  assert.equal(s.reversalCount, 1);
 });
 
-// The exact sequence asked for: Up gains, then switching to Down flips the SIGN
-// of the same untouched movement.
-test('switching direction flips the sign against the same baseline', async () => {
-  const s = gainStrategy();
-  await s.initializeLadder(85);
-  s.trailDirection = 'UP'; s.trailLastDirection = 'UP';
-  await s.initializeLadder(87.06, { trailMove: true });
-  const up = s._trailGainPct();
-  assert.ok(up > 2.4 && up < 2.5, `expected ~+2.42%, got ${up}`);
-
-  s.trailDirection = 'DOWN';
-  const down = s._trailGainPct();
-  assert.ok(Math.abs(down + up) < 1e-9, `expected the exact negation, got ${down} vs ${up}`);
-  assert.equal(s.trailBaselineAnchor, 85, 'the baseline must survive a direction switch');
+// §14.6 — after ratcheting, a hit CLOSES and fills nothing that tick.
+test('a hit after the trail has ratcheted closes and fills nothing', async () => {
+  const s = trendStrategy();
+  s._armTrail();
+  const filled = captureFills(s);
+  await s.handleRealtimePrice(106);                 // ratchet: 106 - 6 = 100
+  assert.equal(s.trailExit, 100);
+  let closes = 0;
+  s._closeConsolidated = async () => { closes++; return true; };
+  s._closeQuantity = () => 0;
+  await s.handleRealtimePrice(100);
+  assert.equal(closes, 1);
+  assert.deepEqual(filled, [], 'the two-tick rule applies to a trailed exit');
+  assert.equal(s.ladderMode, 'SCALING');
+  assert.equal(s.trailExit, null);
+  assert.equal(s.reversalCount, 0, 'a trailed exit is not a reversal');
+  assert.equal(
+    s.ladderLines.filter(l => l.state !== 'EMPTY').length, 0,
+    'BOTH ladders reset to EMPTY on a trailed exit',
+  );
 });
 
-test('a manual harvest re-baselines and resets the count', async () => {
-  const s = gainStrategy();
-  await s.initializeLadder(85);
-  s.trailDirection = 'UP';
-  await s.initializeLadder(87.06, { trailMove: true });
-  assert.equal(s.trailMoveCount, 1);
-
-  await s.initializeLadder(84.10);          // no trailMove -> manual harvest / trigger
-  assert.equal(s.trailBaselineAnchor, 84.10, 'a non-trail re-anchor starts the measurement over');
-  assert.equal(s.trailMoveCount, 0);
-  assert.equal(s._trailGainPct(), null);
+// §14.7 — one-way ratchet, capped at the entry level.
+test('the trail never retreats and caps at bullLevel', async () => {
+  const s = trendStrategy();
+  s._armTrail();
+  await s.handleRealtimePrice(106);
+  assert.equal(s.trailExit, 100);
+  await s.handleRealtimePrice(105);          // pull back
+  assert.equal(s.trailExit, 100, 'the trail must not give ground');
+  await s.handleRealtimePrice(130);          // 130 - 6 = 124, way past bull
+  assert.equal(s.trailExit, 102, 'capped at bullLevel');
 });
 
-// Switching trailing OFF must not erase the reading — the anchor is still where
-// trailing left it, and that is exactly when the number informs the next move.
-test('the gain survives trailing being switched off, using the last direction', async () => {
-  const s = gainStrategy();
-  await s.initializeLadder(85);
-  await s.setTrailDirection('UP');
-  await s.initializeLadder(87.06, { trailMove: true });
-  await s.setTrailDirection(null);
-  assert.equal(s.trailDirection, null);
-  assert.equal(s.trailLastDirection, 'UP', 'the producing direction is remembered');
-  assert.ok((s._trailGainPct() ?? 0) > 2.4, 'the reading must persist while trailing is off');
-});
-
-test('an anchor flatten leaves the baseline and the count untouched', async () => {
-  const s = gainStrategy();
-  await s.initializeLadder(85);
-  s.trailDirection = 'UP';
-  await s.initializeLadder(87.06, { trailMove: true });
-  const before = s._trailGainPct();
-
+// Carry-forward 2 — the pure function has no cross-call side identity, so a
+// LONG-side `previous` left standing would ratchet a later SHORT trail the
+// wrong way. The reversal path (trail still AT bearLevel — once it has
+// ratcheted past, §7 gives the close to the trailed exit instead) must clear it.
+test('a reversal clears the trail so a LONG value cannot leak into a SHORT trail', async () => {
+  const s = trendStrategy();
+  s._armTrail();
+  assert.equal(s.trailExit, 98, 'un-ratcheted: still at bearLevel, so a hit reverses');
   s._closeConsolidated = async () => true;
+  s._closeQuantity = () => 0;
+  captureFills(s);
+  await s.handleRealtimePrice(98);
+  assert.equal(s.reversalCount, 1, 'this must be the reversal path, not a trailed exit');
+  assert.equal(s.trailExit, null);
+  assert.equal(s.trailDistanceValue, null);
+  assert.equal(s.trendStartPrice, null);
+});
+
+// Carry-forward 1 — never trust a persisted exit level. The band can have
+// narrowed since it was written (a level edit or an applied Ask AI proposal),
+// and a stale value above the new bullLevel would win Math.max forever,
+// silently killing the cap whose only job is keeping the exit out of the ladder.
+test('_restoreTrailFromSnapshot re-clamps a stale exit into the restored band', () => {
+  const s = reversalStrategy();          // bull 102 / bear 98
+  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 6, trailExit: 140 });
+  assert.equal(s.trailExit, 102, 'clamped down to bullLevel');
+
+  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 6, trailExit: 12 });
+  assert.equal(s.trailExit, 98, 'clamped up to bearLevel');
+
+  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 6, trailExit: 100 });
+  assert.equal(s.trailExit, 100, 'an in-band value survives untouched');
+});
+
+test('_restoreTrailFromSnapshot refuses a non-finite exit rather than guessing', () => {
+  const s = reversalStrategy();
+  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 6, trailExit: 'oops' });
+  assert.equal(s.trailExit, null);
+  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 6 });
+  assert.equal(s.trailExit, null);
+});
+
+test('_restoreTrailFromSnapshot treats a missing trailEnabled as OFF', () => {
+  const s = reversalStrategy();
+  s._restoreTrailFromSnapshot({});
+  assert.equal(s.trailEnabled, false, "only an explicit true arms it — 'unknown' is not 'on'");
+  assert.equal(s.trailExit, null);
+});
+
+// Trailing off is genuinely off.
+test('trailing disabled never closes on a trail level', async () => {
+  const s = trendStrategy();
+  s.trailEnabled = false;
+  s._armTrail();
+  assert.equal(s.trailExit, null);
+  let closes = 0;
+  s._closeConsolidated = async () => { closes++; return true; };
+  await s.handleRealtimePrice(106);
+  await s.handleRealtimePrice(101);
+  assert.equal(closes, 0);
+});
+
+// ——— Task 6: wire the AI level planner (§10) ——————————————————————————
+
+test('start() with no aiApiKey leaves the planner null — the mechanical fallback still works', () => {
+  const s = reversalStrategy();
+  s._aiPlanner = null;
+  assert.equal(s._aiPlanner, null);
+});
+
+test('an AI usage record accumulates into aiCostUSD', async () => {
+  const s = reversalStrategy();
+  s.ladderLines = [];
+  s.bullLevel = null;
+  s.bearLevel = null;
+  s.volumeProfile = { getVoidProfile: async () => ({ profile: { rangeVoids: [] }, pair: null, window: '24h' }) };
+  s.marketMetrics = {
+    getVolatility: async () => ({ atr: 1, interpretation: 'normal' }),
+    getCvd: async () => ({ cvd: 0 }),
+    getOrderbookDepth: async () => ({ bidVolume: 1, askVolume: 1 }),
+    getFundingRate: async () => ({ rate: 0 }),
+    getOpenInterestChange: async () => ({ oiChange1h: 0 }),
+  };
+  s.aiModel = 'deepseek-v4-flash';
+  s._aiPlanner = {
+    consult: async () => ({
+      json: { bullLevel: 102, bearLevel: 98, rationale: 'test' },
+      usage: { inputTokens: 1000, outputTokens: 500, cacheRead: 0, cacheCreation: 0 },
+    }),
+  };
+  const built = await s._planAndBuildLevels('cycle_start');
+  assert.equal(built, true);
+  assert.equal(s.bullLevel, 102);
+  assert.equal(s.bearLevel, 98);
+  assert.ok(s.aiCostUSD > 0, 'a consult with real token usage must cost something');
+});
+
+test('the API key is never persisted or surfaced', async () => {
+  const s = reversalStrategy();
+  s._aiApiKey = 'sk-secret-value';
+  const status = JSON.stringify(s.getStatus());
+  const beat = JSON.stringify(s.getHeartbeatPayload());
+  assert.ok(!status.includes('sk-secret-value'), 'getStatus leaked the key');
+  assert.ok(!beat.includes('sk-secret-value'), 'the heartbeat leaked the key');
+});
+
+// ——— Task 7: manual level edit and Ask AI (§3, §10) ——————————————————
+
+// §14.9 — an edit is refused while that side holds inventory.
+test('editLevels refuses to move a side that has a filled leg', async () => {
+  const s = reversalStrategy();
+  const L1 = s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1);
+  L1.state = 'POSITION_OPEN';
+  L1.quantity = 1;
+  await assert.rejects(
+    () => s.editLevels({ bullLevel: 105 }),
+    /filled/i,
+    'moving the geometry under a filled leg would orphan it',
+  );
+  assert.equal(s.bullLevel, 102, 'the level must be unchanged after a refusal');
+});
+
+// §14.9 — the §3 invariant is enforced VM-side.
+test('editLevels refuses a pair that violates bear < price < bull', async () => {
+  const s = reversalStrategy();
+  s.currentPrice = 100;
+  await assert.rejects(() => s.editLevels({ bullLevel: 99 }), /above/i);
+  await assert.rejects(() => s.editLevels({ bearLevel: 101 }), /below/i);
+});
+
+test('editLevels rebuilds only the edited side and keeps the other ladder', async () => {
+  const s = reversalStrategy();
+  await s.editLevels({ bullLevel: 105 });
+  assert.equal(s.bullLevel, 105);
+  assert.equal(s.bearLevel, 98);
+  const L1 = s.ladderLines.find(l => l.direction === 'LONG' && l.index === 1);
+  const S1 = s.ladderLines.find(l => l.direction === 'SHORT' && l.index === 1);
+  assert.equal(L1.price, 105, 'L1 IS bullLevel');
+  assert.equal(S1.price, 98, 'the untouched side keeps its geometry');
+});
+
+// NOTE: the brief's original fixture moved BOTH bullLevel and bearLevel at
+// once against a single price (bull 101 / bear 101.5 @ price 100). That is
+// mathematically unreachable: the individual per-side checks require
+// nextBull > price > nextBear, which by transitivity already forces
+// nextBull > nextBear — so an inverted pair can never survive both moving at
+// once, and the "below current price" refusal fires first instead of the
+// unconditional inversion check this test means to exercise. Fixed by moving
+// only ONE side (mirroring the real scenario: price ran past the old level),
+// leaving the other side's un-moved value to collide with it.
+test('editLevels rejects an inverted pair', async () => {
+  const s = reversalStrategy();          // bull 102 / bear 98
+  s.currentPrice = 105;                  // price has run above the old bull level
+  await assert.rejects(() => s.editLevels({ bearLevel: 103 }), /above bearLevel/i);
+});
+
+// In TREND price is legitimately OUTSIDE the band, so the invariant must only
+// bind the side actually being moved — otherwise no edit is ever possible once
+// a position has scaled.
+test('editLevels allows moving the unfilled side while price sits outside the band', async () => {
+  const s = trendStrategy();       // LONG filled, price will be 106, bull 102
+  await s.handleRealtimePrice(106);
+  await s.editLevels({ bearLevel: 99 });
+  assert.equal(s.bearLevel, 99);
+  assert.equal(s.bullLevel, 102, 'the untouched side is not re-validated against price');
+});
+
+// Carry-forward 3 — a narrowed band must not strand the ratchet outside it.
+// Only the SHORT ladder is unfilled here, so bear is the movable side.
+test('editing a level while TREND is armed re-clamps the trail into the new band', async () => {
+  const s = trendStrategy();
+  s._armTrail();
+  await s.handleRealtimePrice(106);
+  assert.equal(s.trailExit, 100);
+  await s.editLevels({ bearLevel: 101 });
+  assert.ok(
+    s.trailExit >= 101 && s.trailExit <= 102,
+    `trail ${s.trailExit} must be re-clamped into the new [101, 102] band`,
+  );
+});
+
+test('askAi returns a proposal without applying it', async () => {
+  const s = reversalStrategy();
+  s.volumeProfile = { getVoidProfile: async () => ({ profile: { rangeVoids: [] }, pair: null, window: '24h' }) };
+  s.marketMetrics = {
+    getVolatility: async () => ({ atr: 1, interpretation: 'normal' }),
+    getCvd: async () => ({ cvd: 0 }),
+    getOrderbookDepth: async () => ({ bidVolume: 1, askVolume: 1 }),
+    getFundingRate: async () => ({ rate: 0 }),
+    getOpenInterestChange: async () => ({ oiChange1h: 0 }),
+  };
+  s._aiPlanner = {
+    consult: async () => ({ json: { bullLevel: 106, bearLevel: 94, rationale: 'wider' }, usage: null }),
+  };
+  const proposal = await s.askAi('go wider');
+  assert.equal(proposal.bullLevel, 106);
+  assert.equal(s.bullLevel, 102, 'a proposal must NOT be applied');
+});
+
+// ——— Tick re-entrancy: `_tickInProgress` ——————————————————————————————————
+//
+// `handleRealtimePrice`'s opening guard (`if (this._tradingSeqInProgress)
+// return;`) is NOT sufficient on its own to serialize ticks: nothing sets
+// `_tradingSeqInProgress` until deep inside an action branch, and there are
+// real awaits before that point (`_reconcileTrendInvariant`, the harvest
+// latch/trigger branches) across which a second WS tick can enter, pass the
+// same gate, and reach the same action branch while the first tick's state
+// mutations are still in flight. `_tickInProgress` closes that window by
+// gating the ENTIRE tick body, immediately after the existing check.
+//
+// It deliberately does NOT reuse `_tradingSeqInProgress`: `_harvestToFlat`
+// self-refuses when THAT flag is already set (`_tradingSeqInProgress`
+// means "a trading sequence is executing"), so folding the tick's mutual
+// exclusion into it would make every tick-driven harvest silently skip.
+
+// A fully-scaled TREND LONG, ready to reverse on the next tick that crosses
+// bearLevel — the concrete scenario from the bug report.
+function trendReadyToReverse() {
+  const s = reversalStrategy({ mode: 'TREND' });
+  s.trendDirection = 'LONG';
+  s.ladderLines.filter(l => l.direction === 'LONG').forEach(l => { l.state = 'POSITION_OPEN'; l.quantity = 1; });
+  s.activePosition = { quantity: 5, entryPrice: 103, notional: 515, unrealizedPnl: 2 };
+  s.currentSide = 'LONG';
+  s.finalTpPrice = 110; // armed, well above current price — Final TP must not fire in this test
+  s.lastProcessedPrice = 100;
   s._computeAccLoss = () => 0;
-  s._computeLadderBaseSize = async () => 1000;
-  await s._flattenAtAnchor();               // rebuilds on the SAME anchor
-  assert.equal(s.trailBaselineAnchor, 85);
-  assert.equal(s.trailMoveCount, 1);
-  assert.equal(s._trailGainPct(), before, 'a flatten does not move the anchor, so it cannot move this');
+  captureFills(s); // real `_fillLeg` would place a live order; record instead
+  return s;
+}
+
+test('two concurrent ticks that both cross bearLevel must reverse exactly once, not twice', async () => {
+  const s = trendReadyToReverse();
+
+  // Both ticks pass the top-of-method gate (`_tradingSeqInProgress` is still
+  // false for both — nothing sets it until deep inside the reverse branch),
+  // then both suspend inside `_reconcileTrendInvariant`, a real REST round
+  // trip in production. Gating BOTH calls on one externally-controlled
+  // promise reproduces that: neither tick has mutated any state yet when
+  // the second one is fired.
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  s._reconcileTrendInvariant = async () => { await gate; return false; };
+
+  // `_closeConsolidated`: the FIRST call is the genuine reversal close — it
+  // succeeds and (as the real close path does) nulls `activePosition`. Any
+  // later call finds nothing left to close, exactly per the bug report
+  // ("the second call finds `_closeQuantity() === 0`").
+  let closeCalls = 0;
+  s._closeConsolidated = async () => {
+    closeCalls += 1;
+    if (closeCalls === 1) { s.activePosition = null; return true; }
+    return false;
+  };
+
+  // Spy on the REAL `_reverseTo` (not a stub) so reversalCount, the leg
+  // reset and every other side effect are the genuine ones the bug report
+  // describes duplicating.
+  let reverseCalls = 0;
+  const realReverseTo = s._reverseTo.bind(s);
+  s._reverseTo = async (side) => { reverseCalls += 1; return realReverseTo(side); };
+
+  const p1 = s.handleRealtimePrice(97);  // tick A
+  const p2 = s.handleRealtimePrice(97);  // tick B — fired before A is released
+  release();
+  await Promise.all([p1, p2]);
+
+  assert.equal(reverseCalls, 1, '_reverseTo must run exactly once for one crossing');
+  assert.equal(s.reversalCount, 1, 'reversalCount must not double-count the same crossing');
 });
 
-test('the trail gain survives a save/resume round trip', async () => {
-  const src = gainStrategy();
-  await src.initializeLadder(85);
-  src.trailDirection = 'UP'; src.trailLastDirection = 'UP';
-  await src.initializeLadder(87.06, { trailMove: true });
+test('the tick latch releases even when the body throws, so a later tick is not permanently locked out', async () => {
+  const s = reversalStrategy();
+  const filled = captureFills(s);
 
-  let doc = null;
-  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await AnchorLadderStrategy.prototype.saveState.call(src);
-  assert.equal(doc.trailBaselineAnchor, 85);
-  assert.equal(doc.trailMoveCount, 1);
+  let shouldThrow = true;
+  const realReconcile = s._reconcileTrendInvariant.bind(s);
+  s._reconcileTrendInvariant = async () => {
+    if (shouldThrow) { shouldThrow = false; throw new Error('boom: simulated REST failure'); }
+    return realReconcile();
+  };
 
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
-  dst.addLog = async () => {};
-  await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
-  cleanupResumeTimers(dst);
-  // Without persistence a redeploy would report 0% while the anchor had genuinely travelled.
-  assert.equal(dst.trailBaselineAnchor, 85);
-  assert.ok((dst._trailGainPct() ?? 0) > 2.4);
+  await assert.rejects(() => s.handleRealtimePrice(97), /boom/);
+  assert.equal(s._tickInProgress, false, 'the latch must release on the throw path, not stay stuck true');
+
+  // A later, ordinary tick must be processed normally — not silently dropped
+  // because a stale latch was left set.
+  await s.handleRealtimePrice(102);
+  assert.deepEqual(filled, ['L1']);
 });
 
-test('a legacy snapshot falls back to its own anchor, never a bogus gain', async () => {
-  const dst = stubResumeIO(new AnchorLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
-  dst.addLog = async () => {};
-  await dst.resume({
-    strategyId: 'anchor_ladder_legacy_gain', isRunning: true, symbol: 'BTCUSDT',
-    // resume() aborts early without these, before reaching any restore line.
-    gcfProxyUrl: 'http://proxy.invalid', sharedVmProxyGcfUrl: 'http://vm.invalid',
-    anchor: 90, trailDirection: 'UP',      // note: no trailBaselineAnchor / trailMoveCount
+test('a queued manual harvest still runs to completion on a tick — regression guard against gating on `_tradingSeqInProgress`', async () => {
+  // If this were "fixed" by setting `_tradingSeqInProgress = true` at the
+  // top of the tick instead of adding a separate `_tickInProgress` latch,
+  // `_harvestToFlat` would see that flag already set and self-refuse (its
+  // own guard: "Harvest (...) skipped — a trading sequence is in
+  // progress"). This pins that `_harvestToFlat` actually runs.
+  const s = reversalStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: 5 };
+  s._manualHarvestRequested = true;
+  s._closeConsolidated = async () => { s.activePosition = null; return true; };
+  let planCalled = false;
+  s._planAndBuildLevels = async () => { planCalled = true; return true; };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s.handleRealtimePrice(100);
+
+  assert.ok(!logs.some((m) => m.includes('skipped')), '_harvestToFlat must not hit its own in-flight refusal');
+  assert.equal(planCalled, true, '_harvestToFlat must run all the way through to the re-plan');
+  assert.equal(s._manualHarvestRequested, false, 'the latch is consumed');
+  assert.equal(s._tradingSeqInProgress, false, 'released once the harvest completes');
+  assert.equal(s._tickInProgress, false, 'the tick latch is released too');
+});
+
+test('a tick dropped by the new latch does not advance lastProcessedPrice — it is re-scanned next tick', async () => {
+  const s = reversalStrategy();
+  const filled = captureFills(s);
+  s.lastProcessedPrice = 100;
+
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  s._reconcileTrendInvariant = async () => { await gate; return false; };
+
+  const p1 = s.handleRealtimePrice(102);    // tick A: suspends inside the reconcile
+  const p2 = s.handleRealtimePrice(102.5);  // tick B: must be dropped immediately
+
+  // Before A is released, neither tick has been able to write anything —
+  // dropping B must be silent and synchronous, with no observable effect.
+  assert.equal(s.lastProcessedPrice, 100);
+
+  release();
+  await Promise.all([p1, p2]);
+
+  assert.equal(s.lastProcessedPrice, 102, 'only the tick that actually ran (A) advances it, to ITS price');
+  assert.deepEqual(filled, ['L1'], 'only tick A fills — the dropped tick B contributes nothing');
+});
+
+// ——— Phase 0a: _resolveAiApiKey — the VM fetches the per-user DeepSeek key
+// from Secret Manager itself instead of trusting config.aiApiKey off the
+// wire. §invariant: "no key supplied" and "couldn't tell if there's a key"
+// are DIFFERENT states — only the latter logs a WARNING (see CLAUDE.md's
+// silent-fail-open rule). The method itself must NEVER throw.
+
+// A minimal Firestore double for users/{userId}/profiles/{profileId}. Mirrors
+// the shape used elsewhere in this file (`collection().doc().set()`), just
+// one level deeper for the nested users/profiles path.
+function profileFirestoreDouble(profileDocResult) {
+  return {
+    collection: (name) => {
+      assert.equal(name, 'users', 'must read from the users collection');
+      return {
+        doc: (uid) => ({
+          collection: (sub) => {
+            assert.equal(sub, 'profiles', 'must descend into the profiles subcollection');
+            return {
+              doc: (pid) => ({
+                get: async () => {
+                  if (profileDocResult instanceof Error) throw profileDocResult;
+                  return profileDocResult;
+                },
+              }),
+            };
+          },
+        }),
+      };
+    },
+  };
+}
+
+function aiKeyStrategy() {
+  const s = reversalStrategy();
+  s.userId = 'test-user';
+  s.profileId = 'test-profile';
+  return s;
+}
+
+test('_resolveAiApiKey: a profile with a secretName yields the secret value', async () => {
+  const s = aiKeyStrategy();
+  s.firestore = profileFirestoreDouble({
+    exists: true,
+    data: () => ({ deepseekApiKeySecretName: 'projects/ycbot-x/secrets/deepseek-api-key-test-profile' }),
   });
-  cleanupResumeTimers(dst);
-  assert.equal(dst.trailBaselineAnchor, 90);
-  assert.equal(dst.trailMoveCount, 0);
-  assert.equal(dst._trailGainPct(), null);
+  s._secretClient = {
+    accessSecretVersion: async ({ name }) => {
+      assert.equal(name, 'projects/ycbot-x/secrets/deepseek-api-key-test-profile/versions/latest');
+      return [{ payload: { data: Buffer.from('sk-real-deepseek-key') } }];
+    },
+  };
+  const key = await s._resolveAiApiKey();
+  assert.equal(key, 'sk-real-deepseek-key');
+});
+
+test('_resolveAiApiKey: a profile without the field returns null and logs no warning', async () => {
+  const s = aiKeyStrategy();
+  s.firestore = profileFirestoreDouble({ exists: true, data: () => ({}) });
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  const key = await s._resolveAiApiKey();
+  assert.equal(key, null);
+  assert.ok(!logs.some((m) => /WARN/i.test(m)), 'the benign no-key case must not warn');
+});
+
+test('_resolveAiApiKey: a missing profile doc returns null', async () => {
+  const s = aiKeyStrategy();
+  s.firestore = profileFirestoreDouble({ exists: false });
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  const key = await s._resolveAiApiKey();
+  assert.equal(key, null);
+  assert.ok(!logs.some((m) => /WARN/i.test(m)), 'a missing profile is also the benign no-key case');
+});
+
+test('_resolveAiApiKey: Firestore throwing returns null, logs a WARNING, and does not throw', async () => {
+  const s = aiKeyStrategy();
+  s.firestore = profileFirestoreDouble(new Error('Firestore unreachable'));
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  let key;
+  await assert.doesNotReject(async () => { key = await s._resolveAiApiKey(); });
+  assert.equal(key, null);
+  assert.ok(logs.some((m) => /WARN/i.test(m)), 'a lookup failure (unknown state) must be visibly different from the benign case');
+  assert.ok(logs.some((m) => m.includes('Firestore unreachable')), 'the warning should name the failure (but never the key)');
+});
+
+test('_resolveAiApiKey: the secret client throwing returns null, logs a WARNING, and does not throw', async () => {
+  const s = aiKeyStrategy();
+  s.firestore = profileFirestoreDouble({
+    exists: true,
+    data: () => ({ deepseekApiKeySecretName: 'projects/ycbot-x/secrets/deepseek-api-key-test-profile' }),
+  });
+  s._secretClient = {
+    accessSecretVersion: async () => { throw new Error('IAM permission denied'); },
+  };
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  let key;
+  await assert.doesNotReject(async () => { key = await s._resolveAiApiKey(); });
+  assert.equal(key, null);
+  assert.ok(logs.some((m) => /WARN/i.test(m)), 'a secret-access failure must warn, not silently look benign');
+});
+
+test('_resolveAiApiKey: missing firestore/userId/profileId short-circuits to null without any I/O', async () => {
+  const s = reversalStrategy(); // no userId set
+  s.firestore = profileFirestoreDouble(new Error('must never be reached'));
+  const key = await s._resolveAiApiKey();
+  assert.equal(key, null);
+});
+
+test('_resolveAiApiKey: the resolved key never appears in getStatus, getHeartbeatPayload, or saveState', async () => {
+  const s = aiKeyStrategy();
+  s.firestore = profileFirestoreDouble({
+    exists: true,
+    data: () => ({ deepseekApiKeySecretName: 'projects/ycbot-x/secrets/deepseek-api-key-test-profile' }),
+  });
+  s._secretClient = {
+    accessSecretVersion: async () => [{ payload: { data: Buffer.from('sk-super-secret-value') } }],
+  };
+  s._aiApiKey = await s._resolveAiApiKey();
+  assert.equal(s._aiApiKey, 'sk-super-secret-value', 'sanity: the key really is resolved');
+
+  const statusStr = JSON.stringify(s.getStatus());
+  assert.ok(!statusStr.includes('sk-super-secret-value'), 'getStatus must never surface the key');
+
+  const heartbeatStr = JSON.stringify(s.getHeartbeatPayload());
+  assert.ok(!heartbeatStr.includes('sk-super-secret-value'), 'getHeartbeatPayload must never surface the key');
+
+  let written = null;
+  // saveState needs a strategies-collection double too; wrap the profile
+  // double's users-only assertion by swapping in a combined firestore stub.
+  s.firestore = {
+    collection: (name) => {
+      if (name === 'strategies') {
+        return { doc: () => ({ set: async (d) => { written = d; } }) };
+      }
+      throw new Error(`unexpected collection ${name}`);
+    },
+  };
+  await ReversalLadderStrategy.prototype.saveState.call(s);
+  assert.ok(written, 'sanity: saveState actually wrote something');
+  const savedStr = JSON.stringify(written);
+  assert.ok(!savedStr.includes('sk-super-secret-value'), 'saveState must never persist the key');
+});
+
+// ——— Phase 0a: wiring into start() and resume() ——————————————————————————
+
+test('start(): an explicit config.aiApiKey still wins over Secret Manager (existing tests depend on this)', async () => {
+  const s = geoStrategy();
+  stubBootInternals(s);
+  s.exchangeInfoCache = { BTCUSDT: { minNotional: 5 } };
+  s.getWalletBalance = async () => 1000;
+  s._resolveAiApiKey = async () => { throw new Error('must not be called when config.aiApiKey is supplied'); };
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, leverage: 10, aiApiKey: 'sk-from-request' });
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+  assert.equal(s._aiApiKey, 'sk-from-request');
+  assert.ok(logs.some((m) => /key from the start request/.test(m)));
+});
+
+test('start(): falls back to Secret Manager when config.aiApiKey is absent', async () => {
+  const s = geoStrategy();
+  stubBootInternals(s);
+  s.exchangeInfoCache = { BTCUSDT: { minNotional: 5 } };
+  s.getWalletBalance = async () => 1000;
+  s._resolveAiApiKey = async () => 'sk-from-secret-manager';
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, leverage: 10 });
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+  assert.equal(s._aiApiKey, 'sk-from-secret-manager');
+  assert.ok(s._aiPlanner, 'a planner must be built from the Secret Manager key');
+  assert.ok(logs.some((m) => /key from Secret Manager/.test(m)));
+});
+
+test('start(): no key anywhere logs the ordinary mechanical-fallback message', async () => {
+  const s = geoStrategy();
+  stubBootInternals(s);
+  s.exchangeInfoCache = { BTCUSDT: { minNotional: 5 } };
+  s.getWalletBalance = async () => 1000;
+  s._resolveAiApiKey = async () => null;
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, leverage: 10 });
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+  assert.equal(s._aiApiKey, null);
+  assert.equal(s._aiPlanner, null);
+  assert.ok(logs.some((m) => /no AI key supplied/.test(m)));
+});
+
+test('resume(): builds a planner from a Secret-Manager key — the old "unavailable after a restart" message is gone', async () => {
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const logs = [];
+  dst.addLog = async (m) => { logs.push(m); };
+  dst._resolveAiApiKey = async () => 'sk-resumed-from-secret-manager';
+  try {
+    await dst.resume({
+      strategyId: 'reversal_ladder_ai_resume_test',
+      profileId: 'p', userId: 'test-user',
+      gcfProxyUrl: 'http://proxy.invalid', sharedVmProxyGcfUrl: 'http://vm.invalid',
+      isRunning: true, symbol: 'BTCUSDT',
+    });
+  } finally {
+    cleanupResumeTimers(dst);
+  }
+  assert.equal(dst._aiApiKey, 'sk-resumed-from-secret-manager');
+  assert.ok(dst._aiPlanner, 'a planner must be built on resume when a key is available');
+  assert.ok(!logs.some((m) => /unavailable after a restart/.test(m)), 'the old limitation message must be gone');
+});
+
+test('resume(): no key falls back to the ordinary mechanical message, never throws', async () => {
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const logs = [];
+  dst.addLog = async (m) => { logs.push(m); };
+  dst._resolveAiApiKey = async () => null;
+  try {
+    await assert.doesNotReject(() => dst.resume({
+      strategyId: 'reversal_ladder_ai_resume_test_2',
+      profileId: 'p', userId: 'test-user',
+      gcfProxyUrl: 'http://proxy.invalid', sharedVmProxyGcfUrl: 'http://vm.invalid',
+      isRunning: true, symbol: 'BTCUSDT',
+    }));
+  } finally {
+    cleanupResumeTimers(dst);
+  }
+  assert.equal(dst._aiApiKey, null);
+  assert.equal(dst._aiPlanner, null);
+  assert.ok(logs.some((m) => /no AI key/.test(m)));
+  assert.ok(!logs.some((m) => /unavailable after a restart/.test(m)));
 });

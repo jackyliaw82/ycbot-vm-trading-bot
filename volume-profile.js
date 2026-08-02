@@ -1,18 +1,39 @@
 // 24h volume profile — the ONLY survivor of ai-market-context.js.
-// Chart-only: nothing in the bot reads vah/val/lvns any more; the ladder is
-// anchored on live price with a fixed step. Kept backend so there is exactly
-// one implementation feeding the chart histogram (binVolumes/priceMin/binWidth).
+// Two roles: (1) chart histogram outputs (binVolumes/priceMin/binWidth/vah/val/
+// hvns/lvns) for the frontend overlay, and (2) the rangeVoids/getVoidProfile
+// path used for ReversalLadder strategy level selection (see selectVoidPair).
 
 const VP_CACHE_TTL_MS = 10 * 60 * 1000;      // 10 min volume profile cache
-const CANDLE_CACHE_TTL_MS = 5 * 60 * 1000;   // 5 min 1m-candle cache
+const CANDLE_CACHE_TTL_MS = 5 * 60 * 1000;   // 5 min candle cache — shared by every WINDOWS interval (1m/5m/1h)
 const VP_24H_1M_BARS = 1440;                 // 1m × 1440 = 24h (fine profile source)
 const VP_BIN_COUNT_24H = 200;                // 24h profile bins — supported by 1m data
+
+// Widen chain for ReversalLadder level selection. Tried in order until a void
+// pair straddles live price. WIDENING, never shifting the window back: a
+// shifted window can sit entirely on one side of current price and yield no
+// valid level at all, whereas a wider window always contains the last 24h.
+// Bar counts stay under Binance's 1500-kline-per-request cap, so each window
+// is a single fetch. Coarser windows get fewer bins — 200 bins over 7d of 1h
+// candles would be resolving noise.
+export const WINDOWS = [
+  { key: '24h', interval: '1m', bars: VP_24H_1M_BARS, bins: VP_BIN_COUNT_24H },
+  { key: '48h', interval: '5m', bars: 576,  bins: VP_BIN_COUNT_24H },
+  { key: '7d',  interval: '1h', bars: 168,  bins: 100 },
+];
 const VP_VALUE_AREA_PCT = 0.70;              // 70% volume defines value area
 // Hybrid HVN/LVN detection — local extrema (Pine-style) + absolute-significance gate.
 const HVN_STRENGTH_FRAC = 0.05;              // HVN peak window = ±5% of bins (Pine strength, scaled to binCount)
 const LVN_STRENGTH_FRAC = 0.075;             // LVN valley window = ±7.5% of bins
 const HVN_MIN_POC_FRAC = 0.20;               // HVN peak kept only if ≥20% of POC volume (drops dead-zone micro-peaks)
 const LVN_MAX_MEAN_FRAC = 0.50;              // LVN valley kept only if ≤50% of mean bin volume (genuine thin/void zone)
+// Pre-v1.0.12 LVN rule, restored for ReversalLadder level selection. A pure
+// percentile with no significance test: it always returns ~20% of bins, which
+// in practice are the thin TAILS of the range. That is the point — unlike the
+// local-extrema `lvns` above (which can legitimately find nothing), this rule
+// is never empty on a non-degenerate profile. It does NOT guarantee the voids
+// straddle price on both sides — selectVoidPair below can and does return null
+// when a pair does not straddle; callers must handle that.
+const RANGE_VOID_FRAC = 0.20;
 
 export function parseKlines(klines) {
   return klines.map(k => ({
@@ -39,12 +60,16 @@ export function parseKlines(klines) {
  * Returns:
  *   {
  *     priceMin, priceMax, binWidth,
- *     bins: [{ priceLow, priceHigh, volume }, ...],
  *     poc: { price, volume },        // Point of Control (highest-volume bin)
  *     vah: number, val: number,      // Value Area boundaries (70% volume)
  *     hvns: [{ priceLow, priceHigh, volume }, ...],
  *     lvns: [{ priceLow, priceHigh, volume }, ...],
+ *     rangeVoids: [{ priceLow, priceHigh, volume }, ...],
+ *       // Bottom-20%-by-volume ranges (RANGE_VOID_FRAC), ascending by price.
+ *       // In practice these sit at the range edges (the thin tails) — used
+ *       // for ReversalLadder level selection via selectVoidPair, not display.
  *     totalVolume,
+ *     binVolumes: [number, ...],     // per-bin volume, rounded — chart histogram overlay
  *   }
  */
 export function computeVolumeProfile(candles, binCount = VP_BIN_COUNT_24H) {
@@ -141,6 +166,13 @@ export function computeVolumeProfile(candles, binCount = VP_BIN_COUNT_24H) {
     if (bins[i].volume <= lvnMaxVol && isLocalMin(i, lvnStrength)) lvnSet.add(i);
   }
 
+  // Bottom-20%-by-volume, verbatim from the pre-v1.0.12 detector
+  // (git show 62677cd^:ai-market-context.js). Sorted DESCENDING then sliced
+  // from the tail, preserving the original tie-break order exactly.
+  const sortedByVol = bins.map((b, i) => ({ ...b, idx: i })).sort((a, b) => b.volume - a.volume);
+  const voidCutoffStart = bins.length - Math.ceil(bins.length * RANGE_VOID_FRAC);
+  const rangeVoidSet = new Set(sortedByVol.slice(voidCutoffStart).map(b => b.idx));
+
   // Merge consecutive HVN/LVN bins into contiguous ranges for AI readability.
   const mergeContiguous = (set) => {
     const idxList = [...set].sort((a, b) => a - b);
@@ -172,6 +204,7 @@ export function computeVolumeProfile(candles, binCount = VP_BIN_COUNT_24H) {
     val,
     hvns: mergeContiguous(hvnSet),
     lvns: mergeContiguous(lvnSet),
+    rangeVoids: mergeContiguous(rangeVoidSet),
     totalVolume,
     // Compact per-bin volume array for the frontend VP histogram overlay.
     // Rounded to integers — sub-unit precision is meaningless for a bar chart
@@ -182,7 +215,39 @@ export function computeVolumeProfile(candles, binCount = VP_BIN_COUNT_24H) {
 }
 
 /**
+ * Pick the void pair that STRADDLES `price` — one wholly above, one wholly
+ * below. Returns null if either side is missing, which is the widen-chain's
+ * signal to try a longer window (see VolumeProfile.getVoidProfile).
+ *
+ * OUTERMOST on each side, not nearest: the bottom-20% rule puts the real tails
+ * at the extremes, and ReversalLadder wants bull and bear far apart — the
+ * distance between them is the dead zone that makes the strategy churn-free.
+ *
+ * The levels are the void INNER edges (the boundary price crosses on its way
+ * into the void), because that is where a breakout begins rather than where it
+ * has already run.
+ */
+export function selectVoidPair(profile, price) {
+  const voids = profile?.rangeVoids;
+  if (!Array.isArray(voids) || voids.length === 0) return null;
+  if (!Number.isFinite(price)) return null;
+
+  let lower = null;   // wholly below price — keep the LOWEST
+  let upper = null;   // wholly above price — keep the HIGHEST
+  for (const v of voids) {
+    if (v.priceHigh < price && (lower === null || v.priceLow < lower.priceLow)) lower = v;
+    if (v.priceLow > price && (upper === null || v.priceHigh > upper.priceHigh)) upper = v;
+  }
+  if (!lower || !upper) return null;
+
+  return { upper, lower, bullLevel: upper.priceLow, bearLevel: lower.priceHigh };
+}
+
+/**
  * VolumeProfile — 24h VPVR for the chart histogram overlay, keyed by symbol.
+ * Also owns a generic multi-interval candle fetcher (`_getCandles`) and the
+ * multi-window widen chain (`getVoidProfile`, over WINDOWS) that ReversalLadder
+ * uses for strategy level selection.
  * `strategy` supplies makeProxyRequest — the same duck-typed proxy transport
  * every strategy already has from TradingBase; this class does not invent a
  * new transport.
@@ -191,28 +256,30 @@ export class VolumeProfile {
   constructor(strategy) {
     this.strategy = strategy;
     this._vpCache = new Map();       // symbol -> { profile, at }
-    this._candleCache = new Map();   // symbol -> { candles, ts }
+    this._candleCache = new Map();   // symbol:interval:limit -> { candles, ts }
   }
 
-  // ——— 24h 1m candle fetcher ——————————————————————————————————————————
-  // 1440 bars × 1m = exactly 24h, fetched in a single request (Binance klines
-  // cap is 1500). Feeds the 24h volume profile — 5× finer than the 5m window,
-  // which is what makes the 200-bin HVN/LVN resolution meaningful rather than
-  // just slicing the same smear thinner.
+  // ——— Generic candle fetcher ——————————————————————————————————————————
+  // Cached per symbol:interval:limit so the widen chain's windows (WINDOWS,
+  // above) do not evict one another. 1440 bars × 1m = exactly 24h in a single
+  // request (Binance klines cap is 1500); the 24h profile is the finest —
+  // 5× the 5m window — which is what makes the 200-bin HVN/LVN resolution
+  // meaningful rather than just slicing the same smear thinner.
 
-  async _get24hCandles1m(symbol) {
+  async _getCandles(symbol, interval, limit) {
+    const key = `${symbol}:${interval}:${limit}`;
     const now = Date.now();
-    const cached = this._candleCache.get(symbol);
+    const cached = this._candleCache.get(key);
     if (cached && (now - cached.ts) < CANDLE_CACHE_TTL_MS) {
       return cached.candles;
     }
     try {
-      const klines = await this.strategy.makeProxyRequest('/fapi/v1/klines', 'GET', { symbol, interval: '1m', limit: VP_24H_1M_BARS }, false, 'futures');
+      const klines = await this.strategy.makeProxyRequest('/fapi/v1/klines', 'GET', { symbol, interval, limit }, false, 'futures');
       const candles = parseKlines(klines);
-      this._candleCache.set(symbol, { candles, ts: now });
+      this._candleCache.set(key, { candles, ts: now });
       return candles;
     } catch (error) {
-      console.error(`Failed to fetch 24h (1m) candles: ${error.message}`);
+      console.error(`Failed to fetch ${interval} candles (${limit}): ${error.message}`);
       return cached?.candles || [];
     }
   }
@@ -226,7 +293,7 @@ export class VolumeProfile {
       return cached.profile;
     }
     try {
-      const candles = await this._get24hCandles1m(symbol);
+      const candles = await this._getCandles(symbol, '1m', VP_24H_1M_BARS);
       if (!candles || candles.length === 0) return null;
       const profile = computeVolumeProfile(candles, VP_BIN_COUNT_24H);
       this._vpCache.set(symbol, { profile, at: now });
@@ -237,8 +304,38 @@ export class VolumeProfile {
     }
   }
 
+  /**
+   * Volume profile for LEVEL SELECTION — separate from get24h, which serves the
+   * chart and must never change shape. Walks WINDOWS until a void pair straddles
+   * `price`.
+   *
+   * Returns { window, profile, pair }. `pair: null` after the whole chain means
+   * no historical window has a void on one side of price — a genuine breakout,
+   * where by definition no volume exists beyond it. That is NOT an error: the
+   * widest profile is still returned so the caller can reason over it, and
+   * Phase 2 hands the AI an explicit "no void above/below price" flag rather
+   * than widening forever and manufacturing a worse level.
+   *
+   * Returns bare null only when no candles could be fetched at all.
+   */
+  async getVoidProfile(symbol, price) {
+    let last = null;
+    for (const w of WINDOWS) {
+      const candles = await this._getCandles(symbol, w.interval, w.bars);
+      if (!candles || candles.length === 0) continue;
+      const profile = computeVolumeProfile(candles, w.bins);
+      if (!profile) continue;
+      last = { window: w.key, profile, pair: null };
+      const pair = selectVoidPair(profile, price);
+      if (pair) return { window: w.key, profile, pair };
+    }
+    return last;
+  }
+
   invalidate(symbol) {
     this._vpCache.delete(symbol);
-    this._candleCache.delete(symbol);
+    for (const key of this._candleCache.keys()) {
+      if (key.startsWith(`${symbol}:`)) this._candleCache.delete(key);
+    }
   }
 }

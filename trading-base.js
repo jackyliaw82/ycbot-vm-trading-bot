@@ -332,7 +332,7 @@ class TradingBase {
       // changed from this fill. Without this push, frontend would see
       // stale accumulators until the next 30s safety-net heartbeat.
       // Hook is optional — strategies that implement _pushHeartbeatNow
-      // (AnchorLadderStrategy) opt in; others no-op.
+      // (ReversalLadderStrategy) opt in; others no-op.
       if (typeof this._pushHeartbeatNow === 'function') {
         try { this._pushHeartbeatNow(); } catch (_) { /* non-fatal */ }
       }
@@ -2055,8 +2055,8 @@ class TradingBase {
 
   // ─── WebSocket: Liquidation stream ─────────────────────────────────────────
   // Replaces deprecated GET /fapi/v1/allForceOrders REST endpoint.
-  // Aggregates forceOrder events into a 15m rolling buffer. ORPHANED as of the
-  // anchor-ladder migration — its only consumer (ai-market-context.js) was
+  // Aggregates forceOrder events into a 15m rolling buffer. ORPHANED since the
+  // mechanical-ladder rewrite — its only consumer (ai-market-context.js) was
   // deleted along with the rest of the AI stack, and no strategy calls
   // connectLiquidationWebSocket() to start this stream. Left in place
   // (never connects, so it costs nothing at runtime) for a future strategy
