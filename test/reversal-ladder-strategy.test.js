@@ -1953,6 +1953,13 @@ function stubBootInternals(s) {
   s.initFirestoreCollections = () => {};
   s.addLog = async () => {};
   s.saveState = async () => {};
+  // Phase 0a: start()/resume() now call _resolveAiApiKey(), which reads
+  // users/{userId}/profiles/{profileId} off `this.firestore`. bootSnapshot()
+  // sets a real `userId`, which would otherwise make this reach the LIVE
+  // Firestore client the constructor built. Stub the resolver directly so
+  // these boot-recovery tests (about the position-refresh chain, not AI
+  // planning) never touch the network for it.
+  s._resolveAiApiKey = async () => null;
   s._writeStrategyFlow = async () => {};
   s.setLeverage = async () => {};
   s.setPositionMode = async () => {};
@@ -3367,4 +3374,246 @@ test('a tick dropped by the new latch does not advance lastProcessedPrice — it
 
   assert.equal(s.lastProcessedPrice, 102, 'only the tick that actually ran (A) advances it, to ITS price');
   assert.deepEqual(filled, ['L1'], 'only tick A fills — the dropped tick B contributes nothing');
+});
+
+// ——— Phase 0a: _resolveAiApiKey — the VM fetches the per-user DeepSeek key
+// from Secret Manager itself instead of trusting config.aiApiKey off the
+// wire. §invariant: "no key supplied" and "couldn't tell if there's a key"
+// are DIFFERENT states — only the latter logs a WARNING (see CLAUDE.md's
+// silent-fail-open rule). The method itself must NEVER throw.
+
+// A minimal Firestore double for users/{userId}/profiles/{profileId}. Mirrors
+// the shape used elsewhere in this file (`collection().doc().set()`), just
+// one level deeper for the nested users/profiles path.
+function profileFirestoreDouble(profileDocResult) {
+  return {
+    collection: (name) => {
+      assert.equal(name, 'users', 'must read from the users collection');
+      return {
+        doc: (uid) => ({
+          collection: (sub) => {
+            assert.equal(sub, 'profiles', 'must descend into the profiles subcollection');
+            return {
+              doc: (pid) => ({
+                get: async () => {
+                  if (profileDocResult instanceof Error) throw profileDocResult;
+                  return profileDocResult;
+                },
+              }),
+            };
+          },
+        }),
+      };
+    },
+  };
+}
+
+function aiKeyStrategy() {
+  const s = reversalStrategy();
+  s.userId = 'test-user';
+  s.profileId = 'test-profile';
+  return s;
+}
+
+test('_resolveAiApiKey: a profile with a secretName yields the secret value', async () => {
+  const s = aiKeyStrategy();
+  s.firestore = profileFirestoreDouble({
+    exists: true,
+    data: () => ({ deepseekApiKeySecretName: 'projects/ycbot-x/secrets/deepseek-api-key-test-profile' }),
+  });
+  s._secretClient = {
+    accessSecretVersion: async ({ name }) => {
+      assert.equal(name, 'projects/ycbot-x/secrets/deepseek-api-key-test-profile/versions/latest');
+      return [{ payload: { data: Buffer.from('sk-real-deepseek-key') } }];
+    },
+  };
+  const key = await s._resolveAiApiKey();
+  assert.equal(key, 'sk-real-deepseek-key');
+});
+
+test('_resolveAiApiKey: a profile without the field returns null and logs no warning', async () => {
+  const s = aiKeyStrategy();
+  s.firestore = profileFirestoreDouble({ exists: true, data: () => ({}) });
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  const key = await s._resolveAiApiKey();
+  assert.equal(key, null);
+  assert.ok(!logs.some((m) => /WARN/i.test(m)), 'the benign no-key case must not warn');
+});
+
+test('_resolveAiApiKey: a missing profile doc returns null', async () => {
+  const s = aiKeyStrategy();
+  s.firestore = profileFirestoreDouble({ exists: false });
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  const key = await s._resolveAiApiKey();
+  assert.equal(key, null);
+  assert.ok(!logs.some((m) => /WARN/i.test(m)), 'a missing profile is also the benign no-key case');
+});
+
+test('_resolveAiApiKey: Firestore throwing returns null, logs a WARNING, and does not throw', async () => {
+  const s = aiKeyStrategy();
+  s.firestore = profileFirestoreDouble(new Error('Firestore unreachable'));
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  let key;
+  await assert.doesNotReject(async () => { key = await s._resolveAiApiKey(); });
+  assert.equal(key, null);
+  assert.ok(logs.some((m) => /WARN/i.test(m)), 'a lookup failure (unknown state) must be visibly different from the benign case');
+  assert.ok(logs.some((m) => m.includes('Firestore unreachable')), 'the warning should name the failure (but never the key)');
+});
+
+test('_resolveAiApiKey: the secret client throwing returns null, logs a WARNING, and does not throw', async () => {
+  const s = aiKeyStrategy();
+  s.firestore = profileFirestoreDouble({
+    exists: true,
+    data: () => ({ deepseekApiKeySecretName: 'projects/ycbot-x/secrets/deepseek-api-key-test-profile' }),
+  });
+  s._secretClient = {
+    accessSecretVersion: async () => { throw new Error('IAM permission denied'); },
+  };
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  let key;
+  await assert.doesNotReject(async () => { key = await s._resolveAiApiKey(); });
+  assert.equal(key, null);
+  assert.ok(logs.some((m) => /WARN/i.test(m)), 'a secret-access failure must warn, not silently look benign');
+});
+
+test('_resolveAiApiKey: missing firestore/userId/profileId short-circuits to null without any I/O', async () => {
+  const s = reversalStrategy(); // no userId set
+  s.firestore = profileFirestoreDouble(new Error('must never be reached'));
+  const key = await s._resolveAiApiKey();
+  assert.equal(key, null);
+});
+
+test('_resolveAiApiKey: the resolved key never appears in getStatus, getHeartbeatPayload, or saveState', async () => {
+  const s = aiKeyStrategy();
+  s.firestore = profileFirestoreDouble({
+    exists: true,
+    data: () => ({ deepseekApiKeySecretName: 'projects/ycbot-x/secrets/deepseek-api-key-test-profile' }),
+  });
+  s._secretClient = {
+    accessSecretVersion: async () => [{ payload: { data: Buffer.from('sk-super-secret-value') } }],
+  };
+  s._aiApiKey = await s._resolveAiApiKey();
+  assert.equal(s._aiApiKey, 'sk-super-secret-value', 'sanity: the key really is resolved');
+
+  const statusStr = JSON.stringify(s.getStatus());
+  assert.ok(!statusStr.includes('sk-super-secret-value'), 'getStatus must never surface the key');
+
+  const heartbeatStr = JSON.stringify(s.getHeartbeatPayload());
+  assert.ok(!heartbeatStr.includes('sk-super-secret-value'), 'getHeartbeatPayload must never surface the key');
+
+  let written = null;
+  // saveState needs a strategies-collection double too; wrap the profile
+  // double's users-only assertion by swapping in a combined firestore stub.
+  s.firestore = {
+    collection: (name) => {
+      if (name === 'strategies') {
+        return { doc: () => ({ set: async (d) => { written = d; } }) };
+      }
+      throw new Error(`unexpected collection ${name}`);
+    },
+  };
+  await ReversalLadderStrategy.prototype.saveState.call(s);
+  assert.ok(written, 'sanity: saveState actually wrote something');
+  const savedStr = JSON.stringify(written);
+  assert.ok(!savedStr.includes('sk-super-secret-value'), 'saveState must never persist the key');
+});
+
+// ——— Phase 0a: wiring into start() and resume() ——————————————————————————
+
+test('start(): an explicit config.aiApiKey still wins over Secret Manager (existing tests depend on this)', async () => {
+  const s = geoStrategy();
+  stubBootInternals(s);
+  s.exchangeInfoCache = { BTCUSDT: { minNotional: 5 } };
+  s.getWalletBalance = async () => 1000;
+  s._resolveAiApiKey = async () => { throw new Error('must not be called when config.aiApiKey is supplied'); };
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, leverage: 10, aiApiKey: 'sk-from-request' });
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+  assert.equal(s._aiApiKey, 'sk-from-request');
+  assert.ok(logs.some((m) => /key from the start request/.test(m)));
+});
+
+test('start(): falls back to Secret Manager when config.aiApiKey is absent', async () => {
+  const s = geoStrategy();
+  stubBootInternals(s);
+  s.exchangeInfoCache = { BTCUSDT: { minNotional: 5 } };
+  s.getWalletBalance = async () => 1000;
+  s._resolveAiApiKey = async () => 'sk-from-secret-manager';
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, leverage: 10 });
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+  assert.equal(s._aiApiKey, 'sk-from-secret-manager');
+  assert.ok(s._aiPlanner, 'a planner must be built from the Secret Manager key');
+  assert.ok(logs.some((m) => /key from Secret Manager/.test(m)));
+});
+
+test('start(): no key anywhere logs the ordinary mechanical-fallback message', async () => {
+  const s = geoStrategy();
+  stubBootInternals(s);
+  s.exchangeInfoCache = { BTCUSDT: { minNotional: 5 } };
+  s.getWalletBalance = async () => 1000;
+  s._resolveAiApiKey = async () => null;
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  try {
+    await s.start({ symbol: 'BTCUSDT', initialSize: 1000, leverage: 10 });
+  } finally {
+    clearInterval(s.listenKeyRefreshInterval);
+  }
+  assert.equal(s._aiApiKey, null);
+  assert.equal(s._aiPlanner, null);
+  assert.ok(logs.some((m) => /no AI key supplied/.test(m)));
+});
+
+test('resume(): builds a planner from a Secret-Manager key — the old "unavailable after a restart" message is gone', async () => {
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const logs = [];
+  dst.addLog = async (m) => { logs.push(m); };
+  dst._resolveAiApiKey = async () => 'sk-resumed-from-secret-manager';
+  try {
+    await dst.resume({
+      strategyId: 'reversal_ladder_ai_resume_test',
+      profileId: 'p', userId: 'test-user',
+      gcfProxyUrl: 'http://proxy.invalid', sharedVmProxyGcfUrl: 'http://vm.invalid',
+      isRunning: true, symbol: 'BTCUSDT',
+    });
+  } finally {
+    cleanupResumeTimers(dst);
+  }
+  assert.equal(dst._aiApiKey, 'sk-resumed-from-secret-manager');
+  assert.ok(dst._aiPlanner, 'a planner must be built on resume when a key is available');
+  assert.ok(!logs.some((m) => /unavailable after a restart/.test(m)), 'the old limitation message must be gone');
+});
+
+test('resume(): no key falls back to the ordinary mechanical message, never throws', async () => {
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const logs = [];
+  dst.addLog = async (m) => { logs.push(m); };
+  dst._resolveAiApiKey = async () => null;
+  try {
+    await assert.doesNotReject(() => dst.resume({
+      strategyId: 'reversal_ladder_ai_resume_test_2',
+      profileId: 'p', userId: 'test-user',
+      gcfProxyUrl: 'http://proxy.invalid', sharedVmProxyGcfUrl: 'http://vm.invalid',
+      isRunning: true, symbol: 'BTCUSDT',
+    }));
+  } finally {
+    cleanupResumeTimers(dst);
+  }
+  assert.equal(dst._aiApiKey, null);
+  assert.equal(dst._aiPlanner, null);
+  assert.ok(logs.some((m) => /no AI key/.test(m)));
+  assert.ok(!logs.some((m) => /unavailable after a restart/.test(m)));
 });

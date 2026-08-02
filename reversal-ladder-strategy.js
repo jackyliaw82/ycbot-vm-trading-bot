@@ -19,6 +19,7 @@ import { precisionFormatter } from './precisionUtils.js';
 import { trailDistance, trailExitLevel } from './reversal-trail.js';
 import { AiPlanner } from './ai-planner.js';
 import { AiUsageAccumulator } from './ai-cost.js';
+import { SecretManagerServiceClient } from '@google-cloud/secret-manager';
 
 const MARGIN_HEADROOM_FLOOR_PCT = 30;              // free margin floor for sizing safety
 const HARVEST_LOSS_THRESHOLD_PCT = 0.08;           // 8% of initial capital — gate for HARVEST eligibility
@@ -192,13 +193,17 @@ class ReversalLadderStrategy extends TradingBase {
     // ---- AI level planning (§10) ----
     // The key is held in memory ONLY. It is never logged, never written to
     // Firestore, and never returned by getStatus/getHeartbeatPayload — it comes
-    // from Secret Manager via the start request (Phase 0) and a persisted copy
-    // would put a live credential in a database the frontend can read.
+    // from an explicit start-request override OR (Phase 0a) Secret Manager via
+    // _resolveAiApiKey(), and a persisted copy would put a live credential in
+    // a database the frontend can read.
     this._aiApiKey = null;
     this._aiPlanner = null;
     this.aiModel = 'deepseek-v4-flash';
     this._aiUsage = new AiUsageAccumulator();
     this.aiCostUSD = 0;
+    // Injectable seam for tests — _resolveAiApiKey() constructs a real
+    // SecretManagerServiceClient on demand when this stays null.
+    this._secretClient = null;
 
     // ---- TREND state ----
     this.trendDirection = null;         // origin breakout direction ('LONG'|'SHORT')
@@ -278,11 +283,25 @@ class ReversalLadderStrategy extends TradingBase {
     // Absent key = mechanical levels from `rangeVoids`. That is a real,
     // supported mode (§10's fallback), not a degraded start — so log it and
     // continue rather than refusing.
+    //
+    // Phase 0a: config.aiApiKey stays as an explicit override — the existing
+    // tests and any caller that wants to force a specific key still can —
+    // but when it's absent the VM fetches the user's own key from Secret
+    // Manager itself (_resolveAiApiKey) rather than requiring the browser to
+    // carry it. A lookup failure there fails closed to null, same as "no key
+    // supplied", never a thrown error.
     this.aiModel = config.aiModel || this.aiModel;
+    let aiKeySource = null;
     if (typeof config.aiApiKey === 'string' && config.aiApiKey.trim() !== '') {
       this._aiApiKey = config.aiApiKey.trim();
+      aiKeySource = 'the start request';
+    } else {
+      this._aiApiKey = await this._resolveAiApiKey();
+      if (this._aiApiKey) aiKeySource = 'Secret Manager';
+    }
+    if (this._aiApiKey) {
       this._aiPlanner = new AiPlanner(this._aiApiKey, this.aiModel);
-      await this.addLog(`[REVERSAL] AI level planning enabled (${this.aiModel}).`);
+      await this.addLog(`[REVERSAL] AI level planning enabled (${this.aiModel}, key from ${aiKeySource}).`);
     } else {
       await this.addLog(
         `[REVERSAL] no AI key supplied — levels will come from the mechanical volume-void edges.`,
@@ -432,6 +451,74 @@ class ReversalLadderStrategy extends TradingBase {
     );
     await this.saveState();
     this._pushHeartbeatNow?.();
+  }
+
+  /**
+   * Resolve this profile's DeepSeek API key from Secret Manager (Phase 0a).
+   *
+   * The key travels users/{userId}/profiles/{profileId} -> a persisted
+   * `deepseekApiKeySecretName` (a FULL Secret Manager resource path, same
+   * shape as the existing `binanceApiKeySecretName` field) -> the secret's
+   * `latest` version. A separate work item owns writing that field; this
+   * method only reads it.
+   *
+   * Two DISTINCT outcomes both return `null`, and must stay visibly distinct
+   * in the logs (see CLAUDE.md's silent-fail-open rule):
+   *   - "the user supplied no key" — no doc, or the field absent/empty. This
+   *     is a normal, supported configuration (the mechanical volume-void
+   *     fallback), NOT an error, so it logs nothing here.
+   *   - "we could not tell whether a key exists" — Firestore unreachable,
+   *     the secret deleted, IAM denied, etc. This is an UNKNOWN state that
+   *     must not silently read as "no key" without a trace, so it logs a
+   *     WARNING naming the failure (never the key) before returning null.
+   *
+   * MUST NEVER THROW. start() has no surrounding try/catch around its AI
+   * block, and resume() explicitly documents (see the tombstone above
+   * _applySnapshotGeometry) that an unguarded throw there escapes into
+   * app.js's recoverActiveStrategies() .catch(), which marks the strategy
+   * stopped and abandons a live position. The outer try/catch below is
+   * belt-and-braces on top of the two narrower ones for exactly that reason.
+   */
+  async _resolveAiApiKey() {
+    if (!this.firestore || !this.userId || !this.profileId) return null;
+
+    try {
+      let secretName;
+      try {
+        const snap = await this.firestore
+          .collection('users').doc(this.userId)
+          .collection('profiles').doc(this.profileId)
+          .get();
+        secretName = snap?.exists ? snap.data()?.deepseekApiKeySecretName : null;
+      } catch (err) {
+        await this.addLog(
+          `WARNING: [REVERSAL] AI key lookup failed (profile read: ${err.message}) — ` +
+          `treating this cycle as if no key was supplied.`,
+        );
+        return null;
+      }
+
+      if (typeof secretName !== 'string' || secretName.trim() === '') return null;
+
+      try {
+        const client = this._secretClient || new SecretManagerServiceClient();
+        const [version] = await client.accessSecretVersion({ name: `${secretName.trim()}/versions/latest` });
+        const value = version?.payload?.data?.toString('utf8').trim();
+        return value ? value : null;
+      } catch (err) {
+        await this.addLog(
+          `WARNING: [REVERSAL] AI key lookup failed (secret access: ${err.message}) — ` +
+          `treating this cycle as if no key was supplied.`,
+        );
+        return null;
+      }
+    } catch (err) {
+      // Should be unreachable given the two narrower try/catches above, but
+      // this method's one hard contract is that it never throws — see the
+      // docstring. A bug here must degrade to "no key", not escape.
+      console.error(`[REVERSAL] _resolveAiApiKey: unexpected failure: ${err.message}`);
+      return null;
+    }
   }
 
   /**
@@ -1621,15 +1708,24 @@ class ReversalLadderStrategy extends TradingBase {
     this.aiCostUSD = snapshot.aiCostUSD || 0;
     this.aiModel = snapshot.aiModel || this.aiModel;
 
-    // The API key is deliberately NOT persisted, so a resumed cycle has no
-    // planner: any level re-plan after a restart (a harvest, a fired reanchor
-    // trigger) uses the mechanical void edges. Say so rather than letting the
-    // source silently change under the user. Phase 0 closes this by fetching
-    // the key from Secret Manager here.
-    await this.addLog(
-      `[RECOVERY] AI level planning is unavailable after a restart (the key is not persisted) — ` +
-      `any re-plan this cycle will use the mechanical volume-void edges.`,
-    );
+    // The API key is deliberately NOT persisted — a live credential does not
+    // belong in a database the frontend can read (see the constructor doc) —
+    // so a resumed cycle re-fetches it from Secret Manager via the profile
+    // doc, exactly like start(). _resolveAiApiKey fails closed to null on any
+    // lookup problem (Firestore unreachable, secret deleted, IAM denied) —
+    // NEVER a thrown error: an unguarded throw here would escape resume()
+    // into app.js's recoverActiveStrategies() .catch(), which marks the
+    // strategy stopped and abandons a live position (see the tombstone
+    // above _applySnapshotGeometry).
+    this._aiApiKey = await this._resolveAiApiKey();
+    if (this._aiApiKey) {
+      this._aiPlanner = new AiPlanner(this._aiApiKey, this.aiModel);
+      await this.addLog(`[RECOVERY] AI level planning enabled (${this.aiModel}, key from Secret Manager).`);
+    } else {
+      await this.addLog(
+        `[RECOVERY] no AI key supplied — levels will come from the mechanical volume-void edges.`,
+      );
+    }
 
     // Funding poll high-water mark. Fall back to strategyStartTime for
     // pre-v3.4.0 snapshots that didn't persist this field.
