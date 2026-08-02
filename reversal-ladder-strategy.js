@@ -178,6 +178,14 @@ class ReversalLadderStrategy extends TradingBase {
     this.stepPct = LADDER_STEP_PCT;     // DEFAULT geometry; start() overrides from config within bounds (see ladder-levels.js resolveLadderGeometry)
     this.levelsPerSide = LADDER_LEVELS_PER_SIDE; // DEFAULT; same override in start()
     this._tradingSeqInProgress = false; // ladder crossing reentrancy guard
+    // Re-entrancy latch for the TICK BODY. Deliberately DISTINCT from
+    // `_tradingSeqInProgress`: that flag means "a trading sequence is
+    // executing", and `_harvestToFlat` refuses to run while it is set — so it
+    // cannot also serve as the tick's mutual-exclusion gate without silently
+    // disabling every tick-driven harvest. See the tombstone in
+    // `handleRealtimePrice`. Transient, never persisted: a restart must always
+    // get a clean first tick rather than inherit a dead process's latch.
+    this._tickInProgress = false;
     this._levelPlanInProgress = false;
     this._levelPlanLastTs = null;
 
@@ -2151,6 +2159,46 @@ class ReversalLadderStrategy extends TradingBase {
 
     if (this._tradingSeqInProgress) return; // do NOT advance lastProcessedPrice: re-scan this band next tick
 
+    // ---- Tick mutual exclusion. ----
+    // The `_tradingSeqInProgress` check above is NOT sufficient on its own:
+    // nothing sets that flag until an action branch deep inside the dispatch
+    // below, and there are awaits in between (`_reconcileTrendInvariant`,
+    // `_harvestToFlat`) across which a SECOND WS tick can enter, pass the very
+    // same gate, and execute the very same branch. That double-counted
+    // `reversalCount` and wrote a duplicate REVERSAL row into the audit trail
+    // the position chart reads. (No duplicate ORDER was possible — reduceOnly
+    // plus the `leg.state === 'EMPTY'` re-check cover that — which is why this
+    // survived as a counter bug rather than a money one.)
+    //
+    // TOMBSTONE — do NOT "simplify" this by setting `_tradingSeqInProgress`
+    // here instead. `_harvestToFlat` REFUSES to run while that flag is set, and
+    // the dispatch below calls it from two branches (the manual-harvest latch
+    // and the armed price trigger), so hoisting it would make every tick-driven
+    // harvest silently skip — turning a counter bug into a real one where the
+    // user's Harvest button and their armed Trigger Price both stop working.
+    // The two flags mean different things and must stay separate.
+    //
+    // Dropping the overlapping tick is safe for the same reason the guard above
+    // is: `lastProcessedPrice` is not advanced, so the band is re-scanned on the
+    // next tick.
+    if (this._tickInProgress) return;
+    this._tickInProgress = true;
+    try {
+      await this._dispatchTick(price);
+    } finally {
+      this._tickInProgress = false;
+    }
+  }
+
+  /**
+   * The tick's decision body — everything downstream of the re-entrancy gates.
+   *
+   * Split out of `handleRealtimePrice` so the `_tickInProgress` latch can wrap
+   * it in one try/finally rather than the method's dozen `return` paths each
+   * needing to remember to clear the flag. Not a public entry point: call
+   * `handleRealtimePrice`, which owns the guards and the latch.
+   */
+  async _dispatchTick(price) {
     // Honor a queued manual harvest on the next free tick (harvestNow sets the latch).
     if (this._manualHarvestRequested) {
       this._manualHarvestRequested = false;

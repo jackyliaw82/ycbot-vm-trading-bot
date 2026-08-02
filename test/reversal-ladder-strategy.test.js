@@ -3230,3 +3230,141 @@ test('askAi returns a proposal without applying it', async () => {
   assert.equal(proposal.bullLevel, 106);
   assert.equal(s.bullLevel, 102, 'a proposal must NOT be applied');
 });
+
+// ——— Tick re-entrancy: `_tickInProgress` ——————————————————————————————————
+//
+// `handleRealtimePrice`'s opening guard (`if (this._tradingSeqInProgress)
+// return;`) is NOT sufficient on its own to serialize ticks: nothing sets
+// `_tradingSeqInProgress` until deep inside an action branch, and there are
+// real awaits before that point (`_reconcileTrendInvariant`, the harvest
+// latch/trigger branches) across which a second WS tick can enter, pass the
+// same gate, and reach the same action branch while the first tick's state
+// mutations are still in flight. `_tickInProgress` closes that window by
+// gating the ENTIRE tick body, immediately after the existing check.
+//
+// It deliberately does NOT reuse `_tradingSeqInProgress`: `_harvestToFlat`
+// self-refuses when THAT flag is already set (`_tradingSeqInProgress`
+// means "a trading sequence is executing"), so folding the tick's mutual
+// exclusion into it would make every tick-driven harvest silently skip.
+
+// A fully-scaled TREND LONG, ready to reverse on the next tick that crosses
+// bearLevel — the concrete scenario from the bug report.
+function trendReadyToReverse() {
+  const s = reversalStrategy({ mode: 'TREND' });
+  s.trendDirection = 'LONG';
+  s.ladderLines.filter(l => l.direction === 'LONG').forEach(l => { l.state = 'POSITION_OPEN'; l.quantity = 1; });
+  s.activePosition = { quantity: 5, entryPrice: 103, notional: 515, unrealizedPnl: 2 };
+  s.currentSide = 'LONG';
+  s.finalTpPrice = 110; // armed, well above current price — Final TP must not fire in this test
+  s.lastProcessedPrice = 100;
+  s._computeAccLoss = () => 0;
+  captureFills(s); // real `_fillLeg` would place a live order; record instead
+  return s;
+}
+
+test('two concurrent ticks that both cross bearLevel must reverse exactly once, not twice', async () => {
+  const s = trendReadyToReverse();
+
+  // Both ticks pass the top-of-method gate (`_tradingSeqInProgress` is still
+  // false for both — nothing sets it until deep inside the reverse branch),
+  // then both suspend inside `_reconcileTrendInvariant`, a real REST round
+  // trip in production. Gating BOTH calls on one externally-controlled
+  // promise reproduces that: neither tick has mutated any state yet when
+  // the second one is fired.
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  s._reconcileTrendInvariant = async () => { await gate; return false; };
+
+  // `_closeConsolidated`: the FIRST call is the genuine reversal close — it
+  // succeeds and (as the real close path does) nulls `activePosition`. Any
+  // later call finds nothing left to close, exactly per the bug report
+  // ("the second call finds `_closeQuantity() === 0`").
+  let closeCalls = 0;
+  s._closeConsolidated = async () => {
+    closeCalls += 1;
+    if (closeCalls === 1) { s.activePosition = null; return true; }
+    return false;
+  };
+
+  // Spy on the REAL `_reverseTo` (not a stub) so reversalCount, the leg
+  // reset and every other side effect are the genuine ones the bug report
+  // describes duplicating.
+  let reverseCalls = 0;
+  const realReverseTo = s._reverseTo.bind(s);
+  s._reverseTo = async (side) => { reverseCalls += 1; return realReverseTo(side); };
+
+  const p1 = s.handleRealtimePrice(97);  // tick A
+  const p2 = s.handleRealtimePrice(97);  // tick B — fired before A is released
+  release();
+  await Promise.all([p1, p2]);
+
+  assert.equal(reverseCalls, 1, '_reverseTo must run exactly once for one crossing');
+  assert.equal(s.reversalCount, 1, 'reversalCount must not double-count the same crossing');
+});
+
+test('the tick latch releases even when the body throws, so a later tick is not permanently locked out', async () => {
+  const s = reversalStrategy();
+  const filled = captureFills(s);
+
+  let shouldThrow = true;
+  const realReconcile = s._reconcileTrendInvariant.bind(s);
+  s._reconcileTrendInvariant = async () => {
+    if (shouldThrow) { shouldThrow = false; throw new Error('boom: simulated REST failure'); }
+    return realReconcile();
+  };
+
+  await assert.rejects(() => s.handleRealtimePrice(97), /boom/);
+  assert.equal(s._tickInProgress, false, 'the latch must release on the throw path, not stay stuck true');
+
+  // A later, ordinary tick must be processed normally — not silently dropped
+  // because a stale latch was left set.
+  await s.handleRealtimePrice(102);
+  assert.deepEqual(filled, ['L1']);
+});
+
+test('a queued manual harvest still runs to completion on a tick — regression guard against gating on `_tradingSeqInProgress`', async () => {
+  // If this were "fixed" by setting `_tradingSeqInProgress = true` at the
+  // top of the tick instead of adding a separate `_tickInProgress` latch,
+  // `_harvestToFlat` would see that flag already set and self-refuse (its
+  // own guard: "Harvest (...) skipped — a trading sequence is in
+  // progress"). This pins that `_harvestToFlat` actually runs.
+  const s = reversalStrategy();
+  s.activePosition = { quantity: 10, entryPrice: 100.3, avgEntry: 100.3, notional: 1003, unrealizedPnl: 5 };
+  s._manualHarvestRequested = true;
+  s._closeConsolidated = async () => { s.activePosition = null; return true; };
+  let planCalled = false;
+  s._planAndBuildLevels = async () => { planCalled = true; return true; };
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s.handleRealtimePrice(100);
+
+  assert.ok(!logs.some((m) => m.includes('skipped')), '_harvestToFlat must not hit its own in-flight refusal');
+  assert.equal(planCalled, true, '_harvestToFlat must run all the way through to the re-plan');
+  assert.equal(s._manualHarvestRequested, false, 'the latch is consumed');
+  assert.equal(s._tradingSeqInProgress, false, 'released once the harvest completes');
+  assert.equal(s._tickInProgress, false, 'the tick latch is released too');
+});
+
+test('a tick dropped by the new latch does not advance lastProcessedPrice — it is re-scanned next tick', async () => {
+  const s = reversalStrategy();
+  const filled = captureFills(s);
+  s.lastProcessedPrice = 100;
+
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  s._reconcileTrendInvariant = async () => { await gate; return false; };
+
+  const p1 = s.handleRealtimePrice(102);    // tick A: suspends inside the reconcile
+  const p2 = s.handleRealtimePrice(102.5);  // tick B: must be dropped immediately
+
+  // Before A is released, neither tick has been able to write anything —
+  // dropping B must be silent and synchronous, with no observable effect.
+  assert.equal(s.lastProcessedPrice, 100);
+
+  release();
+  await Promise.all([p1, p2]);
+
+  assert.equal(s.lastProcessedPrice, 102, 'only the tick that actually ran (A) advances it, to ITS price');
+  assert.deepEqual(filled, ['L1'], 'only tick A fills — the dropped tick B contributes nothing');
+});
