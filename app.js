@@ -22,6 +22,7 @@ import os from 'os';
 import wsBroadcast from './ws-broadcast.js';
 import { httpAuthMiddleware, requireAdmin, createRequireVmOwner, isAllowedVmUser } from './http-auth.js';
 import { checkBillingGate } from './billing-gate.js';
+import { isNewerVersion, parseVersion } from './version-compare.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -44,6 +45,16 @@ try {
 }
 let updateAvailable = false;
 let targetVersion = null;
+// The last target whose FULL retry chain failed. Read by the idle poller so it
+// does not re-attempt a known-impossible update every 60s; cleared whenever the
+// release doc names a genuinely different version. Transient by design — a
+// restart deserves one fresh attempt rather than inheriting a dead process's
+// verdict.
+let lastFailedTarget = null;
+// Whether this process has already written a resting ("up_to_date") status.
+// Ensures a VM booting with a STALE update_failed left in Firestore clears it
+// once, without re-writing the same record on every release-doc snapshot.
+let reportedRestingState = false;
 let isUpdating = false;
 let updateStartedAt = null;
 let releaseUnsubscribe = null;
@@ -1269,6 +1280,11 @@ function triggerSelfUpdate(retryCount = 0) {
         console.error('[UPDATE] stderr:', stderr);
         isUpdating = false;
         updateStartedAt = null;
+        // Remember what just exhausted its retries so the 60s idle poller does
+        // not immediately start the same doomed chain again. A new release
+        // clears this; a manual /self-update call bypasses it deliberately,
+        // because an operator asking explicitly is not the runaway this guards.
+        lastFailedTarget = targetVersion;
         reportUpdateStatus('update_failed', {
           targetVersion,
           error: error.message,
@@ -1396,11 +1412,25 @@ function setupReleaseListener() {
       const data = snapshot.data();
       const latestVersion = data?.latestVersion;
 
-      if (latestVersion && latestVersion !== BOT_VERSION) {
+      // ORDERING, never inequality. TOMBSTONE (2026-08-02): this used to be
+      // `latestVersion !== BOT_VERSION`, which armed an update whenever the two
+      // merely DIFFERED — including when this VM was running code NEWER than
+      // the declared release. That is the normal state for every VM provisioned
+      // between a master push and the admin release bump, and it made them
+      // auto-trigger a DOWNGRADE on boot (a fresh VM has no active strategies,
+      // so the auto-trigger gate was always open). The downgrade could never
+      // land — self-update.sh always pulls origin/master, which IS the newer
+      // code — so it failed and the 60s idle poller retried it forever.
+      // See version-compare.js. Do not "simplify" this back to !==.
+      if (isNewerVersion(latestVersion, BOT_VERSION)) {
         if (!updateAvailable || targetVersion !== latestVersion) {
           console.log(`[UPDATE] New version detected: ${latestVersion} (current: ${BOT_VERSION})`);
           updateAvailable = true;
           targetVersion = latestVersion;
+          // A genuinely different target clears the failure memory below, so a
+          // real new release always gets a fresh attempt even if the previous
+          // one failed.
+          lastFailedTarget = null;
 
           if (activeStrategies.size === 0 && !isUpdating) {
             console.log(`[UPDATE] No active strategies. Auto-triggering update to ${latestVersion}...`);
@@ -1409,9 +1439,33 @@ function setupReleaseListener() {
             console.log(`[UPDATE] ${activeStrategies.size} strategies running. Update will apply when idle.`);
           }
         }
-      } else if (latestVersion === BOT_VERSION) {
+      } else if (parseVersion(latestVersion)) {
+        // Same version, or this VM is AHEAD of the declared release. Both are
+        // "nothing to do". A malformed/absent latestVersion falls through to
+        // neither branch on purpose: it is unknown, not "up to date", so the
+        // current state is left exactly as it is.
+        const wasArmed = updateAvailable;
         updateAvailable = false;
         targetVersion = null;
+        lastFailedTarget = null;
+        // Clear the PERSISTED status too. Without this the admin UI stays stuck
+        // on the old `update_failed` + its stale targetVersion forever:
+        // reportUpdateStatus was only ever called with updating /
+        // update_failed / restarting, so nothing ever wrote it back to a
+        // resting state, and bumping the release doc to match this VM cleared
+        // the in-memory flag while leaving the Firestore record untouched.
+        //
+        // `!reportedRestingState` is what HEALS a VM that is already stuck. On a
+        // fresh boot `wasArmed` is false — the in-memory flag starts false — so
+        // gating on it alone would leave every VM carrying a stale update_failed
+        // from before this fix showing it forever, which is exactly the state
+        // this release exists to clear. Report once per process instead, then
+        // only on a real armed -> resting transition.
+        if (wasArmed || !reportedRestingState) {
+          reportedRestingState = true;
+          console.log(`[UPDATE] Declared release ${latestVersion} is not newer than ${BOT_VERSION} — clearing update state.`);
+          reportUpdateStatus('up_to_date', { latestVersion, botVersion: BOT_VERSION }).catch(() => {});
+        }
       }
     }, (error) => {
       console.error('[UPDATE] Release listener error:', error);
@@ -1424,6 +1478,13 @@ function setupReleaseListener() {
 
 function setupIdleUpdatePolling() {
   idleUpdateInterval = setInterval(async () => {
+    // `lastFailedTarget` stops this retrying a target that has ALREADY failed
+    // its full retry chain. Without it a permanently-impossible update (the
+    // 2026-08-02 downgrade loop) re-ran every 60s forever, each round burning
+    // five script invocations and writing another update_failed to Firestore.
+    // A real new release clears the memory (see setupReleaseListener), so this
+    // suppresses only the exact target that just exhausted its retries.
+    if (updateAvailable && targetVersion && targetVersion === lastFailedTarget) return;
     if (updateAvailable && activeStrategies.size === 0 && !isUpdating) {
       console.log(`[UPDATE] Idle polling: triggering pending update to ${targetVersion}...`);
       try {
