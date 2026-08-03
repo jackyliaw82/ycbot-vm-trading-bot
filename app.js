@@ -1642,6 +1642,23 @@ app.post('/reversal-ladder/start', requireVmOwner, async (req, res) => {
       activeStrategies.delete(strategyId);
     };
 
+    // Persist the doc BEFORE handing the strategyId to the caller.
+    //
+    // `start()` runs non-blocking and only reaches its own saveState() at the
+    // very END — after setLeverage, setPositionMode, exchange info, the wallet
+    // snapshot, WS setup, the position refresh and the funding poll. That is
+    // seconds of network I/O, and the frontend begins polling the moment it
+    // receives this response. Every ownership-scoped route resolves through
+    // `strategyOwnedByCaller`, which fail-closes to 404 when the doc does not
+    // exist yet — so a perfectly healthy start emitted a burst of
+    // "404 Strategy not found" until start() happened to finish.
+    //
+    // Writing it here also means a crash DURING start() leaves a recoverable
+    // doc (userId/profileId/type/isRunning) instead of an orphan the boot scan
+    // cannot see. saveState() catches its own errors, so this cannot reject the
+    // start request.
+    await strategy.saveState();
+
     console.log(`✓ Reversal Ladder Strategy ${strategyId} starting (non-blocking)...`);
     res.json({
       success: true,
