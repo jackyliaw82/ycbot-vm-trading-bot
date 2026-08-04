@@ -301,10 +301,10 @@ class ReversalLadderStrategy extends TradingBase {
     }
     if (this._aiApiKey) {
       this._aiPlanner = new AiPlanner(this._aiApiKey, this.aiModel);
-      await this.addLog(`[REVERSAL] AI level planning enabled (${this.aiModel}, key from ${aiKeySource}).`);
+      await this.addLog(`AI level planning enabled (${this.aiModel}, key from ${aiKeySource}).`);
     } else {
       await this.addLog(
-        `[REVERSAL] no AI key supplied — levels will come from the mechanical volume-void edges.`,
+        `no AI key supplied — levels will come from the mechanical volume-void edges.`,
       );
     }
 
@@ -492,7 +492,7 @@ class ReversalLadderStrategy extends TradingBase {
         secretName = snap?.exists ? snap.data()?.deepseekApiKeySecretName : null;
       } catch (err) {
         await this.addLog(
-          `WARNING: [REVERSAL] AI key lookup failed (profile read: ${err.message}) — ` +
+          `WARNING: AI key lookup failed (profile read: ${err.message}) — ` +
           `treating this cycle as if no key was supplied.`,
         );
         return null;
@@ -507,7 +507,7 @@ class ReversalLadderStrategy extends TradingBase {
         return value ? value : null;
       } catch (err) {
         await this.addLog(
-          `WARNING: [REVERSAL] AI key lookup failed (secret access: ${err.message}) — ` +
+          `WARNING: AI key lookup failed (secret access: ${err.message}) — ` +
           `treating this cycle as if no key was supplied.`,
         );
         return null;
@@ -516,7 +516,7 @@ class ReversalLadderStrategy extends TradingBase {
       // Should be unreachable given the two narrower try/catches above, but
       // this method's one hard contract is that it never throws — see the
       // docstring. A bug here must degrade to "no key", not escape.
-      console.error(`[REVERSAL] _resolveAiApiKey: unexpected failure: ${err.message}`);
+      console.error(`_resolveAiApiKey: unexpected failure: ${err.message}`);
       return null;
     }
   }
@@ -570,10 +570,10 @@ class ReversalLadderStrategy extends TradingBase {
         this.aiCostUSD = this._aiUsage.costUsd(this.aiModel);
       }
       if (result.error) {
-        await this.addLog(`[REVERSAL] level planning note: ${result.error}`);
+        await this.addLog(`level planning note: ${result.error}`);
       }
       await this.addLog(
-        `[REVERSAL] levels from ${result.source} — bull ${this._formatPrice(result.bullLevel)} / ` +
+        `levels from ${result.source} — bull ${this._formatPrice(result.bullLevel)} / ` +
         `bear ${this._formatPrice(result.bearLevel)}` +
         (result.rationale ? ` — ${result.rationale}` : ''),
       );
@@ -588,7 +588,7 @@ class ReversalLadderStrategy extends TradingBase {
       const live = this.currentPrice;
       if (!Number.isFinite(live) || !(result.bearLevel < live && live < result.bullLevel)) {
         await this.addLog(
-          `[REVERSAL] level planning (${reason}) discarded — price moved to ` +
+          `level planning (${reason}) discarded — price moved to ` +
           `${this._formatPrice(live)}, outside the proposed band ` +
           `${this._formatPrice(result.bearLevel)}–${this._formatPrice(result.bullLevel)} ` +
           `while the market context was being fetched. Re-planning.`,
@@ -912,7 +912,7 @@ class ReversalLadderStrategy extends TradingBase {
       // FAIL CLOSED: an unknown margin balance must never read as "plenty of
       // headroom". Cap to the safe floor (currentInitialSize) rather than
       // falling back to a stale/guessed figure.
-      await this.addLog(`[LADDER] margin-headroom cap: getTotalMarginBalance() failed (${err.message}) — capping to currentInitialSize (fail-closed).`);
+      await this.addLog(`margin-headroom cap: getTotalMarginBalance() failed (${err.message}) — capping to currentInitialSize (fail-closed).`);
       const floor = this.currentInitialSize || 0;
       this._lastLadderSize = floor;
       return floor;
@@ -1115,7 +1115,7 @@ class ReversalLadderStrategy extends TradingBase {
       // it were, `_recomputeFinalTpPrice` refuses to derive from a position
       // whose refresh just failed.
       await this.addLog(
-        `[LADDER] WARNING: _enterTrend: Binance position refresh failed (twice) while arming TREND ${direction} ` +
+        `WARNING: _enterTrend: Binance position refresh failed (twice) while arming TREND ${direction} ` +
         `for ${this.symbol} — Final TP NOT armed from unverified data. Position remains fully exposed with NO ` +
         `exit target until _reconcileTrendInvariant self-heals it on a later tick/resume.`
       );
@@ -1149,7 +1149,7 @@ class ReversalLadderStrategy extends TradingBase {
     const floorUSDT = this.minDesiredProfitUSDT || 0;
     if ((this.desiredProfitUSDT || 0) > floorUSDT + 1e-9) {
       await this.addLog(
-        `[LADDER] carrying the manual profit target ${this._formatNotional(this.desiredProfitUSDT)} USDT ` +
+        `carrying the manual profit target ${this._formatNotional(this.desiredProfitUSDT)} USDT ` +
         `into this TREND (config target ${this._formatNotional(floorUSDT)} USDT) — ` +
         `Final TP sits further out as a result. Reset it from Position Control to return to config.`,
       );
@@ -1302,7 +1302,7 @@ class ReversalLadderStrategy extends TradingBase {
     await this.saveState();
     this._pushHeartbeatNow?.();
     await this.addLog(
-      `[REVERSAL] trailing exit ${enabled ? 'ON' : 'OFF'}` +
+      `trailing exit ${enabled ? 'ON' : 'OFF'}` +
       (enabled && this.trailExit != null ? ` — exit at ${this._formatPrice(this.trailExit)}` : ''),
     );
     return { trailEnabled: this.trailEnabled, trailExit: this.trailExit };
@@ -1360,7 +1360,7 @@ class ReversalLadderStrategy extends TradingBase {
       );
       if (!outermost) return false;
       await this.addLog(
-        `[LADDER] SCALING→TREND invariant reconcile: outermost ${outermost.direction} leg already ` +
+        `SCALING→TREND invariant reconcile: outermost ${outermost.direction} leg already ` +
         `POSITION_OPEN with ladderMode still SCALING — arming TREND now (resume or a missed tick).`,
       );
       await this._enterTrend(outermost.direction);
@@ -1388,13 +1388,13 @@ class ReversalLadderStrategy extends TradingBase {
       this._trendArmRetryLastTs = now;
 
       await this.addLog(
-        `[LADDER] TREND Final-TP invariant reconcile: TREND ${this.trendDirection} active for ${this.symbol} but ` +
+        `TREND Final-TP invariant reconcile: TREND ${this.trendDirection} active for ${this.symbol} but ` +
         `Final TP is still unarmed — retrying position refresh.`
       );
       await this._refreshCurrentPosition(true);
       if (this._lastPositionRefreshFailed) {
         await this.addLog(
-          `[LADDER] WARNING: TREND Final-TP invariant reconcile: refresh failed again for ${this.symbol} — ` +
+          `WARNING: TREND Final-TP invariant reconcile: refresh failed again for ${this.symbol} — ` +
           `Final TP still unarmed, will retry next tick.`
         );
         return false;
@@ -1419,7 +1419,7 @@ class ReversalLadderStrategy extends TradingBase {
       // A reconciler may only report the state it actually reached.
       if (!this._trendFinalTpArmed) {
         await this.addLog(
-          `[LADDER] WARNING: TREND Final-TP invariant reconcile: refresh SUCCEEDED for ${this.symbol} but no Final TP ` +
+          `WARNING: TREND Final-TP invariant reconcile: refresh SUCCEEDED for ${this.symbol} but no Final TP ` +
           `could be derived (position ${this.activePosition && this.activePosition.quantity > 0
             ? `qty ${this.activePosition.quantity}, side ${this.currentSide || 'UNRESOLVED'}`
             : 'FLAT on Binance'}` +
@@ -1433,7 +1433,7 @@ class ReversalLadderStrategy extends TradingBase {
       // than waiting out an interval left over from this recovery.
       this._trendArmRetryLastTs = null;
       await this.addLog(
-        `[LADDER] TREND Final-TP invariant reconcile: Final TP armed at ${this._formatPrice(this.finalTpPrice)}.`
+        `TREND Final-TP invariant reconcile: Final TP armed at ${this._formatPrice(this.finalTpPrice)}.`
       );
       await this.saveState();
       return true;
@@ -1481,7 +1481,14 @@ class ReversalLadderStrategy extends TradingBase {
         ? this.activePosition.unrealizedPnl : 0;
       const kind = !hadInventory ? 'RE-ANCHOR' : (closingPnl >= 0 ? 'HARVEST' : 'RE-ANCHOR');
       let detail = reason;
-      await this.addLog(`===== ${kind} (${detail}) — flatten + re-plan levels =====`);
+      // Name the price this fired at. For a price_trigger that is the level the
+      // market actually reached — read BEFORE the close, because the close and
+      // the re-plan both move on from here and the log would otherwise describe
+      // the trigger with a price from after it fired. Without this the line said
+      // only "RE-ANCHOR (price_trigger)" and there was no way to tell, from the
+      // log alone, what price had hit.
+      const firedAt = Number.isFinite(this.currentPrice) ? ` @ ${this._formatPrice(this.currentPrice)}` : '';
+      await this.addLog(`===== ${kind} (${detail})${firedAt} — flatten + re-plan levels =====`);
 
       // Self-gating and self-sizing (see `_closeQuantity`). This matters most
       // here of all the close paths: the harvest RE-ANCHORS, so anything left
@@ -1801,7 +1808,7 @@ class ReversalLadderStrategy extends TradingBase {
     // automatically. Best-effort; swallow errors — the
     // automatic 30-min L3 will catch anything we miss here.
     this._reconcileRecentTrades().catch((err) => {
-      console.error(`[LADDER] L3 reconcile on resume failed: ${err.message}`);
+      console.error(`L3 reconcile on resume failed: ${err.message}`);
     });
 
     // Reconcile position from Binance (source of truth).
@@ -1930,7 +1937,7 @@ class ReversalLadderStrategy extends TradingBase {
       try {
         await this._refreshCurrentPosition();
       } catch (err) {
-        await this.addLog(`[LADDER] stop: pre-flatten position refresh failed: ${err.message}`);
+        await this.addLog(`stop: pre-flatten position refresh failed: ${err.message}`);
       }
 
       // closedSomething reflects an ACTUAL close, never a leg marking —
@@ -1943,7 +1950,7 @@ class ReversalLadderStrategy extends TradingBase {
         try {
           closedSomething = await this._flattenGrid();
         } catch (err) {
-          await this.addLog(`[LADDER] stop: grid flatten failed: ${err.message}`);
+          await this.addLog(`stop: grid flatten failed: ${err.message}`);
         }
       }
       // Fallback for a position with no ladder leg left marked POSITION_OPEN
@@ -1956,7 +1963,7 @@ class ReversalLadderStrategy extends TradingBase {
         try {
           closedSomething = await this._closeConsolidated(closeReason);
         } catch (err) {
-          await this.addLog(`[LADDER] stop: flatten failed: ${err.message}`);
+          await this.addLog(`stop: flatten failed: ${err.message}`);
         }
       }
       // Only claim "nothing to flatten" when Binance actually ANSWERED and
@@ -1964,7 +1971,7 @@ class ReversalLadderStrategy extends TradingBase {
       // unknown, or while a close attempt just threw over a live quantity,
       // reads as false reassurance.
       if (!closedSomething && !this._lastPositionRefreshFailed && !this._closeQuantity()) {
-        await this.addLog('[LADDER] stop: no open position on Binance — nothing to flatten');
+        await this.addLog('stop: no open position on Binance — nothing to flatten');
       }
 
       // Residual verification — ALWAYS runs, regardless of which branch (if
@@ -1975,7 +1982,7 @@ class ReversalLadderStrategy extends TradingBase {
       try {
         await this._refreshCurrentPosition();
       } catch (err) {
-        await this.addLog(`[LADDER] stop: post-flatten position refresh failed: ${err.message}`);
+        await this.addLog(`stop: post-flatten position refresh failed: ${err.message}`);
       }
       // TOMBSTONE — the flag check MUST come first. This block used to lead
       // with `activePosition` and then `else if (closedSomething) ->
@@ -1999,14 +2006,14 @@ class ReversalLadderStrategy extends TradingBase {
           ? `last-known position ${this.currentSide} ${this.activePosition.quantity}`
           : 'no position in memory (which is NOT proof of flat — the refresh failed)';
         await this.addLog(
-          `[LADDER] WARNING: stop: FINAL STATE UNKNOWN for ${this.symbol} — Binance could not be reached to confirm ` +
+          `WARNING: stop: FINAL STATE UNKNOWN for ${this.symbol} — Binance could not be reached to confirm ` +
           `flat${closedSomething ? ' after a close was attempted' : ''}. ${openLegs.length} ladder leg(s) (qty ` +
           `${legQty}) remain marked open; ${lastKnown}. Verify manually on Binance.`
         );
       } else if (this.activePosition && this.activePosition.quantity > 0) {
-        await this.addLog(`[LADDER] WARNING: stop+flatten left residual ${this.currentSide} ${this.activePosition.quantity} ${this.symbol} on Binance — close it manually`);
+        await this.addLog(`WARNING: stop+flatten left residual ${this.currentSide} ${this.activePosition.quantity} ${this.symbol} on Binance — close it manually`);
       } else if (closedSomething) {
-        await this.addLog('[LADDER] stop: position confirmed flat');
+        await this.addLog('stop: position confirmed flat');
       }
 
       // Final TP: write the strategyFlow audit record + metricsSample so
@@ -2016,7 +2023,7 @@ class ReversalLadderStrategy extends TradingBase {
         try {
           await this._postExecuteBookkeeping('FINAL_TP_HIT', { exitPrice });
         } catch (bkErr) {
-          console.error(`[LADDER] FINAL_TP_HIT bookkeeping failed: ${bkErr.message}`);
+          console.error(`FINAL_TP_HIT bookkeeping failed: ${bkErr.message}`);
         }
       }
     }
@@ -2037,14 +2044,14 @@ class ReversalLadderStrategy extends TradingBase {
     try {
       await this._pollFundingIncome();
     } catch (err) {
-      console.error(`[LADDER] final funding poll failed: ${err.message}`);
+      console.error(`final funding poll failed: ${err.message}`);
     }
 
     // Release the user-data listen key + drop both WS streams.
     try {
       if (typeof this.cleanupWebSockets === 'function') this.cleanupWebSockets();
     } catch (err) {
-      console.error(`[LADDER] cleanupWebSockets failed: ${err.message}`);
+      console.error(`cleanupWebSockets failed: ${err.message}`);
     }
 
     this.executionState = 'TERMINATED';
@@ -2065,7 +2072,7 @@ class ReversalLadderStrategy extends TradingBase {
       try {
         await this.deductPlatformFee(netPnL);
       } catch (feeErr) {
-        console.error(`[LADDER] platform fee error: ${feeErr.message}`);
+        console.error(`platform fee error: ${feeErr.message}`);
       }
     }
 
@@ -2088,8 +2095,8 @@ class ReversalLadderStrategy extends TradingBase {
     await this._recordHeroProfit(netPnL);
 
     await this.addLog(reason === 'final_tp'
-      ? '[LADDER] Final TP — cycle complete, strategy terminated.'
-      : '[LADDER] stop: terminated');
+      ? 'Final TP — cycle complete, strategy terminated.'
+      : 'stop: terminated');
 
     // Completion notification. Helper signature is
     // (userId, strategyData); the FCM token lookup relies on the
@@ -2112,7 +2119,7 @@ class ReversalLadderStrategy extends TradingBase {
           fundingFees: this.accumulatedFundingFees || 0,
         });
       } catch (notifyErr) {
-        console.error(`[LADDER] notify error: ${notifyErr.message}`);
+        console.error(`notify error: ${notifyErr.message}`);
       }
     }
 
@@ -2120,7 +2127,7 @@ class ReversalLadderStrategy extends TradingBase {
     // `activeStrategies.delete(strategyId)`. Without this, the next start
     // attempt for this profile is rejected with "already running".
     try { this.onStopComplete?.(); } catch (e) {
-      console.error('[LADDER] onStopComplete hook failed:', e.message);
+      console.error('onStopComplete hook failed:', e.message);
     }
   }
 
@@ -2169,16 +2176,16 @@ class ReversalLadderStrategy extends TradingBase {
         try {
           await this.deleteSubcollection(ref, name);
         } catch (subErr) {
-          console.error(`[LADDER] no-trade cleanup: ${name} delete failed: ${subErr.message}`);
+          console.error(`no-trade cleanup: ${name} delete failed: ${subErr.message}`);
         }
       }
       await strategyRef.delete();
-      console.log(`[LADDER] no-trade cycle ${this.strategyId} — strategy doc deleted (not persisted as completed).`);
+      console.log(`no-trade cycle ${this.strategyId} — strategy doc deleted (not persisted as completed).`);
     } catch (err) {
-      console.error(`[LADDER] no-trade doc delete failed for ${this.strategyId}: ${err.message} — falling back to saveState()`);
+      console.error(`no-trade doc delete failed for ${this.strategyId}: ${err.message} — falling back to saveState()`);
       this.willBeDeleted = false;
       try { await this.saveState(); } catch (saveErr) {
-        console.error(`[LADDER] fallback saveState also failed: ${saveErr.message}`);
+        console.error(`fallback saveState also failed: ${saveErr.message}`);
       }
     }
   }
@@ -2210,7 +2217,7 @@ class ReversalLadderStrategy extends TradingBase {
         tx.set(strategyRef, { heroCounted: true }, { merge: true });
       });
     } catch (err) {
-      console.error(`[LADDER] hero-profit record failed: ${err.message}`);
+      console.error(`hero-profit record failed: ${err.message}`);
     }
   }
 
@@ -2439,7 +2446,7 @@ class ReversalLadderStrategy extends TradingBase {
     await this.saveState();
 
     await this.addLog(
-      `[LADDER] manual profit-target adjust: ${pct}% → ${this._formatNotional(newUSDT)} USDT ` +
+      `manual profit-target adjust: ${pct}% → ${this._formatNotional(newUSDT)} USDT ` +
       `(was ${this._formatNotional(before)} USDT, initialCapital ${this._formatNotional(this.initialCapital)})`,
     );
 
@@ -2524,7 +2531,7 @@ class ReversalLadderStrategy extends TradingBase {
       await this.saveState();
       this._pushHeartbeatNow?.();
       await this.addLog(
-        `[LADDER] Final TP reset to the config target — desired profit ` +
+        `Final TP reset to the config target — desired profit ` +
         `${this._formatNotional(this.desiredProfitUSDT)} USDT` +
         (this.finalTpPrice ? ` (Final TP ${this._formatPrice(this.finalTpPrice)}).` : '.'),
       );
@@ -2559,7 +2566,7 @@ class ReversalLadderStrategy extends TradingBase {
       await this.saveState();
       this._pushHeartbeatNow?.();
       await this.addLog(
-        `[LADDER] profit target ${this._formatNotional(prev)} → ${this._formatNotional(want)} USDT ` +
+        `profit target ${this._formatNotional(prev)} → ${this._formatNotional(want)} USDT ` +
         (this.finalTpPrice ? `(Final TP ${this._formatPrice(this.finalTpPrice)}).` : '(no position yet — applies when TREND arms).'),
       );
       return {
@@ -2596,7 +2603,7 @@ class ReversalLadderStrategy extends TradingBase {
     await this.saveState();
     this._pushHeartbeatNow?.();
     await this.addLog(
-      `[LADDER] Final TP moved to ${this._formatPrice(this.finalTpPrice ?? px)} — desired profit ` +
+      `Final TP moved to ${this._formatPrice(this.finalTpPrice ?? px)} — desired profit ` +
       `${this._formatNotional(before)} → ${this._formatNotional(this.desiredProfitUSDT)} USDT ` +
       `(config floor ${this._formatNotional(floor)}).`,
     );
@@ -2687,7 +2694,7 @@ class ReversalLadderStrategy extends TradingBase {
     await this.saveState();
     this._pushHeartbeatNow?.();
     await this.addLog(
-      `[LADDER] ${action === 'stop' ? 'PROTECT' : 'harvest'} trigger armed @ ${this._formatPrice(rounded)} ` +
+      `${action === 'stop' ? 'PROTECT' : 'harvest'} trigger armed @ ${this._formatPrice(rounded)} ` +
       `(fires when price ${this.harvestTriggerAbove ? '>=' : '<='} ${this._formatPrice(rounded)}` +
       `${action === 'stop' ? ' — closes and ENDS the cycle' : ' — closes and re-anchors'}).`,
     );
@@ -2706,7 +2713,7 @@ class ReversalLadderStrategy extends TradingBase {
     if (had) {
       await this.saveState();
       this._pushHeartbeatNow?.();
-      await this.addLog('[LADDER] harvest trigger cancelled.');
+      await this.addLog('harvest trigger cancelled.');
     }
     return { cancelled: true };
   }
@@ -2806,7 +2813,7 @@ class ReversalLadderStrategy extends TradingBase {
     }
 
     await this.addLog(
-      `[REVERSAL] levels edited — BULL ${this._formatPrice(this.bullLevel)} / ` +
+      `levels edited — BULL ${this._formatPrice(this.bullLevel)} / ` +
       `BEAR ${this._formatPrice(this.bearLevel)} (rebuilt: ` +
       `${[movingBull && 'bull', movingBear && 'bear'].filter(Boolean).join(' + ')}).`,
     );
@@ -2896,7 +2903,7 @@ class ReversalLadderStrategy extends TradingBase {
     // NaN, since `NaN <= 0` is false).
     if (!Number.isFinite(wallet) || wallet <= 0) {
       const floor = this.currentInitialSize || 0;
-      void this.addLog(`[LADDER] margin-headroom cap: wallet balance invalid/unknown (${wallet}) — capping to ${floor} (fail-closed).`);
+      void this.addLog(`margin-headroom cap: wallet balance invalid/unknown (${wallet}) — capping to ${floor} (fail-closed).`);
       return floor;
     }
     const proposedNotional = proposedSize;
@@ -2907,7 +2914,7 @@ class ReversalLadderStrategy extends TradingBase {
     const projectedFreePct = ((wallet - projectedUsed) / wallet) * 100;
     if (projectedFreePct < MARGIN_HEADROOM_FLOOR_PCT) {
       const floor = this.currentInitialSize || 0;
-      void this.addLog(`[LADDER] margin-headroom cap: proposed=${proposedSize} projectedFree=${projectedFreePct.toFixed(2)}% < ${MARGIN_HEADROOM_FLOOR_PCT}% → capped to ${floor}`);
+      void this.addLog(`margin-headroom cap: proposed=${proposedSize} projectedFree=${projectedFreePct.toFixed(2)}% < ${MARGIN_HEADROOM_FLOOR_PCT}% → capped to ${floor}`);
       return floor;
     }
     return proposedSize;
@@ -2977,12 +2984,23 @@ class ReversalLadderStrategy extends TradingBase {
     const qty = this.activePosition.quantity;
     const entry = this.activePosition.entryPrice || this.activePosition.avgEntry;
     const notional = this.activePosition.notional || (entry * qty) || 0;
-    // needed = accLoss + desiredProfit + estimatedClosingFee
-    // (the AI-cost term is gone — there is no AI.)
+    // needed = accLoss + desiredProfit + estimatedClosingFee + aiCost
+    //
+    // The aiCost term is BACK. It was removed when the AI stack was deleted for
+    // AnchorLadder ("there is no AI"), but ReversalLadder plans its levels with
+    // DeepSeek and the frontend now counts that spend in the cycle's Net. Without
+    // this term the two disagree by exactly the AI cost: the cycle would close at
+    // Final TP reporting a Net BELOW the target the user asked for, every time,
+    // and the shortfall would grow with each Ask AI / re-plan.
+    //
+    // Note this is denominated in USD while everything else here is USDT. They
+    // are treated 1:1 — the drift is a fraction of a cent on a sub-dollar figure,
+    // far below the tick rounding applied downstream.
     const estimatedClosingFee = notional * FEE_RATE;
     const needed = (this.cycleAccumulatedLoss || 0)
       + (this.desiredProfitUSDT || 0)
-      + estimatedClosingFee;
+      + estimatedClosingFee
+      + (this.aiCostUSD || 0);
     if (!entry || qty <= 0) {
       this.finalTpPrice = null;
       return;
@@ -3076,7 +3094,7 @@ class ReversalLadderStrategy extends TradingBase {
       // TRUE LIVE state snapshot so the frontend can re-sync without waiting.
       this._pushHeartbeatNow();
     } catch (err) {
-      console.error(`[LADDER] _postExecuteBookkeeping error: ${err.message}`);
+      console.error(`_postExecuteBookkeeping error: ${err.message}`);
     }
   }
 
@@ -3149,7 +3167,7 @@ class ReversalLadderStrategy extends TradingBase {
         });
       } catch (_) { /* push is best-effort; REST poll catches stragglers */ }
     } catch (err) {
-      console.error(`[LADDER] _writeStrategyFlow failed: ${err.message}`);
+      console.error(`_writeStrategyFlow failed: ${err.message}`);
     }
   }
 
@@ -3224,7 +3242,7 @@ class ReversalLadderStrategy extends TradingBase {
       this._pushHeartbeatNow();
       return { added, count: incomes.length };
     } catch (err) {
-      console.error(`[LADDER] funding poll error: ${err.message}`);
+      console.error(`funding poll error: ${err.message}`);
       return { added: 0, count: 0, error: err.message };
     }
   }
@@ -3305,14 +3323,14 @@ class ReversalLadderStrategy extends TradingBase {
 
       if (expectNonEmpty && !hasPosition) {
         for (let attempt = 1; attempt <= 5; attempt++) {
-          console.log(`[LADDER] _refreshCurrentPosition: REST returned empty post-trade; retry ${attempt}/5 after 300ms`);
+          console.log(`_refreshCurrentPosition: REST returned empty post-trade; retry ${attempt}/5 after 300ms`);
           await new Promise((r) => setTimeout(r, 300));
           await this.detectCurrentPosition(true);
           side = this.currentPosition;
           qty = this.currentPositionQuantity;
           entryPrice = this.positionEntryPrice;
           if ((side === 'LONG' || side === 'SHORT') && qty && qty > 0 && Number.isFinite(entryPrice) && entryPrice > 0) {
-            console.log(`[LADDER] _refreshCurrentPosition: REST resolved non-empty on attempt ${attempt}/5`);
+            console.log(`_refreshCurrentPosition: REST resolved non-empty on attempt ${attempt}/5`);
             break;
           }
         }
@@ -3353,7 +3371,7 @@ class ReversalLadderStrategy extends TradingBase {
       // but flag the failure so state-sensitive callers like stop()'s
       // flatten path can tell "confirmed flat" apart from "unknown".
       this._lastPositionRefreshFailed = true;
-      await this.addLog(`[LADDER] _refreshCurrentPosition error: ${err.message} — position state UNKNOWN, NOT treated as flat.`);
+      await this.addLog(`_refreshCurrentPosition error: ${err.message} — position state UNKNOWN, NOT treated as flat.`);
     }
   }
 
@@ -3756,7 +3774,7 @@ class ReversalLadderStrategy extends TradingBase {
       };
       await this.firestore.collection('strategies').doc(this.strategyId).set(doc, { merge: true });
     } catch (err) {
-      await this.addLog(`[LADDER] saveState error: ${err.message}`);
+      await this.addLog(`saveState error: ${err.message}`);
     }
   }
 
