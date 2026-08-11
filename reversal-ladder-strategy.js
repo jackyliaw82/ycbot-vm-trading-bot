@@ -6,7 +6,7 @@ import { FEE_RATE } from './fees.js';
 import { VolumeProfile } from './volume-profile.js';
 import { MarketMetrics } from './market-metrics.js';
 import { BREAKOUT_PCT, resolveBreakoutGeometry, deriveBreakoutLevels } from './breakout-levels.js';
-import { planReversalActions, averageOpenEntry } from './reversal-crossings.js';
+import { planBreakoutEntry } from './breakout-crossings.js';
 import { planLevels } from './level-planner.js';
 import { buildLevelContext } from './market-context.js';
 import { precisionFormatter } from './precisionUtils.js';
@@ -1154,33 +1154,36 @@ class ReversalLadderStrategy extends TradingBase {
   }
 
   /**
-   * Arm the trail at the moment TREND arms. The distance is fixed here and
-   * never recomputed, which is what makes the exit start exactly at the
-   * opposite level and move 1:1 with price — no tuning knob, self-scaling
-   * across symbols.
+   * Arm the trail at the moment the position opens. The distance is fixed
+   * here and never recomputed, which is what makes the exit start exactly at
+   * the entry level and move 1:1 with price from there — no tuning knob,
+   * self-scaling across symbols.
    *
-   * A no-op when trailing is off, so `trailExit` stays null and every hit
-   * check below is dead. Safe to call twice.
+   * A no-op when trailing is off, so `trailExit` stays null and
+   * `_updateTrailAndCheckHit` falls back to the plain pinned stop. Gated on
+   * `openLeg` (the single-row ledger), not a deleted mode field. Safe to call
+   * twice.
    */
   _armTrail() {
-    if (!this.trailEnabled || this.ladderMode !== 'TREND') {
+    if (!this.trailEnabled || !this.openLeg) {
       this.trailDistanceValue = null;
       this.trailExit = null;
       return;
     }
-    const side = this.trendDirection;
-    const d = trailDistance(this.trendStartPrice, side, this.bullLevel, this.bearLevel);
+    const side = this.heldSide;
+    const d = trailDistance(side, {
+      bullLevel: this.bullLevel, bearLevel: this.bearLevel,
+      bullBreakout: this.bullBreakout, bearBreakout: this.bearBreakout,
+    });
     if (d == null || !(d > 0)) {
-      // An unusable distance must leave the trail DISARMED, never guessed. A
-      // trail derived from a bad start price would sit at an arbitrary level
-      // and close a healthy position.
+      // An unusable distance must leave the trail DISARMED, never guessed.
       this.trailDistanceValue = null;
       this.trailExit = null;
       return;
     }
     this.trailDistanceValue = d;
     this.trailExit = trailExitLevel({
-      price: this.trendStartPrice, distance: d, side,
+      price: this.openLeg.fillPrice, distance: d, side,
       bullLevel: this.bullLevel, bearLevel: this.bearLevel, previous: null,
     });
   }
@@ -1192,80 +1195,78 @@ class ReversalLadderStrategy extends TradingBase {
   }
 
   /**
-   * Ratchet the exit level toward the entry level. Returns true when price has
-   * reached it AND the trail has actually moved off the opposite level.
+   * The strategy's ONLY stop check while a position is held. Returns true
+   * when price has reached the current exit level.
    *
-   * The strict inequality is the §7 collision rule: while `trailExit` still
-   * equals the opposite level, a hit there is a REVERSAL (Rule 2), not a
-   * trailed exit. Only once the ratchet has carried it past that level does the
-   * trail own the close.
+   * The stop and the trailed exit are ONE mechanism, not two. With trailing
+   * DISARMED the level is pinned at bullLevel/bearLevel and this behaves as a
+   * plain stop; with it ARMED, the level ratchets via `trailExitLevel` and can
+   * lock profit above the entry. Either way `_stopOut` owns the close — the
+   * caller does not need to know which framing produced the hit.
    */
   _updateTrailAndCheckHit(price) {
-    if (!this.trailEnabled || this.ladderMode !== 'TREND') return false;
+    const side = this.heldSide;
+    if (!side) return false;
+
+    // With trailing DISARMED the stop still exists — it just never ratchets.
+    // Pin it to the exit level so this one branch serves both framings.
+    if (!this.trailEnabled) {
+      const stop = side === 'LONG' ? this.bullLevel : this.bearLevel;
+      if (!Number.isFinite(stop)) return false;
+      this.trailExit = stop;
+      return side === 'LONG' ? price <= stop : price >= stop;
+    }
+
     if (this.trailDistanceValue == null) return false;
-    const side = this.trendDirection;
     const next = trailExitLevel({
       price, distance: this.trailDistanceValue, side,
       bullLevel: this.bullLevel, bearLevel: this.bearLevel, previous: this.trailExit,
     });
     if (next == null) return false;
     this.trailExit = next;
-    if (side === 'LONG')  return next > this.bearLevel && price <= next;
-    if (side === 'SHORT') return next < this.bullLevel && price >= next;
-    return false;
+    return side === 'LONG' ? price <= next : price >= next;
   }
 
   /**
-   * §7 — the trailed exit. Close, reset BOTH ladders, return to SCALING flat,
-   * and fill NOTHING on this tick.
+   * The cycle's only non-terminal exit: close and go flat, cycle continues.
    *
-   * The two-tick rule DOES apply here (unlike a reversal): the trail caps at the
-   * entry level, so closing there would leave price sitting on L1/S1 and the
-   * same tick would immediately refill the position just closed.
+   * Serves both framings of the same level — a stop at bullLevel/bearLevel when
+   * trailing is disarmed, and a ratcheted trailed exit when it is armed.
    *
-   * Returns false when the caller must not advance `lastProcessedPrice`.
+   * Returns false when the close could not be VERIFIED, in which case the caller
+   * must not advance `lastProcessedPrice`. `_closeConsolidated` leaves `openLeg`
+   * intact on an unverified close, so the position stays tracked and the exit
+   * retries on the next tick. Do NOT clear `openLeg` here.
    */
-  async _trailedExit() {
+  async _stopOut(price) {
     let closed = false;
-    try { closed = await this._closeConsolidated('trailed_exit'); }
-    catch (e) { await this.addLog(`ERROR trailed-exit close: ${e.message}`); }
+    try { closed = await this._closeConsolidated('stop_out'); }
+    catch (e) { await this.addLog(`ERROR stop-out close: ${e.message}`); }
 
     if (!closed && this._closeQuantity() > 0) {
       await this.addLog(
-        `WARNING: TRAILED EXIT aborted — the close could not be verified; the ladder was left INTACT ` +
-        `so the open position stays tracked. It will retry on the next tick.`,
+        'WARNING: stop-out aborted — the close could not be verified; the position was left TRACKED. ' +
+        'It will retry on the next tick.',
       );
       await this.saveState();
       this._pushHeartbeatNow?.();
       return false;
     }
 
-    const exitAt = this.trailExit;
-    for (const leg of this.ladderLines) {
-      leg.state = 'EMPTY';
-      leg.quantity = null;
-      leg.fillPrice = null;
-    }
-    this.ladderMode = 'SCALING';
-    this.trendDirection = null;
-    this.trendStartPrice = null;
-    this.finalTpPrice = null;
     this._clearTrail();
-    this.cycleAccumulatedLoss = this._computeAccLoss();
-    this._ladderBaseSize = await this._computeLadderBaseSize();
 
-    await this.addLog(
-      `===== TRAILED EXIT @ ${this._formatPrice(exitAt)} ===== levels UNCHANGED ` +
-      `(bull ${this._formatPrice(this.bullLevel)} / bear ${this._formatPrice(this.bearLevel)}) | ` +
-      `accLoss ${this._formatNotional(this.cycleAccumulatedLoss)} USDT | ` +
-      `leg ${this._formatNotional(this._legNotional())} USDT`,
-    );
-    await this._writeStrategyFlow('TRAILED_EXIT', {
-      exitLevel: exitAt, bullLevel: this.bullLevel, bearLevel: this.bearLevel,
-      accLoss: this.cycleAccumulatedLoss,
-    }).catch(() => {});
+    // Gap latch. Price can land beyond the OPPOSITE entry level on the very tick
+    // that stopped us out. Opening there on this tick would book an entry at a
+    // price the level never saw, so the two-tick rule applies and the opposite
+    // side opens on the NEXT tick instead. Not persisted: it is valid for one
+    // tick only.
+    if (price <= this.bearBreakout) this._pendingEntry = 'SHORT';
+    else if (price >= this.bullBreakout) this._pendingEntry = 'LONG';
+    else this._pendingEntry = null;
+
+    this._ladderBaseSize = await this._computeLadderBaseSize();
+    await this._postExecuteBookkeeping('STOP_OUT', { price, pendingEntry: this._pendingEntry });
     await this.saveState();
-    this._pushHeartbeatNow?.();
     return true;
   }
 
@@ -2247,11 +2248,11 @@ class ReversalLadderStrategy extends TradingBase {
     // reversal clears activePosition via `_closeConsolidated`, a few lines down.
     if (this.activePosition) this._updateUnrealizedPnL(price);
 
-    // ---- Level gate: plan the pair and build both ladders. ----
+    // ---- Level gate: plan the pair and derive the entry levels. ----
     // Unlike the deleted anchor, levels are DERIVED from market data, so this
     // can fail. It returns false and builds nothing when it does; we then trade
     // nothing this tick rather than guessing a level.
-    if (!this.ladderLines.length) {
+    if (this.bullBreakout == null || this.bearBreakout == null) {
       await this._planAndBuildLevels('cycle_start');
       return;
     }
@@ -2339,67 +2340,44 @@ class ReversalLadderStrategy extends TradingBase {
       }
     }
 
-    // ---- Derive the SCALING→TREND invariant BEFORE dispatching. ----
-    await this._reconcileTrendInvariant();
-
-    // ---- TREND exit 1: Final TP -> close + STOP. The cycle ends. ----
-    if (this.ladderMode === 'TREND' && this.finalTpPrice && this._checkFinalTpHit(price)) {
+    // ---- Exit 1: Final TP -> close + STOP. The cycle ends. ----
+    if (this.heldSide && this.finalTpPrice && this._checkFinalTpHit(price)) {
       this._tradingSeqInProgress = true;
       try { await this.stop({ flatten: true, reason: 'final_tp' }); }
       finally { this._tradingSeqInProgress = false; }
       return;
     }
 
-    // ---- TREND exit 2: the trailed exit (§7). Checked before the tick rules so
-    // a ratcheted trail owns the close; while it still sits AT the opposite
-    // level `_updateTrailAndCheckHit` returns false and the reversal below
-    // handles the hit instead.
-    if (this.ladderMode === 'TREND' && this._updateTrailAndCheckHit(price)) {
+    // ---- Exit 2: the stop. With trailing disarmed this level never moves off
+    // bullLevel/bearLevel, so this single branch is both the near-level stop and
+    // the trailed exit — they are one mechanism, not two.
+    if (this.heldSide && this._updateTrailAndCheckHit(price)) {
       this._tradingSeqInProgress = true;
       let ok = false;
-      try { ok = await this._trailedExit(); } finally { this._tradingSeqInProgress = false; }
-      if (!ok) return;              // aborted: re-scan this band next tick
+      try { ok = await this._stopOut(price); } finally { this._tradingSeqInProgress = false; }
+      if (!ok) return;              // unverified close: re-scan this band next tick
       this.lastProcessedPrice = price;
-      return;                       // two-tick rule: fill nothing on this tick
+      return;                       // two-tick rule: open nothing on this tick
     }
 
-    // ---- Tick rules 0-3 (§6). One call covers SCALING and TREND alike: the
-    // rules are identical, and TREND differs only in already being fully
-    // scaled (so `fills` comes back empty) and in the two exits handled above
-    // and below.
-    const plan = planReversalActions({
+    // ---- Entry. ----
+    const plan = planBreakoutEntry({
       prevPrice: this.lastProcessedPrice,
       currentPrice: price,
-      bullLevel: this.bullLevel,
-      bearLevel: this.bearLevel,
-      legs: this.ladderLines,
+      bullBreakout: this.bullBreakout,
+      bearBreakout: this.bearBreakout,
       heldSide: this.heldSide,
+      pendingEntry: this._pendingEntry,
     });
 
-    if (plan.reverse) {
-      this._tradingSeqInProgress = true;
-      try {
-        const ok = await this._reverseTo(plan.side);
-        if (!ok) return;  // aborted: fill nothing, do NOT advance lastProcessedPrice
-        for (const leg of plan.fills) {
-          if (leg.state === 'EMPTY') await this._fillLeg(leg);
-        }
-        if (plan.enterTrend) await this._enterTrend(plan.side);
-      } finally { this._tradingSeqInProgress = false; }
-      this.lastProcessedPrice = price;
-      return;
-    }
+    if (plan.clearPending) this._pendingEntry = null;
 
-    if (plan.fills.length) {
+    if (plan.open) {
       this._tradingSeqInProgress = true;
       try {
-        for (const leg of plan.fills) {
-          if (leg.state === 'EMPTY') await this._fillLeg(leg); // re-check: state may have moved since planning
-        }
-        // Fully scaled -> TREND. `enterTrend` comes from planReversalActions,
-        // which derives the outermost index FROM THE LEGS — never from a rung
-        // count that could disagree with them.
-        if (plan.enterTrend) await this._enterTrend(plan.side);
+        await this._openPosition(plan.open);
+        this._armTrail();
+        await this._recomputeFinalTpPrice();
       } finally { this._tradingSeqInProgress = false; }
     }
 
@@ -2923,16 +2901,12 @@ class ReversalLadderStrategy extends TradingBase {
    * so the target now moves only with accumulated loss, the desired profit, and
    * the estimated closing fee. Recomputed on every position/funding event.
    *
-   * Side resolution mirrors `_checkFinalTpHit`: key off `trendDirection`
-   * (set synchronously in `_enterTrend` and restored directly from the
-   * snapshot in `resume`) with a `currentSide` fallback, rather than
-   * `currentSide` alone. `currentSide` is only ever populated by
-   * `_refreshCurrentPosition()` (a REST call) or restored from a snapshot,
-   * so on a boot-recovery race (resume() calls this before the position
-   * refresh resolves currentSide) keying on currentSide alone left
-   * finalTpPrice null and the Final TP call site
-   * (`if (this.finalTpPrice && this._checkFinalTpHit(price))`) silently
-   * never arms.
+   * Side resolution mirrors `_checkFinalTpHit`: key off `heldSide` — derived
+   * from `openLeg`, the single-row close ledger set the instant `_openPosition`
+   * fills — rather than `currentSide` alone. `currentSide` is only ever
+   * populated by `_refreshCurrentPosition()` (a REST call) or restored from a
+   * snapshot, so on a boot-recovery race keying on it alone could leave
+   * finalTpPrice null even with a position already recorded.
    */
   _recomputeFinalTpPrice() {
     // SINGLE CHOKE POINT — the only writer of finalTpPrice that derives a
@@ -2987,7 +2961,11 @@ class ReversalLadderStrategy extends TradingBase {
       this.finalTpPrice = null;
       return;
     }
-    const side = this.trendDirection || this.currentSide;
+    const side = this.heldSide;
+    if (side == null) {
+      this.finalTpPrice = null;
+      return;
+    }
     if (side === 'LONG') {
       this.finalTpPrice = entry + needed / qty;
     } else if (side === 'SHORT') {
@@ -2997,14 +2975,15 @@ class ReversalLadderStrategy extends TradingBase {
     }
   }
 
-  // TREND-only check (SCALING never calls this — see handleRealtimePrice). Keys
-  // off `trendDirection`, the mechanical direction fixed the instant TREND was
-  // entered, rather than `currentSide` — the latter is exchange-derived via
-  // `_refreshCurrentPosition` and, on a boot-recovery race, could still be
-  // unset even though the strategy doc already recorded which way TREND runs.
+  // Keys off `heldSide` — derived from `openLeg`, the single-row close
+  // ledger — rather than `currentSide` (exchange-derived via
+  // `_refreshCurrentPosition`, which can still be unresolved on a
+  // boot-recovery race even though the leg is already recorded). Mirrors
+  // `_recomputeFinalTpPrice`'s side resolution; the two must stay in
+  // agreement.
   _checkFinalTpHit(price) {
     if (!this.finalTpPrice) return false;
-    const side = this.trendDirection || this.currentSide;
+    const side = this.heldSide;
     if (side === 'LONG') return price >= this.finalTpPrice;
     if (side === 'SHORT') return price <= this.finalTpPrice;
     return false;

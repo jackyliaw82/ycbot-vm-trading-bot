@@ -276,3 +276,145 @@ test('_closeConsolidated leaves openLeg INTACT on an unverified close', async ()
   assert.equal(closed, false);
   assert.equal(s.openLeg, leg, 'an unverified close must leave the leg ledger intact — the position stays tracked');
 });
+
+// ——— tick dispatch (Task 6) ————————————————————————————————————————
+
+function captureOpens(s) {
+  const opens = [];
+  s._openPosition = async (side) => {
+    s.openLeg = { direction: side, quantity: 1, fillPrice: side === 'LONG' ? s.bullBreakout : s.bearBreakout, openedAt: s.currentPrice };
+    opens.push(side);
+  };
+  return opens;
+}
+
+function captureCloses(s) {
+  const closes = [];
+  s._closeConsolidated = async (reason) => { s.openLeg = null; closes.push(reason); return true; };
+  s._closeQuantity = () => (s.openLeg ? s.openLeg.quantity : 0);
+  return closes;
+}
+
+test('the band is inert — no order anywhere between the entry levels', async () => {
+  const s = breakoutStrategy();
+  const opens = captureOpens(s);
+  for (const p of [99, 101, 97, 100.9, 96.6, 99]) await s.handleRealtimePrice(p);
+  assert.deepEqual(opens, []);
+  assert.equal(s.heldSide, null);
+});
+
+test('crossing bullBreakout upward opens exactly one LONG', async () => {
+  const s = breakoutStrategy();
+  const opens = captureOpens(s);
+  await s.handleRealtimePrice(101);
+  await s.handleRealtimePrice(101.6);
+  await s.handleRealtimePrice(103);
+  assert.deepEqual(opens, ['LONG'], 'no scaling — one position per cycle leg');
+});
+
+test('a LONG closes at bullLevel and the cycle continues', async () => {
+  const s = breakoutStrategy();
+  captureOpens(s);
+  const closes = captureCloses(s);
+  await s.handleRealtimePrice(101);
+  await s.handleRealtimePrice(101.6);
+  assert.equal(s.heldSide, 'LONG');
+  await s.handleRealtimePrice(99.9);
+  assert.equal(s.heldSide, null);
+  assert.equal(closes.length, 1);
+  assert.equal(s.isRunning, true, 'a stop-out does not end the cycle');
+});
+
+test('after closing at bullLevel, no SHORT opens until bearBreakout', async () => {
+  const s = breakoutStrategy();
+  const opens = captureOpens(s);
+  captureCloses(s);
+  await s.handleRealtimePrice(101);
+  await s.handleRealtimePrice(101.6);
+  await s.handleRealtimePrice(99.9);
+  await s.handleRealtimePrice(98);       // bearLevel — an exit level, not an entry
+  await s.handleRealtimePrice(97);
+  assert.deepEqual(opens, ['LONG'], 'no immediate flip');
+  await s.handleRealtimePrice(96.4);
+  assert.deepEqual(opens, ['LONG', 'SHORT']);
+});
+
+test('the two-tick rule: a close opens nothing on the same tick', async () => {
+  const s = breakoutStrategy();
+  const opens = captureOpens(s);
+  captureCloses(s);
+  await s.handleRealtimePrice(101);
+  await s.handleRealtimePrice(101.6);
+  await s.handleRealtimePrice(96.4);              // gap: closes the LONG only
+  assert.deepEqual(opens, ['LONG']);
+  assert.equal(s._pendingEntry, 'SHORT');
+  await s.handleRealtimePrice(96.3);              // next tick consumes the latch
+  assert.deepEqual(opens, ['LONG', 'SHORT']);
+  assert.equal(s._pendingEntry, null);
+});
+
+test('the gap latch is dropped if price returns inside the band', async () => {
+  const s = breakoutStrategy();
+  const opens = captureOpens(s);
+  captureCloses(s);
+  await s.handleRealtimePrice(101);
+  await s.handleRealtimePrice(101.6);
+  await s.handleRealtimePrice(96.4);
+  assert.equal(s._pendingEntry, 'SHORT');
+  await s.handleRealtimePrice(99);
+  assert.equal(s._pendingEntry, null);
+  assert.deepEqual(opens, ['LONG']);
+});
+
+test('Final TP ends the cycle', async () => {
+  const s = breakoutStrategy();
+  captureOpens(s);
+  let stopped = null;
+  s.stop = async (opts) => { stopped = opts; s.isRunning = false; };
+  await s.handleRealtimePrice(101);
+  await s.handleRealtimePrice(101.6);
+  s.finalTpPrice = 105;
+  await s.handleRealtimePrice(105.2);
+  assert.deepEqual(stopped, { flatten: true, reason: 'final_tp' });
+});
+
+test('with trailing off the stop stays pinned at bullLevel', async () => {
+  const s = breakoutStrategy();
+  s.trailEnabled = false;
+  captureOpens(s);
+  const closes = captureCloses(s);
+  await s.handleRealtimePrice(101);
+  await s.handleRealtimePrice(101.6);
+  await s.handleRealtimePrice(110);              // a big favourable run
+  assert.equal(s.heldSide, 'LONG');
+  await s.handleRealtimePrice(103);              // above bullLevel — no exit
+  assert.equal(s.heldSide, 'LONG');
+  await s.handleRealtimePrice(99.9);
+  assert.equal(closes.length, 1);
+});
+
+test('with trailing on the stop ratchets above the entry and locks profit', async () => {
+  const s = breakoutStrategy();
+  s.trailEnabled = true;
+  captureOpens(s);
+  const closes = captureCloses(s);
+  await s.handleRealtimePrice(101);
+  await s.handleRealtimePrice(101.6);
+  await s.handleRealtimePrice(110);
+  assert.ok(s.trailExit > s.bullBreakout, `trail ${s.trailExit} should lock profit above ${s.bullBreakout}`);
+  await s.handleRealtimePrice(107);
+  assert.equal(closes.length, 1, 'the ratcheted trail owns the close');
+});
+
+test('an unverified close leaves the position tracked and re-scans next tick', async () => {
+  const s = breakoutStrategy();
+  captureOpens(s);
+  s._closeConsolidated = async () => false;      // unverified — leg NOT cleared
+  s._closeQuantity = () => (s.openLeg ? s.openLeg.quantity : 0);
+  await s.handleRealtimePrice(101);
+  await s.handleRealtimePrice(101.6);
+  const before = s.lastProcessedPrice;
+  await s.handleRealtimePrice(99.9);
+  assert.equal(s.heldSide, 'LONG', 'the leg must survive an unverified close');
+  assert.equal(s.lastProcessedPrice, before, 'the band must be re-scanned next tick');
+});
