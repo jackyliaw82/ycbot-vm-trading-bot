@@ -429,13 +429,15 @@ class ReversalLadderStrategy extends TradingBase {
   }
 
   /**
-   * Build BOTH ladders around a validated level pair. The single writer of
-   * `bullLevel`/`bearLevel` and of `ladderLines` on a fresh build.
+   * Apply a validated level pair for a new cycle. The single writer of
+   * `bullLevel`/`bearLevel` on a fresh build, and the trigger for deriving the
+   * breakout entry levels from them.
    *
    * Callers must have validated the pair already (planLevels does, and refuses
-   * to return an invalid one). `buildReversalLadder` throws on bad geometry
-   * rather than silently building something unreachable — that throw is a real
-   * bug signal and must not be swallowed here.
+   * to return an invalid one). `_deriveBreakoutLevels` (via `deriveBreakoutLevels`
+   * in breakout-levels.js) throws on bad geometry rather than silently building
+   * something unreachable — that throw is a real bug signal and must not be
+   * swallowed here.
    */
   async _applyLevels({ bullLevel, bearLevel, reason = 'cycle_start' }) {
     this.bullLevel = bullLevel;
@@ -453,7 +455,7 @@ class ReversalLadderStrategy extends TradingBase {
     await this.addLog(
       `BULL ${this._formatPrice(bullLevel)} | BEAR ${this._formatPrice(bearLevel)} | ` +
       `dead zone ${(((bullLevel - bearLevel) / bearLevel) * 100).toFixed(2)}% | ` +
-      `step ${(this.stepPct * 100).toFixed(2)}% | ${this.levelsPerSide} levels/side | ` +
+      `breakout ${(this.breakoutPct * 100).toFixed(2)}% | entries ${this._formatPrice(this.bullBreakout)} / ${this._formatPrice(this.bearBreakout)} | ` +
       `leg ${this._formatNotional(this._legNotional())} USDT`,
     );
     await this.saveState();
@@ -1635,8 +1637,6 @@ class ReversalLadderStrategy extends TradingBase {
       await this.addLog(msg);
       throw new Error(msg);
     }
-
-    if (!snapshot) throw new Error('ReversalLadderStrategy.resume: missing snapshot');
 
     // Restore identifiers FIRST so addLog writes under the correct strategyId.
     this.strategyId = snapshot.strategyId;
@@ -3606,22 +3606,20 @@ class ReversalLadderStrategy extends TradingBase {
       aiCostUSD: this.aiCostUSD ?? 0,
       aiModel: this.aiModel,
 
-      // Ladder state — see docstring: included here on every heartbeat
-      // because mode/ladder transitions happen mid-cycle.
-      mode: this.ladderMode,         // the frontend reads status.mode, not ladderMode
+      // Breakout state — included here on every heartbeat because entry/exit
+      // transitions happen mid-cycle.
+      breakoutPct: this.breakoutPct,
+      bullBreakout: this.bullBreakout,
+      bearBreakout: this.bearBreakout,
+      openLeg: this.openLeg,
+      heldSide: this.heldSide,
       bullLevel: this.bullLevel,
       bearLevel: this.bearLevel,
-      ladderLines: this.ladderLines,
-      trendDirection: this.trendDirection,
-      levelsPerSide: this.levelsPerSide,
-      stepPct: this.stepPct,
-      legNotional: this._legNotional(),
       ladderBaseSize: this._ladderBaseSize,
       // Trailing exit (§7).
       trailEnabled: this.trailEnabled ?? false,
       trailDistanceValue: this.trailDistanceValue ?? null,
       trailExit: this.trailExit ?? null,
-      trendStartPrice: this.trendStartPrice ?? null,
       harvestTriggerPrice: this.harvestTriggerPrice ?? null,
       harvestTriggerAbove: this.harvestTriggerAbove ?? null,
       harvestTriggerAction: this.harvestTriggerAction ?? 'reanchor',
@@ -3731,10 +3729,10 @@ class ReversalLadderStrategy extends TradingBase {
         harvestTriggerPrice: this.harvestTriggerPrice ?? null,
         harvestTriggerAbove: this.harvestTriggerAbove ?? null,
         harvestTriggerAction: this.harvestTriggerAction ?? 'reanchor',
-        // Geometry is per-cycle config, not a constant — resume MUST rebuild the
-        // ladder this cycle actually started with (see _applySnapshotGeometry).
-        stepPct: this.stepPct,
-        levelsPerSide: this.levelsPerSide,
+        // Geometry is per-cycle config, not a constant — resume MUST restore the
+        // percentage and re-derive the entry levels from it. The levels
+        // themselves are DERIVED and deliberately NOT persisted.
+        breakoutPct: this.breakoutPct,
         // Trailing exit (§7) — PERSISTED so a redeploy cannot silently disarm
         // it (see the field's own doc in the constructor).
         trailEnabled: this.trailEnabled ?? false,

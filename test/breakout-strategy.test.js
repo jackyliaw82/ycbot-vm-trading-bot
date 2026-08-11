@@ -78,3 +78,73 @@ test('the default breakoutPct is applied when config omits it', () => {
   s._deriveBreakoutLevels();
   near(s.bullBreakout, 101);
 });
+
+// ——— saveState/resume round trip (fix round 1, Critical 1) ————————————
+//
+// This is the gap that let breakoutPct go unpersisted: saveState still wrote
+// the deleted stepPct/levelsPerSide pair and never wrote breakoutPct, so
+// resume()'s own migration guard refused every snapshot a healthy breakout
+// strategy actually produced. Pin the contract directly: a snapshot this
+// class WRITES is a snapshot this class can READ BACK.
+
+// resume() drives a lot of I/O (leverage/position-mode/exchange-info REST
+// calls, WS connections, funding polling, L3 reconcile, AI key lookup). None
+// of it is under test here, so stub it out — mirrors
+// test/reversal-ladder-strategy.test.js's stubResumeIO exactly, since resume()
+// itself is untouched infrastructure outside this task's scope.
+function stubResumeIO(s) {
+  s.setLeverage = async () => {};
+  s.setPositionMode = async () => {};
+  s._getExchangeInfo = async () => {};
+  s._retryListenKeyRequest = async () => {};
+  s.connectUserDataStream = () => {};
+  s.connectRealtimeWebSocket = () => {};
+  s._startWebSocketHealthMonitoring = () => {};
+  s._scheduleVolumeRefresh = () => {};
+  s._refreshVolumeSnapshot = async () => {};
+  s._preloadWsHandledOrderIdsFromFirestore = async () => {};
+  s._reconcileRecentTrades = async () => {};
+  s.detectCurrentPosition = async () => {};
+  s._refreshCurrentPosition = async () => {};
+  s._pollFundingIncome = async () => {};
+  s._scheduleNextFundingPoll = () => {};
+  s.saveState = async () => {};
+  return s;
+}
+
+// resume() unconditionally starts a real 30-minute listen-key refresh
+// setInterval that would otherwise keep `node --test` alive indefinitely.
+function cleanupResumeTimers(s) {
+  if (s.listenKeyRefreshInterval) clearInterval(s.listenKeyRefreshInterval);
+  if (s._fundingPollTimeout) clearTimeout(s._fundingPollTimeout);
+  if (s._volumeRefreshInterval) clearInterval(s._volumeRefreshInterval);
+}
+
+test('a snapshot this class writes is a snapshot this class can read back', async () => {
+  const src = breakoutStrategy({ bull: 100, bear: 98, pct: 0.02 });
+
+  let doc = null;
+  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
+  // breakoutStrategy() stubs saveState for the OTHER tests in this file; this
+  // test is specifically about persistence, so it calls the real prototype
+  // method against a fake firestore.
+  await ReversalLadderStrategy.prototype.saveState.call(src);
+
+  // The dead fields must actually be gone, not just falsy — a lingering key
+  // set to undefined would still (wrongly) read as "present" to a loose check.
+  assert.ok(!('stepPct' in doc), 'stepPct must not be written');
+  assert.ok(!('levelsPerSide' in doc), 'levelsPerSide must not be written');
+  assert.equal(doc.breakoutPct, 0.02, 'breakoutPct must be written');
+  assert.ok(!Array.isArray(doc.ladderLines), 'a fresh breakout doc carries no ladderLines');
+
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  // Must NOT throw: this is exactly the snapshot a healthy breakout strategy
+  // persists, and the migration guard must accept its own output.
+  await assert.doesNotReject(() => dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' }));
+  cleanupResumeTimers(dst);
+
+  assert.equal(dst.breakoutPct, 0.02, 'resume must restore breakoutPct');
+  near(dst.bullBreakout, src.bullBreakout, 'resume must re-derive the same bull entry level');
+  near(dst.bearBreakout, src.bearBreakout, 'resume must re-derive the same bear entry level');
+});
