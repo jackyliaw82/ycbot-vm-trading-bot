@@ -32,10 +32,15 @@ export const BREAKOUT_PCT_MAX = 0.03;
  *
  * Pure: no I/O, throws nothing, always returns a result object.
  *
- * @param {{breakoutPct?: unknown}} [input]
+ * `input` itself is nullable, not just its fields — `{x} = {}` only applies
+ * its default for `undefined`, and an explicit `null` (a plausible "no config
+ * object" call) would still throw destructuring it. `input ?? {}` covers both.
+ *
+ * @param {{breakoutPct?: unknown}|null} [input]
  * @returns {{ok: true, breakoutPct: number} | {ok: false, code: string, error: string}}
  */
-export function resolveBreakoutGeometry({ breakoutPct } = {}) {
+export function resolveBreakoutGeometry(input) {
+  const { breakoutPct } = input ?? {};
   const pct = breakoutPct ?? BREAKOUT_PCT;
 
   if (typeof pct !== 'number' || !Number.isFinite(pct)

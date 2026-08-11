@@ -14,7 +14,11 @@ const finite = (v) => typeof v === 'number' && Number.isFinite(v);
 /**
  * Decide whether this price move opens a position.
  *
- * @param {object} input
+ * `input` itself is nullable, not just its fields — `{x} = {}` only applies
+ * its default for `undefined`, and an explicit `null` would still throw
+ * destructuring it. `input ?? {}` covers both.
+ *
+ * @param {object|null} [input]
  * @param {number|null} input.prevPrice      last processed price; null on the first tick
  * @param {number} input.currentPrice
  * @param {number} input.bullBreakout        a LONG opens at or above this
@@ -23,14 +27,15 @@ const finite = (v) => typeof v === 'number' && Number.isFinite(v);
  * @param {'LONG'|'SHORT'|null} input.pendingEntry  gap latch set by the previous tick's close
  * @returns {{open: 'LONG'|'SHORT'|null, clearPending: boolean}}
  */
-export function planBreakoutEntry({
-  prevPrice,
-  currentPrice,
-  bullBreakout,
-  bearBreakout,
-  heldSide = null,
-  pendingEntry = null,
-} = {}) {
+export function planBreakoutEntry(input) {
+  const {
+    prevPrice,
+    currentPrice,
+    bullBreakout,
+    bearBreakout,
+    heldSide = null,
+    pendingEntry = null,
+  } = input ?? {};
   const none = { open: null, clearPending: false };
 
   if (!finite(currentPrice)) return none;

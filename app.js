@@ -1,10 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { ReversalLadderStrategy } from './reversal-ladder-strategy.js';
-import {
-  minInitialSizeUSDT,
-  resolveLadderGeometry,
-} from './ladder-levels.js';
+import { resolveBreakoutGeometry } from './breakout-levels.js';
 import {
   ownerUidFromInstanceName,
   selectRecoverableStrategies,
@@ -862,7 +859,7 @@ async function recoverActiveStrategies() {
                 () => _snapshotWallet(strategy).catch(() => {}),
                 WALLET_SNAPSHOT_INTERVAL_MS
               );
-              console.log(`[RECOVERY] ✓ ${strategyId} recovered (symbol=${data.symbol}, mode=${strategy.ladderMode}, legs=${Array.isArray(strategy.ladderLines) ? strategy.ladderLines.length : 0})`);
+              console.log(`[RECOVERY] ✓ ${strategyId} recovered (symbol=${data.symbol}, held=${strategy.heldSide || 'FLAT'})`);
             } else {
               console.log(`[RECOVERY] ${strategyId} marked stopped during resume (positions gone)`);
             }
@@ -1558,27 +1555,21 @@ app.post('/reversal-ladder/start', requireVmOwner, async (req, res) => {
     }
 
     // Defence in depth — ReversalLadderStrategy.start() gates on the geometry
-    // bounds (ladder-levels.js resolveLadderGeometry) too, but those checks
+    // bounds (breakout-levels.js resolveBreakoutGeometry) too, but those checks
     // fire deep inside the non-blocking start() promise after the 200
     // response has already gone out. Reject here up front, via the SAME
     // validator start() uses, so an out-of-bounds request never even mints a
     // strategyId or touches the billing gate, AND so this gate can never
     // silently re-diverge from start()'s (it did once, within a single task —
-    // see resolveLadderGeometry's docstring in ladder-levels.js).
-    const geometry = resolveLadderGeometry({
-      ladderStepPct: config.ladderStepPct,
-      ladderLevelsPerSide: config.ladderLevelsPerSide,
-    });
+    // see resolveBreakoutGeometry's docstring in breakout-levels.js).
+    const geometry = resolveBreakoutGeometry({ breakoutPct: config.breakoutPct });
     if (!geometry.ok) {
       return res.status(400).json({ error: geometry.error, code: geometry.code });
     }
-    const minSize = minInitialSizeUSDT(geometry.levelsPerSide);
-    if (!(Number(config.initialSize) >= minSize)) {
-      return res.status(400).json({
-        error: `Initial size (${config.initialSize} USDT) is below the ${minSize} USDT minimum for a ${geometry.levelsPerSide}-level ladder.`,
-        code: 'INITIAL_SIZE_TOO_LOW',
-      });
-    }
+    // No per-level minimum here — a breakout cycle opens ONE order for the
+    // whole size, so the only floor is the symbol's exchange minNotional,
+    // which start() enforces itself once it has fetched exchange info (a
+    // Binance-sourced figure this synchronous route cannot know in advance).
 
     // One strategy per profile (matches existing model). User must stop the running strategy first.
     for (const [sId, running] of activeStrategies.entries()) {
@@ -1723,11 +1714,11 @@ app.post('/reversal-ladder/stop', requireVmOwner, async (req, res) => {
   }
 });
 
-// ReversalLadderStrategy.getStatus() (Task 9) already returns the full ladder
-// shape directly — mode, anchor, ladderLines, trendDirection, levelsPerSide,
-// stepPct, legNotional, ladderBaseSize — alongside the base TradingBase
-// fields. Unlike the retired grid strategy's status route, no extra
-// field-bolting is needed here; getStatus() IS the response.
+// ReversalLadderStrategy.getStatus() already returns the full breakout shape
+// directly — bullLevel/bearLevel, bullBreakout/bearBreakout, openLeg,
+// heldSide, ladderBaseSize — alongside the base TradingBase fields. Unlike
+// the retired grid strategy's status route, no extra field-bolting is needed
+// here; getStatus() IS the response.
 app.get('/reversal-ladder/status', requireVmOwner, (req, res) => {
   const { strategyId } = req.query;
 
@@ -1895,7 +1886,7 @@ app.post('/reversal-ladder/ask-ai', requireVmOwner, async (req, res) => {
   }
 });
 
-// Arm/disarm the TREND trailing exit. `enabled` is passed through to
+// Arm/disarm the trailing exit. `enabled` is passed through to
 // setTrailEnabled() VERBATIM — do NOT coerce it (no !!enabled, no
 // enabled === 'true', no ?? false). setTrailEnabled() deliberately accepts
 // only real booleans and rejects everything else with .invalidInput = true,
@@ -1919,8 +1910,8 @@ app.post('/reversal-ladder/trail', requireVmOwner, async (req, res) => {
 // strategyFlow audit trail for Reversal Ladder. Reads from
 // strategies/{strategyId}/strategyFlow subcollection populated by
 // ReversalLadderStrategy._writeStrategyFlow inside its post-execute bookkeeping
-// on every position event (LADDER_FILL / REVERSAL / TREND_ENTER / TRAILED_EXIT
-// / HARVEST / LEVELS_EDITED / FINAL_TP_HIT). Used by the position chart to place TP segment boundaries
+// on every position event (OPEN_BREAKOUT / STOP_OUT / HARVEST / LEVELS_EDITED
+// / FINAL_TP_HIT). Used by the position chart to place TP segment boundaries
 // at EXACT event moments instead of heartbeat-resolution timestamps.
 app.get('/reversal-ladder/strategy-flow', requireVmOwner, async (req, res) => {
   try {

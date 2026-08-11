@@ -483,3 +483,77 @@ test('when _openPosition throws, the latch survives and lastProcessedPrice does 
   assert.equal(s._pendingEntry, 'SHORT', 'a failed open must not consume the latch');
   assert.equal(s.lastProcessedPrice, beforePrice, 'a failed open must not advance lastProcessedPrice');
 });
+
+// ——— harvest / re-anchor (_harvestToFlat) — Task 7 ——————————————————————
+//
+// _harvestToFlat is the shipped Harvest / Re-anchor button plus armed price
+// triggers. It survived the ladder-to-breakout sweep by name but had gone
+// dark — the module it called into was deleted — so it would have thrown a
+// TypeError on every real invocation. The test file that covered it was
+// deleted earlier in this plan; these tests are its replacement.
+//
+// _planAndBuildLevels/_closeConsolidated/_writeMetricsSample are the real
+// (unstubbed by breakoutStrategy()) prototype methods here, so they are
+// stubbed per-test: _planAndBuildLevels and _closeConsolidated would
+// otherwise reach real network/AI-planner and Binance calls, and
+// _writeMetricsSample would attempt a real Firestore write that rejects
+// after the test has already finished.
+
+test('_harvestToFlat runs to completion on a flat run — closes nothing, clears the leg, re-plans', async () => {
+  const s = breakoutStrategy();
+  s.openLeg = null;
+  s.activePosition = null;
+  let closeCalls = 0;
+  s._closeConsolidated = async () => { closeCalls++; return false; }; // nothing open — matches the real self-gate
+  let replanCalls = 0;
+  s._planAndBuildLevels = async () => { replanCalls++; return true; };
+  s._writeMetricsSample = async () => {};
+
+  const result = await s._harvestToFlat('manual_harvest');
+
+  assert.equal(result, true, 'a flat re-anchor still reaches the re-plan and reports success');
+  assert.equal(closeCalls, 1);
+  assert.equal(s.openLeg, null, 'stays cleared');
+  assert.equal(replanCalls, 1, 'levels must be re-planned');
+  assert.equal(s.reanchorCount, 1);
+  assert.equal(s.harvestCount, 0, 'a flat run with nothing closed is a re-anchor, not a harvest');
+});
+
+test('_harvestToFlat runs to completion while holding a position — closes it, clears the leg, re-plans', async () => {
+  const s = breakoutStrategy();
+  s.openLeg = { direction: 'LONG', quantity: 2, fillPrice: 101.5, openedAt: 1 };
+  s.activePosition = { quantity: 2, unrealizedPnl: 5 };
+  let closeCalls = 0;
+  s._closeConsolidated = async () => { closeCalls++; s.openLeg = null; s.activePosition = null; return true; };
+  let replanCalls = 0;
+  s._planAndBuildLevels = async () => { replanCalls++; return true; };
+  s._writeMetricsSample = async () => {};
+
+  const result = await s._harvestToFlat('manual_harvest');
+
+  assert.equal(result, true);
+  assert.equal(closeCalls, 1, 'the open position must actually be closed');
+  assert.equal(s.openLeg, null, 'the leg ledger must be cleared');
+  assert.equal(replanCalls, 1, 'levels must be re-planned after the harvest');
+  assert.equal(s.harvestCount, 1, 'a verified close with inventory counts as a harvest');
+});
+
+// The guard that stops a failed close from orphaning a live position — the
+// only thing preventing _harvestToFlat from wiping the leg ledger out from
+// under an order that never actually closed.
+test('_harvestToFlat aborts and leaves the position tracked when the close is unverified', async () => {
+  const s = breakoutStrategy();
+  const leg = { direction: 'LONG', quantity: 2, fillPrice: 101.5, openedAt: 1 };
+  s.openLeg = leg;
+  s.activePosition = { quantity: 2 };
+  s._closeConsolidated = async () => false; // unverified close — nothing actually confirmed closed
+  let replanCalls = 0;
+  s._planAndBuildLevels = async () => { replanCalls++; return true; };
+  s._writeMetricsSample = async () => {};
+
+  const result = await s._harvestToFlat('manual_harvest');
+
+  assert.equal(result, false, 'an aborted harvest must not report success');
+  assert.equal(s.openLeg, leg, 'the leg ledger must survive an unverified close — the position stays tracked');
+  assert.equal(replanCalls, 0, 'must not rebuild levels while a live position is still unaccounted for');
+});

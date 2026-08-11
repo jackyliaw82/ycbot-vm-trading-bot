@@ -133,3 +133,8 @@ test('non-finite inputs decide nothing rather than guessing', () => {
 test('an unchanged price decides nothing', () => {
   assert.deepEqual(plan({ prevPrice: UP, currentPrice: UP }), NOTHING);
 });
+
+// `{x} = {}` only defaults for `undefined` — an explicit `null` call must not throw.
+test('planBreakoutEntry(null) does not throw and decides nothing', () => {
+  assert.deepEqual(planBreakoutEntry(null), NOTHING);
+});
