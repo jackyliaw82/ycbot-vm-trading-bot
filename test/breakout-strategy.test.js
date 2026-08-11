@@ -217,3 +217,62 @@ test('_openPosition refuses to open while a position is already held', async () 
   s.placeMarketOrder = async () => { throw new Error('must not be called'); };
   await assert.rejects(() => s._openPosition('SHORT'), /already open/);
 });
+
+// Fix round 1 — the review-caught defect: 'OPEN_BREAKOUT' must retry the REST
+// position read (Binance's ~100-500ms fill lag), or a lagged read comes back
+// null with _lastPositionRefreshFailed still false — which _closeQuantity()
+// reads as "reachable and flat" moments after a real position opened. A
+// closing action must NOT retry (it expects empty). breakoutStrategy() stubs
+// _postExecuteBookkeeping itself, so call the real prototype method directly.
+test('_postExecuteBookkeeping retries the position refresh for a fresh OPEN, not for a close', async () => {
+  const s = breakoutStrategy();
+  const expectNonEmptyCalls = [];
+  s._refreshCurrentPosition = async (expectNonEmpty) => { expectNonEmptyCalls.push(expectNonEmpty); };
+  // TradingBase's constructor sets a REAL `this.firestore` client (see
+  // trading-base.js), so calling the real prototype method (bypassing
+  // breakoutStrategy()'s stub) reaches the real, un-mocked
+  // _writeMetricsSample and tries to authenticate against GCP — an
+  // unhandled rejection that lands after this test's own awaits finish.
+  // Stub it, same as breakoutStrategy() already does for saveState /
+  // _writeStrategyFlow / addLog / _pushHeartbeatNow.
+  s._writeMetricsSample = async () => {};
+
+  await ReversalLadderStrategy.prototype._postExecuteBookkeeping.call(s, 'OPEN_BREAKOUT', {});
+  await ReversalLadderStrategy.prototype._postExecuteBookkeeping.call(s, 'STOP_OUT', {});
+
+  assert.deepEqual(expectNonEmptyCalls, [true, false],
+    'OPEN_BREAKOUT must retry against Binance REST lag; a close must not');
+});
+
+// Fix round 1 — MINOR: pin the openLeg = null placement directly rather than
+// by inspection. It sits after the sole `if (!verified) return false;`, so it
+// can only ever run on a VERIFIED close.
+test('_closeConsolidated nulls openLeg only on a VERIFIED close', async () => {
+  const s = breakoutStrategy();
+  s.currentSide = 'LONG';
+  s.openLeg = { direction: 'LONG', quantity: 3, fillPrice: 101.5, openedAt: 1 };
+  s.activePosition = { quantity: 3 };
+  s.placeMarketOrder = async () => ({ orderId: 1, executedQty: '3' });
+  s._waitForOrderFillConfirmation = async () => true; // tier 1: WS fill confirmed
+
+  const closed = await s._closeConsolidated('test');
+
+  assert.equal(closed, true);
+  assert.equal(s.openLeg, null, 'a verified close must clear the leg ledger');
+});
+
+test('_closeConsolidated leaves openLeg INTACT on an unverified close', async () => {
+  const s = breakoutStrategy();
+  s.currentSide = 'LONG';
+  const leg = { direction: 'LONG', quantity: 3, fillPrice: 101.5, openedAt: 1 };
+  s.openLeg = leg;
+  s.activePosition = { quantity: 3 };
+  s.placeMarketOrder = async () => ({ orderId: 2 }); // no executedQty — tier 2 can't verify either
+  s._waitForOrderFillConfirmation = async () => false; // tier 1: no WS fill event
+  s._refreshCurrentPosition = async () => { s._lastPositionRefreshFailed = true; }; // tier 3: still unknown
+
+  const closed = await s._closeConsolidated('test');
+
+  assert.equal(closed, false);
+  assert.equal(s.openLeg, leg, 'an unverified close must leave the leg ledger intact — the position stays tracked');
+});

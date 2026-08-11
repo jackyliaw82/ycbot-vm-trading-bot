@@ -3034,15 +3034,15 @@ class ReversalLadderStrategy extends TradingBase {
   async _postExecuteBookkeeping(actionType, extra = {}) {
     try {
       await new Promise((r) => setTimeout(r, 250));
-      // OPEN/REVERSE actions leave a fresh position on Binance; pass
-      // expectNonEmpty so _refreshCurrentPosition retries against REST
-      // lag (Binance's /fapi/v2/account routinely takes 100-500ms to
-      // reflect a market-order fill). HARVEST/FINAL_TP close the
-      // position — expect empty; no retry.
-      const expectNonEmpty = actionType === 'OPEN_LONG_AT_LEVEL'
-        || actionType === 'OPEN_SHORT_AT_LEVEL'
-        || actionType === 'REVERSE_TO_LONG'
-        || actionType === 'REVERSE_TO_SHORT';
+      // The breakout OPEN leaves a fresh position on Binance; pass
+      // expectNonEmpty so _refreshCurrentPosition RETRIES against REST lag
+      // (Binance's /fapi/v2/account routinely takes 100-500ms to reflect a
+      // market-order fill). Without the retry a lagged read returns null with
+      // _lastPositionRefreshFailed still false — which _closeQuantity() reads
+      // as "reachable and flat" and would answer 0 for a position we just
+      // opened. STOP_OUT / HARVEST / FINAL_TP close the position and expect
+      // empty, so they take no retry.
+      const expectNonEmpty = actionType === 'OPEN_BREAKOUT';
       await this._refreshCurrentPosition(expectNonEmpty);
       this.cycleAccumulatedLoss = this._computeAccLoss();
       this._recomputeFinalTpPrice();
