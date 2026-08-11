@@ -813,3 +813,10 @@ test('stop({flatten:true}) reports "confirmed flat" when the close is actually v
   assert.ok(!logs.some((m) => m.includes('FINAL STATE UNKNOWN')), 'no cry-wolf on the verified path');
   assert.equal(s.executionState, 'TERMINATED');
 });
+
+test('both status channels emit stopOutCount', () => {
+  const s = breakoutStrategy();
+  s.stopOutCount = 4;
+  assert.equal(s.getStatus().stopOutCount, 4, 'getStatus must carry it');
+  assert.equal(s.getHeartbeatPayload().stopOutCount, 4, 'the WS payload must agree with getStatus');
+});
