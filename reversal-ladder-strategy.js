@@ -1239,6 +1239,10 @@ class ReversalLadderStrategy extends TradingBase {
    * retries on the next tick. Do NOT clear `openLeg` here.
    */
   async _stopOut(price) {
+    // Capture BEFORE the close — _closeConsolidated nulls openLeg, and the latch
+    // must never re-arm the side that just closed.
+    const closedSide = this.heldSide;
+
     let closed = false;
     try { closed = await this._closeConsolidated('stop_out'); }
     catch (e) { await this.addLog(`ERROR stop-out close: ${e.message}`); }
@@ -1255,13 +1259,14 @@ class ReversalLadderStrategy extends TradingBase {
 
     this._clearTrail();
 
-    // Gap latch. Price can land beyond the OPPOSITE entry level on the very tick
-    // that stopped us out. Opening there on this tick would book an entry at a
-    // price the level never saw, so the two-tick rule applies and the opposite
-    // side opens on the NEXT tick instead. Not persisted: it is valid for one
-    // tick only.
-    if (price <= this.bearBreakout) this._pendingEntry = 'SHORT';
-    else if (price >= this.bullBreakout) this._pendingEntry = 'LONG';
+    // Gap latch. A single tick can carry price past the OPPOSITE entry level on
+    // the very tick that stopped us out; the two-tick rule means that side opens
+    // NEXT tick, not this one. Only ever the opposite side: with the trail able
+    // to ratchet past the entry, a profitable exit routinely lands beyond the
+    // level we just traded, and latching that side would re-enter uncommanded.
+    // Not persisted — it is valid for one tick only.
+    if (closedSide === 'LONG' && price <= this.bearBreakout) this._pendingEntry = 'SHORT';
+    else if (closedSide === 'SHORT' && price >= this.bullBreakout) this._pendingEntry = 'LONG';
     else this._pendingEntry = null;
 
     this._ladderBaseSize = await this._computeLadderBaseSize();
@@ -2370,15 +2375,16 @@ class ReversalLadderStrategy extends TradingBase {
       pendingEntry: this._pendingEntry,
     });
 
-    if (plan.clearPending) this._pendingEntry = null;
-
     if (plan.open) {
       this._tradingSeqInProgress = true;
       try {
         await this._openPosition(plan.open);
+        this._pendingEntry = null;   // consumed only once the open actually succeeded
         this._armTrail();
         await this._recomputeFinalTpPrice();
       } finally { this._tradingSeqInProgress = false; }
+    } else if (plan.clearPending) {
+      this._pendingEntry = null;     // price returned inside the band — intent is stale
     }
 
     this.lastProcessedPrice = price;

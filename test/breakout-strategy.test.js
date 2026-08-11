@@ -418,3 +418,68 @@ test('an unverified close leaves the position tracked and re-scans next tick', a
   assert.equal(s.heldSide, 'LONG', 'the leg must survive an unverified close');
   assert.equal(s.lastProcessedPrice, before, 'the band must be re-scanned next tick');
 });
+
+// ——— fix round 1: the gap latch must never re-arm the side that just closed ———
+//
+// Task 3 removed the trail's upper cap so it can ratchet PAST the entry level
+// and lock real profit — which means a routine profitable exit can close a
+// LONG at a price still above bullBreakout (or a SHORT still below
+// bearBreakout). The latch decision must be keyed off the side that just
+// closed, captured BEFORE the close (which nulls openLeg), not off price alone.
+
+test('a trailing LONG that exits ABOVE bullBreakout does not latch a re-entry', async () => {
+  const s = breakoutStrategy();
+  s.trailEnabled = true;
+  const opens = captureOpens(s);
+  captureCloses(s);
+  await s.handleRealtimePrice(101);
+  await s.handleRealtimePrice(101.6);
+  await s.handleRealtimePrice(110);              // trail ratchets to 108.5
+  await s.handleRealtimePrice(107);               // hit — closes at 107, still > bullBreakout 101.5
+  assert.equal(s._pendingEntry, null, 'must not re-arm the side that just closed');
+  await s.handleRealtimePrice(107.1);              // still above bullBreakout — no fresh crossing
+  assert.deepEqual(opens, ['LONG'], 'no uncommanded re-entry');
+});
+
+test('a trailing SHORT that exits BELOW bearBreakout does not latch a re-entry', async () => {
+  const s = breakoutStrategy();
+  s.trailEnabled = true;
+  const opens = captureOpens(s);
+  captureCloses(s);
+  await s.handleRealtimePrice(96);                // opens SHORT (96 <= bearBreakout 96.53)
+  assert.deepEqual(opens, ['SHORT']);
+  await s.handleRealtimePrice(90);                 // trail ratchets down to 91.47
+  await s.handleRealtimePrice(93);                 // hit — closes at 93, still < bearBreakout 96.53
+  assert.equal(s._pendingEntry, null, 'must not re-arm the side that just closed');
+  await s.handleRealtimePrice(92.9);               // still below bearBreakout — no fresh crossing
+  assert.deepEqual(opens, ['SHORT'], 'no uncommanded re-entry');
+});
+
+test('the genuine gap case still latches: a LONG stopped out below bearBreakout arms SHORT', async () => {
+  const s = breakoutStrategy();                    // trailEnabled: false — pinned stop at bullLevel
+  captureOpens(s);
+  captureCloses(s);
+  await s.handleRealtimePrice(101);
+  await s.handleRealtimePrice(101.6);
+  await s.handleRealtimePrice(96.4);                // gap straight through bullLevel past bearBreakout
+  assert.equal(s._pendingEntry, 'SHORT', 'a genuine opposite-side gap must still latch');
+});
+
+// ——— fix round 1: the latch must survive a failed open ———
+
+test('when _openPosition throws, the latch survives and lastProcessedPrice does not advance', async () => {
+  const s = breakoutStrategy();
+  captureOpens(s);
+  captureCloses(s);
+  await s.handleRealtimePrice(101);
+  await s.handleRealtimePrice(101.6);
+  await s.handleRealtimePrice(96.4);                // stop-out; latches SHORT
+  assert.equal(s._pendingEntry, 'SHORT');
+  const beforePrice = s.lastProcessedPrice;
+
+  s._openPosition = async () => { throw new Error('Binance rejected the order'); };
+  await assert.rejects(() => s.handleRealtimePrice(96.3));  // consumes the latch, open throws
+
+  assert.equal(s._pendingEntry, 'SHORT', 'a failed open must not consume the latch');
+  assert.equal(s.lastProcessedPrice, beforePrice, 'a failed open must not advance lastProcessedPrice');
+});
