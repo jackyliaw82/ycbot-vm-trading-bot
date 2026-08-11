@@ -72,18 +72,12 @@ test('deriveBreakoutLevels: throws rather than returning a nonsense level', () =
 
 // ——— route migration (Task 8) ————————————————————————————————————————
 //
-// app.js must not carry a stale import of a deleted module. This is the
-// tripwire: if app.js still imports ladder-levels.js, this throws at import.
-//
-// NOTE: importing app.js starts a real HTTP listener (server.listen) and
-// kicks off the boot-recovery / VM-owner-metadata retry loop, which keeps the
-// process alive indefinitely — there is no NODE_ENV/test guard in app.js. A
-// bounded standalone run confirms the assertions below pass cleanly in a few
-// seconds; the process itself does not exit on its own afterwards. Treat a
-// clean start (no throw, correct source-text assertions) as the pass
-// condition for this test, not a graceful process exit.
-test('app.js imports cleanly and carries no reference to the deleted geometry', async () => {
-  await import('../app.js');            // throws on a stale/missing import
+// app.js must not carry a stale import of a deleted module. Asserted against
+// the SOURCE TEXT rather than by importing it: importing app.js boots a real
+// express listener and a 12x15s boot-recovery retry loop, which hangs the
+// suite. "Does app.js actually load" is verified separately by the module-load
+// check in the plan's done criteria, which runs it in its own process.
+test('app.js carries no reference to the deleted geometry module', async () => {
   const src = await readFile(new URL('../app.js', import.meta.url), 'utf8');
   assert.doesNotMatch(src, /ladder-levels/, 'app.js must not import the deleted module');
   assert.doesNotMatch(src, /resolveLadderGeometry/, 'the old validator is gone');
