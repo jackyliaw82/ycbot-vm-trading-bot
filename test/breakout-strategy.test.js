@@ -183,6 +183,64 @@ test('resume with an OPEN position restores openLeg/heldSide and refuses a secon
   await assert.rejects(() => dst._openPosition('SHORT'), /already open/);
 });
 
+// ——— openLeg reconciliation on resume (fix round 3) —————————————————————
+//
+// `_closeConsolidated` nulls `openLeg` in memory, but the `saveState()` that
+// persists that null runs several `await`s later. A crash in that window
+// leaves the LAST-persisted snapshot holding a non-null `openLeg` for a
+// position Binance has already closed. resume() must reconcile it against
+// Binance using the SAME flat-vs-unknown protocol `_closeQuantity()` already
+// encodes — clearing only when the refresh actually PROVES flat, never on an
+// unverified/failed refresh.
+
+test('resume discards a phantom openLeg when Binance is reachable and reports flat', async () => {
+  const src = breakoutStrategy({ bull: 100, bear: 98, pct: 0.02 });
+  // Simulates the crash window: the position was already closed on Binance,
+  // but the persisted snapshot still carries the pre-close leg.
+  src.openLeg = { direction: 'LONG', quantity: 5, fillPrice: 102, openedAt: 101.9 };
+  src.activePosition = { quantity: 5, entryPrice: 102, notional: 510, unrealizedPnl: 12 };
+  src.currentSide = 'LONG';
+
+  let doc = null;
+  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
+  await ReversalLadderStrategy.prototype.saveState.call(src);
+
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  // Binance is reachable and the position is ACTUALLY closed.
+  dst._refreshCurrentPosition = async () => {
+    dst._lastPositionRefreshFailed = false;
+    dst.activePosition = null;
+    dst.currentSide = null;
+  };
+  await assert.doesNotReject(() => dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' }));
+  cleanupResumeTimers(dst);
+
+  assert.equal(dst.openLeg, null, 'a phantom leg must be discarded once Binance CONFIRMS flat');
+  assert.equal(dst.heldSide, null, 'heldSide must clear so the strategy can trade again');
+});
+
+test('resume KEEPS a persisted openLeg when the position refresh fails — unknown must never read as flat', async () => {
+  const src = breakoutStrategy({ bull: 100, bear: 98, pct: 0.02 });
+  src.openLeg = { direction: 'LONG', quantity: 5, fillPrice: 102, openedAt: 101.9 };
+  src.activePosition = { quantity: 5, entryPrice: 102, notional: 510, unrealizedPnl: 12 };
+  src.currentSide = 'LONG';
+
+  let doc = null;
+  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
+  await ReversalLadderStrategy.prototype.saveState.call(src);
+
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  // Binance is UNREACHABLE — state is unknown, not flat.
+  dst._refreshCurrentPosition = async () => { dst._lastPositionRefreshFailed = true; };
+  await assert.doesNotReject(() => dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' }));
+  cleanupResumeTimers(dst);
+
+  assert.deepEqual(dst.openLeg, src.openLeg, 'an unverified refresh must never discard a real leg — unknown is not flat');
+  assert.equal(dst.heldSide, 'LONG', 'the leg — and therefore heldSide — must survive an unknown refresh');
+});
+
 // ——— trail restore (fix round 2, Important 1) ——————————————————————————
 //
 // Task 3 removed the trail's upper cap so it can ratchet PAST the entry level

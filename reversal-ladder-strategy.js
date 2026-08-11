@@ -1520,6 +1520,46 @@ class ReversalLadderStrategy extends TradingBase {
     // built for this case.
     await this._refreshCurrentPosition();
 
+    // Reconcile a persisted `openLeg` against what Binance actually reports —
+    // the SAME flat-vs-unknown protocol `_closeQuantity()` already encodes,
+    // applied to the one piece of restored state the refresh above does NOT
+    // touch. `_closeConsolidated` nulls `openLeg` in memory, but the
+    // `saveState()` that persists that null runs several `await`s later; a
+    // crash in that window leaves the LAST-persisted snapshot holding a
+    // non-null `openLeg` for a position Binance has already closed.
+    // `activePosition`/`currentSide` get re-derived from Binance by the
+    // refresh just above, but `openLeg` was restored verbatim from the
+    // snapshot with no reconciliation of its own — so a phantom leg would
+    // otherwise survive FOREVER: `heldSide` stays truthy, `_openPosition`
+    // refuses every new entry, and every tick's stop-out is a silent no-op
+    // (`_closeQuantity()` reads 0, so `_stopOut` returns `true` without ever
+    // touching `openLeg`). No bad order is ever placed — `_closeQuantity()`'s
+    // reachable-and-flat guard sees to that — so this is an availability bug,
+    // not a fund-safety one, but the bot stops trading until someone notices
+    // and manually Harvests to self-heal it.
+    //
+    // The asymmetry below is deliberate — do NOT "simplify" this into clearing
+    // on both branches. Binance REACHABLE + FLAT is the ONLY case where a
+    // leftover leg can be proven a crash-window artifact. When the refresh
+    // FAILED, the state is UNKNOWN, not flat — keeping a real position's
+    // ledger is the far cheaper mistake than silently discarding one that
+    // turns out to still be open (see the file-level SILENT FAIL-OPEN rule).
+    if (this.openLeg) {
+      if (this._lastPositionRefreshFailed) {
+        await this.addLog(
+          `[RECOVERY] openLeg ${this.openLeg.direction} qty ${this.openLeg.quantity} kept — the Binance ` +
+          `position refresh failed, so this state is UNKNOWN, not flat.`,
+        );
+      } else if (!(this.activePosition && this.activePosition.quantity > 0)) {
+        await this.addLog(
+          `[RECOVERY] openLeg ${this.openLeg.direction} qty ${this.openLeg.quantity} discarded — Binance ` +
+          `confirms flat, so this is a crash-window artifact (the close landed before saveState persisted it).`,
+        );
+        this.openLeg = null;
+      }
+      // else: Binance reports a live position matching the leg — it is real, keep it.
+    }
+
     // Catch up on any funding settlements during downtime, then schedule
     // the next 8h-aligned poll. _pollFundingIncome calls saveState itself
     // so accumulators are persisted before we proceed.
