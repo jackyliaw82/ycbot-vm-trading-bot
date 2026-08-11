@@ -149,6 +149,76 @@ test('a snapshot this class writes is a snapshot this class can read back', asyn
   near(dst.bearBreakout, src.bearBreakout, 'resume must re-derive the same bear entry level');
 });
 
+// Final-fix-round CRITICAL 1: `openLeg` had NO writer in saveState's doc
+// literal and no reader in resume() — a restart mid-position resumed with
+// openLeg/heldSide both null, dropping the Final TP/stop/trail entirely and
+// leaving `_openPosition`'s `if (this.openLeg)` guard free to open a SECOND
+// full-size position on the very next crossing. Unlike the round-trip test
+// above (which is deliberately flat), this one resumes a LIVE position.
+test('resume with an OPEN position restores openLeg/heldSide and refuses a second open (Critical 1)', async () => {
+  const src = breakoutStrategy({ bull: 100, bear: 98, pct: 0.02 });
+  src.openLeg = { direction: 'LONG', quantity: 5, fillPrice: 102, openedAt: 101.9 };
+  src.activePosition = { quantity: 5, entryPrice: 102, notional: 510, unrealizedPnl: 12 };
+  src.currentSide = 'LONG';
+
+  let doc = null;
+  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
+  await ReversalLadderStrategy.prototype.saveState.call(src);
+
+  assert.deepEqual(doc.openLeg, src.openLeg, 'openLeg must be written to the persisted doc');
+
+  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  await assert.doesNotReject(() => dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' }));
+  cleanupResumeTimers(dst);
+
+  assert.deepEqual(dst.openLeg, src.openLeg, 'resume must restore openLeg');
+  assert.equal(dst.heldSide, 'LONG', 'heldSide must be re-derived from the restored openLeg');
+  near(dst.bullBreakout, src.bullBreakout, 'resume must re-derive the same bull entry level');
+  near(dst.bearBreakout, src.bearBreakout, 'resume must re-derive the same bear entry level');
+
+  // A subsequent crossing must NOT open a second position — `_openPosition`'s
+  // guard reads `this.openLeg`, which must be non-null after a correct resume.
+  dst.placeMarketOrder = async () => { throw new Error('must not be called — a position is already open'); };
+  await assert.rejects(() => dst._openPosition('SHORT'), /already open/);
+});
+
+// ——— trail restore (fix round 2, Important 1) ——————————————————————————
+//
+// Task 3 removed the trail's upper cap so it can ratchet PAST the entry level
+// and lock real profit. `_restoreTrailFromSnapshot` must clamp FLOOR-ONLY
+// (matching `trailExitLevel`'s own semantics), never back down to the
+// two-sided ladder-era clamp — that would discard a locked-in profit on
+// every VM restart.
+
+test('_restoreTrailFromSnapshot keeps a locked-in LONG profit above bullLevel unchanged (Important 1)', () => {
+  const s = breakoutStrategy({ bull: 100, bear: 98 });
+  s.openLeg = { direction: 'LONG', quantity: 1, fillPrice: 101.5, openedAt: 1 };
+  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 1.5, trailExit: 105 });
+  assert.equal(s.trailExit, 105, 'a trailExit locked above bullLevel must survive resume unchanged, not clamp down to bullLevel');
+});
+
+test('_restoreTrailFromSnapshot mirrors for a locked-in SHORT profit below bearLevel', () => {
+  const s = breakoutStrategy({ bull: 100, bear: 98 });
+  s.openLeg = { direction: 'SHORT', quantity: 1, fillPrice: 96.5, openedAt: 1 };
+  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 1.5, trailExit: 93 });
+  assert.equal(s.trailExit, 93, 'a trailExit locked below bearLevel must survive resume unchanged, not clamp up to bearLevel');
+});
+
+test('_restoreTrailFromSnapshot still floors a stale LONG exit back up to bullLevel', () => {
+  const s = breakoutStrategy({ bull: 100, bear: 98 });
+  s.openLeg = { direction: 'LONG', quantity: 1, fillPrice: 101.5, openedAt: 1 };
+  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 1.5, trailExit: 95 });
+  assert.equal(s.trailExit, 100, 'a stale exit below the floor must be pulled back up to bullLevel, not preserved below it');
+});
+
+test('_restoreTrailFromSnapshot nulls the exit when nothing is held', () => {
+  const s = breakoutStrategy({ bull: 100, bear: 98 });
+  s.openLeg = null;
+  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 1.5, trailExit: 105 });
+  assert.equal(s.trailExit, null, 'a flat run has no held side and therefore no meaningful exit level');
+});
+
 test('_closeQuantity reads the open leg, not activePosition', () => {
   const s = breakoutStrategy();
   s.roundQuantity = (q) => q;
@@ -323,6 +393,36 @@ test('a LONG closes at bullLevel and the cycle continues', async () => {
   assert.equal(s.heldSide, null);
   assert.equal(closes.length, 1);
   assert.equal(s.isRunning, true, 'a stop-out does not end the cycle');
+});
+
+// Final-fix-round MINOR: `reversalCount` is write-only (nothing ever
+// increments it) yet fed `tradeCount`, so a cycle with several stop-outs
+// reported 0 trades. `stopOutCount` is the real counter now.
+test('a verified stop-out increments stopOutCount, not the dead reversalCount (Minor)', async () => {
+  const s = breakoutStrategy();
+  s.openLeg = { direction: 'LONG', quantity: 1, fillPrice: 101.5, openedAt: 1 };
+  s.activePosition = { quantity: 1 };
+  s._closeConsolidated = async () => { s.openLeg = null; s.activePosition = null; return true; };
+  s._closeQuantity = () => (s.openLeg ? s.openLeg.quantity : 0);
+
+  const ok = await s._stopOut(99.9);
+
+  assert.equal(ok, true);
+  assert.equal(s.stopOutCount, 1, 'a verified stop-out must increment stopOutCount');
+  assert.equal(s.reversalCount, 0, 'reversalCount stays dead — nothing writes it anymore');
+});
+
+test('an unverified stop-out does not increment stopOutCount', async () => {
+  const s = breakoutStrategy();
+  s.openLeg = { direction: 'LONG', quantity: 1, fillPrice: 101.5, openedAt: 1 };
+  s.activePosition = { quantity: 1 };
+  s._closeConsolidated = async () => false; // unverified — leg stays tracked
+  s._closeQuantity = () => (s.openLeg ? s.openLeg.quantity : 0);
+
+  const ok = await s._stopOut(99.9);
+
+  assert.equal(ok, false);
+  assert.equal(s.stopOutCount, 0, 'an aborted stop-out must not count as a trade');
 });
 
 test('after closing at bullLevel, no SHORT opens until bearBreakout', async () => {
@@ -556,4 +656,102 @@ test('_harvestToFlat aborts and leaves the position tracked when the close is un
   assert.equal(result, false, 'an aborted harvest must not report success');
   assert.equal(s.openLeg, leg, 'the leg ledger must survive an unverified close — the position stays tracked');
   assert.equal(replanCalls, 0, 'must not rebuild levels while a live position is still unaccounted for');
+});
+
+// Final-fix-round CRITICAL 2: `_harvestToFlat` nulled bullLevel/bearLevel but
+// NOT bullBreakout/bearBreakout. The tick gate in `handleRealtimePrice` keys
+// off `this.bullBreakout == null || this.bearBreakout == null` to decide
+// whether to re-plan — so when `_planAndBuildLevels` fails (a throttle, the
+// AI planner unavailable, the price-staleness discard), the old code left
+// non-null stale entry levels behind and the gate never fired again: the
+// strategy would trade last cycle's stale levels forever, with a null
+// bullLevel/bearLevel silencing both stop framings in
+// `_updateTrailAndCheckHit`.
+test('_harvestToFlat nulls bullBreakout/bearBreakout when the re-plan fails (Critical 2)', async () => {
+  const s = breakoutStrategy();
+  s.openLeg = { direction: 'LONG', quantity: 2, fillPrice: 101.5, openedAt: 1 };
+  s.activePosition = { quantity: 2, unrealizedPnl: 5 };
+  s._closeConsolidated = async () => { s.openLeg = null; s.activePosition = null; return true; };
+  s._planAndBuildLevels = async () => false; // throttled / AI unavailable / price-staleness discard
+  s._writeMetricsSample = async () => {};
+
+  assert.ok(s.bullBreakout != null && s.bearBreakout != null, 'sanity: the fixture starts with real entry levels');
+
+  const result = await s._harvestToFlat('manual_harvest');
+
+  assert.equal(result, true, 'the harvest itself still completes even though the re-plan failed');
+  assert.equal(s.bullLevel, null);
+  assert.equal(s.bearLevel, null);
+  assert.equal(s.bullBreakout, null, 'a failed re-plan must leave no stale entry level behind — else the tick gate never re-plans again');
+  assert.equal(s.bearBreakout, null, 'a failed re-plan must leave no stale entry level behind — else the tick gate never re-plans again');
+});
+
+// ——— stop() residual verification (fix round 2, Test 4) ————————————————
+//
+// stop({flatten:true}) has zero coverage in this file — every other test that
+// touches stop() stubs it out entirely. This is the last moment anyone is
+// watching: if the close cannot be verified against Binance, the strategy
+// must never report a clean "confirmed flat" stop, and must say so loudly
+// rather than silently terminating.
+
+function stubStopTail(s) {
+  s._pollFundingIncome = async () => {};
+  s.cleanupWebSockets = () => {};
+  s.deductPlatformFee = async () => {};
+  s._recordHeroProfit = async () => {};
+  s._deleteNoTradeStrategyDoc = async () => {};
+  return s;
+}
+
+test('stop({flatten:true}) reports FINAL STATE UNKNOWN — never "confirmed flat" — when the close cannot be verified', async () => {
+  const s = stubStopTail(breakoutStrategy());
+  s.openLeg = { direction: 'LONG', quantity: 2, fillPrice: 101.5, openedAt: 1 };
+  s.activePosition = { quantity: 2, entryPrice: 101.5, notional: 203, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.isRunning = true;
+
+  // Binance is unreachable throughout: the pre-flatten refresh, the close
+  // attempt, and the post-flatten residual-verification refresh all fail.
+  s._refreshCurrentPosition = async () => { s._lastPositionRefreshFailed = true; };
+  s.placeMarketOrder = async () => { throw new Error('-1001 Internal error'); };
+
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s.stop({ flatten: true });
+
+  assert.ok(
+    !logs.some((m) => m.includes('position confirmed flat')),
+    'the user must NEVER be told the position is confirmed flat while the position state is UNKNOWN',
+  );
+  assert.ok(
+    logs.some((m) => m.includes('WARNING') && m.includes('FINAL STATE UNKNOWN')),
+    'an unverified close must be reported loudly, not silently — this is the last moment anyone is watching',
+  );
+  assert.ok(
+    logs.some((m) => m.includes('FINAL STATE UNKNOWN') && m.includes('openLeg qty 2')),
+    'the warning must name what was still tracked, not silently discard it',
+  );
+  assert.equal(s.executionState, 'TERMINATED', 'stop() still completes termination — it never hangs open on an unverified close');
+});
+
+test('stop({flatten:true}) reports "confirmed flat" when the close is actually verified', async () => {
+  const s = stubStopTail(breakoutStrategy());
+  s.openLeg = { direction: 'LONG', quantity: 2, fillPrice: 101.5, openedAt: 1 };
+  s.activePosition = { quantity: 2, entryPrice: 101.5, notional: 203, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  s.isRunning = true;
+
+  s._refreshCurrentPosition = async () => { s._lastPositionRefreshFailed = false; };
+  s.placeMarketOrder = async () => ({ orderId: 1, executedQty: '2' }); // REST-ack tier verifies the close
+  s._waitForOrderFillConfirmation = async () => false; // force tier 2 (REST-ack), not tier 1
+
+  const logs = [];
+  s.addLog = async (msg) => { logs.push(msg); };
+
+  await s.stop({ flatten: true });
+
+  assert.ok(logs.some((m) => m.includes('position confirmed flat')), 'a genuinely verified flat is still reported as such');
+  assert.ok(!logs.some((m) => m.includes('FINAL STATE UNKNOWN')), 'no cry-wolf on the verified path');
+  assert.equal(s.executionState, 'TERMINATED');
 });

@@ -168,6 +168,7 @@ class ReversalLadderStrategy extends TradingBase {
     this.bullLevel = null;              // upper trigger — L1 IS this price
     this.bearLevel = null;              // lower trigger — S1 IS this price
     this.reversalCount = 0;             // committed reversals this cycle
+    this.stopOutCount = 0;              // verified stop-outs this cycle (feeds tradeCount — reversalCount never increments)
     this.lastProcessedPrice = null;     // last tick price the ladder crossing logic saw
     this._tradingSeqInProgress = false; // ladder crossing reentrancy guard
     // Re-entrancy latch for the TICK BODY. Deliberately DISTINCT from
@@ -1007,6 +1008,12 @@ class ReversalLadderStrategy extends TradingBase {
 
     this._clearTrail();
 
+    // Only a VERIFIED close is a real stop-out — mirrors the harvestCount gate
+    // in `_harvestToFlat`. `closed` can still be false here with nothing left
+    // to abort on (the abort guard above only fires when `_closeQuantity() >
+    // 0`), which means there was genuinely nothing open to stop out of.
+    if (closed) this.stopOutCount = (this.stopOutCount || 0) + 1;
+
     // Gap latch. A single tick can carry price past the OPPOSITE entry level on
     // the very tick that stopped us out; the two-tick rule means that side opens
     // NEXT tick, not this one. Only ever the opposite side: with the trail able
@@ -1056,10 +1063,22 @@ class ReversalLadderStrategy extends TradingBase {
    * invariant worth testing, and `resume()` cannot be exercised in a unit test.
    *
    * Carry-forward 1: never TRUST the persisted exit — re-clamp it into the
-   * RESTORED band. The levels can have moved since it was written (a manual edit
-   * or an applied Ask AI proposal narrows the band), and a stale value outside
-   * that band would win the ratchet's Math.max/Math.min forever, silently
-   * defeating the cap whose only job is keeping the exit out of the ladder.
+   * RESTORED band, FLOOR-ONLY, mirroring `trailExitLevel`'s own semantics
+   * (see reversal-trail.js): `Math.max(bullLevel, exit)` for a LONG,
+   * `Math.min(bearLevel, exit)` for a SHORT. There is deliberately NO upper
+   * cap — Task 3 removed the two-sided ladder-era clamp everywhere else
+   * specifically so the trail can ratchet PAST the entry level and lock a
+   * real profit, and this restore must not throw that profit away by pulling
+   * a persisted exit of, say, 105 (locked above a bullLevel of 100) back down
+   * to 100 — that would turn a resume during a favourable retrace into a
+   * silently discarded protective exit. The levels can still have moved since
+   * the snapshot was written (a manual edit or an applied Ask AI proposal
+   * narrows the band), which is exactly why this still clamps at the floor
+   * rather than trusting the raw persisted value outright.
+   *
+   * The side comes from `this.openLeg` (Critical 1 — restored earlier in
+   * `resume()`, before this call, specifically so it is available here). A
+   * flat run has no held side and therefore no meaningful exit level.
    *
    * `trailEnabled` restores from an EXPLICIT `=== true` only: a missing or
    * malformed field is unknown, and unknown must never read as armed.
@@ -1068,10 +1087,18 @@ class ReversalLadderStrategy extends TradingBase {
     this.trailEnabled = snapshot.trailEnabled === true;
     this.trailDistanceValue = Number.isFinite(snapshot.trailDistanceValue) ? snapshot.trailDistanceValue : null;
     const exit = snapshot.trailExit;
-    this.trailExit = (Number.isFinite(exit)
-      && Number.isFinite(this.bullLevel) && Number.isFinite(this.bearLevel))
-      ? Math.min(this.bullLevel, Math.max(this.bearLevel, exit))
-      : null;
+    const side = this.openLeg ? this.openLeg.direction : null;
+    if (!Number.isFinite(exit) || side == null) {
+      this.trailExit = null;
+      return;
+    }
+    if (side === 'LONG' && Number.isFinite(this.bullLevel)) {
+      this.trailExit = Math.max(this.bullLevel, exit);
+    } else if (side === 'SHORT' && Number.isFinite(this.bearLevel)) {
+      this.trailExit = Math.min(this.bearLevel, exit);
+    } else {
+      this.trailExit = null;
+    }
   }
 
   /**
@@ -1198,10 +1225,25 @@ class ReversalLadderStrategy extends TradingBase {
       // close (the only way this line is reached, per the abort guard above),
       // so this is defense in depth; `_pendingEntry` is a one-tick latch that
       // must not survive into the freshly re-planned levels.
+      //
+      // CRITICAL 2 — bullBreakout/bearBreakout MUST be nulled here too, not
+      // just bullLevel/bearLevel. The tick gate in `handleRealtimePrice` keys
+      // off `this.bullBreakout == null || this.bearBreakout == null` to decide
+      // whether to re-plan; leaving them non-null after a re-plan FAILURE (a
+      // throttle, the AI planner unavailable, or the price-staleness discard
+      // inside `_planAndBuildLevels`) would leave that gate permanently
+      // satisfied, so the strategy would never re-plan again and would keep
+      // trading last cycle's stale entry levels indefinitely with bullLevel/
+      // bearLevel null — which also silences BOTH stop framings in
+      // `_updateTrailAndCheckHit` (untrailed: `!Number.isFinite(null)`;
+      // trailed: `trailDistanceValue` derives from the null levels too),
+      // leaving only Final TP and a manual stop as exits.
       this.openLeg = null;
       this._pendingEntry = null;
       this.bullLevel = null;
       this.bearLevel = null;
+      this.bullBreakout = null;
+      this.bearBreakout = null;
       await this._planAndBuildLevels(reason);
 
       // The audit label reflects what ACTUALLY happened (keyed off `closed`), not
@@ -1312,8 +1354,19 @@ class ReversalLadderStrategy extends TradingBase {
     // ---- cycle levels ----
     this.bullLevel = snapshot.bullLevel ?? null;
     this.bearLevel = snapshot.bearLevel ?? null;
-    // Trailing exit (§7) — restored AFTER bullLevel/bearLevel: the restore
-    // re-clamps the persisted exit into the just-restored band (carry-forward 1).
+    // The single-row open-position ledger (Critical 1) — restored HERE, before
+    // both the trail restore below (which needs the held side to re-clamp the
+    // ratchet to the correct floor) and `_recomputeFinalTpPrice()` further down
+    // (which needs `heldSide`, derived from this, to resolve entry/exit
+    // direction). Without this a restart mid-position resumed with
+    // openLeg/heldSide both null, which silently dropped the Final TP, the
+    // stop and the trail, AND let `_openPosition` open a SECOND full-size
+    // position on the next crossing (its own `if (this.openLeg)` guard read
+    // null as "nothing open").
+    this.openLeg = snapshot.openLeg ?? null;
+    // Trailing exit (§7) — restored AFTER bullLevel/bearLevel AND openLeg: the
+    // restore re-clamps the persisted exit into the just-restored band and
+    // needs the held side (carry-forward 1).
     this._restoreTrailFromSnapshot(snapshot);
     this.lastProcessedPrice = snapshot.lastProcessedPrice ?? null;
     this._ladderBaseSize = snapshot.ladderBaseSize || this.currentInitialSize; // grown ladder base survives restarts (else ladder shrinks to initial)
@@ -1338,6 +1391,7 @@ class ReversalLadderStrategy extends TradingBase {
     this.reversalCount = snapshot.reversalCount || 0;
     this.harvestCount = snapshot.harvestCount || 0;
     this.reanchorCount = snapshot.reanchorCount || 0;
+    this.stopOutCount = snapshot.stopOutCount || 0;
     this.initialCapital = snapshot.initialCapital || 0;
     this.initialWalletBalance = snapshot.initialWalletBalance || null;
     const sst = snapshot.cycleStartTime;
@@ -1720,7 +1774,7 @@ class ReversalLadderStrategy extends TradingBase {
           symbol: this.symbol,
           netPnL,
           profitPercentage: this.initialCapital ? (netPnL / this.initialCapital) * 100 : 0,
-          tradeCount: this.tradeCount || (this.reversalCount + this.harvestCount + (reason === 'final_tp' ? 1 : 0)),
+          tradeCount: this.tradeCount || (this.stopOutCount + this.harvestCount + (reason === 'final_tp' ? 1 : 0)),
           timeTaken: elapsed,
           realizedPnL: this.accumulatedRealizedPnL || 0,
           tradingFees: this.accumulatedTradingFees || 0,
@@ -3247,11 +3301,19 @@ class ReversalLadderStrategy extends TradingBase {
         stopReason: this.stopReason ?? null,
         currentSide: this.currentSide,
         currentPosition: this.activePosition,
+        // The single-row open-position ledger (Critical 1). Without this a
+        // restart mid-position resumes with openLeg/heldSide both null, which
+        // drops the Final TP/stop/trail AND lets `_openPosition` open a SECOND
+        // full-size position on the next crossing (its `if (this.openLeg)`
+        // guard reads null as "nothing open"). A flat object, not an array —
+        // Firestore rejects nested arrays but this shape is fine.
+        openLeg: this.openLeg,
         finalTpPrice: this.finalTpPrice,
         cycleAccumulatedLoss: this.cycleAccumulatedLoss,
         reversalCount: this.reversalCount,
         harvestCount: this.harvestCount,
         reanchorCount: this.reanchorCount,
+        stopOutCount: this.stopOutCount,
         initialCapital: this.initialCapital,
         initialWalletBalance: this.initialWalletBalance,
         currentInitialSize: this.currentInitialSize,
