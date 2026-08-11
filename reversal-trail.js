@@ -1,44 +1,67 @@
-// Trailing exit for ReversalLadder's TREND mode. Pure.
+// Trailing exit for the breakout strategy. Pure.
 //
-// The level starts at the OPPOSITE level and walks toward the entry level as
-// price runs, capped there. That cap is deliberate and has a consequence worth
-// stating plainly: trailing can never lock in a profit. Its best outcome is
-// roughly the entry level, which on a fully-scaled ladder is a small loss
-// against the average entry. It is a give-back limiter, not a profit lock —
-// profit comes only from Final TP, and profit PROTECTION from Close & stop.
+// The trail and the near-level stop are ONE mechanism. The level starts exactly
+// at the exit level (bullLevel for a LONG) and ratchets away from it as price
+// runs. With trailing disarmed the strategy simply never ratchets it, so it
+// stays pinned there and behaves as a plain stop.
 //
-// The cap is also what keeps the exit out of the ladder: closing above the bull
-// level would leave price inside the LONG rungs, which would immediately refill
-// the position just closed.
+// Unlike the ladder version, the trail is NOT capped at the entry level. That
+// cap existed because closing above the bull level would leave price inside the
+// LONG rungs and immediately refill the position just closed — there are no
+// rungs now, so the trail can ratchet past the entry and lock a real profit.
 
 const finite = (v) => typeof v === 'number' && Number.isFinite(v);
 
 /**
- * Fixed once, when TREND arms: the gap from the arming price to the opposite
- * level. Parameter-free by construction — the trail therefore begins exactly at
- * the opposite level and moves 1:1 with price, so it needs no tuning knob and
- * self-scales across symbols.
+ * Fixed once, at entry: the gap from the entry level to the exit level. Equal
+ * to breakoutPct of the exit level by construction, but derived from the two
+ * ACTUAL levels so the trail starts exactly on the exit level after tick-size
+ * rounding rather than a hair off it.
+ *
+ * Parameter-free, so it needs no tuning knob and self-scales across symbols.
+ *
+ * @param {'LONG'|'SHORT'} side
+ * @param {{bullLevel: number, bearLevel: number, bullBreakout: number, bearBreakout: number}} levels
+ * @returns {number|null}
  */
-export function trailDistance(trendStartPrice, side, bullLevel, bearLevel) {
-  if (!finite(trendStartPrice) || !finite(bullLevel) || !finite(bearLevel)) return null;
-  if (side === 'LONG') return trendStartPrice - bearLevel;
-  if (side === 'SHORT') return bullLevel - trendStartPrice;
+export function trailDistance(side, levels) {
+  if (!levels) return null;
+  const { bullLevel, bearLevel, bullBreakout, bearBreakout } = levels;
+  if (side === 'LONG') {
+    if (!finite(bullLevel) || !finite(bullBreakout)) return null;
+    const d = bullBreakout - bullLevel;
+    return d > 0 ? d : null;
+  }
+  if (side === 'SHORT') {
+    if (!finite(bearLevel) || !finite(bearBreakout)) return null;
+    const d = bearLevel - bearBreakout;
+    return d > 0 ? d : null;
+  }
   return null;
 }
 
 /**
- * The current exit level. Ratchets toward the entry level only — `previous` is
- * the last value and is never given back.
+ * The current exit level. Ratchets away from the exit level only — `previous`
+ * is the last value and is never given back.
+ *
+ * Floored (LONG) / ceilinged (SHORT) at the exit level so the very first call
+ * lands exactly there even with no `previous`, and so a stale value restored
+ * from a snapshot taken before a level edit is pulled back into range instead
+ * of being preserved forever. There is deliberately NO bound on the profitable
+ * side.
  */
 export function trailExitLevel({ price, distance, side, bullLevel, bearLevel, previous = null } = {}) {
-  if (!finite(price) || !finite(distance) || !finite(bullLevel) || !finite(bearLevel)) return null;
+  if (!finite(price) || !finite(distance)) return null;
   if (side !== 'LONG' && side !== 'SHORT') return null;
 
+  const floor = side === 'LONG' ? bullLevel : bearLevel;
+  if (!finite(floor)) return null;
+
   const raw = side === 'LONG' ? price - distance : price + distance;
-  const clamped = Math.min(bullLevel, Math.max(bearLevel, raw));
+  const clamped = side === 'LONG' ? Math.max(floor, raw) : Math.min(floor, raw);
 
   if (!finite(previous)) return clamped;
-  const clampedPrevious = Math.min(bullLevel, Math.max(bearLevel, previous));
+  const clampedPrevious = side === 'LONG' ? Math.max(floor, previous) : Math.min(floor, previous);
   // One-way ratchet: LONG only ever rises, SHORT only ever falls.
   return side === 'LONG' ? Math.max(clampedPrevious, clamped) : Math.min(clampedPrevious, clamped);
 }
