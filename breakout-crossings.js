@@ -9,7 +9,6 @@
 // reversal: a close leaves the strategy FLAT, and the opposite side opens only
 // if price later reaches the opposite entry level.
 
-const between = (v, a, b) => (a <= b ? v >= a && v <= b : v >= b && v <= a);
 const finite = (v) => typeof v === 'number' && Number.isFinite(v);
 
 /**
@@ -54,16 +53,23 @@ export function planBreakoutEntry({
   if (!finite(prevPrice)) return none;             // first tick: no band
   if (currentPrice === prevPrice) return none;
 
-  // A crossing AND the landing side. The second half is load-bearing: a trailed
-  // exit can close a LONG with price ABOVE bullBreakout, and price falling back
-  // THROUGH bullBreakout is a crossing that must not open a LONG.
+  // A DIRECTIONAL crossing: price was strictly on the inside and ended on or
+  // beyond the level. Both halves are load-bearing — a trailed exit can close a
+  // LONG with price ABOVE bullBreakout, and price falling back to that level
+  // must not open a LONG.
+  //
+  // Do NOT express this with a symmetric `between(level, prev, current)` test.
+  // An endpoint is always "between" its own bounds, so `between` returns true
+  // for ANY prevPrice when currentPrice lands exactly ON the level — and mark
+  // prices are tick-rounded, so exact equality is a real input, not a corner
+  // case. A fall from 200 to exactly 101.5 would open a LONG.
   //
   // The two branches are mutually exclusive (bullBreakout > bearBreakout), so a
   // band spanning both levels resolves to whichever side price landed on.
-  if (between(bullBreakout, prevPrice, currentPrice) && currentPrice >= bullBreakout) {
+  if (prevPrice < bullBreakout && currentPrice >= bullBreakout) {
     return { open: 'LONG', clearPending: false };
   }
-  if (between(bearBreakout, prevPrice, currentPrice) && currentPrice <= bearBreakout) {
+  if (prevPrice > bearBreakout && currentPrice <= bearBreakout) {
     return { open: 'SHORT', clearPending: false };
   }
 

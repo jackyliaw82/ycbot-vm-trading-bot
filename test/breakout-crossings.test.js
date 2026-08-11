@@ -50,6 +50,25 @@ test('crossing bearBreakout UPWARD does not open a SHORT', () => {
   assert.deepEqual(plan({ prevPrice: 95, currentPrice: 96.6 }), NOTHING);
 });
 
+// The equality trap. Mark prices are tick-rounded, so landing EXACTLY on a
+// level is a real input. A symmetric `between(level, prev, current)` test
+// returns true here for any prevPrice — an endpoint is always between its own
+// bounds — and would open a LONG on a fall from far above.
+test('falling from above onto bullBreakout EXACTLY does not open a LONG', () => {
+  assert.deepEqual(plan({ prevPrice: 200, currentPrice: UP }), NOTHING);
+  assert.deepEqual(plan({ prevPrice: 101.6, currentPrice: UP }), NOTHING);
+});
+
+test('rising from below onto bearBreakout EXACTLY does not open a SHORT', () => {
+  assert.deepEqual(plan({ prevPrice: 50, currentPrice: DOWN }), NOTHING);
+  assert.deepEqual(plan({ prevPrice: 96.4, currentPrice: DOWN }), NOTHING);
+});
+
+test('sitting exactly ON a level and staying there opens nothing', () => {
+  assert.deepEqual(plan({ prevPrice: UP, currentPrice: UP }), NOTHING);
+  assert.deepEqual(plan({ prevPrice: DOWN, currentPrice: DOWN }), NOTHING);
+});
+
 test('no entry while a position is already held', () => {
   assert.deepEqual(plan({ prevPrice: 101, currentPrice: 101.6, heldSide: 'LONG' }), NOTHING);
   assert.deepEqual(plan({ prevPrice: 101, currentPrice: 101.6, heldSide: 'SHORT' }), NOTHING);
