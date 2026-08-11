@@ -148,3 +148,72 @@ test('a snapshot this class writes is a snapshot this class can read back', asyn
   near(dst.bullBreakout, src.bullBreakout, 'resume must re-derive the same bull entry level');
   near(dst.bearBreakout, src.bearBreakout, 'resume must re-derive the same bear entry level');
 });
+
+test('_closeQuantity reads the open leg, not activePosition', () => {
+  const s = breakoutStrategy();
+  s.roundQuantity = (q) => q;
+  s.openLeg = { direction: 'LONG', quantity: 3, fillPrice: 101.5, openedAt: 1 };
+  s.activePosition = { quantity: 3 };
+  assert.equal(s._closeQuantity(), 3);
+});
+
+// The fail-safe that stops a stale REST read orphaning part of a position.
+test('_closeQuantity takes the LARGER of leg and REST quantity', () => {
+  const s = breakoutStrategy();
+  s.roundQuantity = (q) => q;
+  s.activePosition = { quantity: 1 };
+  s.openLeg = { direction: 'LONG', quantity: 3, fillPrice: 101.5, openedAt: 1 };
+  assert.equal(s._closeQuantity(), 3, 'an under-sized close orphans the remainder');
+  s.openLeg.quantity = 0.5;
+  assert.equal(s._closeQuantity(), 1, 'reduceOnly clamps an over-sized close — max() is safe both ways');
+});
+
+// "Flat" and "unknown" are different states.
+test('_closeQuantity returns 0 only when Binance was REACHABLE and said flat', () => {
+  const s = breakoutStrategy();
+  s.roundQuantity = (q) => q;
+  s.activePosition = null;
+  s.openLeg = { direction: 'LONG', quantity: 3, fillPrice: 101.5, openedAt: 1 };
+
+  s._lastPositionRefreshFailed = false;
+  assert.equal(s._closeQuantity(), 0, 'reachable + flat -> the leg is stale bookkeeping');
+
+  s._lastPositionRefreshFailed = true;
+  assert.equal(s._closeQuantity(), 3, 'UNKNOWN must never read as flat');
+});
+
+test('_openPosition records the ACTUAL fill, never the requested quantity', async () => {
+  const s = breakoutStrategy();
+  let placed = null;
+  s._ladderBaseSize = 1000;
+  s._quantityFor = async () => 10;
+  s.placeMarketOrder = async (symbol, side, qty) => { placed = { symbol, side, qty }; return { orderId: 7 }; };
+  // _resolveFill returns { filledQty, fillPrice, source } — see line 633.
+  s._resolveFill = async () => ({ filledQty: 9.4, fillPrice: 101.62, source: 'ws' });
+
+  await s._openPosition('LONG');
+
+  assert.deepEqual(placed, { symbol: 'BTCUSDT', side: 'BUY', qty: 10 });
+  assert.equal(s.openLeg.direction, 'LONG');
+  assert.equal(s.openLeg.quantity, 9.4, 'the WS fill wins over the requested qty');
+  assert.equal(s.openLeg.fillPrice, 101.62);
+  assert.equal(s.heldSide, 'LONG');
+});
+
+test('_openPosition sells for a SHORT', async () => {
+  const s = breakoutStrategy();
+  let side = null;
+  s._quantityFor = async () => 10;
+  s.placeMarketOrder = async (_sym, sd) => { side = sd; return { orderId: 8 }; };
+  s._resolveFill = async () => ({ filledQty: 10, fillPrice: 96.5, source: 'ws' });
+  await s._openPosition('SHORT');
+  assert.equal(side, 'SELL');
+  assert.equal(s.heldSide, 'SHORT');
+});
+
+test('_openPosition refuses to open while a position is already held', async () => {
+  const s = breakoutStrategy();
+  s.openLeg = { direction: 'LONG', quantity: 1, fillPrice: 101.5, openedAt: 1 };
+  s.placeMarketOrder = async () => { throw new Error('must not be called'); };
+  await assert.rejects(() => s._openPosition('SHORT'), /already open/);
+});

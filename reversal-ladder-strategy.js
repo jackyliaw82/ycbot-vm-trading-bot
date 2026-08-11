@@ -624,13 +624,6 @@ class ReversalLadderStrategy extends TradingBase {
     }
   }
 
-  // Each leg is an equal slice of the ladder base. The base is the initial size
-  // at cycle start, then whatever dynamic sizing produces at each reversal
-  // and post-harvest.
-  _legNotional() {
-    return (this._ladderBaseSize || this.currentInitialSize || 0) / this.levelsPerSide;
-  }
-
   /**
    * Resolve an order's ACTUAL fill (avg price + filled qty) from the user-data
    * WS, so open paths book position state from the real fill rather than the
@@ -743,21 +736,16 @@ class ReversalLadderStrategy extends TradingBase {
    */
   _closeQuantity() {
     const restQty = (this.activePosition && this.activePosition.quantity) || 0;
-    // The one question REST still answers better than the legs: Binance was
-    // REACHABLE and reported flat, so open legs are stale bookkeeping and
-    // there is genuinely nothing to close. Detection, NOT a refusal — when the
-    // state is UNKNOWN this falls through and closes what the legs know.
+    // The one question REST still answers better than the leg: Binance was
+    // REACHABLE and reported flat, so an open leg is stale bookkeeping and there
+    // is genuinely nothing to close. Detection, NOT a refusal — when the state is
+    // UNKNOWN this falls through and closes what the leg knows.
     if (!restQty && !this._lastPositionRefreshFailed) return 0;
-    const legQty = this.ladderLines
-      .filter((l) => l.state === 'POSITION_OPEN')
-      .reduce((sum, l) => sum + (l.quantity || 0), 0);
-    // Round to the symbol's stepSize before returning. Summing per-leg
-    // quantities — each already exchange-valid — produces float artifacts like
-    // 0.28 × 3 = 0.8400000000000001, which Binance rejects on the close order
-    // with -1111 "precision over maximum". roundQuantity FLOORS on the stepSize
-    // (never overshoots the real position → no -2018 insufficient-position) and
-    // cleans the FP noise; legQty and restQty describe the same position, so
-    // this is lossless for a genuine close.
+    const legQty = (this.openLeg && this.openLeg.quantity) || 0;
+    // reduceOnly can never flip a position, so an over-sized close is clamped by
+    // Binance and harmless while an under-sized one orphans — max() is fail-safe
+    // on both. roundQuantity FLOORS on stepSize, cleaning FP noise without
+    // overshooting the real position.
     return this.roundQuantity(Math.max(legQty, restQty));
   }
 
@@ -881,6 +869,7 @@ class ReversalLadderStrategy extends TradingBase {
     this.activePosition = null;
     this.currentSide = null;
     this.finalTpPrice = null;
+    this.openLeg = null;
     return true;
   }
 
@@ -932,30 +921,35 @@ class ReversalLadderStrategy extends TradingBase {
   }
 
   /**
-   * Fill one ladder leg — a market order that ADDS to the net one-way position.
+   * Open the cycle's one position — a single market order for the full base
+   * size. Replaces `_fillLeg`, which opened one rung of many.
    *
-   * In one-way mode the legs are not separate positions: Binance nets them.
-   * `leg` is bookkeeping for which level has filled; `activePosition` is the
-   * real thing. Books from the ACTUAL user-data WS fill, never the requested qty.
+   * Books from the ACTUAL user-data WS fill (`_resolveFill`, which falls back to
+   * a REST order lookup), never the requested qty. A requested quantity that was
+   * only partially filled would leave `openLeg` claiming more than exists, and
+   * every later close would size off that lie.
    */
-  async _fillLeg(leg) {
-    const notional = this._legNotional();
-    const qty = await this._quantityFor(this.symbol, notional, leg.price);
-    const side = leg.direction === 'LONG' ? 'BUY' : 'SELL';
+  async _openPosition(side) {
+    if (this.openLeg) {
+      throw new Error(`_openPosition(${side}) refused — a ${this.openLeg.direction} position is already open.`);
+    }
+    const notional = this._ladderBaseSize;
+    const level = side === 'LONG' ? this.bullBreakout : this.bearBreakout;
+    const qty = await this._quantityFor(this.symbol, notional, level);
+    const orderSide = side === 'LONG' ? 'BUY' : 'SELL';
 
-    const res = await this.placeMarketOrder(this.symbol, side, qty); // one-way: no positionSide
-    const fill = await this._resolveFill(res?.orderId, res, qty, leg.price);
+    const res = await this.placeMarketOrder(this.symbol, orderSide, qty); // one-way: no positionSide
+    const fill = await this._resolveFill(res?.orderId, res, qty, level);
 
-    leg.state = 'POSITION_OPEN';
-    leg.quantity = fill.filledQty;
-    leg.fillPrice = fill.fillPrice;
+    this.openLeg = {
+      direction: side,
+      quantity: fill.filledQty,
+      fillPrice: fill.fillPrice,
+      openedAt: this.currentPrice,
+    };
 
-    await this.addLog(
-      `${leg.direction} ${leg.direction === 'LONG' ? 'L' : 'S'}${leg.index} filled: ` +
-      `${fill.filledQty} @ ${this._formatPrice(fill.fillPrice)} (${this._formatNotional(notional)} USDT)`,
-    );
-    await this._refreshCurrentPosition(true);
-    await this._postExecuteBookkeeping('LADDER_FILL', { direction: leg.direction, index: leg.index });
+    await this._postExecuteBookkeeping('OPEN_BREAKOUT', { side, level, requestedQty: qty, filledQty: fill.filledQty });
+    await this.saveState();
   }
 
   /**
