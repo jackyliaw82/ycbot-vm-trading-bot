@@ -5,13 +5,7 @@ import { FieldValue } from '@google-cloud/firestore';
 import { FEE_RATE } from './fees.js';
 import { VolumeProfile } from './volume-profile.js';
 import { MarketMetrics } from './market-metrics.js';
-import {
-  minInitialSizeUSDT,
-  resolveLadderGeometry,
-  LADDER_STEP_PCT,
-  LADDER_LEVELS_PER_SIDE,
-} from './ladder-levels.js';
-import { buildReversalLadder } from './reversal-levels.js';
+import { BREAKOUT_PCT, resolveBreakoutGeometry, deriveBreakoutLevels } from './breakout-levels.js';
 import { planReversalActions, averageOpenEntry } from './reversal-crossings.js';
 import { planLevels } from './level-planner.js';
 import { buildLevelContext } from './market-context.js';
@@ -118,6 +112,18 @@ class ReversalLadderStrategy extends TradingBase {
     this.harvestCount = 0;
     this.reanchorCount = 0;              // every completed _harvestToFlat (flat reset OR position harvest); FE spinner watches this
     this.initialCapital = 0;
+    this.breakoutPct = BREAKOUT_PCT;
+    this.bullBreakout = null;
+    this.bearBreakout = null;
+    // The single-row open-position ledger. This is what `_closeQuantity()`
+    // reads. It is NOT `activePosition`: that comes from a REST refresh that
+    // can fail, and an unknown state must never read as flat.
+    this.openLeg = null;
+    // One-shot gap latch. Set only when a close leaves price already beyond the
+    // OPPOSITE entry level; consumed on the next tick. Deliberately NOT
+    // persisted — it lives one tick, and firing it on stale intent after a
+    // restart would open a position the market no longer justifies.
+    this._pendingEntry = null;
     this.currentInitialSize = 0;         // base for DYNAMIC trend sizing (original config size; never overwritten → no compounding)
     this._ladderBaseSize = 0;            // base the LADDER is sized from: initial size, then the dynamically re-sized base after a reversal / harvest
     this.cycleStartTime = null;
@@ -169,15 +175,10 @@ class ReversalLadderStrategy extends TradingBase {
     this._lastFundingPollTs = null;
 
     // ---- Ladder state ----
-    this.ladderMode = 'SCALING';        // SCALING | TREND
     this.bullLevel = null;              // upper trigger — L1 IS this price
     this.bearLevel = null;              // lower trigger — S1 IS this price
     this.reversalCount = 0;             // committed reversals this cycle
-    this.trendStartPrice = null;        // the price TREND armed at; Task 5's trail measures from it
-    this.ladderLines = [];              // [{index, direction, price, state, quantity}]
     this.lastProcessedPrice = null;     // last tick price the ladder crossing logic saw
-    this.stepPct = LADDER_STEP_PCT;     // DEFAULT geometry; start() overrides from config within bounds (see ladder-levels.js resolveLadderGeometry)
-    this.levelsPerSide = LADDER_LEVELS_PER_SIDE; // DEFAULT; same override in start()
     this._tradingSeqInProgress = false; // ladder crossing reentrancy guard
     // Re-entrancy latch for the TICK BODY. Deliberately DISTINCT from
     // `_tradingSeqInProgress`: that flag means "a trading sequence is
@@ -204,9 +205,6 @@ class ReversalLadderStrategy extends TradingBase {
     // Injectable seam for tests — _resolveAiApiKey() constructs a real
     // SecretManagerServiceClient on demand when this stays null.
     this._secretClient = null;
-
-    // ---- TREND state ----
-    this.trendDirection = null;         // origin breakout direction ('LONG'|'SHORT')
 
     // ---- Trailing exit (§7) ----
     // TREND-only give-back limiter. PERSISTED: a redeploy that silently
@@ -237,6 +235,37 @@ class ReversalLadderStrategy extends TradingBase {
     this.harvestTriggerAction = 'reanchor';   // 'reanchor' | 'stop'
   }
 
+  /**
+   * Which side is open, derived from the leg ledger. DERIVED, with a THROWING
+   * setter — never a stored field. A stored copy is a second source of truth
+   * for a fact `openLeg` already carries, and the two drift; that is exactly
+   * the `_trendFinalTpArmed` bug this codebase already paid for once.
+   */
+  get heldSide() {
+    return this.openLeg ? this.openLeg.direction : null;
+  }
+
+  set heldSide(_v) {
+    throw new Error('heldSide is derived from openLeg — set or clear openLeg instead.');
+  }
+
+  /**
+   * Recompute both entry levels from the AI-planned pair. Call after ANY change
+   * to bullLevel/bearLevel/breakoutPct: cycle start, harvest re-plan, editLevels,
+   * and resume.
+   *
+   * DERIVED, never persisted — see the getter above for why.
+   *
+   * Rounds to tick size here rather than in the pure module, because this is the
+   * only layer that knows the symbol's exchange info. `trailDistance` reads the
+   * ROUNDED levels, so the trail starts exactly on the exit level.
+   */
+  _deriveBreakoutLevels() {
+    const raw = deriveBreakoutLevels(this.bullLevel, this.bearLevel, this.breakoutPct);
+    this.bullBreakout = this.roundPrice(raw.bullBreakout);
+    this.bearBreakout = this.roundPrice(raw.bearBreakout);
+  }
+
   // ——— Lifecycle ——————————————————————————————————————————————————————
 
   /**
@@ -262,23 +291,12 @@ class ReversalLadderStrategy extends TradingBase {
     this._ladderBaseSize = this.currentInitialSize; // initial ladder uses the initial size; a harvest later carries the last consolidated notional
 
     if (!this.symbol) throw new Error('ReversalLadderStrategy.start: missing symbol');
-    // Ladder geometry. DEFAULTS preserve the original fixed geometry; both are
-    // user-configurable within bounds enforced HERE via resolveLadderGeometry
-    // (ladder-levels.js) — the SAME validator the /reversal-ladder/start route
-    // uses, so the two gates can never drift again. The UI is a convenience —
-    // the VM is the authority, so an old frontend or a direct API call cannot
-    // deploy a structurally lossy or unreachable ladder. Rejected BEFORE any
-    // network call, like the size gate below.
-    const geometry = resolveLadderGeometry({
-      ladderStepPct: config.ladderStepPct,
-      ladderLevelsPerSide: config.ladderLevelsPerSide,
-    });
+    const geometry = resolveBreakoutGeometry({ breakoutPct: config.breakoutPct });
     if (!geometry.ok) {
-      await this.addLog(`ERROR: [VALIDATION_ERROR] ${geometry.error}`);
+      await this.addLog(`ERROR: [${geometry.code}] ${geometry.error}`);
       throw new Error(geometry.error);
     }
-    this.stepPct = geometry.stepPct;
-    this.levelsPerSide = geometry.levelsPerSide;
+    this.breakoutPct = geometry.breakoutPct;
 
     // Absent key = mechanical levels from `rangeVoids`. That is a real,
     // supported mode (§10's fallback), not a degraded start — so log it and
@@ -308,18 +326,6 @@ class ReversalLadderStrategy extends TradingBase {
       );
     }
 
-    // Gate on the trivially-known minimum BEFORE any network call — no point
-    // burning a setLeverage/setPositionMode/exchangeInfo round trip on an
-    // input that's rejected regardless. (The tighter per-symbol minNotional
-    // check, which needs exchangeInfoCache, runs further down after
-    // _getExchangeInfo.)
-    const minSize = minInitialSizeUSDT(this.levelsPerSide);
-    if (!(this.currentInitialSize >= minSize)) {
-      const msg = `Initial size (${this.currentInitialSize} USDT) is below the ${minSize} USDT minimum for a ${this.levelsPerSide}-level ladder.`;
-      await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
-      throw new Error(msg);
-    }
-
     await this.addLog(`Starting Reversal Ladder Strategy for ${this.symbol}...`);
     // Surface EVERY config field — used to verify the form values made it
     // through to the VM untouched. Three groups separated by `|` for
@@ -327,7 +333,7 @@ class ReversalLadderStrategy extends TradingBase {
     await this.addLog(
       `Config: symbol=${this.symbol}, initialSize=${this.currentInitialSize} USDT, ` +
       `leverage=${this.leverage}x, priceType=${this.priceType}, ` +
-      `ladderStep=${(this.stepPct * 100).toFixed(2)}%, ladderLevels=${this.levelsPerSide}/side ` +
+      `breakoutPct=${(this.breakoutPct * 100).toFixed(2)}% ` +
       `| recoveryFactor=${(this.recoveryFactor * 100).toFixed(0)}%, ` +
       `recoveryDistance=${(this.recoveryDistance * 100).toFixed(2)}%, ` +
       `harvestLossThreshold=${(this.harvestLossThreshold * 100).toFixed(0)}%, ` +
@@ -356,13 +362,14 @@ class ReversalLadderStrategy extends TradingBase {
 
     const minNotional = this.exchangeInfoCache[this.symbol]?.minNotional || 5;
     this.minNotional = minNotional;
-    // Divide by the FIELD, not the constant — `_legNotional()` (the runtime
-    // sizing path) already does, and the two must agree or this gate validates a
-    // 5-rung ladder against an N-rung runtime (too permissive for N > 5).
-    const legNotional = this.currentInitialSize / this.levelsPerSide;
-    if (legNotional < minNotional) {
-      const msg = `Each ladder leg would be ${legNotional.toFixed(2)} USDT, below this symbol's ${minNotional} USDT minimum notional.`;
-      await this.addLog(`ERROR: [VALIDATION_ERROR] ${msg}`);
+    // ONE order for the whole size, so there is one floor to clear rather than
+    // levelsPerSide of them. The old minimum SCALED with the rung count
+    // (levelsPerSide * MIN_LEG_USDT); there are no rungs, so it does not.
+    if (this.currentInitialSize < minNotional) {
+      const msg =
+        `Initial size ${this.currentInitialSize} USDT is below ${this.symbol}'s minimum notional ` +
+        `(${minNotional} USDT). Raise the size rather than running a position Binance will reject.`;
+      await this.addLog(`ERROR: [SIZE_BELOW_MIN_NOTIONAL] ${msg}`);
       throw new Error(msg);
     }
 
@@ -416,7 +423,7 @@ class ReversalLadderStrategy extends TradingBase {
     await this.addLog('ReversalLadderStrategy running — awaiting the first tick to plan levels.');
     await this.saveState();
     // Push immediately — one harmless extra heartbeat moments before the
-    // first tick's own push from _buildLadders(). Synchronous + internally
+    // first tick's own push from _applyLevels(). Synchronous + internally
     // try/caught, so no await (see _pushHeartbeatNow's own doc).
     this._pushHeartbeatNow?.();
   }
@@ -430,10 +437,10 @@ class ReversalLadderStrategy extends TradingBase {
    * rather than silently building something unreachable — that throw is a real
    * bug signal and must not be swallowed here.
    */
-  async _buildLadders({ bullLevel, bearLevel, reason = 'cycle_start' }) {
-    this.ladderLines = buildReversalLadder(bullLevel, bearLevel, this.stepPct, this.levelsPerSide);
+  async _applyLevels({ bullLevel, bearLevel, reason = 'cycle_start' }) {
     this.bullLevel = bullLevel;
     this.bearLevel = bearLevel;
+    this._deriveBreakoutLevels();
     this.ladderMode = 'SCALING';
     this.trendDirection = null;
     // Nulling finalTpPrice IS the disarm — `_trendFinalTpArmed` derives from it.
@@ -596,7 +603,7 @@ class ReversalLadderStrategy extends TradingBase {
         return false;
       }
 
-      await this._buildLadders({ bullLevel: result.bullLevel, bearLevel: result.bearLevel, reason });
+      await this._applyLevels({ bullLevel: result.bullLevel, bearLevel: result.bearLevel, reason });
       this._levelPlanLastTs = null;   // succeeded: no throttle carried forward
       return true;
     } catch (err) {
@@ -1019,20 +1026,6 @@ class ReversalLadderStrategy extends TradingBase {
     await this.saveState();
     this._pushHeartbeatNow?.();
     return true;
-  }
-
-  /**
-   * Which side currently holds inventory, DERIVED from the leg ledger.
-   *
-   * Never stored. The legs are the WS-true record (`_fillLeg` books
-   * `leg.quantity` from the actual user-data fill), so this needs no network
-   * call and cannot go stale behind a failed REST refresh — unlike
-   * `currentSide`, which `_refreshCurrentPosition` leaves null on exactly the
-   * ticks it matters. Rule 2 resets the abandoned side to EMPTY before the new
-   * side fills, so at most one direction is ever open.
-   */
-  get heldSide() {
-    return this.ladderLines.find((l) => l.state === 'POSITION_OPEN')?.direction ?? null;
   }
 
   /**
@@ -1589,41 +1582,30 @@ class ReversalLadderStrategy extends TradingBase {
   }
 
   /**
-   * Restore ladder geometry from a persisted snapshot.
+   * Restore breakout geometry from a persisted snapshot.
    *
-   * This MUST come from the snapshot, not the constants. A cycle started at 8
-   * levels that resumed at 5 would rebuild a DIFFERENT ladder beneath its own
-   * filled legs — orphaning inventory and confusing _reconcileTrendInvariant,
-   * which derives TREND from "fully scaled". Snapshots written before geometry
-   * was configurable carry neither field; those legitimately default.
-   *
-   * Validation is delegated to resolveLadderGeometry — the SAME single
-   * definition of "valid geometry" that start() and the HTTP route use (see
-   * its docstring in ladder-levels.js). Its `?? DEFAULT` fallback covers the
-   * genuinely-absent (null/undefined) case, i.e. a legacy pre-geometry
-   * snapshot. A field that is PRESENT but fails the bounds/type check (e.g.
-   * corrupted Firestore data, a hand-edited doc, 0, NaN, a numeric string) is
-   * NOT the same as absent — silently coercing it to the default would read
-   * "unknown" as "safe" and rebuild a ladder that may not match whatever is
-   * actually open on the exchange for this cycle. That is exactly the
-   * silent-fail-open shape this codebase forbids (see CLAUDE.md), so this
-   * throws instead: resume() has no surrounding try/catch around this call,
-   * so the throw rejects the resume() promise, and app.js's
-   * recoverActiveStrategies() already treats a rejected resume() as a hard
-   * recovery failure — isRunning:false + criticalError persisted, strategy
-   * NOT added to activeStrategies — rather than silently running with the
-   * wrong ladder.
+   * This MUST come from the snapshot, not the constant. A cycle started at 2%
+   * that resumed at the 1% default would arm entry levels the cycle never
+   * agreed to. Validation is delegated to resolveBreakoutGeometry — the SAME
+   * single definition of "valid geometry" that start() and the HTTP route use
+   * (see its docstring in breakout-levels.js). Its `?? DEFAULT` fallback covers
+   * the genuinely-absent (null/undefined) case only; a PRESENT-but-invalid
+   * value (corrupted Firestore data, a hand-edited doc, 0, NaN, a numeric
+   * string) is NOT the same as absent — silently coercing it to the default
+   * would read "unknown" as "safe". That is exactly the silent-fail-open shape
+   * this codebase forbids (see CLAUDE.md), so this throws instead: resume()
+   * has no surrounding try/catch around this call, so the throw rejects the
+   * resume() promise, and app.js's recoverActiveStrategies() already treats a
+   * rejected resume() as a hard recovery failure — isRunning:false +
+   * criticalError persisted, strategy NOT added to activeStrategies — rather
+   * than silently running with the wrong geometry.
    */
   _applySnapshotGeometry(snapshot = {}) {
-    const geometry = resolveLadderGeometry({
-      ladderStepPct: snapshot.stepPct,
-      ladderLevelsPerSide: snapshot.levelsPerSide,
-    });
+    const geometry = resolveBreakoutGeometry({ breakoutPct: snapshot.config?.breakoutPct ?? snapshot.breakoutPct });
     if (!geometry.ok) {
-      throw new Error(`ReversalLadderStrategy.resume: invalid persisted geometry — ${geometry.error}`);
+      throw new Error(`[RECOVERY] ${geometry.error}`);
     }
-    this.stepPct = geometry.stepPct;
-    this.levelsPerSide = geometry.levelsPerSide;
+    this.breakoutPct = geometry.breakoutPct;
   }
 
   /**
@@ -1641,6 +1623,19 @@ class ReversalLadderStrategy extends TradingBase {
    *   - Reconcile current position from Binance (source of truth)
    */
   async resume(snapshot) {
+    // MIGRATION GUARD. The strategyId prefix is unchanged, so boot recovery will
+    // hand this code pre-breakout ladder snapshots. An incompatible snapshot is
+    // UNKNOWN state and must not read as safe: resuming one would restore a
+    // rung ledger this class no longer has, leaving any open position untracked.
+    if (Array.isArray(snapshot?.ladderLines) || snapshot?.breakoutPct == null) {
+      const msg =
+        `[RECOVERY] REFUSING to resume ${snapshot?.strategyId ?? 'strategy'}: the saved state predates the ` +
+        `breakout redesign (ladderLines present or breakoutPct missing). It must be stopped and restarted manually. ` +
+        `Any position it holds is STILL OPEN on Binance and is NOT being tracked.`;
+      await this.addLog(msg);
+      throw new Error(msg);
+    }
+
     if (!snapshot) throw new Error('ReversalLadderStrategy.resume: missing snapshot');
 
     // Restore identifiers FIRST so addLog writes under the correct strategyId.
@@ -1690,6 +1685,13 @@ class ReversalLadderStrategy extends TradingBase {
     this._ladderBaseSize = snapshot.ladderBaseSize || this.currentInitialSize; // grown ladder base survives restarts (else ladder shrinks to initial)
     this._lastLadderSize = snapshot._lastLadderSize ?? null;
     this._applySnapshotGeometry(snapshot);
+    // Entry levels are DERIVED, never persisted (see _deriveBreakoutLevels).
+    // Recompute now that both the pair and breakoutPct are restored. Guarded:
+    // a strategy resumed before its first tick ever planned a pair has null
+    // levels, and deriveBreakoutLevels throws on a null input.
+    if (this.bullLevel != null && this.bearLevel != null) {
+      this._deriveBreakoutLevels();
+    }
 
     // Restore cycle state
     this.currentSide = snapshot.currentSide || null;
@@ -2774,42 +2776,28 @@ class ReversalLadderStrategy extends TradingBase {
       throw invalidInput(`bullLevel (${this._formatPrice(nextBull)}) must be above bearLevel (${this._formatPrice(nextBear)}).`);
     }
 
-    const held = (dir) => this.ladderLines.some((l) => l.direction === dir && l.state === 'POSITION_OPEN');
-    if (movingBull && held('LONG')) {
-      throw new Error('The bull ladder has a filled leg — close the position before moving that level.');
+    if (movingBull && this.openLeg?.direction === 'LONG') {
+      throw new Error('A LONG position is open — close it before moving the bull level.');
     }
-    if (movingBear && held('SHORT')) {
-      throw new Error('The bear ladder has a filled leg — close the position before moving that level.');
+    if (movingBear && this.openLeg?.direction === 'SHORT') {
+      throw new Error('A SHORT position is open — close it before moving the bear level.');
     }
     if (!movingBull && !movingBear) {
       return { bullLevel: this.bullLevel, bearLevel: this.bearLevel, changed: false };
     }
 
-    // Rebuild ONLY the moved side, preserving the other side's legs verbatim —
-    // the untouched ladder may hold inventory, and buildReversalLadder returns
-    // fresh EMPTY legs for both sides.
-    const rebuilt = buildReversalLadder(nextBull, nextBear, this.stepPct, this.levelsPerSide);
-    this.ladderLines = this.ladderLines.map((leg) => {
-      const moving = leg.direction === 'LONG' ? movingBull : movingBear;
-      if (!moving) return leg;
-      return rebuilt.find((r) => r.direction === leg.direction && r.index === leg.index) ?? leg;
-    });
     this.bullLevel = nextBull;
     this.bearLevel = nextBear;
+    this._deriveBreakoutLevels();
 
-    // Carry-forward 3: the band just moved. The ratchet's stored value may now
-    // sit outside it, where Math.max/Math.min would let it win forever and the
-    // cap that keeps the exit out of the ladder would be silently dead.
-    if (Number.isFinite(this.trailExit)) {
-      this.trailExit = Math.min(this.bullLevel, Math.max(this.bearLevel, this.trailExit));
-    }
-    if (this.trailEnabled && this.ladderMode === 'TREND') {
-      // The distance is measured against the levels, so a moved level changes
-      // it. Re-arm from the current trend start rather than keeping a distance
-      // derived from a band that no longer exists.
-      const d = trailDistance(this.trendStartPrice, this.trendDirection, this.bullLevel, this.bearLevel);
-      this.trailDistanceValue = (d != null && d > 0) ? d : null;
-      if (this.trailDistanceValue == null) this.trailExit = null;
+    // Carry-forward: the band just moved, so a stored ratchet value may now sit
+    // on the wrong side of its floor. Pull it back rather than letting a stale
+    // value win forever. The distance itself is re-derived by _armTrail, which
+    // Task 6 owns.
+    if (this.openLeg && Number.isFinite(this.trailExit)) {
+      this.trailExit = this.openLeg.direction === 'LONG'
+        ? Math.max(this.bullLevel, this.trailExit)
+        : Math.min(this.bearLevel, this.trailExit);
     }
 
     await this.addLog(
@@ -3526,23 +3514,20 @@ class ReversalLadderStrategy extends TradingBase {
       aiCostUSD: this.aiCostUSD ?? 0,
       aiModel: this.aiModel,
 
-      // Ladder state — the frontend's status/chart view renders these
-      // directly. `mode` is the alias the frontend actually reads
-      // (status.mode, not status.ladderMode).
-      mode: this.ladderMode,         // the frontend reads status.mode, not ladderMode
+      // Breakout state — the frontend's status/chart view renders these
+      // directly.
+      breakoutPct: this.breakoutPct,
+      bullBreakout: this.bullBreakout,
+      bearBreakout: this.bearBreakout,
+      openLeg: this.openLeg,
+      heldSide: this.heldSide,
       bullLevel: this.bullLevel,
       bearLevel: this.bearLevel,
-      ladderLines: this.ladderLines,
-      trendDirection: this.trendDirection,
-      levelsPerSide: this.levelsPerSide,
-      stepPct: this.stepPct,
-      legNotional: this._legNotional(),
       ladderBaseSize: this._ladderBaseSize,
       // Trailing exit (§7).
       trailEnabled: this.trailEnabled ?? false,
       trailDistanceValue: this.trailDistanceValue ?? null,
       trailExit: this.trailExit ?? null,
-      trendStartPrice: this.trendStartPrice ?? null,
       // Running config — surfaced so the frontend's Active Config panel
       // can show the values the bot is ACTUALLY using rather than the
       // form's DEFAULT_CONFIG (which is what reversal's frontend used
