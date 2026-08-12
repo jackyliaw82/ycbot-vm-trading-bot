@@ -820,3 +820,419 @@ test('both status channels emit stopOutCount', () => {
   assert.equal(s.getStatus().stopOutCount, 4, 'getStatus must carry it');
   assert.equal(s.getHeartbeatPayload().stopOutCount, 4, 'the WS payload must agree with getStatus');
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// The six user-facing (button-driven) methods below have zero prior
+// coverage. Four had their internals rewritten by the ladder->breakout
+// migration (editLevels, setTrailEnabled, adjustProfitTarget/adjustFinalTp
+// via _recomputeFinalTpPrice). Contracts here are read directly from the
+// source, not guessed from the method name — see the class-body comments
+// this file cross-references.
+// ═══════════════════════════════════════════════════════════════════════
+
+// ——— editLevels (§3, §10) — the most-rewritten method in the file ————————
+
+function heldLong(s, { bull = 100, bear = 98, fillPrice = 101.5 } = {}) {
+  s.bullLevel = bull;
+  s.bearLevel = bear;
+  s._deriveBreakoutLevels();
+  s.openLeg = { direction: 'LONG', quantity: 2, fillPrice, openedAt: fillPrice };
+  s.activePosition = { quantity: 2, entryPrice: fillPrice, notional: fillPrice * 2, unrealizedPnl: 0 };
+  s.currentSide = 'LONG';
+  return s;
+}
+
+function heldShort(s, { bull = 100, bear = 98, fillPrice = 96.5 } = {}) {
+  s.bullLevel = bull;
+  s.bearLevel = bear;
+  s._deriveBreakoutLevels();
+  s.openLeg = { direction: 'SHORT', quantity: 2, fillPrice, openedAt: fillPrice };
+  s.activePosition = { quantity: 2, entryPrice: fillPrice, notional: fillPrice * 2, unrealizedPnl: 0 };
+  s.currentSide = 'SHORT';
+  return s;
+}
+
+test('editLevels refuses to move bullLevel while a LONG holds inventory (guard reads openLeg)', async () => {
+  const s = heldLong(breakoutStrategy());
+  await assert.rejects(
+    () => s.editLevels({ bullLevel: 105 }),
+    /LONG position is open/,
+  );
+  assert.equal(s.bullLevel, 100, 'the level must not have moved');
+});
+
+test('editLevels refuses to move bearLevel while a SHORT holds inventory (mirror)', async () => {
+  const s = heldShort(breakoutStrategy());
+  await assert.rejects(
+    () => s.editLevels({ bearLevel: 90 }),
+    /SHORT position is open/,
+  );
+  assert.equal(s.bearLevel, 98, 'the level must not have moved');
+});
+
+test('editLevels PERMITS moving the other side while holding', async () => {
+  const s = heldLong(breakoutStrategy());
+  const result = await s.editLevels({ bearLevel: 90 });
+  assert.equal(result.changed, true);
+  assert.equal(s.bearLevel, 90);
+  assert.equal(s.bullLevel, 100, 'the held side is untouched');
+});
+
+test('editLevels re-derives both breakout levels after a successful change', async () => {
+  const s = breakoutStrategy(); // flat — either side may move
+  const result = await s.editLevels({ bullLevel: 105 });
+  assert.equal(result.changed, true);
+  near(s.bullBreakout, 105 * 1.015, 'bullBreakout must reflect the new bullLevel');
+  near(s.bearBreakout, 98 * 0.985, 'bearBreakout is re-derived too (unchanged value, but recomputed)');
+});
+
+test('editLevels trail carry-forward pulls a stale LONG trailExit back up to the new floor', async () => {
+  const s = heldLong(breakoutStrategy());
+  s.trailExit = 95; // stale — below bullLevel (100), the LONG floor
+  await s.editLevels({ bearLevel: 90 }); // permitted: the other side moves, bullLevel (the floor) stays 100
+  assert.equal(s.trailExit, 100, 'a trailExit below the floor must be pulled back up to it');
+});
+
+test('editLevels trail carry-forward pulls a stale SHORT trailExit back down to the new floor (mirror)', async () => {
+  const s = heldShort(breakoutStrategy());
+  s.trailExit = 99; // stale — above bearLevel (98), the SHORT floor
+  await s.editLevels({ bullLevel: 110 }); // permitted: the other side moves, bearLevel (the floor) stays 98
+  assert.equal(s.trailExit, 98, 'a trailExit above the floor must be pulled back down to it');
+});
+
+test('editLevels reports no change when the call moves neither level', async () => {
+  const s = breakoutStrategy(); // bull 100 / bear 98
+  const result = await s.editLevels({ bullLevel: 100, bearLevel: 98 });
+  assert.deepEqual(result, { bullLevel: 100, bearLevel: 98, changed: false });
+});
+
+test('editLevels requires at least one of bullLevel/bearLevel (invalidInput, 400-shaped)', async () => {
+  const s = breakoutStrategy();
+  await assert.rejects(
+    () => s.editLevels({}),
+    (err) => { assert.match(err.message, /Supply bullLevel, bearLevel, or both/); assert.equal(err.invalidInput, true); return true; },
+  );
+});
+
+test('editLevels rejects a bullLevel at or below the current price (invalidInput)', async () => {
+  const s = breakoutStrategy(); // currentPrice 99
+  await assert.rejects(
+    () => s.editLevels({ bullLevel: 95 }),
+    (err) => { assert.match(err.message, /bullLevel must be above the current price/); assert.equal(err.invalidInput, true); return true; },
+  );
+});
+
+test('editLevels rejects a bearLevel at or above the current price (invalidInput)', async () => {
+  const s = breakoutStrategy(); // currentPrice 99
+  await assert.rejects(
+    () => s.editLevels({ bearLevel: 100 }),
+    (err) => { assert.match(err.message, /bearLevel must be below the current price/); assert.equal(err.invalidInput, true); return true; },
+  );
+});
+
+test('editLevels refuses to run when the strategy is not running (untagged, 409-shaped)', async () => {
+  const s = breakoutStrategy();
+  s.isRunning = false;
+  await assert.rejects(
+    () => s.editLevels({ bullLevel: 105 }),
+    (err) => { assert.match(err.message, /not running/); assert.equal(err.invalidInput, undefined); return true; },
+  );
+});
+
+test('editLevels refuses to validate without a live price (untagged, distinct from invalidInput)', async () => {
+  const s = breakoutStrategy();
+  s.currentPrice = NaN;
+  await assert.rejects(
+    () => s.editLevels({ bullLevel: 105 }),
+    (err) => { assert.match(err.message, /No live price yet/); assert.equal(err.invalidInput, undefined); return true; },
+  );
+});
+
+// ——— setTrailEnabled — strict boolean, unified stop/trail mechanism ——————
+
+test('setTrailEnabled rejects a non-boolean rather than coercing it', async () => {
+  const s = breakoutStrategy();
+  await assert.rejects(
+    () => s.setTrailEnabled(1),
+    (err) => { assert.match(err.message, /must be true or false/); assert.equal(err.invalidInput, true); return true; },
+  );
+  await assert.rejects(() => s.setTrailEnabled('true'), /must be true or false/);
+});
+
+test('setTrailEnabled refuses to run when the strategy is not running', async () => {
+  const s = breakoutStrategy();
+  s.isRunning = false;
+  await assert.rejects(() => s.setTrailEnabled(true), /not running/);
+});
+
+test('setTrailEnabled(true) while holding arms the trail: distance set, exit starts at the held side\'s exit level', async () => {
+  const s = heldLong(breakoutStrategy(), { fillPrice: 101.5 }); // fillPrice == bullBreakout exactly
+  const result = await s.setTrailEnabled(true);
+  assert.equal(result.trailEnabled, true);
+  near(s.trailDistanceValue, 1.5, 'distance = bullBreakout - bullLevel');
+  near(s.trailExit, 100, 'starts exactly at bullLevel — the LONG exit level');
+});
+
+test('setTrailEnabled(true) while flat arms nothing', async () => {
+  const s = breakoutStrategy();
+  s.openLeg = null;
+  const result = await s.setTrailEnabled(true);
+  assert.equal(result.trailEnabled, true, 'the toggle itself still flips');
+  assert.equal(s.trailDistanceValue, null, 'nothing to arm without a held side');
+  assert.equal(result.trailExit, null);
+});
+
+test('setTrailEnabled(false) still leaves the stop pinned at bullLevel — the unified mechanism must not silently disarm the only stop', async () => {
+  const s = heldLong(breakoutStrategy(), { fillPrice: 101.5 });
+  await s.setTrailEnabled(true);
+  // simulate the ratchet having moved
+  s.trailExit = 105;
+
+  const result = await s.setTrailEnabled(false);
+  assert.equal(result.trailEnabled, false);
+  // _clearTrail nulls the stored ratchet — but the stop check below proves
+  // the mechanism is still live: it recomputes the pinned level from
+  // bullLevel on the next check, it does not depend on the stored value.
+  assert.equal(s.trailExit, null, 'the stored ratchet is cleared');
+
+  const hit = s._updateTrailAndCheckHit(99.9); // below bullLevel (100)
+  assert.equal(hit, true, 'the stop must still fire — turning trailing off must not remove the only stop');
+  assert.equal(s.trailExit, 100, 'the pinned stop is bullLevel itself');
+});
+
+test('setTrailEnabled(false) mirrors for a held SHORT — the stop stays pinned at bearLevel', async () => {
+  const s = heldShort(breakoutStrategy(), { fillPrice: 96.5 });
+  await s.setTrailEnabled(true);
+  s.trailExit = 93; // simulate a ratchet
+  await s.setTrailEnabled(false);
+  const hit = s._updateTrailAndCheckHit(98.1); // above bearLevel (98)
+  assert.equal(hit, true, 'the stop must still fire for the SHORT side too');
+  assert.equal(s.trailExit, 98);
+});
+
+// ——— adjustProfitTarget — routes through _recomputeFinalTpPrice(heldSide) ——
+
+test('adjustProfitTarget moves the target and re-derives finalTpPrice off heldSide', async () => {
+  const s = heldLong(breakoutStrategy(), { fillPrice: 101.5 });
+  s.initialCapital = 1000;
+  const result = await s.adjustProfitTarget({ desiredProfitPercent: 5 });
+  assert.equal(result.desiredProfitUSDT, 50, '5% of initialCapital 1000');
+  near(s.finalTpPrice, 126.5812, 'entry 101.5 + (0 accLoss + 50 desiredProfit + 0.1624 fee) / 2 qty');
+});
+
+test('adjustProfitTarget enforces the documented bounds (0, 100] rather than silently accepting', async () => {
+  const s = heldLong(breakoutStrategy());
+  await assert.rejects(() => s.adjustProfitTarget({ desiredProfitPercent: 0 }), /Invalid desiredProfitPercent/);
+  await assert.rejects(() => s.adjustProfitTarget({ desiredProfitPercent: 101 }), /Invalid desiredProfitPercent/);
+  await assert.rejects(() => s.adjustProfitTarget({ desiredProfitPercent: -5 }), /Invalid desiredProfitPercent/);
+  await assert.rejects(() => s.adjustProfitTarget({ desiredProfitPercent: 'not-a-number' }), /Invalid desiredProfitPercent/);
+});
+
+test('adjustProfitTarget refuses to run when the strategy is not running', async () => {
+  const s = breakoutStrategy();
+  s.isRunning = false;
+  await assert.rejects(() => s.adjustProfitTarget({ desiredProfitPercent: 5 }), /not running/);
+});
+
+test('adjustProfitTarget while flat succeeds but finalTpPrice stays null (no position to derive it from)', async () => {
+  const s = breakoutStrategy(); // openLeg/activePosition both null
+  s.initialCapital = 1000;
+  const result = await s.adjustProfitTarget({ desiredProfitPercent: 5 });
+  assert.equal(result.desiredProfitUSDT, 50, 'the target itself is still recorded while flat');
+  assert.equal(s.finalTpPrice, null, '_recomputeFinalTpPrice requires a verified position; none exists');
+});
+
+// PIN, not fix: `Number(desiredProfitPercent)` coerces — a numeric STRING is
+// accepted here, unlike the STRICT breakoutPct validator elsewhere in this
+// file (resolveBreakoutGeometry). Reported as a concern, not changed.
+test('adjustProfitTarget COERCES a numeric string rather than rejecting it (pin, see report)', async () => {
+  const s = heldLong(breakoutStrategy());
+  s.initialCapital = 1000;
+  const result = await s.adjustProfitTarget({ desiredProfitPercent: '5' });
+  assert.equal(result.desiredProfitPercent, 5, 'Number("5") coerces cleanly — no rejection');
+});
+
+// ——— adjustFinalTp — profitUSDT / price / reset, all floor-gated ——————————
+
+test('adjustFinalTp(profitUSDT) moves the target and re-derives finalTpPrice', async () => {
+  const s = heldLong(breakoutStrategy(), { fillPrice: 101.5 });
+  s.minDesiredProfitUSDT = 20;
+  const result = await s.adjustFinalTp({ profitUSDT: 25 });
+  assert.equal(result.desiredProfitUSDT, 25);
+  near(s.finalTpPrice, 114.0812, 'entry 101.5 + (0 accLoss + 25 desiredProfit + 0.1624 fee) / 2 qty');
+});
+
+test('adjustFinalTp(profitUSDT) enforces the config floor — rejects rather than clamping', async () => {
+  const s = heldLong(breakoutStrategy());
+  s.minDesiredProfitUSDT = 20;
+  await assert.rejects(
+    () => s.adjustFinalTp({ profitUSDT: 10 }),
+    (err) => { assert.match(err.message, /below the.*20.*target set in the config/s); assert.equal(err.invalidInput, true); return true; },
+  );
+  assert.equal(s.desiredProfitUSDT, 0, 'a rejected edit must not have moved the target');
+});
+
+test('adjustFinalTp(price) moves the target by back-solving desiredProfitUSDT from the level', async () => {
+  const s = heldLong(breakoutStrategy(), { fillPrice: 101.5 });
+  s.minDesiredProfitUSDT = 20;
+  const result = await s.adjustFinalTp({ price: 115 });
+  near(result.desiredProfitUSDT, 26.8376, 'gain (115-101.5)*2 - 0.1624 fee, back-solved from price 115');
+  near(s.finalTpPrice, 115, 'back-solving must round-trip to the level that was submitted');
+});
+
+test('adjustFinalTp(price) enforces the config floor on the PROJECTED profit, not the raw price', async () => {
+  const s = heldLong(breakoutStrategy(), { fillPrice: 101.5 });
+  s.minDesiredProfitUSDT = 20;
+  await assert.rejects(
+    () => s.adjustFinalTp({ price: 105 }), // projects ~6.84 USDT — below the 20 floor
+    (err) => { assert.match(err.message, /below the/); assert.equal(err.invalidInput, true); return true; },
+  );
+});
+
+test('adjustFinalTp(price) refuses while flat — no verified position to derive a level from', async () => {
+  const s = breakoutStrategy();
+  await assert.rejects(
+    () => s.adjustFinalTp({ price: 115 }),
+    /no verified open position/,
+  );
+});
+
+test('adjustFinalTp(profitUSDT) succeeds while flat but leaves finalTpPrice null ("applies once a position opens")', async () => {
+  const s = breakoutStrategy();
+  s.minDesiredProfitUSDT = 20;
+  const result = await s.adjustFinalTp({ profitUSDT: 25 });
+  assert.equal(result.desiredProfitUSDT, 25, 'the profitUSDT path does not require a position');
+  assert.equal(s.finalTpPrice, null);
+});
+
+test('adjustFinalTp(reset) returns to the config-derived (minDesiredProfitUSDT) target', async () => {
+  const s = heldLong(breakoutStrategy(), { fillPrice: 101.5 });
+  s.minDesiredProfitUSDT = 20;
+  s.desiredProfitUSDT = 999; // simulate a prior manual edit
+  const result = await s.adjustFinalTp({ reset: true });
+  assert.equal(result.reset, true);
+  assert.equal(s.desiredProfitUSDT, 20, 'reset returns exactly to the config floor');
+  near(s.finalTpPrice, 111.5812, 'entry 101.5 + (0 accLoss + 20 floor + 0.1624 fee) / 2 qty');
+});
+
+test('adjustFinalTp refuses to run when the strategy is not running', async () => {
+  const s = breakoutStrategy();
+  s.isRunning = false;
+  await assert.rejects(() => s.adjustFinalTp({ reset: true }), /not running/);
+});
+
+// ——— harvestNow — manual latch vs. armed Trigger Price ——————————————————
+
+test('harvestNow() with no price sets the manual latch and clears any previously-armed trigger', async () => {
+  const s = breakoutStrategy();
+  s.harvestTriggerPrice = 105; // simulate a previously-armed trigger
+  s.harvestTriggerAbove = true;
+  s.harvestTriggerAction = 'stop';
+
+  const result = await s.harvestNow();
+
+  assert.deepEqual(result, { harvesting: true, queued: true, price: 99 });
+  assert.equal(s._manualHarvestRequested, true);
+  assert.equal(s.harvestTriggerPrice, null, 'an immediate harvest supersedes a pending trigger');
+  assert.equal(s.harvestTriggerAbove, null);
+  assert.equal(s.harvestTriggerAction, 'reanchor');
+});
+
+test('harvestNow(triggerPrice) validates the price is a positive number (invalidInput)', async () => {
+  const s = breakoutStrategy();
+  await assert.rejects(
+    () => s.harvestNow(-5),
+    (err) => { assert.match(err.message, /positive number/); assert.equal(err.invalidInput, true); return true; },
+  );
+  await assert.rejects(() => s.harvestNow(0), /positive number/);
+});
+
+test('harvestNow(triggerPrice) rounds the armed price to tick size, not the raw input', async () => {
+  const s = breakoutStrategy();
+  s.roundPrice = (p) => Math.round(p * 2) / 2; // simulated tick size of 0.5
+  const result = await s.harvestNow(101.23); // currentPrice is 99
+  assert.equal(result.triggerPrice, 101, 'rounded to the nearest 0.5, not the raw 101.23');
+  assert.equal(s.harvestTriggerPrice, 101);
+});
+
+test('harvestNow(triggerPrice) enforces the documented minimum 0.1% gap from the current price', async () => {
+  const s = breakoutStrategy(); // currentPrice 99
+  await assert.rejects(
+    () => s.harvestNow(99.05), // 0.05 away — below 99 * 0.1% = 0.099
+    (err) => { assert.match(err.message, /at least 0\.1% from the current price/); assert.equal(err.invalidInput, true); return true; },
+  );
+  assert.equal(s.harvestTriggerPrice, null, 'a rejected arm must not have armed anything');
+});
+
+test('harvestNow(triggerPrice) accepts a price clearing the gap and records above/below correctly', async () => {
+  const s = breakoutStrategy(); // currentPrice 99
+  const above = await s.harvestNow(150);
+  assert.equal(above.above, true);
+  const below = await s.harvestNow(50);
+  assert.equal(below.above, false);
+});
+
+test('harvestNow distinguishes action "stop" from "reanchor"', async () => {
+  const s = breakoutStrategy();
+  const stopResult = await s.harvestNow(150, { action: 'stop' });
+  assert.equal(stopResult.action, 'stop');
+  assert.equal(s.harvestTriggerAction, 'stop');
+
+  const reanchorResult = await s.harvestNow(150, { action: 'reanchor' });
+  assert.equal(reanchorResult.action, 'reanchor');
+  assert.equal(s.harvestTriggerAction, 'reanchor');
+});
+
+test('harvestNow rejects an unrecognised action rather than defaulting silently', async () => {
+  const s = breakoutStrategy();
+  await assert.rejects(
+    () => s.harvestNow(150, { action: 'flatten' }),
+    (err) => { assert.match(err.message, /must be 'reanchor' or 'stop'/); assert.equal(err.invalidInput, true); return true; },
+  );
+});
+
+test('harvestNow(triggerPrice) refuses to arm without a live price', async () => {
+  const s = breakoutStrategy();
+  s.currentPrice = NaN;
+  await assert.rejects(() => s.harvestNow(150), /No live price yet/);
+});
+
+test('harvestNow refuses to run when the strategy is not running', async () => {
+  const s = breakoutStrategy();
+  s.isRunning = false;
+  await assert.rejects(() => s.harvestNow(), /not running/);
+});
+
+// ——— cancelHarvestTrigger ——————————————————————————————————————————————
+
+test('cancelHarvestTrigger clears an armed trigger', async () => {
+  const s = breakoutStrategy();
+  await s.harvestNow(150, { action: 'stop' });
+  assert.ok(s.harvestTriggerPrice != null, 'sanity: a trigger is armed');
+
+  let saved = false;
+  s.saveState = async () => { saved = true; };
+  const result = await s.cancelHarvestTrigger();
+
+  assert.deepEqual(result, { cancelled: true });
+  assert.equal(s.harvestTriggerPrice, null);
+  assert.equal(s.harvestTriggerAbove, null);
+  assert.equal(s.harvestTriggerAction, 'reanchor');
+  assert.equal(saved, true, 'an actual cancellation persists');
+});
+
+// PIN, not fix: the method computes `had` (whether a trigger was actually
+// armed) but does NOT include it in the returned object — the return shape
+// is `{ cancelled: true }` in BOTH cases. See report for the concern this
+// raises for callers that want to know whether anything happened.
+test('cancelHarvestTrigger is a no-op when nothing is armed, but still reports {cancelled:true} (pin, see report)', async () => {
+  const s = breakoutStrategy();
+  assert.equal(s.harvestTriggerPrice, null, 'sanity: nothing armed');
+
+  let saved = false;
+  s.saveState = async () => { saved = true; };
+  const result = await s.cancelHarvestTrigger();
+
+  assert.deepEqual(result, { cancelled: true }, 'the return value does not distinguish "cleared something" from "no-op"');
+  assert.equal(saved, false, 'no persistence happens when nothing was armed — the ONLY observable difference is the side effects, not the return value');
+});
