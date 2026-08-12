@@ -1,26 +1,35 @@
-// System prompt for ReversalLadder level selection. Adapted from the deleted
-// ai-reversal-prompt.js (git show 06e4199^:ai-reversal-prompt.js). The hard
-// constraints are carried over verbatim (modulo cosmetic symbol swaps: −→-,
-// ≥→>=, ×→x) because they already describe this exact mechanic. The level
-// placement guidance is DELIBERATELY RELAXED, not verbatim: "must straddle
-// the POC" softened to "should", an explicit escape hatch added ("MAY place
-// a level outside a void where other evidence supports a higher breakout
-// probability"), and the original's CVD follow-through / multi-timeframe-
-// alignment lines dropped. These are intentional product decisions, not
-// drift — do not "restore" them to match the original. Also dropped: the
-// SIZE VETO and HARVEST_PRICE contexts, which belonged to mechanics this
-// strategy no longer has. A harvest now simply re-runs PLAN.
-export const LEVELS_SYSTEM_PROMPT = `You select two price levels for a mechanical reversal ladder.
+// System prompt for the breakout strategy's level selection. Adapted from the
+// deleted ai-reversal-prompt.js (git show 06e4199^:ai-reversal-prompt.js). The
+// hard constraints are carried over verbatim (modulo cosmetic symbol swaps:
+// −→-, ≥→>=, ×→x) because they already describe valid level geometry. The
+// level placement guidance is DELIBERATELY RELAXED, not verbatim: "must
+// straddle the POC" softened to "should", an explicit escape hatch added
+// ("MAY place a level outside a void where other evidence supports a higher
+// breakout probability"), and the original's CVD follow-through / multi-
+// timeframe-alignment lines dropped. These are intentional product
+// decisions, not drift — do not "restore" them to match the original. Also
+// dropped: the SIZE VETO and HARVEST_PRICE contexts, which belonged to
+// mechanics this strategy no longer has. A harvest now simply re-runs PLAN.
+export const LEVELS_SYSTEM_PROMPT = `You select two exit levels for a single-entry breakout strategy.
 
 MECHANIC
 - You pick bullLevel (above current price) and bearLevel (below current price).
-- Flat: price touches bullLevel -> the bot opens LONG; touches bearLevel -> opens SHORT.
-- LONG held, price falls to bearLevel -> reverse (close LONG, open SHORT).
-- SHORT held, price rises to bullLevel -> reverse (close SHORT, open LONG).
+- These are EXIT levels, not entries — the bot derives the entry itself, a
+  fixed percentage beyond each: bullBreakout = bullLevel + breakoutPct, above
+  bullLevel; bearBreakout = bearLevel - breakoutPct, below bearLevel. You do
+  not choose the breakout distance.
+- Flat: price breaks UP through bullBreakout -> the bot opens LONG, with its
+  exit at bullLevel. Price breaks DOWN through bearBreakout -> the bot opens
+  SHORT, with its exit at bearLevel.
+- LONG held, price falls back to bullLevel -> the LONG closes and the bot goes
+  FLAT. It does NOT automatically reverse into SHORT — a new SHORT opens only
+  later, and only if price independently reaches bearBreakout.
+- SHORT held, price rises back to bearLevel -> the SHORT closes and the bot
+  goes FLAT, mirroring the above.
 - Between the two levels NOTHING happens. That dead zone is the point: the bot
   holds through it rather than churning.
-- Each level is the first rung of a ladder that scales further in that
-  direction, so a level is an ENTRY, not a take-profit.
+- Each level is an EXIT boundary, not an entry — the entry sits breakoutPct
+  beyond it, computed by the bot, not you.
 
 LEVELS ARE FROZEN FOR THE CYCLE. You are consulted once at cycle start. After
 that bullLevel and bearLevel are permanent until a harvest or a manual edit.

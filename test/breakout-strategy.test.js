@@ -1,15 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ReversalLadderStrategy } from '../reversal-ladder-strategy.js';
+import { BreakoutStrategy } from '../breakout-strategy.js';
 import { BREAKOUT_PCT } from '../breakout-levels.js';
 
 // A strategy with levels set and nothing open. All I/O stubbed, so a tick
 // exercises only the dispatch. bull 100 / bear 98 with breakoutPct 1.5% puts
 // the entries at 101.5 and 96.53, and price parked at 99 sits inside the band.
 export function breakoutStrategy({ bull = 100, bear = 98, pct = 0.015, base = 1000 } = {}) {
-  const s = new ReversalLadderStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
+  const s = new BreakoutStrategy('http://proxy.invalid', 'test-profile', 'http://vm.invalid');
   s.isRunning = true;
-  s.strategyId = 'reversal_ladder_test';
+  s.strategyId = 'breakout_test';
   s.symbol = 'BTCUSDT';
   s.breakoutPct = pct;
   s.bullLevel = bull;
@@ -17,7 +17,7 @@ export function breakoutStrategy({ bull = 100, bear = 98, pct = 0.015, base = 10
   s.currentPrice = 99;
   s.lastProcessedPrice = 99;
   s.minNotional = 5;
-  s._ladderBaseSize = base;
+  s._positionBaseSize = base;
   s.currentInitialSize = base;
   s.initialCapital = base;
   s.openLeg = null;
@@ -32,7 +32,7 @@ export function breakoutStrategy({ bull = 100, bear = 98, pct = 0.015, base = 10
   s._refreshCurrentPosition = async () => {};
   s._postExecuteBookkeeping = async () => {};
   s._pushHeartbeatNow = () => {};
-  s._computeLadderBaseSize = async () => s._ladderBaseSize;
+  s._computePositionBaseSize = async () => s._positionBaseSize;
   s.roundPrice = (p) => p;              // no tick rounding in tests
   s.roundQuantity = (q) => q;
   s.trailEnabled = false;               // explicit: never depend on a constructor default
@@ -89,9 +89,8 @@ test('the default breakoutPct is applied when config omits it', () => {
 
 // resume() drives a lot of I/O (leverage/position-mode/exchange-info REST
 // calls, WS connections, funding polling, L3 reconcile, AI key lookup). None
-// of it is under test here, so stub it out — mirrors
-// test/reversal-ladder-strategy.test.js's stubResumeIO exactly, since resume()
-// itself is untouched infrastructure outside this task's scope.
+// of it is under test here, so stub it out — resume() itself is untouched
+// infrastructure outside this task's scope.
 function stubResumeIO(s) {
   s.setLeverage = async () => {};
   s.setPositionMode = async () => {};
@@ -128,7 +127,7 @@ test('a snapshot this class writes is a snapshot this class can read back', asyn
   // breakoutStrategy() stubs saveState for the OTHER tests in this file; this
   // test is specifically about persistence, so it calls the real prototype
   // method against a fake firestore.
-  await ReversalLadderStrategy.prototype.saveState.call(src);
+  await BreakoutStrategy.prototype.saveState.call(src);
 
   // The dead fields must actually be gone, not just falsy — a lingering key
   // set to undefined would still (wrongly) read as "present" to a loose check.
@@ -137,7 +136,7 @@ test('a snapshot this class writes is a snapshot this class can read back', asyn
   assert.equal(doc.breakoutPct, 0.02, 'breakoutPct must be written');
   assert.ok(!Array.isArray(doc.ladderLines), 'a fresh breakout doc carries no ladderLines');
 
-  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new BreakoutStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   // Must NOT throw: this is exactly the snapshot a healthy breakout strategy
   // persists, and the migration guard must accept its own output.
@@ -163,11 +162,11 @@ test('resume with an OPEN position restores openLeg/heldSide and refuses a secon
 
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await ReversalLadderStrategy.prototype.saveState.call(src);
+  await BreakoutStrategy.prototype.saveState.call(src);
 
   assert.deepEqual(doc.openLeg, src.openLeg, 'openLeg must be written to the persisted doc');
 
-  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new BreakoutStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   await assert.doesNotReject(() => dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' }));
   cleanupResumeTimers(dst);
@@ -203,9 +202,9 @@ test('resume discards a phantom openLeg when Binance is reachable and reports fl
 
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await ReversalLadderStrategy.prototype.saveState.call(src);
+  await BreakoutStrategy.prototype.saveState.call(src);
 
-  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new BreakoutStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   // Binance is reachable and the position is ACTUALLY closed.
   dst._refreshCurrentPosition = async () => {
@@ -228,9 +227,9 @@ test('resume KEEPS a persisted openLeg when the position refresh fails — unkno
 
   let doc = null;
   src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
-  await ReversalLadderStrategy.prototype.saveState.call(src);
+  await BreakoutStrategy.prototype.saveState.call(src);
 
-  const dst = stubResumeIO(new ReversalLadderStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  const dst = stubResumeIO(new BreakoutStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
   dst.addLog = async () => {};
   // Binance is UNREACHABLE — state is unknown, not flat.
   dst._refreshCurrentPosition = async () => { dst._lastPositionRefreshFailed = true; };
@@ -313,7 +312,7 @@ test('_closeQuantity returns 0 only when Binance was REACHABLE and said flat', (
 test('_openPosition records the ACTUAL fill, never the requested quantity', async () => {
   const s = breakoutStrategy();
   let placed = null;
-  s._ladderBaseSize = 1000;
+  s._positionBaseSize = 1000;
   s._quantityFor = async () => 10;
   s.placeMarketOrder = async (symbol, side, qty) => { placed = { symbol, side, qty }; return { orderId: 7 }; };
   // _resolveFill returns { filledQty, fillPrice, source } — see line 633.
@@ -365,8 +364,8 @@ test('_postExecuteBookkeeping retries the position refresh for a fresh OPEN, not
   // _writeStrategyFlow / addLog / _pushHeartbeatNow.
   s._writeMetricsSample = async () => {};
 
-  await ReversalLadderStrategy.prototype._postExecuteBookkeeping.call(s, 'OPEN_BREAKOUT', {});
-  await ReversalLadderStrategy.prototype._postExecuteBookkeeping.call(s, 'STOP_OUT', {});
+  await BreakoutStrategy.prototype._postExecuteBookkeeping.call(s, 'OPEN_BREAKOUT', {});
+  await BreakoutStrategy.prototype._postExecuteBookkeeping.call(s, 'STOP_OUT', {});
 
   assert.deepEqual(expectNonEmptyCalls, [true, false],
     'OPEN_BREAKOUT must retry against Binance REST lag; a close must not');

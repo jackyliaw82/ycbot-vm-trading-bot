@@ -4,8 +4,9 @@
 // Volume Analytics panel now.
 //
 // NOT display-only. Every fetcher in this file ALSO feeds
-// buildLevelContext -> planLevels (level-planner.js) for the ReversalLadder,
-// which turns these values into real entry-order levels — a trading path.
+// buildLevelContext -> planLevels (level-planner.js) for the breakout
+// strategy, which turns these values into real bullLevel/bearLevel exits
+// (entries are DERIVED from them via breakoutPct) — a trading path.
 // "Best effort: log and return the last snapshot (or null) rather than
 // throw" is still the right default (a Binance hiccup must not crash a cycle
 // start), but it is no longer an AUTOMATICALLY SAFE default the way it was
@@ -153,7 +154,7 @@ function staleCacheOrNull(cached, ttlMs, now, multiplier = STALE_CACHE_MULTIPLIE
 /**
  * MarketMetrics — market-data fetchers, keyed by symbol. Feeds BOTH the
  * frontend's display-only Volume Analytics panel AND buildLevelContext ->
- * planLevels for the ReversalLadder (a trading path) — see the file header.
+ * planLevels for the breakout strategy (a trading path) — see the file header.
  * `strategy` supplies makeProxyRequest + currentPrice — the same duck-typed
  * surface VolumeProfile takes; this class does not invent a new transport.
  */

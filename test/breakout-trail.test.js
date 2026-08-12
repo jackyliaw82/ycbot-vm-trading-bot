@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { trailDistance, trailExitLevel } from '../reversal-trail.js';
+import { trailDistance, trailExitLevel } from '../breakout-trail.js';
 
 // bull 104000 / bear 100000, breakoutPct 1% -> entries at 105040 and 99000.
 const LEVELS = { bullLevel: 104000, bearLevel: 100000, bullBreakout: 105040, bearBreakout: 99000 };

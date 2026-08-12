@@ -202,7 +202,7 @@ class TradingBase {
     // status FILLED — i.e. every partial of a multi-fill market order has
     // landed and folded into accumulatedRealizedPnL/accumulatedTradingFees.
     // _waitForOrderFillConfirmation gates on this so callers that size off a
-    // just-closed leg (reversal recovery sizing) never read a partial accLoss.
+    // just-closed leg (recovery sizing after a stop-out) never read a partial accLoss.
     this._wsFullyFilledOrderIds = new Map(); // orderId → timestamp
     // Per-order fill summary from the user-data WS (avg fill price + total
     // filled qty), so callers can reconcile position state from the ACTUAL
@@ -332,7 +332,7 @@ class TradingBase {
       // changed from this fill. Without this push, frontend would see
       // stale accumulators until the next 30s safety-net heartbeat.
       // Hook is optional — strategies that implement _pushHeartbeatNow
-      // (ReversalLadderStrategy) opt in; others no-op.
+      // (BreakoutStrategy) opt in; others no-op.
       if (typeof this._pushHeartbeatNow === 'function') {
         try { this._pushHeartbeatNow(); } catch (_) { /* non-fatal */ }
       }
@@ -1147,7 +1147,7 @@ class TradingBase {
         // notional check so sub-minNotional residue can still be closed.
         // ONE-WAY mode only (Binance rejects reduceOnly in HEDGE mode;
         // hedge closes use positionSide=LONG/SHORT which encodes direction).
-        // The ladder's close paths (_closeConsolidated, used by every
+        // The strategy's close paths (_closeConsolidated, used by every
         // flatten/harvest/Final-TP close) pass reduceOnly=true.
         if (options.reduceOnly) orderParams.reduceOnly = 'true';
         const result = await this.makeProxyRequest('/fapi/v1/order', 'POST', orderParams, true, 'futures');
@@ -2272,7 +2272,7 @@ class TradingBase {
    *   2. A market order that fills across MANY partials emits a TRADE (and
    *      thus _wsHandledOrderIds) on the FIRST partial — waiting on that marker
    *      returned true with only a fraction of the realized PnL/fee folded into
-   *      the accumulators, so reversal recovery sizing under-read accLoss and
+   *      the accumulators, so stop-out recovery sizing under-read accLoss and
    *      under-sized the recovery leg. Gating on FILLED guarantees every
    *      partial has landed before we proceed.
    *

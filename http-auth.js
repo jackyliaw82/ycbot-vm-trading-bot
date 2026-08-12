@@ -168,7 +168,7 @@ export function isAllowedVmUser(uid, ownerUid) {
  * Each user gets a dedicated VM, but every VM is publicly addressable via its
  * per-user A record (https://vm-user-<uid>.vm.ycbot.trade). httpAuthMiddleware
  * proves WHO the caller is; it never checks WHOSE VM is being called. Without
- * this guard any authenticated user can POST /reversal-ladder/start to another
+ * this guard any authenticated user can POST /breakout/start to another
  * user's VM with their own credentials in the body. That trades the caller's
  * OWN account (no fund breach), but it strands a live instance on a foreign VM
  * while the strategy doc carries the caller's uid — so the caller's own VM
