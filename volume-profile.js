@@ -1,14 +1,14 @@
 // 24h volume profile — the ONLY survivor of ai-market-context.js.
 // Two roles: (1) chart histogram outputs (binVolumes/priceMin/binWidth/vah/val/
 // hvns/lvns) for the frontend overlay, and (2) the rangeVoids/getVoidProfile
-// path used for ReversalLadder strategy level selection (see selectVoidPair).
+// path used for the breakout strategy's level selection (see selectVoidPair).
 
 const VP_CACHE_TTL_MS = 10 * 60 * 1000;      // 10 min volume profile cache
 const CANDLE_CACHE_TTL_MS = 5 * 60 * 1000;   // 5 min candle cache — shared by every WINDOWS interval (1m/5m/1h)
 const VP_24H_1M_BARS = 1440;                 // 1m × 1440 = 24h (fine profile source)
 const VP_BIN_COUNT_24H = 200;                // 24h profile bins — supported by 1m data
 
-// Widen chain for ReversalLadder level selection. Tried in order until a void
+// Widen chain for the breakout strategy's level selection. Tried in order until a void
 // pair straddles live price. WIDENING, never shifting the window back: a
 // shifted window can sit entirely on one side of current price and yield no
 // valid level at all, whereas a wider window always contains the last 24h.
@@ -26,7 +26,7 @@ const HVN_STRENGTH_FRAC = 0.05;              // HVN peak window = ±5% of bins (
 const LVN_STRENGTH_FRAC = 0.075;             // LVN valley window = ±7.5% of bins
 const HVN_MIN_POC_FRAC = 0.20;               // HVN peak kept only if ≥20% of POC volume (drops dead-zone micro-peaks)
 const LVN_MAX_MEAN_FRAC = 0.50;              // LVN valley kept only if ≤50% of mean bin volume (genuine thin/void zone)
-// Pre-v1.0.12 LVN rule, restored for ReversalLadder level selection. A pure
+// Pre-v1.0.12 LVN rule, restored for the breakout strategy's level selection. A pure
 // percentile with no significance test: it always returns ~20% of bins, which
 // in practice are the thin TAILS of the range. That is the point — unlike the
 // local-extrema `lvns` above (which can legitimately find nothing), this rule
@@ -67,7 +67,7 @@ export function parseKlines(klines) {
  *     rangeVoids: [{ priceLow, priceHigh, volume }, ...],
  *       // Bottom-20%-by-volume ranges (RANGE_VOID_FRAC), ascending by price.
  *       // In practice these sit at the range edges (the thin tails) — used
- *       // for ReversalLadder level selection via selectVoidPair, not display.
+ *       // for the breakout strategy's level selection via selectVoidPair, not display.
  *     totalVolume,
  *     binVolumes: [number, ...],     // per-bin volume, rounded — chart histogram overlay
  *   }
@@ -220,7 +220,7 @@ export function computeVolumeProfile(candles, binCount = VP_BIN_COUNT_24H) {
  * signal to try a longer window (see VolumeProfile.getVoidProfile).
  *
  * OUTERMOST on each side, not nearest: the bottom-20% rule puts the real tails
- * at the extremes, and ReversalLadder wants bull and bear far apart — the
+ * at the extremes, and the breakout strategy wants bull and bear far apart — the
  * distance between them is the dead zone that makes the strategy churn-free.
  *
  * The levels are the void INNER edges (the boundary price crosses on its way
@@ -246,8 +246,8 @@ export function selectVoidPair(profile, price) {
 /**
  * VolumeProfile — 24h VPVR for the chart histogram overlay, keyed by symbol.
  * Also owns a generic multi-interval candle fetcher (`_getCandles`) and the
- * multi-window widen chain (`getVoidProfile`, over WINDOWS) that ReversalLadder
- * uses for strategy level selection.
+ * multi-window widen chain (`getVoidProfile`, over WINDOWS) that the breakout
+ * strategy uses for level selection.
  * `strategy` supplies makeProxyRequest — the same duck-typed proxy transport
  * every strategy already has from TradingBase; this class does not invent a
  * new transport.

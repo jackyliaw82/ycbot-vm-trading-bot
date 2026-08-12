@@ -12,7 +12,17 @@
 // The rule lives here, isolated from Express/Firestore, so it is unit-testable.
 
 const INSTANCE_NAME_PREFIX = 'vm-user-';
-const STRATEGY_ID_PREFIX = 'reversal_ladder_';
+// New strategies mint `breakout_${profileId}_${Date.now()}` (see
+// breakout-strategy.js's start() and app.js's /breakout/start route). The
+// legacy `reversal_ladder_` prefix is kept allowlisted too: it is what every
+// strategy minted before this rename carries, and any of those docs still
+// marked `isRunning: true` on a VM restart must still be SELECTED here, not
+// silently skipped — silently skipping a running doc orphans whatever
+// position it holds. A selected legacy doc still hits resume()'s own schema
+// guard, which refuses it loudly (missing breakoutPct / carrying
+// ladderLines) — that loud refusal is the safe outcome; silent skipping here
+// is not.
+const STRATEGY_ID_PREFIXES = ['breakout_', 'reversal_ladder_'];
 
 /**
  * Derive the owner uid from a GCP instance name.
@@ -68,9 +78,10 @@ export function selectRecoverableStrategies(records, ownerUid) {
   for (const record of records || []) {
     const id = record && record.id;
     // Retired ai_reversal_ / ai_dual_ / ai_hedge_ / anchor_ladder_ docs have a
-    // different persisted shape and cannot be resumed as a ladder. Excluded
-    // silently, as before.
-    if (typeof id !== 'string' || !id.startsWith(STRATEGY_ID_PREFIX)) continue;
+    // different persisted shape and cannot be resumed as a breakout strategy.
+    // Excluded silently, as before — only breakout_ and reversal_ladder_ are
+    // recognised (see STRATEGY_ID_PREFIXES above).
+    if (typeof id !== 'string' || !STRATEGY_ID_PREFIXES.some((prefix) => id.startsWith(prefix))) continue;
 
     const userId = record.userId;
     if (typeof userId !== 'string' || !userId) { skippedNoUserId++; noUserIdIds.push(id); continue; }

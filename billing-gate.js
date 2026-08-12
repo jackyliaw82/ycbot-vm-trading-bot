@@ -1,6 +1,6 @@
 /**
  * Server-side billing gate for the strategy START endpoint (currently
- * ReversalLadderStrategy's `/reversal-ladder/start`).
+ * BreakoutStrategy's `/breakout/start`).
  *
  * This is a fail-closed mirror of the read-only checks in backend-service's
  * `/billing/preflight`. The React frontend calls preflight (which ALSO lazily

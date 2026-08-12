@@ -1,14 +1,11 @@
 import express from 'express';
 import cors from 'cors';
-import { ReversalLadderStrategy } from './reversal-ladder-strategy.js';
-import {
-  minInitialSizeUSDT,
-  resolveLadderGeometry,
-} from './ladder-levels.js';
+import { BreakoutStrategy } from './breakout-strategy.js';
+import { resolveBreakoutGeometry } from './breakout-levels.js';
 import {
   ownerUidFromInstanceName,
   selectRecoverableStrategies,
-} from './ladder-recovery.js';
+} from './breakout-recovery.js';
 import http from 'http';
 import { WebSocketServer, WebSocket as WsClient } from 'ws';
 import { Firestore, Timestamp, FieldValue } from '@google-cloud/firestore';
@@ -664,7 +661,7 @@ app.get('/strategies', requireVmOwner, async (req, res) => {
 
     // Docs with no userId can't be attributed to anyone and are dropped below —
     // log which ones so a legacy doc vanishing from a user's list is
-    // diagnosable rather than silently invisible (mirrors ladder-recovery.js's
+    // diagnosable rather than silently invisible (mirrors breakout-recovery.js's
     // noUserIdIds).
     const noUserIdIds = docs.filter(({ data }) => !data.userId).map(({ id }) => id);
     if (noUserIdIds.length) {
@@ -739,7 +736,7 @@ app.get('/strategies/:strategyId', requireVmOwner, async (req, res) => {
 // the new process can reattach via the boot recovery scan. The latest state
 // is already in Firestore; we just save once more for freshness and exit.
 //
-// User-initiated stop still goes through the /reversal-ladder/stop HTTP endpoint,
+// User-initiated stop still goes through the /breakout/stop HTTP endpoint,
 // which does close positions. SIGTERM is reserved for restart-recovery.
 const shutdown = async () => {
   console.log('[SHUTDOWN] Received signal — saving state and exiting (positions preserved for restart recovery).');
@@ -830,7 +827,7 @@ async function recoverActiveStrategies() {
       if (!resumable.has(strategyId)) continue;
 
       try {
-        const strategy = new ReversalLadderStrategy(
+        const strategy = new BreakoutStrategy(
           data.gcfProxyUrl || null,
           data.profileId,
           data.sharedVmProxyGcfUrl || null
@@ -852,7 +849,7 @@ async function recoverActiveStrategies() {
 
         activeStrategies.set(strategyId, strategy);
 
-        // Resume in background — same non-blocking pattern as /reversal-ladder/start.
+        // Resume in background — same non-blocking pattern as /breakout/start.
         strategy.resume(data)
           .then(() => {
             // Only continue wallet snapshot loop if resume left strategy running.
@@ -862,7 +859,7 @@ async function recoverActiveStrategies() {
                 () => _snapshotWallet(strategy).catch(() => {}),
                 WALLET_SNAPSHOT_INTERVAL_MS
               );
-              console.log(`[RECOVERY] ✓ ${strategyId} recovered (symbol=${data.symbol}, mode=${strategy.ladderMode}, legs=${Array.isArray(strategy.ladderLines) ? strategy.ladderLines.length : 0})`);
+              console.log(`[RECOVERY] ✓ ${strategyId} recovered (symbol=${data.symbol}, held=${strategy.heldSide || 'FLAT'})`);
             } else {
               console.log(`[RECOVERY] ${strategyId} marked stopped during resume (positions gone)`);
             }
@@ -1213,10 +1210,10 @@ app.post('/system/force-update', requireAdmin, async (req, res) => {
   //   1. PM2 restart sends SIGTERM → shutdown handler (line ~552) saves
   //      each strategy's state to Firestore with isRunning: true.
   //   2. New bot process boots → recoverActiveStrategies queries Firestore
-  //      for isRunning Reversal Ladder strategies and calls strategy.resume()
+  //      for isRunning Breakout strategies and calls strategy.resume()
   //      on each, which reconciles positions against Binance and reattaches
   //      WS streams.
-  //   3. User-initiated stop (/reversal-ladder/stop) is still the only path that
+  //   3. User-initiated stop (/breakout/stop) is still the only path that
   //      closes positions + processes platform fees. Force-update is now
   //      strictly a fast-restart-with-state-preservation operation.
   const activeCount = activeStrategies.size;
@@ -1529,9 +1526,9 @@ async function reportVersionOnStartup(retryCount = 0) {
   }
 }
 
-// ——— Reversal Ladder Strategy endpoints ————————————————————————————————
+// ——— Breakout Strategy endpoints ————————————————————————————————
 
-app.post('/reversal-ladder/prepare-symbol', requireVmOwner, (req, res) => {
+app.post('/breakout/prepare-symbol', requireVmOwner, (req, res) => {
   const { symbol } = req.body || {};
   if (!symbol || typeof symbol !== 'string') {
     return res.status(400).json({ error: 'symbol is required' });
@@ -1545,7 +1542,7 @@ app.post('/reversal-ladder/prepare-symbol', requireVmOwner, (req, res) => {
   return res.json({ ok: true, symbol: normalized });
 });
 
-app.post('/reversal-ladder/start', requireVmOwner, async (req, res) => {
+app.post('/breakout/start', requireVmOwner, async (req, res) => {
   if (isUpdating) {
     return res.status(503).json({ error: 'VM is currently updating.', code: 'VM_UPDATING' });
   }
@@ -1557,34 +1554,28 @@ app.post('/reversal-ladder/start', requireVmOwner, async (req, res) => {
       return res.status(400).json({ error: 'profileId, gcpProxyUrl, sharedVmProxyGcfUrl, and config are required.' });
     }
 
-    // Defence in depth — ReversalLadderStrategy.start() gates on the geometry
-    // bounds (ladder-levels.js resolveLadderGeometry) too, but those checks
+    // Defence in depth — BreakoutStrategy.start() gates on the geometry
+    // bounds (breakout-levels.js resolveBreakoutGeometry) too, but those checks
     // fire deep inside the non-blocking start() promise after the 200
     // response has already gone out. Reject here up front, via the SAME
     // validator start() uses, so an out-of-bounds request never even mints a
     // strategyId or touches the billing gate, AND so this gate can never
     // silently re-diverge from start()'s (it did once, within a single task —
-    // see resolveLadderGeometry's docstring in ladder-levels.js).
-    const geometry = resolveLadderGeometry({
-      ladderStepPct: config.ladderStepPct,
-      ladderLevelsPerSide: config.ladderLevelsPerSide,
-    });
+    // see resolveBreakoutGeometry's docstring in breakout-levels.js).
+    const geometry = resolveBreakoutGeometry({ breakoutPct: config.breakoutPct });
     if (!geometry.ok) {
       return res.status(400).json({ error: geometry.error, code: geometry.code });
     }
-    const minSize = minInitialSizeUSDT(geometry.levelsPerSide);
-    if (!(Number(config.initialSize) >= minSize)) {
-      return res.status(400).json({
-        error: `Initial size (${config.initialSize} USDT) is below the ${minSize} USDT minimum for a ${geometry.levelsPerSide}-level ladder.`,
-        code: 'INITIAL_SIZE_TOO_LOW',
-      });
-    }
+    // No per-level minimum here — a breakout cycle opens ONE order for the
+    // whole size, so the only floor is the symbol's exchange minNotional,
+    // which start() enforces itself once it has fetched exchange info (a
+    // Binance-sourced figure this synchronous route cannot know in advance).
 
     // One strategy per profile (matches existing model). User must stop the running strategy first.
     for (const [sId, running] of activeStrategies.entries()) {
       if (running.profileId === profileId) {
         return res.status(400).json({
-          error: `A strategy for profile ${profileId} is already running. Stop it before starting Reversal Ladder.`,
+          error: `A strategy for profile ${profileId} is already running. Stop it before starting Breakout.`,
           strategyId: sId,
         });
       }
@@ -1624,10 +1615,10 @@ app.post('/reversal-ladder/start', requireVmOwner, async (req, res) => {
     }
     // ──────────────────────────────────────────────────────────────────────
 
-    const strategy = new ReversalLadderStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
+    const strategy = new BreakoutStrategy(gcpProxyUrl, profileId, sharedVmProxyGcfUrl);
     strategy.userId = req.uid || userId;
 
-    const strategyId = `reversal_ladder_${profileId}_${Date.now()}`;
+    const strategyId = `breakout_${profileId}_${Date.now()}`;
     strategy.strategyId = strategyId;
     strategy.isRunning = true;
     activeStrategies.set(strategyId, strategy);
@@ -1659,11 +1650,11 @@ app.post('/reversal-ladder/start', requireVmOwner, async (req, res) => {
     // start request.
     await strategy.saveState();
 
-    console.log(`✓ Reversal Ladder Strategy ${strategyId} starting (non-blocking)...`);
+    console.log(`✓ Breakout Strategy ${strategyId} starting (non-blocking)...`);
     res.json({
       success: true,
       strategyId,
-      message: 'Reversal Ladder Strategy starting',
+      message: 'Breakout Strategy starting',
     });
 
     strategy.start(config)
@@ -1675,7 +1666,7 @@ app.post('/reversal-ladder/start', requireVmOwner, async (req, res) => {
         );
       })
       .catch((error) => {
-        console.error(`Failed to start Reversal Ladder Strategy ${strategyId}:`, error);
+        console.error(`Failed to start Breakout Strategy ${strategyId}:`, error);
         // NOTE: the parent Firestore doc does not exist yet at this point — the
         // id is freshly minted, initFirestoreCollections only builds
         // references, and addLog writes to the `logs` SUBcollection (leaving
@@ -1693,29 +1684,29 @@ app.post('/reversal-ladder/start', requireVmOwner, async (req, res) => {
         strategy.saveState().catch(() => {});
       });
   } catch (error) {
-    console.error('Failed to start Reversal Ladder Strategy:', error);
+    console.error('Failed to start Breakout Strategy:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.post('/reversal-ladder/stop', requireVmOwner, async (req, res) => {
+app.post('/breakout/stop', requireVmOwner, async (req, res) => {
   try {
     const { strategyId, flatten } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
 
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No Reversal Ladder strategy running with ID ${strategyId}` });
+    if (!strategy || !(strategy instanceof BreakoutStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No Breakout strategy running with ID ${strategyId}` });
     }
 
-    res.json({ success: true, stopping: true, message: 'Reversal Ladder Strategy stop initiated', strategyId });
+    res.json({ success: true, stopping: true, message: 'Breakout Strategy stop initiated', strategyId });
 
     setImmediate(async () => {
       try {
         await strategy.stop({ flatten: !!flatten });
         activeStrategies.delete(strategyId);
       } catch (error) {
-        console.error(`Error stopping Reversal Ladder Strategy ${strategyId}:`, error);
+        console.error(`Error stopping Breakout Strategy ${strategyId}:`, error);
       }
     });
   } catch (error) {
@@ -1723,35 +1714,35 @@ app.post('/reversal-ladder/stop', requireVmOwner, async (req, res) => {
   }
 });
 
-// ReversalLadderStrategy.getStatus() (Task 9) already returns the full ladder
-// shape directly — mode, anchor, ladderLines, trendDirection, levelsPerSide,
-// stepPct, legNotional, ladderBaseSize — alongside the base TradingBase
-// fields. Unlike the retired grid strategy's status route, no extra
-// field-bolting is needed here; getStatus() IS the response.
-app.get('/reversal-ladder/status', requireVmOwner, (req, res) => {
+// BreakoutStrategy.getStatus() already returns the full breakout shape
+// directly — bullLevel/bearLevel, bullBreakout/bearBreakout, openLeg,
+// heldSide, positionBaseSize — alongside the base TradingBase fields. Unlike
+// the retired grid strategy's status route, no extra field-bolting is needed
+// here; getStatus() IS the response.
+app.get('/breakout/status', requireVmOwner, (req, res) => {
   const { strategyId } = req.query;
 
   if (strategyId) {
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof ReversalLadderStrategy)) {
-      return res.status(404).json({ error: `Reversal Ladder strategy ${strategyId} not found.` });
+    if (!strategy || !(strategy instanceof BreakoutStrategy)) {
+      return res.status(404).json({ error: `Breakout strategy ${strategyId} not found.` });
     }
     return res.json(strategy.getStatus());
   }
 
-  const ladderStrategies = {};
+  const breakoutStrategies = {};
   activeStrategies.forEach((strategy, sId) => {
-    if (strategy instanceof ReversalLadderStrategy) {
-      ladderStrategies[sId] = strategy.getStatus();
+    if (strategy instanceof BreakoutStrategy) {
+      breakoutStrategies[sId] = strategy.getStatus();
     }
   });
 
-  res.json({ strategies: ladderStrategies, count: Object.keys(ladderStrategies).length });
+  res.json({ strategies: breakoutStrategies, count: Object.keys(breakoutStrategies).length });
 });
 
 // Manual user-driven re-anchor / harvest. Works whether flat or holding — the
 // only gate is that the strategy is running. Closes any open position to flat at
-// market (reduceOnly; nothing to close when flat), then re-anchors the ladder on
+// market (reduceOnly; nothing to close when flat), then re-anchors the levels on
 // the live price. A flat run is recorded as a RE-ANCHOR (reanchorCount), not a
 // harvest. The frontend labels it Harvest (unrealized >= 0), Re-anchor
 // (unrealized < 0), or Re-anchor (flat). The cycle CONTINUES — this does NOT stop
@@ -1765,17 +1756,17 @@ app.get('/reversal-ladder/status', requireVmOwner, (req, res) => {
 // the current price) are tagged by the strategy (error.invalidInput) → 400. The
 // strategy remains the sole authority on trigger validity — this route does not
 // duplicate that logic.
-app.post('/reversal-ladder/harvest-now', requireVmOwner, async (req, res) => {
+app.post('/breakout/harvest-now', requireVmOwner, async (req, res) => {
   try {
     // `action` selects what an armed trigger DOES on arrival: 'reanchor'
     // (default, today's behaviour) or 'stop' — close and end the cycle, for
-    // banking a profit without rebuilding the ladder. Ignored for an immediate
+    // banking a profit without rebuilding the levels. Ignored for an immediate
     // harvest (no triggerPrice), which has nothing to schedule.
     const { strategyId, triggerPrice, action } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running Reversal Ladder strategy with ID ${strategyId}` });
+    if (!strategy || !(strategy instanceof BreakoutStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Breakout strategy with ID ${strategyId}` });
     }
     const result = await strategy.harvestNow(triggerPrice ?? null, { action: action ?? 'reanchor' });
     res.json({ success: true, ...result });
@@ -1786,14 +1777,14 @@ app.post('/reversal-ladder/harvest-now', requireVmOwner, async (req, res) => {
 
 // Cancel an armed harvest/re-anchor Trigger Price (set via harvest-now with a
 // triggerPrice). Idempotent — clears the latch if present. 400 if the strategy
-// isn't a running Reversal Ladder.
-app.post('/reversal-ladder/cancel-harvest-trigger', requireVmOwner, async (req, res) => {
+// isn't a running Breakout strategy.
+app.post('/breakout/cancel-harvest-trigger', requireVmOwner, async (req, res) => {
   try {
     const { strategyId } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running Reversal Ladder strategy with ID ${strategyId}` });
+    if (!strategy || !(strategy instanceof BreakoutStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Breakout strategy with ID ${strategyId}` });
     }
     const result = await strategy.cancelHarvestTrigger();
     res.json({ success: true, ...result });
@@ -1807,7 +1798,7 @@ app.post('/reversal-ladder/cancel-harvest-trigger', requireVmOwner, async (req, 
 // recomputes Final TP, and persists. Allowed in any subState — no trade
 // fires here; the new Final TP target just takes effect on the next price
 // tick. Shipped user feature carried over from AI Reversal; adjustProfitTarget
-// survives unchanged on ReversalLadderStrategy.
+// survives unchanged on BreakoutStrategy.
 // Move the Final TP to a user-chosen LEVEL, or reset it to the config target.
 // Body: { strategyId, price } to set, or { strategyId, reset: true } to restore
 // the config view's desired profit. The bot back-solves the level into a profit
@@ -1815,7 +1806,7 @@ app.post('/reversal-ladder/cancel-harvest-trigger', requireVmOwner, async (req, 
 // becomes a second writer of finalTpPrice. 400 on a bad/too-low level (the
 // config target is a hard floor), 409 when there is no verified position to
 // derive against; the not-found guard returns 400 like its siblings.
-app.post('/reversal-ladder/adjust-final-tp', requireVmOwner, async (req, res) => {
+app.post('/breakout/adjust-final-tp', requireVmOwner, async (req, res) => {
   try {
     const { strategyId, price, profitUSDT, reset } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
@@ -1823,8 +1814,8 @@ app.post('/reversal-ladder/adjust-final-tp', requireVmOwner, async (req, res) =>
       return res.status(400).json({ error: 'Provide a price, a profitUSDT, or reset: true.' });
     }
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running Reversal Ladder strategy with ID ${strategyId}` });
+    if (!strategy || !(strategy instanceof BreakoutStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Breakout strategy with ID ${strategyId}` });
     }
     const result = await strategy.adjustFinalTp({ price: price ?? null, profitUSDT: profitUSDT ?? null, reset: reset === true });
     res.json({ success: true, ...result });
@@ -1833,7 +1824,7 @@ app.post('/reversal-ladder/adjust-final-tp', requireVmOwner, async (req, res) =>
   }
 });
 
-app.post('/reversal-ladder/adjust-profit-target', requireVmOwner, async (req, res) => {
+app.post('/breakout/adjust-profit-target', requireVmOwner, async (req, res) => {
   try {
     const { strategyId, desiredProfitPercent } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
@@ -1842,8 +1833,8 @@ app.post('/reversal-ladder/adjust-profit-target', requireVmOwner, async (req, re
     }
 
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running Reversal Ladder strategy with ID ${strategyId}` });
+    if (!strategy || !(strategy instanceof BreakoutStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Breakout strategy with ID ${strategyId}` });
     }
 
     const result = await strategy.adjustProfitTarget({ desiredProfitPercent: Number(desiredProfitPercent) });
@@ -1857,16 +1848,16 @@ app.post('/reversal-ladder/adjust-profit-target', requireVmOwner, async (req, re
 // optional but at least one is required — editLevels() enforces that itself,
 // so this route does not duplicate the check. It also refuses a level on the
 // wrong side of live price and refuses to move a side that already holds a
-// filled leg (see editLevels' docstring in reversal-ladder-strategy.js).
+// filled leg (see editLevels' docstring in breakout-strategy.js).
 // Error shapes match harvestNow: input errors set .invalidInput = true
 // (→ 400); state conflicts are untagged (→ 409).
-app.post('/reversal-ladder/edit-levels', requireVmOwner, async (req, res) => {
+app.post('/breakout/edit-levels', requireVmOwner, async (req, res) => {
   try {
     const { strategyId, bullLevel, bearLevel } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running Reversal Ladder strategy with ID ${strategyId}` });
+    if (!strategy || !(strategy instanceof BreakoutStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Breakout strategy with ID ${strategyId}` });
     }
     const result = await strategy.editLevels({ bullLevel: bullLevel ?? null, bearLevel: bearLevel ?? null });
     res.json({ success: true, ...result });
@@ -1880,13 +1871,13 @@ app.post('/reversal-ladder/edit-levels', requireVmOwner, async (req, res) => {
 // callers should not assume harvest-now/adjust-*-style response latency
 // here. Returns a PROPOSAL ONLY; applying it is a separate, explicit
 // edit-levels call made by the user.
-app.post('/reversal-ladder/ask-ai', requireVmOwner, async (req, res) => {
+app.post('/breakout/ask-ai', requireVmOwner, async (req, res) => {
   try {
     const { strategyId, question } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running Reversal Ladder strategy with ID ${strategyId}` });
+    if (!strategy || !(strategy instanceof BreakoutStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Breakout strategy with ID ${strategyId}` });
     }
     const result = await strategy.askAi(question);
     res.json({ success: true, ...result });
@@ -1895,19 +1886,19 @@ app.post('/reversal-ladder/ask-ai', requireVmOwner, async (req, res) => {
   }
 });
 
-// Arm/disarm the TREND trailing exit. `enabled` is passed through to
+// Arm/disarm the trailing exit. `enabled` is passed through to
 // setTrailEnabled() VERBATIM — do NOT coerce it (no !!enabled, no
 // enabled === 'true', no ?? false). setTrailEnabled() deliberately accepts
 // only real booleans and rejects everything else with .invalidInput = true,
 // so a malformed request surfaces as a visible 400 instead of silently
 // reading as "off" and disarming an exit the user believed was armed.
-app.post('/reversal-ladder/trail', requireVmOwner, async (req, res) => {
+app.post('/breakout/trail', requireVmOwner, async (req, res) => {
   try {
     const { strategyId, enabled } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
     const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof ReversalLadderStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running Reversal Ladder strategy with ID ${strategyId}` });
+    if (!strategy || !(strategy instanceof BreakoutStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Breakout strategy with ID ${strategyId}` });
     }
     const result = await strategy.setTrailEnabled(enabled);
     res.json({ success: true, ...result });
@@ -1916,13 +1907,13 @@ app.post('/reversal-ladder/trail', requireVmOwner, async (req, res) => {
   }
 });
 
-// strategyFlow audit trail for Reversal Ladder. Reads from
+// strategyFlow audit trail for Breakout. Reads from
 // strategies/{strategyId}/strategyFlow subcollection populated by
-// ReversalLadderStrategy._writeStrategyFlow inside its post-execute bookkeeping
-// on every position event (LADDER_FILL / REVERSAL / TREND_ENTER / TRAILED_EXIT
-// / HARVEST / LEVELS_EDITED / FINAL_TP_HIT). Used by the position chart to place TP segment boundaries
+// BreakoutStrategy._writeStrategyFlow inside its post-execute bookkeeping
+// on every position event (OPEN_BREAKOUT / STOP_OUT / HARVEST / LEVELS_EDITED
+// / FINAL_TP_HIT). Used by the position chart to place TP segment boundaries
 // at EXACT event moments instead of heartbeat-resolution timestamps.
-app.get('/reversal-ladder/strategy-flow', requireVmOwner, async (req, res) => {
+app.get('/breakout/strategy-flow', requireVmOwner, async (req, res) => {
   try {
     const { strategyId, limit: queryLimit } = req.query;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
