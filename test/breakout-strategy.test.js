@@ -1235,3 +1235,62 @@ test('cancelHarvestTrigger is a no-op when nothing is armed, but still reports {
   assert.deepEqual(result, { cancelled: true }, 'the return value does not distinguish "cleared something" from "no-op"');
   assert.equal(saved, false, 'no persistence happens when nothing was armed — the ONLY observable difference is the side effects, not the return value');
 });
+
+// ——— logging regressions (found live, 2026-08-13) ————————————————————————
+//
+// A real cycle opened a LONG at 76.32 and closed it at 75.55, and the strategy
+// log showed ONLY the close. `_writeStrategyFlow` (fired by
+// `_postExecuteBookkeeping`) feeds the CHART, not the strategy log, so an open
+// with no `addLog` is invisible to anyone reading the log — while its close
+// still appears, because that line lives inside the frozen `_closeConsolidated`.
+// The result reads as a cycle closing a position it never opened.
+
+test('_openPosition writes the entry to the strategy log', async () => {
+  const s = breakoutStrategy();
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  s._formatPrice = (p) => String(p);
+  s._formatNotional = (n) => String(n);
+  s._quantityFor = async () => 1.31;
+  s.placeMarketOrder = async () => ({ orderId: 1 });
+  s._resolveFill = async () => ({ filledQty: 1.31, fillPrice: 76.32, source: 'ws' });
+
+  await s._openPosition('LONG');
+
+  const line = logs.find((l) => l.includes('OPEN LONG'));
+  assert.ok(line, `expected an OPEN LONG line; got ${JSON.stringify(logs)}`);
+  assert.match(line, /1\.31/, 'the ACTUAL filled quantity must appear');
+  assert.match(line, /76\.32/, 'the ACTUAL fill price must appear, not the requested level');
+});
+
+test('_openPosition logs the SHORT side too', async () => {
+  const s = breakoutStrategy();
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  s._formatPrice = (p) => String(p);
+  s._formatNotional = (n) => String(n);
+  s._quantityFor = async () => 2;
+  s.placeMarketOrder = async () => ({ orderId: 2 });
+  s._resolveFill = async () => ({ filledQty: 2, fillPrice: 96.53, source: 'rest' });
+
+  await s._openPosition('SHORT');
+  assert.ok(logs.some((l) => l.includes('OPEN SHORT')), `got ${JSON.stringify(logs)}`);
+});
+
+// Editing bullLevel moves bullBreakout with it, and THAT is where the next
+// order fills. A log naming only the level makes the fill price look like it
+// came from nowhere — which is exactly how the 76.32 entry above read.
+test('editLevels logs the re-derived entries, not just the levels', async () => {
+  const s = breakoutStrategy();
+  const logs = [];
+  s.addLog = async (m) => { logs.push(m); };
+  s._formatPrice = (p) => String(p);
+
+  await s.editLevels({ bullLevel: 105 });
+
+  const line = logs.find((l) => l.includes('levels edited'));
+  assert.ok(line, `expected a levels-edited line; got ${JSON.stringify(logs)}`);
+  assert.match(line, /entries/, 'the entry levels must be named');
+  assert.match(line, /106\.57/, 'bullBreakout = 105 x 1.015 = 106.575 must appear');
+  assert.doesNotMatch(line, /rebuilt/, '"rebuilt" is ladder language — nothing is rebuilt');
+});

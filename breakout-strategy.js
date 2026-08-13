@@ -898,6 +898,19 @@ class BreakoutStrategy extends TradingBase {
       openedAt: this.currentPrice,
     };
 
+    // The ONLY human-readable record that a position opened. `_writeStrategyFlow`
+    // (fired by `_postExecuteBookkeeping` below) feeds the chart, not the strategy
+    // log — so without this line an entry is invisible to anyone reading the log,
+    // while its close still appears from `_closeConsolidated`. The deleted
+    // `_fillLeg` logged every rung; dropping it here made a cycle look like it
+    // closed a position it never opened.
+    await this.addLog(
+      `OPEN ${side} qty ${fill.filledQty} @ ${this._formatPrice(fill.fillPrice)} ` +
+      `| breakout ${this._formatPrice(level)} ` +
+      `| exit ${this._formatPrice(side === 'LONG' ? this.bullLevel : this.bearLevel)} ` +
+      `| ${this._formatNotional(this._positionBaseSize)} USDT | fill from ${fill.source}.`,
+    );
+
     await this._postExecuteBookkeeping('OPEN_BREAKOUT', { side, level, requestedQty: qty, filledQty: fill.filledQty });
     await this.saveState();
   }
@@ -2481,9 +2494,15 @@ class BreakoutStrategy extends TradingBase {
     }
 
     await this.addLog(
+      // Name the re-derived ENTRIES, not just the levels. Editing bullLevel moves
+      // bullBreakout with it, and that entry is where the next order actually
+      // fills — a log that reports only the level leaves the fill price looking
+      // like it came from nowhere. "rebuilt" was ladder language; nothing is
+      // rebuilt now, the levels simply move.
       `levels edited — BULL ${this._formatPrice(this.bullLevel)} / ` +
-      `BEAR ${this._formatPrice(this.bearLevel)} (rebuilt: ` +
-      `${[movingBull && 'bull', movingBear && 'bear'].filter(Boolean).join(' + ')}).`,
+      `BEAR ${this._formatPrice(this.bearLevel)} | entries ` +
+      `${this._formatPrice(this.bullBreakout)} / ${this._formatPrice(this.bearBreakout)} ` +
+      `(moved: ${[movingBull && 'bull', movingBear && 'bear'].filter(Boolean).join(' + ')}).`,
     );
     await this._writeStrategyFlow('LEVELS_EDITED', {
       bullLevel: this.bullLevel, bearLevel: this.bearLevel, movedBull: movingBull, movedBear: movingBear,
