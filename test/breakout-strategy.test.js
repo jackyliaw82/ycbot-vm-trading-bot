@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { BreakoutStrategy } from '../breakout-strategy.js';
 import { BREAKOUT_PCT } from '../breakout-levels.js';
+import { readFile } from 'node:fs/promises';
 
 // A strategy with levels set and nothing open. All I/O stubbed, so a tick
 // exercises only the dispatch. bull 100 / bear 98 with breakoutPct 1.5% puts
@@ -1293,4 +1294,111 @@ test('editLevels logs the re-derived entries, not just the levels', async () => 
   assert.match(line, /entries/, 'the entry levels must be named');
   assert.match(line, /106\.57/, 'bullBreakout = 105 x 1.015 = 106.575 must appear');
   assert.doesNotMatch(line, /rebuilt/, '"rebuilt" is ladder language — nothing is rebuilt');
+});
+
+// ——— Active AI plan (§10 panel) ————————————————————————————————————————
+//
+// A RECORD of what the planner said — never a source of truth for the levels.
+// The whole design rests on the record and the live pair being allowed to
+// diverge, so these tests pin both halves: that an AI writes it, and that a
+// manual edit deliberately does NOT.
+
+test('_setActiveAiPlan normalises blank prose and junk confidence to null', () => {
+  const s = breakoutStrategy();
+
+  s._setActiveAiPlan({ bullLevel: 100, bearLevel: 98, rationale: '   ', confidence: 0.82, source: 'ai' });
+  assert.equal(s.activeAiPlan.rationale, null, 'whitespace-only prose must store as null, not ""');
+  assert.equal(s.activeAiPlan.confidence, 0.82);
+
+  s._setActiveAiPlan({ bullLevel: 100, bearLevel: 98, rationale: '  ok  ', confidence: NaN, source: '' });
+  assert.equal(s.activeAiPlan.rationale, 'ok', 'prose must be trimmed');
+  assert.equal(s.activeAiPlan.confidence, null, 'NaN confidence must not reach the frontend');
+  assert.equal(s.activeAiPlan.source, 'ai', 'an empty source falls back rather than rendering blank');
+  assert.ok(Number.isFinite(s.activeAiPlan.plannedAt), 'plannedAt drives the "38s ago" readout');
+});
+
+test('the active AI plan rides BOTH frontend channels', () => {
+  const s = breakoutStrategy();
+  s._setActiveAiPlan({ bullLevel: 100, bearLevel: 98, rationale: 'POC aligned', confidence: 0.8, source: 'ai' });
+
+  // Two channels, not one: a WS-connected frontend disables REST polling, so a
+  // field on getStatus() alone would never arrive after a harvest re-plan.
+  assert.equal(s.getHeartbeatPayload().activeAiPlan.rationale, 'POC aligned');
+  assert.equal(s.getStatus().activeAiPlan.rationale, 'POC aligned');
+});
+
+test('the active AI plan survives a saveState/resume round trip', async () => {
+  const src = breakoutStrategy({ bull: 100, bear: 98, pct: 0.02 });
+  src._setActiveAiPlan({ bullLevel: 100, bearLevel: 98, rationale: 'tight range', confidence: 0.77, source: 'ai', reason: 'cycle_start' });
+
+  let doc = null;
+  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
+  await BreakoutStrategy.prototype.saveState.call(src);
+  assert.equal(doc.activeAiPlan.rationale, 'tight range', 'saveState must write the plan');
+
+  const dst = stubResumeIO(new BreakoutStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  await dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' });
+  cleanupResumeTimers(dst);
+  assert.equal(dst.activeAiPlan.confidence, 0.77, 'resume must restore the plan');
+});
+
+test('a snapshot with no plan resumes to null WITHOUT tripping the schema guard', async () => {
+  const src = breakoutStrategy({ pct: 0.02 });
+  let doc = null;
+  src.firestore = { collection: () => ({ doc: () => ({ set: async (d) => { doc = d; } }) }) };
+  await BreakoutStrategy.prototype.saveState.call(src);
+  delete doc.activeAiPlan;   // a snapshot written before this field existed
+
+  const dst = stubResumeIO(new BreakoutStrategy('http://proxy.invalid', 'p', 'http://vm.invalid'));
+  dst.addLog = async () => {};
+  // A missing plan is a cosmetic gap, NOT the unrepresentable state the guard
+  // exists to refuse — resuming must not be blocked by it.
+  await assert.doesNotReject(() => dst.resume({ ...doc, isRunning: true, symbol: 'BTCUSDT' }));
+  cleanupResumeTimers(dst);
+  assert.equal(dst.activeAiPlan, null);
+});
+
+test('applying an Ask-AI proposal records the plan; a manual edit leaves it alone', async () => {
+  const s = breakoutStrategy();
+  s._armTrail = () => {};
+
+  await s.editLevels({ bullLevel: 105, rationale: 'CVD rising confirms buy pressure', confidence: 0.82 });
+  assert.equal(s.activeAiPlan.rationale, 'CVD rising confirms buy pressure');
+  assert.equal(s.activeAiPlan.bullLevel, 105, 'the record must name the levels the AI proposed');
+  assert.equal(s.activeAiPlan.reason, 'ask_ai_applied');
+
+  // A manual pencil edit sends no prose. The record MUST survive unchanged —
+  // the frontend marks it superseded by comparing its levels to the live pair,
+  // which only works if the stale record is still there to compare.
+  await s.editLevels({ bullLevel: 110 });
+  assert.equal(s.activeAiPlan.bullLevel, 105, 'a manual edit must not rewrite the AI record');
+  assert.equal(s.bullLevel, 110, 'but it must still move the live level');
+});
+
+test('a no-op apply still refreshes the plan, and persists it', async () => {
+  const s = breakoutStrategy({ bull: 100, bear: 98 });
+  s._armTrail = () => {};
+  let saved = false;
+  s.saveState = async () => { saved = true; };
+
+  // Levels identical to the live pair: editLevels returns changed:false, but
+  // the planner still spoke, so the panel must show the NEW prose.
+  const res = await s.editLevels({ bullLevel: 100, bearLevel: 98, rationale: 'unchanged, still valid', confidence: 0.9 });
+  assert.equal(res.changed, false);
+  assert.equal(s.activeAiPlan.rationale, 'unchanged, still valid');
+  assert.ok(saved, 'a recorded plan on a no-op edit must not linger unpersisted');
+});
+
+test('the auto-planner records the plan only AFTER the levels are applied', async () => {
+  // Ordering invariant, asserted against source text: a plan that failed to
+  // apply was never in force, and a panel captioned ACTIVE AI PLAN must never
+  // show one the strategy is not trading. Exercising this for real would need
+  // the module-scope planLevels import stubbed, which node:test cannot do.
+  const src = await readFile(new URL('../breakout-strategy.js', import.meta.url), 'utf8');
+  const body = src.slice(src.indexOf('async _planAndBuildLevels('));
+  const applied = body.indexOf('await this._applyLevels(');
+  const recorded = body.indexOf('this._setActiveAiPlan(');
+  assert.ok(applied > 0 && recorded > 0, 'both calls must exist in _planAndBuildLevels');
+  assert.ok(recorded > applied, '_setActiveAiPlan must come after _applyLevels');
 });

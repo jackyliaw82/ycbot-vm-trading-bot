@@ -1853,13 +1853,22 @@ app.post('/breakout/adjust-profit-target', requireVmOwner, async (req, res) => {
 // (→ 400); state conflicts are untagged (→ 409).
 app.post('/breakout/edit-levels', requireVmOwner, async (req, res) => {
   try {
-    const { strategyId, bullLevel, bearLevel } = req.body;
+    // rationale/confidence are OPTIONAL and only sent when the edit is the user
+    // applying an Ask-AI proposal — they record which plan is in force, and are
+    // absent on a manual pencil edit. editLevels normalises both; nothing here
+    // validates them because neither can affect what gets traded.
+    const { strategyId, bullLevel, bearLevel, rationale, confidence } = req.body;
     if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
     const strategy = activeStrategies.get(strategyId);
     if (!strategy || !(strategy instanceof BreakoutStrategy) || !strategy.isRunning) {
       return res.status(400).json({ error: `No running Breakout strategy with ID ${strategyId}` });
     }
-    const result = await strategy.editLevels({ bullLevel: bullLevel ?? null, bearLevel: bearLevel ?? null });
+    const result = await strategy.editLevels({
+      bullLevel: bullLevel ?? null,
+      bearLevel: bearLevel ?? null,
+      rationale: rationale ?? null,
+      confidence: confidence ?? null,
+    });
     res.json({ success: true, ...result });
   } catch (error) {
     res.status(error.invalidInput ? 400 : 409).json({ error: error.message });

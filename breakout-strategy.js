@@ -193,6 +193,22 @@ class BreakoutStrategy extends TradingBase {
     this.aiModel = 'deepseek-v4-flash';
     this._aiUsage = new AiUsageAccumulator();
     this.aiCostUSD = 0;
+    /**
+     * The AI level plan currently in force — `{ bullLevel, bearLevel,
+     * rationale, confidence, source, reason, plannedAt }` or null.
+     *
+     * A RECORD of what the planner said, not a source of truth for the levels
+     * themselves: `this.bullLevel`/`this.bearLevel` remain the only thing the
+     * strategy trades against. Kept separate precisely so the two can DIVERGE
+     * — a manual pencil edit moves the levels without consulting anyone, and
+     * the frontend detects that by comparing the two rather than by any stored
+     * "superseded" flag (a second copy of a fact the pair already carries; see
+     * heldSide's note on why this codebase refuses those).
+     *
+     * Written ONLY where an AI actually spoke: a successful auto-plan, or an
+     * Ask-AI proposal the user applied. Never inferred.
+     */
+    this.activeAiPlan = null;
     // Injectable seam for tests — _resolveAiApiKey() constructs a real
     // SecretManagerServiceClient on demand when this stays null.
     this._secretClient = null;
@@ -537,6 +553,28 @@ class BreakoutStrategy extends TradingBase {
    * calling this, so non-null values after a throw can only mean
    * `_applyLevels` itself already assigned them.
    */
+  /**
+   * Record the plan an AI just produced. ONE normalisation point shared by the
+   * auto-planner and the apply-a-proposal path, so the two can't drift in shape
+   * — the frontend reads a single contract off `getStatus()`/heartbeat.
+   *
+   * Strict about `rationale`: a plan whose prose is missing or blank is stored
+   * with `rationale: null` rather than an empty string, so the panel can tell
+   * "no rationale" from "" without trimming at the render site.
+   */
+  _setActiveAiPlan({ bullLevel, bearLevel, rationale, confidence, source, reason }) {
+    const prose = typeof rationale === 'string' && rationale.trim() ? rationale.trim() : null;
+    this.activeAiPlan = {
+      bullLevel,
+      bearLevel,
+      rationale: prose,
+      confidence: typeof confidence === 'number' && Number.isFinite(confidence) ? confidence : null,
+      source: typeof source === 'string' && source ? source : 'ai',
+      reason: typeof reason === 'string' && reason ? reason : null,
+      plannedAt: Date.now(),
+    };
+  }
+
   async _planAndBuildLevels(reason) {
     if (this._levelPlanInProgress) return false;
     const now = Date.now();
@@ -595,6 +633,18 @@ class BreakoutStrategy extends TradingBase {
       }
 
       await this._applyLevels({ bullLevel: result.bullLevel, bearLevel: result.bearLevel, reason });
+      // AFTER _applyLevels, never before: a pair that fails to apply was never
+      // in force, and a panel captioned ACTIVE AI PLAN must not show one the
+      // strategy is not trading. The price-staleness gate above returns early
+      // for the same reason.
+      this._setActiveAiPlan({
+        bullLevel: result.bullLevel,
+        bearLevel: result.bearLevel,
+        rationale: result.rationale,
+        confidence: result.confidence,
+        source: result.source,
+        reason,
+      });
       this._levelPlanLastTs = null;   // succeeded: no throttle carried forward
       return true;
     } catch (err) {
@@ -1418,6 +1468,11 @@ class BreakoutStrategy extends TradingBase {
     this.accumulatedTradingFees = snapshot.accumulatedTradingFees || 0;
     this.accumulatedFundingFees = snapshot.accumulatedFundingFees || 0;
     this.aiCostUSD = snapshot.aiCostUSD || 0;
+    // Optional by construction: snapshots written before this field existed
+    // resume with no plan on record, which the panel renders as absent. It
+    // must NEVER join the resume schema guard above — a missing plan is a
+    // cosmetic gap, not the unrepresentable state that guard exists to refuse.
+    this.activeAiPlan = snapshot.activeAiPlan ?? null;
     this.aiModel = snapshot.aiModel || this.aiModel;
 
     // The API key is deliberately NOT persisted — a live credential does not
@@ -2430,7 +2485,7 @@ class BreakoutStrategy extends TradingBase {
    * Error shapes match `harvestNow`: input errors set `.invalidInput = true`
    * (→ 400); state conflicts are untagged (→ 409).
    */
-  async editLevels({ bullLevel = null, bearLevel = null } = {}) {
+  async editLevels({ bullLevel = null, bearLevel = null, rationale = null, confidence = null } = {}) {
     if (!this.isRunning) throw new Error('Strategy is not running.');
     const invalidInput = (msg) => { const e = new Error(msg); e.invalidInput = true; return e; };
 
@@ -2475,7 +2530,29 @@ class BreakoutStrategy extends TradingBase {
     if (movingBear && this.openLeg?.direction === 'SHORT') {
       throw new Error('A SHORT position is open — close it before moving the bear level.');
     }
+    // An applied Ask-AI proposal carries the planner's prose, and that makes it
+    // the newest AI plan whether or not the numbers moved. Recorded here —
+    // after validation, before the no-op early return — so applying a proposal
+    // that happens to match the live levels still refreshes the panel instead
+    // of leaving an older plan captioned as active. A manual pencil edit sends
+    // no rationale and deliberately leaves the record alone: the frontend then
+    // shows the stored plan as superseded by comparing its levels to the live
+    // pair.
+    const recordedPlan = typeof rationale === 'string' && rationale.trim()
+      ? (this._setActiveAiPlan({
+        bullLevel: nextBull,
+        bearLevel: nextBear,
+        rationale,
+        confidence,
+        source: 'ai',
+        reason: 'ask_ai_applied',
+      }), true)
+      : false;
+
     if (!movingBull && !movingBear) {
+      // Persist even on a no-op edit when a plan was just recorded — otherwise
+      // it lives only in memory until some unrelated mutation happens to save.
+      if (recordedPlan) await this.saveState();
       return { bullLevel: this.bullLevel, bearLevel: this.bearLevel, changed: false };
     }
 
@@ -3198,6 +3275,7 @@ class BreakoutStrategy extends TradingBase {
       // (`_aiApiKey`) is NEVER surfaced here — see its constructor doc.
       aiCostUSD: this.aiCostUSD ?? 0,
       aiModel: this.aiModel,
+      activeAiPlan: this.activeAiPlan ?? null,
 
       // Breakout state — the frontend's status/chart view renders these
       // directly.
@@ -3291,6 +3369,10 @@ class BreakoutStrategy extends TradingBase {
       // AI level planning (§10) — cost accounting only; the key is never here.
       aiCostUSD: this.aiCostUSD ?? 0,
       aiModel: this.aiModel,
+      // Rides the heartbeat too, not just getStatus(): a harvest re-plan swaps
+      // the plan mid-cycle, and a WS-connected frontend disables REST polling.
+      // Both channels or the UI disagrees with itself.
+      activeAiPlan: this.activeAiPlan ?? null,
 
       // Breakout state — included here on every heartbeat because entry/exit
       // transitions happen mid-cycle.
@@ -3412,6 +3494,10 @@ class BreakoutStrategy extends TradingBase {
         // ---- level state ----
         bullLevel: this.bullLevel,
         bearLevel: this.bearLevel,
+        // The AI plan record behind those levels (or null). A flat object of
+        // primitives — Firestore rejects nested ARRAYS, which is why history
+        // is deliberately not kept here.
+        activeAiPlan: this.activeAiPlan ?? null,
         lastProcessedPrice: this.lastProcessedPrice,
         ladderBaseSize: this._positionBaseSize,
         _lastPositionSize: this._lastPositionSize,
