@@ -147,6 +147,11 @@ class BreakoutStrategy extends TradingBase {
     // POC/VAH/VAL/HVN edges. The strategy itself reads nothing from it.
     this.volumeProfile = null;              // VolumeProfile instance (built in start()/resume())
     this._lastVolumeProfile24h = null;
+    // Balance / contraction reading (balance-metrics.js). Display-only, exactly
+    // like the profile above — nothing in the strategy branches on it. DERIVED
+    // from the same cached candle array on every refresh, never accumulated, so
+    // a restart cannot leave it blind (see balance-metrics.js's own note).
+    this._lastBalance = null;
     // Volume Analytics cells, fed by MarketMetrics off the same 5-min refresh.
     // Display-only, exactly like the profile above: the strategy reads none of
     // them. See market-metrics.js.
@@ -3039,6 +3044,7 @@ class BreakoutStrategy extends TradingBase {
 
     await Promise.all([
       refresh('Volume profile', () => this.volumeProfile.get24h(this.symbol), v => { this._lastVolumeProfile24h = v; }),
+      refresh('Balance metrics', () => this.volumeProfile.getBalance(this.symbol), v => { this._lastBalance = v; }),
       refresh('CVD', () => this.marketMetrics.getCvd(this.symbol), v => { this._lastCvd = v; }),
       refresh('Orderbook depth', () => this.marketMetrics.getOrderbookDepth(this.symbol), v => { this._lastOrderbookDepth = v; }),
       refresh('ATR', () => this.marketMetrics.getVolatility(this.symbol), v => { this._lastVolatility = v; }),
@@ -3192,6 +3198,12 @@ class BreakoutStrategy extends TradingBase {
       // Volume primitives — refreshed for the chart by _refreshVolumeSnapshot.
       // Frontend chart overlays POC / VAH / VAL / HVN edges from these.
       volumeProfile24h: this._lastVolumeProfile24h,
+      // Balance / contraction. Rides getStatus ONLY, alongside the other
+      // volume-snapshot fields — the heartbeat deliberately omits this whole
+      // class (see getHeartbeatPayload's exclusion list): it refreshes on its
+      // own 5-minute interval, so pushing it every 30s would carry a value that
+      // had not changed.
+      balance: this._lastBalance,
       cvd: this._lastCvd,
       orderbookDepth: this._lastOrderbookDepth,
       // ATR / volatility — feeds the Volume Analytics panel's ATR cell.
@@ -3204,7 +3216,7 @@ class BreakoutStrategy extends TradingBase {
    *   - Static config (leverage / priceType / recovery params / etc.) — loaded
    *     once by frontend's initial REST fetch of getStatus().
    *   - Fields covered by other event pushes (currentPrice via price_tick).
-   *   - Volume/volatility snapshot cache (volumeProfile24h / cvd /
+   *   - Volume/volatility snapshot cache (volumeProfile24h / balance / cvd /
    *     orderbookDepth / volatility) — refreshed on its own interval, not
    *     worth a heartbeat push every time.
    *   - Derivable fields (cycleDuration = Date.now() - cycleStartTime).

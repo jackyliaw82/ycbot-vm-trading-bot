@@ -3,6 +3,8 @@
 // hvns/lvns) for the frontend overlay, and (2) the rangeVoids/getVoidProfile
 // path used for the breakout strategy's level selection (see selectVoidPair).
 
+import { computeBalance } from './balance-metrics.js';
+
 const VP_CACHE_TTL_MS = 10 * 60 * 1000;      // 10 min volume profile cache
 const CANDLE_CACHE_TTL_MS = 5 * 60 * 1000;   // 5 min candle cache — shared by every WINDOWS interval (1m/5m/1h)
 const VP_24H_1M_BARS = 1440;                 // 1m × 1440 = 24h (fine profile source)
@@ -300,6 +302,29 @@ export class VolumeProfile {
       return profile;
     } catch (error) {
       console.error(`Failed to compute volume profile (24h): ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Balance / contraction reading over the same 24h 1m candles get24h uses.
+   *
+   * Deliberately re-uses `_getCandles`, which caches for CANDLE_CACHE_TTL_MS, so
+   * on the 5-minute refresh cadence this costs ZERO extra Binance requests — the
+   * array is already warm from the 24h profile. All the work is CPU: a handful
+   * of sub-window profiles at ~0.6ms each.
+   *
+   * Returns null when there is not enough data (a freshly listed symbol, or a
+   * failed fetch). Callers keep their previous snapshot rather than blanking —
+   * see `_refreshVolumeSnapshot`.
+   */
+  async getBalance(symbol) {
+    try {
+      const candles = await this._getCandles(symbol, '1m', VP_24H_1M_BARS);
+      if (!candles || candles.length === 0) return null;
+      return computeBalance(candles);
+    } catch (error) {
+      console.error(`Failed to compute balance metrics: ${error.message}`);
       return null;
     }
   }
