@@ -59,9 +59,10 @@ export function planBreakoutEntry(input) {
   if (currentPrice === prevPrice) return none;
 
   // A DIRECTIONAL crossing: price was strictly on the inside and ended on or
-  // beyond the level. Both halves are load-bearing — a trailed exit can close a
-  // LONG with price ABOVE bullBreakout, and price falling back to that level
-  // must not open a LONG.
+  // beyond the level. Both halves are load-bearing: while FLAT, price can
+  // legitimately sit beyond an entry level — a harvest closes at an arbitrary
+  // live price and the re-plan lands a tick or more later — and price falling
+  // back onto that level must not open a position.
   //
   // Do NOT express this with a symmetric `between(level, prev, current)` test.
   // An endpoint is always "between" its own bounds, so `between` returns true

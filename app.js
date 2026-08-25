@@ -1895,26 +1895,6 @@ app.post('/breakout/ask-ai', requireVmOwner, async (req, res) => {
   }
 });
 
-// Arm/disarm the trailing exit. `enabled` is passed through to
-// setTrailEnabled() VERBATIM — do NOT coerce it (no !!enabled, no
-// enabled === 'true', no ?? false). setTrailEnabled() deliberately accepts
-// only real booleans and rejects everything else with .invalidInput = true,
-// so a malformed request surfaces as a visible 400 instead of silently
-// reading as "off" and disarming an exit the user believed was armed.
-app.post('/breakout/trail', requireVmOwner, async (req, res) => {
-  try {
-    const { strategyId, enabled } = req.body;
-    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
-    const strategy = activeStrategies.get(strategyId);
-    if (!strategy || !(strategy instanceof BreakoutStrategy) || !strategy.isRunning) {
-      return res.status(400).json({ error: `No running Breakout strategy with ID ${strategyId}` });
-    }
-    const result = await strategy.setTrailEnabled(enabled);
-    res.json({ success: true, ...result });
-  } catch (error) {
-    res.status(error.invalidInput ? 400 : 409).json({ error: error.message });
-  }
-});
 
 // strategyFlow audit trail for Breakout. Reads from
 // strategies/{strategyId}/strategyFlow subcollection populated by

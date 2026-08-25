@@ -10,7 +10,6 @@ import { planBreakoutEntry } from './breakout-crossings.js';
 import { planLevels } from './level-planner.js';
 import { buildLevelContext } from './market-context.js';
 import { precisionFormatter } from './precisionUtils.js';
-import { trailDistance, trailExitLevel } from './breakout-trail.js';
 import { AiPlanner } from './ai-planner.js';
 import { AiUsageAccumulator } from './ai-cost.js';
 import { SecretManagerServiceClient } from '@google-cloud/secret-manager';
@@ -57,8 +56,8 @@ function formatDuration(ms) {
  * all of that: a cycle now holds AT MOST ONE position, opened with a single
  * market order for the full base size at `bullBreakout` / `bearBreakout` —
  * each a fixed `breakoutPct` beyond the AI-planned `bullLevel` / `bearLevel`
- * — and closed either at the level (the stop, or its trailed variant once
- * ratcheted past entry — one mechanism, see `_stopOut`) or at the Final TP.
+ * — and closed either at the level (the stop — see `_checkStopHit`) or at the
+ * Final TP.
  * There is no rung ladder, no scaling, no TREND mode, and no reversal: a
  * close leaves the strategy FLAT, and the opposite side opens only if price
  * later reaches the opposite entry level (see `breakout-crossings.js`'s
@@ -213,17 +212,6 @@ class BreakoutStrategy extends TradingBase {
     // SecretManagerServiceClient on demand when this stays null.
     this._secretClient = null;
 
-    // ---- Trailing exit (§7) ----
-    // Give-back limiter for the held position. PERSISTED: a redeploy that
-    // silently disarmed it would resume holding a runaway position the user
-    // armed trailing to bound — a textbook fail-open. `trailExit` is persisted
-    // too (not re-derived) because the ratchet is path-dependent: re-deriving
-    // it from the live price after a restart would silently GIVE BACK every
-    // tick of progress the ratchet had already locked in.
-    this.trailEnabled = false;          // boolean — plain On/Off, direction comes from the position
-    this.trailDistanceValue = null;     // number|null — fixed when the position opens
-    this.trailExit = null;              // number|null — the live ratcheted exit level
-
     // ---- Phase 3: harvest-gauge cap ----
     this._lastPositionSize = null;        // last dynamic position base size (for gauge-full freeze)
     this._manualHarvestRequested = false; // latch: harvestNow() sets this; honored on the next free tick (transient, not persisted)
@@ -265,8 +253,8 @@ class BreakoutStrategy extends TradingBase {
    * DERIVED, never persisted — see the getter above for why.
    *
    * Rounds to tick size here rather than in the pure module, because this is the
-   * only layer that knows the symbol's exchange info. `trailDistance` reads the
-   * ROUNDED levels, so the trail starts exactly on the exit level.
+   * only layer that knows the symbol's exchange info. `_checkStopHit` compares
+   * against these ROUNDED levels, so the stop sits exactly on the exit level.
    */
   _deriveBreakoutLevels() {
     const raw = deriveBreakoutLevels(this.bullLevel, this.bearLevel, this.breakoutPct);
@@ -452,7 +440,6 @@ class BreakoutStrategy extends TradingBase {
     // Nulling finalTpPrice clears any previous target — the new levels have
     // no position behind them yet.
     this.finalTpPrice = null;
-    this._clearTrail();
     this.lastProcessedPrice = this.currentPrice;
 
     await this.addLog(`===== LEVELS SET (${reason}) =====`);
@@ -966,84 +953,30 @@ class BreakoutStrategy extends TradingBase {
   }
 
   /**
-   * Arm the trail at the moment the position opens. The distance is fixed
-   * here and never recomputed, which is what makes the exit start exactly at
-   * the entry level and move 1:1 with price from there — no tuning knob,
-   * self-scaling across symbols.
+   * The strategy's ONLY stop check while a position is held. Returns true when
+   * price has reached the exit level for the held side.
    *
-   * A no-op when trailing is off, so `trailExit` stays null and
-   * `_updateTrailAndCheckHit` falls back to the plain pinned stop. Gated on
-   * `openLeg` (the single-row ledger), not a deleted mode field. Safe to call
-   * twice.
-   */
-  _armTrail() {
-    if (!this.trailEnabled || !this.openLeg) {
-      this.trailDistanceValue = null;
-      this.trailExit = null;
-      return;
-    }
-    const side = this.heldSide;
-    const d = trailDistance(side, {
-      bullLevel: this.bullLevel, bearLevel: this.bearLevel,
-      bullBreakout: this.bullBreakout, bearBreakout: this.bearBreakout,
-    });
-    if (d == null || !(d > 0)) {
-      // An unusable distance must leave the trail DISARMED, never guessed.
-      this.trailDistanceValue = null;
-      this.trailExit = null;
-      return;
-    }
-    this.trailDistanceValue = d;
-    this.trailExit = trailExitLevel({
-      price: this.openLeg.fillPrice, distance: d, side,
-      bullLevel: this.bullLevel, bearLevel: this.bearLevel, previous: null,
-    });
-  }
-
-  /** Clear the trail. Called on every stop-out (plain or trailed), level rebuild, and toggling the trail off. */
-  _clearTrail() {
-    this.trailDistanceValue = null;
-    this.trailExit = null;
-  }
-
-  /**
-   * The strategy's ONLY stop check while a position is held. Returns true
-   * when price has reached the current exit level.
+   * The stop is FIXED at bullLevel (LONG) / bearLevel (SHORT) — the level the
+   * position's own entry was derived from, `breakoutPct` away. It does not
+   * move. The trailing exit that used to share this method was removed; there
+   * is no ratchet and no second framing, so this is a plain threshold.
    *
-   * The stop and the trailed exit are ONE mechanism, not two. With trailing
-   * DISARMED the level is pinned at bullLevel/bearLevel and this behaves as a
-   * plain stop; with it ARMED, the level ratchets via `trailExitLevel` and can
-   * lock profit above the entry. Either way `_stopOut` owns the close — the
-   * caller does not need to know which framing produced the hit.
+   * Returns false on a null level rather than guessing: a re-plan failure nulls
+   * both levels (see `_harvestToFlat`'s CRITICAL 2 note), and a stop derived
+   * from a missing level would be a fabricated exit, not a safe default.
    */
-  _updateTrailAndCheckHit(price) {
+  _checkStopHit(price) {
     const side = this.heldSide;
     if (!side) return false;
-
-    // With trailing DISARMED the stop still exists — it just never ratchets.
-    // Pin it to the exit level so this one branch serves both framings.
-    if (!this.trailEnabled) {
-      const stop = side === 'LONG' ? this.bullLevel : this.bearLevel;
-      if (!Number.isFinite(stop)) return false;
-      this.trailExit = stop;
-      return side === 'LONG' ? price <= stop : price >= stop;
-    }
-
-    if (this.trailDistanceValue == null) return false;
-    const next = trailExitLevel({
-      price, distance: this.trailDistanceValue, side,
-      bullLevel: this.bullLevel, bearLevel: this.bearLevel, previous: this.trailExit,
-    });
-    if (next == null) return false;
-    this.trailExit = next;
-    return side === 'LONG' ? price <= next : price >= next;
+    const stop = side === 'LONG' ? this.bullLevel : this.bearLevel;
+    if (!Number.isFinite(stop)) return false;
+    return side === 'LONG' ? price <= stop : price >= stop;
   }
 
   /**
    * The cycle's only non-terminal exit: close and go flat, cycle continues.
    *
-   * Serves both framings of the same level — a stop at bullLevel/bearLevel when
-   * trailing is disarmed, and a ratcheted trailed exit when it is armed.
+   * Closes at bullLevel/bearLevel for the held side — the fixed stop.
    *
    * Returns false when the close could not be VERIFIED, in which case the caller
    * must not advance `lastProcessedPrice`. `_closeConsolidated` leaves `openLeg`
@@ -1069,8 +1002,6 @@ class BreakoutStrategy extends TradingBase {
       return false;
     }
 
-    this._clearTrail();
-
     // Only a VERIFIED close is a real stop-out — mirrors the harvestCount gate
     // in `_harvestToFlat`. `closed` can still be false here with nothing left
     // to abort on (the abort guard above only fires when `_closeQuantity() >
@@ -1079,9 +1010,9 @@ class BreakoutStrategy extends TradingBase {
 
     // Gap latch. A single tick can carry price past the OPPOSITE entry level on
     // the very tick that stopped us out; the two-tick rule means that side opens
-    // NEXT tick, not this one. Only ever the opposite side: with the trail able
-    // to ratchet past the entry, a profitable exit routinely lands beyond the
-    // level we just traded, and latching that side would re-enter uncommanded.
+    // NEXT tick, not this one. Only ever the OPPOSITE side, and `closedSide` is
+    // captured BEFORE the close (`_closeConsolidated` nulls `openLeg`): latching
+    // on price alone could re-arm the side just closed and re-enter uncommanded.
     // Not persisted — it is valid for one tick only.
     if (closedSide === 'LONG' && price <= this.bearBreakout) this._pendingEntry = 'SHORT';
     else if (closedSide === 'SHORT' && price >= this.bullBreakout) this._pendingEntry = 'LONG';
@@ -1093,76 +1024,7 @@ class BreakoutStrategy extends TradingBase {
     return true;
   }
 
-  /**
-   * Turn the trailing exit on or off. Accepted at any time while running: it is
-   * a state change, not an action. Switching it on while a position is held
-   * arms it now; switching it off clears the ratchet so a later re-arm starts
-   * fresh rather than inheriting a stale level from a different position.
-   *
-   * STRICT, not coercing — only real booleans. Error shapes match `harvestNow`
-   * so the route can map them: bad input sets `.invalidInput = true` (→ 400);
-   * `!isRunning` is untagged (→ 409).
-   */
-  async setTrailEnabled(enabled) {
-    if (!this.isRunning) throw new Error('Strategy is not running.');
-    if (typeof enabled !== 'boolean') {
-      const e = new Error('Trailing must be true or false.');
-      e.invalidInput = true;
-      throw e;
-    }
-    this.trailEnabled = enabled;
-    if (enabled) this._armTrail(); else this._clearTrail();
-    await this.saveState();
-    this._pushHeartbeatNow?.();
-    await this.addLog(
-      `trailing exit ${enabled ? 'ON' : 'OFF'}` +
-      (enabled && this.trailExit != null ? ` — exit at ${this._formatPrice(this.trailExit)}` : ''),
-    );
-    return { trailEnabled: this.trailEnabled, trailExit: this.trailExit };
-  }
 
-  /**
-   * Restore the trail from a snapshot. Its own method because it holds an
-   * invariant worth testing, and `resume()` cannot be exercised in a unit test.
-   *
-   * Carry-forward 1: never TRUST the persisted exit — re-clamp it into the
-   * RESTORED band, FLOOR-ONLY, mirroring `trailExitLevel`'s own semantics
-   * (see breakout-trail.js): `Math.max(bullLevel, exit)` for a LONG,
-   * `Math.min(bearLevel, exit)` for a SHORT. There is deliberately NO upper
-   * cap — Task 3 removed the two-sided ladder-era clamp everywhere else
-   * specifically so the trail can ratchet PAST the entry level and lock a
-   * real profit, and this restore must not throw that profit away by pulling
-   * a persisted exit of, say, 105 (locked above a bullLevel of 100) back down
-   * to 100 — that would turn a resume during a favourable retrace into a
-   * silently discarded protective exit. The levels can still have moved since
-   * the snapshot was written (a manual edit or an applied Ask AI proposal
-   * narrows the band), which is exactly why this still clamps at the floor
-   * rather than trusting the raw persisted value outright.
-   *
-   * The side comes from `this.openLeg` (Critical 1 — restored earlier in
-   * `resume()`, before this call, specifically so it is available here). A
-   * flat run has no held side and therefore no meaningful exit level.
-   *
-   * `trailEnabled` restores from an EXPLICIT `=== true` only: a missing or
-   * malformed field is unknown, and unknown must never read as armed.
-   */
-  _restoreTrailFromSnapshot(snapshot = {}) {
-    this.trailEnabled = snapshot.trailEnabled === true;
-    this.trailDistanceValue = Number.isFinite(snapshot.trailDistanceValue) ? snapshot.trailDistanceValue : null;
-    const exit = snapshot.trailExit;
-    const side = this.openLeg ? this.openLeg.direction : null;
-    if (!Number.isFinite(exit) || side == null) {
-      this.trailExit = null;
-      return;
-    }
-    if (side === 'LONG' && Number.isFinite(this.bullLevel)) {
-      this.trailExit = Math.max(this.bullLevel, exit);
-    } else if (side === 'SHORT' && Number.isFinite(this.bearLevel)) {
-      this.trailExit = Math.min(this.bearLevel, exit);
-    } else {
-      this.trailExit = null;
-    }
-  }
 
   /**
    * Manual harvest — close whatever is open (nothing, if already flat),
@@ -1297,10 +1159,9 @@ class BreakoutStrategy extends TradingBase {
       // inside `_planAndBuildLevels`) would leave that gate permanently
       // satisfied, so the strategy would never re-plan again and would keep
       // trading last cycle's stale entry levels indefinitely with bullLevel/
-      // bearLevel null — which also silences BOTH stop framings in
-      // `_updateTrailAndCheckHit` (untrailed: `!Number.isFinite(null)`;
-      // trailed: `trailDistanceValue` derives from the null levels too),
-      // leaving only Final TP and a manual stop as exits.
+      // bearLevel null — which also silences the stop in `_checkStopHit`
+      // (`!Number.isFinite(null)`), leaving only Final TP and a manual stop
+      // as exits.
       this.openLeg = null;
       this._pendingEntry = null;
       this.bullLevel = null;
@@ -1420,19 +1281,13 @@ class BreakoutStrategy extends TradingBase {
     this.bullLevel = snapshot.bullLevel ?? null;
     this.bearLevel = snapshot.bearLevel ?? null;
     // The single-row open-position ledger (Critical 1) — restored HERE, before
-    // both the trail restore below (which needs the held side to re-clamp the
-    // ratchet to the correct floor) and `_recomputeFinalTpPrice()` further down
-    // (which needs `heldSide`, derived from this, to resolve entry/exit
-    // direction). Without this a restart mid-position resumed with
-    // openLeg/heldSide both null, which silently dropped the Final TP, the
-    // stop and the trail, AND let `_openPosition` open a SECOND full-size
-    // position on the next crossing (its own `if (this.openLeg)` guard read
-    // null as "nothing open").
+    // `_recomputeFinalTpPrice()` further down (which needs `heldSide`, derived
+    // from this, to resolve entry/exit direction). Without this a restart
+    // mid-position resumed with openLeg/heldSide both null, which silently
+    // dropped the Final TP and the stop, AND let `_openPosition` open a SECOND
+    // full-size position on the next crossing (its own `if (this.openLeg)`
+    // guard read null as "nothing open").
     this.openLeg = snapshot.openLeg ?? null;
-    // Trailing exit (§7) — restored AFTER bullLevel/bearLevel AND openLeg: the
-    // restore re-clamps the persisted exit into the just-restored band and
-    // needs the held side (carry-forward 1).
-    this._restoreTrailFromSnapshot(snapshot);
     this.lastProcessedPrice = snapshot.lastProcessedPrice ?? null;
     this._positionBaseSize = snapshot.ladderBaseSize || this.currentInitialSize; // grown position base survives restarts (else it shrinks to initial)
     this._lastPositionSize = snapshot._lastPositionSize ?? null;
@@ -1647,12 +1502,6 @@ class BreakoutStrategy extends TradingBase {
     await this.addLog(`[RECOVERY] subState=${this.subState} side=${this.currentSide || 'NONE'} reversals=${this.reversalCount} harvests=${this.harvestCount} accLoss=${this.cycleAccumulatedLoss.toFixed(4)} USDT`);
 
     await this.saveState();
-
-    // A resumed position with trailing on but no usable distance must re-arm
-    // rather than run untrailed — the user armed it to bound this position.
-    if (this.trailEnabled && this.openLeg && this.trailDistanceValue == null) {
-      this._armTrail();
-    }
   }
 
   /**
@@ -2122,10 +1971,8 @@ class BreakoutStrategy extends TradingBase {
       return;
     }
 
-    // ---- Exit 2: the stop. With trailing disarmed this level never moves off
-    // bullLevel/bearLevel, so this single branch is both the near-level stop and
-    // the trailed exit — they are one mechanism, not two.
-    if (this.heldSide && this._updateTrailAndCheckHit(price)) {
+    // ---- Exit 2: the stop, fixed at bullLevel/bearLevel for the held side.
+    if (this.heldSide && this._checkStopHit(price)) {
       this._tradingSeqInProgress = true;
       let ok = false;
       try { ok = await this._stopOut(price); } finally { this._tradingSeqInProgress = false; }
@@ -2149,7 +1996,6 @@ class BreakoutStrategy extends TradingBase {
       try {
         await this._openPosition(plan.open);
         this._pendingEntry = null;   // consumed only once the open actually succeeded
-        this._armTrail();
         await this._recomputeFinalTpPrice();
       } finally { this._tradingSeqInProgress = false; }
     } else if (plan.clearPending) {
@@ -2241,7 +2087,17 @@ class BreakoutStrategy extends TradingBase {
     const notional = pos.notional || entry * qty || 0;
     const estimatedClosingFee = notional * FEE_RATE;
     return {
-      projectedProfitUSDT: gain - (this.cycleAccumulatedLoss || 0) - estimatedClosingFee,
+      // Signed, matching `_recomputeFinalTpPrice`. These two MUST agree — this is
+      // the number the Final TP editor previews and `adjustFinalTp(price)` then
+      // back-solves `desiredProfitUSDT` from, so a preview computed off the
+      // clamped value would show one figure and arm a different target.
+      //
+      // `- aiCost` closes a drift that predates the signed change: the target
+      // carried an aiCost term and this preview did not, so back-solving from a
+      // requested LEVEL armed one aiCost/qty away from it. Substituting this
+      // expression into `needed` now cancels every term but `gain`, which is
+      // what makes "ask for price X, get price X" exactly true.
+      projectedProfitUSDT: gain + this._computeNetSignedPnL() - estimatedClosingFee - (this.aiCostUSD || 0),
       side,
     };
   }
@@ -2506,8 +2362,8 @@ class BreakoutStrategy extends TradingBase {
     const movingBear = bearLevel != null && nextBear !== this.bearLevel;
 
     // The §3 invariant is checked ONLY against the side being moved. Once a
-    // position is open and the trail has ratcheted past its entry level, price
-    // is legitimately OUTSIDE the band by construction, so re-validating the
+    // position is open, price has by construction run past that side's entry
+    // level, so it is legitimately OUTSIDE the band, and re-validating the
     // untouched side against live price would refuse every edit exactly when
     // the user most wants one. The untouched side cannot have become invalid
     // on its own — it has not moved — and the side price HAS run past is
@@ -2559,16 +2415,6 @@ class BreakoutStrategy extends TradingBase {
     this.bullLevel = nextBull;
     this.bearLevel = nextBear;
     this._deriveBreakoutLevels();
-
-    // Carry-forward: the band just moved, so a stored ratchet value may now sit
-    // on the wrong side of its floor. Pull it back rather than letting a stale
-    // value win forever. The distance itself is re-derived by _armTrail, which
-    // Task 6 owns.
-    if (this.openLeg && Number.isFinite(this.trailExit)) {
-      this.trailExit = this.openLeg.direction === 'LONG'
-        ? Math.max(this.bullLevel, this.trailExit)
-        : Math.min(this.bearLevel, this.trailExit);
-    }
 
     await this.addLog(
       // Name the re-derived ENTRIES, not just the levels. Editing bullLevel moves
@@ -2759,10 +2605,37 @@ class BreakoutStrategy extends TradingBase {
     // are treated 1:1 — the drift is a fraction of a cent on a sub-dollar figure,
     // far below the tick rounding applied downstream.
     const estimatedClosingFee = notional * FEE_RATE;
-    const needed = (this.cycleAccumulatedLoss || 0)
-      + (this.desiredProfitUSDT || 0)
-      + estimatedClosingFee
-      + (this.aiCostUSD || 0);
+
+    // SIGNED, not `cycleAccumulatedLoss`. The two differ only when the cycle is
+    // net POSITIVE, and that is exactly the case this has to get right.
+    //
+    // `cycleAccumulatedLoss` is max(0, −net) — correct for SIZING, where a
+    // negative loss would shrink the position below its initial size and mean
+    // nothing, and that clamp stays put in `_computeFormulaSize`. But feeding
+    // the clamped value to a TARGET throws the banked profit away: the current
+    // position is asked to earn the WHOLE desired profit again, on top of money
+    // already in the wallet, so the cycle closes at desiredProfit + banked and
+    // stays exposed far longer than the target requires.
+    //
+    // Observed live on CL/USDT: a harvest at 84.79 banked +6.07, flipping the
+    // cycle from −4.15 to +1.88, and the very next log line read
+    // "Post-HARVEST base 50.00 USDT (accLoss 0.00)". Every Final TP for the six
+    // days after that was derived as if the +1.88 did not exist — 80.26 (6.4%
+    // from entry) where the target actually needed 83.58 (2.5%).
+    const signedAccLoss = -this._computeNetSignedPnL();
+
+    // Floor at the closing fee so the target can never cross to the LOSING side
+    // of entry. Once banked profit alone covers the desired profit the raw sum
+    // goes negative, and a negative `needed` would put the level below entry for
+    // a LONG / above it for a SHORT — which `_checkFinalTpHit` (a bare
+    // threshold) would fire on immediately, turning the take-profit into an
+    // uncommanded stop at a loss. Flooring keeps it a TAKE-profit: the cycle
+    // ends at the first moment the open leg is not itself losing money, and the
+    // net still clears the target because the profit is already banked.
+    const needed = Math.max(
+      estimatedClosingFee,
+      signedAccLoss + (this.desiredProfitUSDT || 0) + estimatedClosingFee + (this.aiCostUSD || 0),
+    );
     if (!entry || qty <= 0) {
       this.finalTpPrice = null;
       return;
@@ -2869,11 +2742,15 @@ class BreakoutStrategy extends TradingBase {
    * the broader codebase's existing storage shape while the formula
    * reads cleanly with all three terms in the same sign space.
    */
-  _computeAccLoss() {
+  _computeNetSignedPnL() {
     const realized = (this.accumulatedRealizedPnL  || 0);                        // signed
     const fees     = -(this.accumulatedTradingFees || 0);                        // → signed (always negative)
     const funding  = (this.accumulatedFundingFees   || 0);                       // signed
-    const netSignedPnL = realized + fees + funding;
+    return realized + fees + funding;
+  }
+
+  _computeAccLoss() {
+    const netSignedPnL = this._computeNetSignedPnL();
     return netSignedPnL < 0 ? -netSignedPnL : 0;
   }
 
@@ -3287,10 +3164,6 @@ class BreakoutStrategy extends TradingBase {
       bullLevel: this.bullLevel,
       bearLevel: this.bearLevel,
       positionBaseSize: this._positionBaseSize,
-      // Trailing exit (§7).
-      trailEnabled: this.trailEnabled ?? false,
-      trailDistanceValue: this.trailDistanceValue ?? null,
-      trailExit: this.trailExit ?? null,
       // Running config — surfaced so the frontend's Active Config panel
       // can show the values the bot is ACTUALLY using rather than the
       // form's DEFAULT_CONFIG (which is what the ladder-era frontend used
@@ -3337,7 +3210,7 @@ class BreakoutStrategy extends TradingBase {
    *   - Derivable fields (cycleDuration = Date.now() - cycleStartTime).
    * Breakout/position fields (bullLevel/bearLevel/bullBreakout/bearBreakout/
    * openLeg/heldSide, finalTpPrice, ...) ARE included here because entries,
-   * exits and trail ratchets happen mid-cycle, and the frontend merges
+   * and exits happen mid-cycle, and the frontend merges
    * this payload directly into `status`
    * (setStatus(prev => ({...prev, ...payload}))) so a value missing here
    * would only ever reach the frontend via the next full REST getStatus().
@@ -3384,10 +3257,6 @@ class BreakoutStrategy extends TradingBase {
       bullLevel: this.bullLevel,
       bearLevel: this.bearLevel,
       positionBaseSize: this._positionBaseSize,
-      // Trailing exit (§7).
-      trailEnabled: this.trailEnabled ?? false,
-      trailDistanceValue: this.trailDistanceValue ?? null,
-      trailExit: this.trailExit ?? null,
       harvestTriggerPrice: this.harvestTriggerPrice ?? null,
       harvestTriggerAbove: this.harvestTriggerAbove ?? null,
       harvestTriggerAction: this.harvestTriggerAction ?? 'reanchor',
@@ -3447,7 +3316,7 @@ class BreakoutStrategy extends TradingBase {
         currentPosition: this.activePosition,
         // The single-row open-position ledger (Critical 1). Without this a
         // restart mid-position resumes with openLeg/heldSide both null, which
-        // drops the Final TP/stop/trail AND lets `_openPosition` open a SECOND
+        // drops the Final TP and the stop AND lets `_openPosition` open a SECOND
         // full-size position on the next crossing (its `if (this.openLeg)`
         // guard reads null as "nothing open"). A flat object, not an array —
         // Firestore rejects nested arrays but this shape is fine.
@@ -3510,11 +3379,6 @@ class BreakoutStrategy extends TradingBase {
         // percentage and re-derive the entry levels from it. The levels
         // themselves are DERIVED and deliberately NOT persisted.
         breakoutPct: this.breakoutPct,
-        // Trailing exit (§7) — PERSISTED so a redeploy cannot silently disarm
-        // it (see the field's own doc in the constructor).
-        trailEnabled: this.trailEnabled ?? false,
-        trailDistanceValue: this.trailDistanceValue ?? null,
-        trailExit: this.trailExit ?? null,
         // AI level planning (§10) — cost accounting only. NEVER persist
         // `_aiApiKey` here: that would put a live credential in a database the
         // frontend can read (see the field's own doc in the constructor).

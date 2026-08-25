@@ -36,7 +36,6 @@ export function breakoutStrategy({ bull = 100, bear = 98, pct = 0.015, base = 10
   s._computePositionBaseSize = async () => s._positionBaseSize;
   s.roundPrice = (p) => p;              // no tick rounding in tests
   s.roundQuantity = (q) => q;
-  s.trailEnabled = false;               // explicit: never depend on a constructor default
   s._deriveBreakoutLevels();
   return s;
 }
@@ -151,7 +150,7 @@ test('a snapshot this class writes is a snapshot this class can read back', asyn
 
 // Final-fix-round CRITICAL 1: `openLeg` had NO writer in saveState's doc
 // literal and no reader in resume() — a restart mid-position resumed with
-// openLeg/heldSide both null, dropping the Final TP/stop/trail entirely and
+// openLeg/heldSide both null, dropping the Final TP and the stop entirely and
 // leaving `_openPosition`'s `if (this.openLeg)` guard free to open a SECOND
 // full-size position on the very next crossing. Unlike the round-trip test
 // above (which is deliberately flat), this one resumes a LIVE position.
@@ -239,42 +238,6 @@ test('resume KEEPS a persisted openLeg when the position refresh fails — unkno
 
   assert.deepEqual(dst.openLeg, src.openLeg, 'an unverified refresh must never discard a real leg — unknown is not flat');
   assert.equal(dst.heldSide, 'LONG', 'the leg — and therefore heldSide — must survive an unknown refresh');
-});
-
-// ——— trail restore (fix round 2, Important 1) ——————————————————————————
-//
-// Task 3 removed the trail's upper cap so it can ratchet PAST the entry level
-// and lock real profit. `_restoreTrailFromSnapshot` must clamp FLOOR-ONLY
-// (matching `trailExitLevel`'s own semantics), never back down to the
-// two-sided ladder-era clamp — that would discard a locked-in profit on
-// every VM restart.
-
-test('_restoreTrailFromSnapshot keeps a locked-in LONG profit above bullLevel unchanged (Important 1)', () => {
-  const s = breakoutStrategy({ bull: 100, bear: 98 });
-  s.openLeg = { direction: 'LONG', quantity: 1, fillPrice: 101.5, openedAt: 1 };
-  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 1.5, trailExit: 105 });
-  assert.equal(s.trailExit, 105, 'a trailExit locked above bullLevel must survive resume unchanged, not clamp down to bullLevel');
-});
-
-test('_restoreTrailFromSnapshot mirrors for a locked-in SHORT profit below bearLevel', () => {
-  const s = breakoutStrategy({ bull: 100, bear: 98 });
-  s.openLeg = { direction: 'SHORT', quantity: 1, fillPrice: 96.5, openedAt: 1 };
-  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 1.5, trailExit: 93 });
-  assert.equal(s.trailExit, 93, 'a trailExit locked below bearLevel must survive resume unchanged, not clamp up to bearLevel');
-});
-
-test('_restoreTrailFromSnapshot still floors a stale LONG exit back up to bullLevel', () => {
-  const s = breakoutStrategy({ bull: 100, bear: 98 });
-  s.openLeg = { direction: 'LONG', quantity: 1, fillPrice: 101.5, openedAt: 1 };
-  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 1.5, trailExit: 95 });
-  assert.equal(s.trailExit, 100, 'a stale exit below the floor must be pulled back up to bullLevel, not preserved below it');
-});
-
-test('_restoreTrailFromSnapshot nulls the exit when nothing is held', () => {
-  const s = breakoutStrategy({ bull: 100, bear: 98 });
-  s.openLeg = null;
-  s._restoreTrailFromSnapshot({ trailEnabled: true, trailDistanceValue: 1.5, trailExit: 105 });
-  assert.equal(s.trailExit, null, 'a flat run has no held side and therefore no meaningful exit level');
 });
 
 test('_closeQuantity reads the open leg, not activePosition', () => {
@@ -536,9 +499,8 @@ test('Final TP ends the cycle', async () => {
   assert.deepEqual(stopped, { flatten: true, reason: 'final_tp' });
 });
 
-test('with trailing off the stop stays pinned at bullLevel', async () => {
+test('the stop is pinned at bullLevel and never moves off it', async () => {
   const s = breakoutStrategy();
-  s.trailEnabled = false;
   captureOpens(s);
   const closes = captureCloses(s);
   await s.handleRealtimePrice(101);
@@ -551,17 +513,18 @@ test('with trailing off the stop stays pinned at bullLevel', async () => {
   assert.equal(closes.length, 1);
 });
 
-test('with trailing on the stop ratchets above the entry and locks profit', async () => {
+test('the stop is pinned at bearLevel for a held SHORT (mirror)', async () => {
   const s = breakoutStrategy();
-  s.trailEnabled = true;
   captureOpens(s);
   const closes = captureCloses(s);
-  await s.handleRealtimePrice(101);
-  await s.handleRealtimePrice(101.6);
-  await s.handleRealtimePrice(110);
-  assert.ok(s.trailExit > s.bullBreakout, `trail ${s.trailExit} should lock profit above ${s.bullBreakout}`);
-  await s.handleRealtimePrice(107);
-  assert.equal(closes.length, 1, 'the ratcheted trail owns the close');
+  await s.handleRealtimePrice(96);               // opens SHORT (96 <= bearBreakout 96.53)
+  assert.equal(s.heldSide, 'SHORT');
+  await s.handleRealtimePrice(90);               // a big favourable run — nothing ratchets
+  assert.equal(s.heldSide, 'SHORT', 'a favourable run must not move the stop');
+  await s.handleRealtimePrice(97);               // below bearLevel 98 — no exit
+  assert.equal(s.heldSide, 'SHORT');
+  await s.handleRealtimePrice(98.1);             // at/through bearLevel — stop hits
+  assert.equal(closes.length, 1);
 });
 
 test('an unverified close leaves the position tracked and re-scans next tick', async () => {
@@ -577,44 +540,8 @@ test('an unverified close leaves the position tracked and re-scans next tick', a
   assert.equal(s.lastProcessedPrice, before, 'the band must be re-scanned next tick');
 });
 
-// ——— fix round 1: the gap latch must never re-arm the side that just closed ———
-//
-// Task 3 removed the trail's upper cap so it can ratchet PAST the entry level
-// and lock real profit — which means a routine profitable exit can close a
-// LONG at a price still above bullBreakout (or a SHORT still below
-// bearBreakout). The latch decision must be keyed off the side that just
-// closed, captured BEFORE the close (which nulls openLeg), not off price alone.
-
-test('a trailing LONG that exits ABOVE bullBreakout does not latch a re-entry', async () => {
-  const s = breakoutStrategy();
-  s.trailEnabled = true;
-  const opens = captureOpens(s);
-  captureCloses(s);
-  await s.handleRealtimePrice(101);
-  await s.handleRealtimePrice(101.6);
-  await s.handleRealtimePrice(110);              // trail ratchets to 108.5
-  await s.handleRealtimePrice(107);               // hit — closes at 107, still > bullBreakout 101.5
-  assert.equal(s._pendingEntry, null, 'must not re-arm the side that just closed');
-  await s.handleRealtimePrice(107.1);              // still above bullBreakout — no fresh crossing
-  assert.deepEqual(opens, ['LONG'], 'no uncommanded re-entry');
-});
-
-test('a trailing SHORT that exits BELOW bearBreakout does not latch a re-entry', async () => {
-  const s = breakoutStrategy();
-  s.trailEnabled = true;
-  const opens = captureOpens(s);
-  captureCloses(s);
-  await s.handleRealtimePrice(96);                // opens SHORT (96 <= bearBreakout 96.53)
-  assert.deepEqual(opens, ['SHORT']);
-  await s.handleRealtimePrice(90);                 // trail ratchets down to 91.47
-  await s.handleRealtimePrice(93);                 // hit — closes at 93, still < bearBreakout 96.53
-  assert.equal(s._pendingEntry, null, 'must not re-arm the side that just closed');
-  await s.handleRealtimePrice(92.9);               // still below bearBreakout — no fresh crossing
-  assert.deepEqual(opens, ['SHORT'], 'no uncommanded re-entry');
-});
-
 test('the genuine gap case still latches: a LONG stopped out below bearBreakout arms SHORT', async () => {
-  const s = breakoutStrategy();                    // trailEnabled: false — pinned stop at bullLevel
+  const s = breakoutStrategy();                    // pinned stop at bullLevel
   captureOpens(s);
   captureCloses(s);
   await s.handleRealtimePrice(101);
@@ -723,8 +650,7 @@ test('_harvestToFlat aborts and leaves the position tracked when the close is un
 // AI planner unavailable, the price-staleness discard), the old code left
 // non-null stale entry levels behind and the gate never fired again: the
 // strategy would trade last cycle's stale levels forever, with a null
-// bullLevel/bearLevel silencing both stop framings in
-// `_updateTrailAndCheckHit`.
+// bullLevel/bearLevel silencing the stop in `_checkStopHit`.
 test('_harvestToFlat nulls bullBreakout/bearBreakout when the re-plan fails (Critical 2)', async () => {
   const s = breakoutStrategy();
   s.openLeg = { direction: 'LONG', quantity: 2, fillPrice: 101.5, openedAt: 1 };
@@ -822,10 +748,9 @@ test('both status channels emit stopOutCount', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// The six user-facing (button-driven) methods below have zero prior
-// coverage. Four had their internals rewritten by the ladder->breakout
-// migration (editLevels, setTrailEnabled, adjustProfitTarget/adjustFinalTp
-// via _recomputeFinalTpPrice). Contracts here are read directly from the
+// The user-facing (button-driven) methods below have zero prior coverage.
+// Several had their internals rewritten by the ladder->breakout migration
+// (editLevels, adjustProfitTarget/adjustFinalTp via _recomputeFinalTpPrice). Contracts here are read directly from the
 // source, not guessed from the method name — see the class-body comments
 // this file cross-references.
 // ═══════════════════════════════════════════════════════════════════════
@@ -886,20 +811,6 @@ test('editLevels re-derives both breakout levels after a successful change', asy
   near(s.bearBreakout, 98 * 0.985, 'bearBreakout is re-derived too (unchanged value, but recomputed)');
 });
 
-test('editLevels trail carry-forward pulls a stale LONG trailExit back up to the new floor', async () => {
-  const s = heldLong(breakoutStrategy());
-  s.trailExit = 95; // stale — below bullLevel (100), the LONG floor
-  await s.editLevels({ bearLevel: 90 }); // permitted: the other side moves, bullLevel (the floor) stays 100
-  assert.equal(s.trailExit, 100, 'a trailExit below the floor must be pulled back up to it');
-});
-
-test('editLevels trail carry-forward pulls a stale SHORT trailExit back down to the new floor (mirror)', async () => {
-  const s = heldShort(breakoutStrategy());
-  s.trailExit = 99; // stale — above bearLevel (98), the SHORT floor
-  await s.editLevels({ bullLevel: 110 }); // permitted: the other side moves, bearLevel (the floor) stays 98
-  assert.equal(s.trailExit, 98, 'a trailExit above the floor must be pulled back down to it');
-});
-
 test('editLevels reports no change when the call moves neither level', async () => {
   const s = breakoutStrategy(); // bull 100 / bear 98
   const result = await s.editLevels({ bullLevel: 100, bearLevel: 98 });
@@ -946,68 +857,6 @@ test('editLevels refuses to validate without a live price (untagged, distinct fr
     () => s.editLevels({ bullLevel: 105 }),
     (err) => { assert.match(err.message, /No live price yet/); assert.equal(err.invalidInput, undefined); return true; },
   );
-});
-
-// ——— setTrailEnabled — strict boolean, unified stop/trail mechanism ——————
-
-test('setTrailEnabled rejects a non-boolean rather than coercing it', async () => {
-  const s = breakoutStrategy();
-  await assert.rejects(
-    () => s.setTrailEnabled(1),
-    (err) => { assert.match(err.message, /must be true or false/); assert.equal(err.invalidInput, true); return true; },
-  );
-  await assert.rejects(() => s.setTrailEnabled('true'), /must be true or false/);
-});
-
-test('setTrailEnabled refuses to run when the strategy is not running', async () => {
-  const s = breakoutStrategy();
-  s.isRunning = false;
-  await assert.rejects(() => s.setTrailEnabled(true), /not running/);
-});
-
-test('setTrailEnabled(true) while holding arms the trail: distance set, exit starts at the held side\'s exit level', async () => {
-  const s = heldLong(breakoutStrategy(), { fillPrice: 101.5 }); // fillPrice == bullBreakout exactly
-  const result = await s.setTrailEnabled(true);
-  assert.equal(result.trailEnabled, true);
-  near(s.trailDistanceValue, 1.5, 'distance = bullBreakout - bullLevel');
-  near(s.trailExit, 100, 'starts exactly at bullLevel — the LONG exit level');
-});
-
-test('setTrailEnabled(true) while flat arms nothing', async () => {
-  const s = breakoutStrategy();
-  s.openLeg = null;
-  const result = await s.setTrailEnabled(true);
-  assert.equal(result.trailEnabled, true, 'the toggle itself still flips');
-  assert.equal(s.trailDistanceValue, null, 'nothing to arm without a held side');
-  assert.equal(result.trailExit, null);
-});
-
-test('setTrailEnabled(false) still leaves the stop pinned at bullLevel — the unified mechanism must not silently disarm the only stop', async () => {
-  const s = heldLong(breakoutStrategy(), { fillPrice: 101.5 });
-  await s.setTrailEnabled(true);
-  // simulate the ratchet having moved
-  s.trailExit = 105;
-
-  const result = await s.setTrailEnabled(false);
-  assert.equal(result.trailEnabled, false);
-  // _clearTrail nulls the stored ratchet — but the stop check below proves
-  // the mechanism is still live: it recomputes the pinned level from
-  // bullLevel on the next check, it does not depend on the stored value.
-  assert.equal(s.trailExit, null, 'the stored ratchet is cleared');
-
-  const hit = s._updateTrailAndCheckHit(99.9); // below bullLevel (100)
-  assert.equal(hit, true, 'the stop must still fire — turning trailing off must not remove the only stop');
-  assert.equal(s.trailExit, 100, 'the pinned stop is bullLevel itself');
-});
-
-test('setTrailEnabled(false) mirrors for a held SHORT — the stop stays pinned at bearLevel', async () => {
-  const s = heldShort(breakoutStrategy(), { fillPrice: 96.5 });
-  await s.setTrailEnabled(true);
-  s.trailExit = 93; // simulate a ratchet
-  await s.setTrailEnabled(false);
-  const hit = s._updateTrailAndCheckHit(98.1); // above bearLevel (98)
-  assert.equal(hit, true, 'the stop must still fire for the SHORT side too');
-  assert.equal(s.trailExit, 98);
 });
 
 // ——— adjustProfitTarget — routes through _recomputeFinalTpPrice(heldSide) ——
@@ -1361,7 +1210,6 @@ test('a snapshot with no plan resumes to null WITHOUT tripping the schema guard'
 
 test('applying an Ask-AI proposal records the plan; a manual edit leaves it alone', async () => {
   const s = breakoutStrategy();
-  s._armTrail = () => {};
 
   await s.editLevels({ bullLevel: 105, rationale: 'CVD rising confirms buy pressure', confidence: 0.82 });
   assert.equal(s.activeAiPlan.rationale, 'CVD rising confirms buy pressure');
@@ -1378,7 +1226,6 @@ test('applying an Ask-AI proposal records the plan; a manual edit leaves it alon
 
 test('a no-op apply still refreshes the plan, and persists it', async () => {
   const s = breakoutStrategy({ bull: 100, bear: 98 });
-  s._armTrail = () => {};
   let saved = false;
   s.saveState = async () => { saved = true; };
 
