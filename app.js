@@ -1775,6 +1775,23 @@ app.post('/breakout/harvest-now', requireVmOwner, async (req, res) => {
   }
 });
 
+// Hold / release new entries at the breakout levels. Exits are unaffected:
+// an open position keeps its Final TP and its stop. Idempotent.
+app.post('/breakout/pause-entries', requireVmOwner, async (req, res) => {
+  try {
+    const { strategyId, paused } = req.body;
+    if (!strategyId) return res.status(400).json({ error: 'strategyId is required.' });
+    const strategy = activeStrategies.get(strategyId);
+    if (!strategy || !(strategy instanceof BreakoutStrategy) || !strategy.isRunning) {
+      return res.status(400).json({ error: `No running Breakout strategy with ID ${strategyId}` });
+    }
+    const result = await strategy.pauseEntries(paused);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(error.invalidInput ? 400 : 409).json({ error: error.message });
+  }
+});
+
 // Cancel an armed harvest/re-anchor Trigger Price (set via harvest-now with a
 // triggerPrice). Idempotent — clears the latch if present. 400 if the strategy
 // isn't a running Breakout strategy.

@@ -113,6 +113,18 @@ class BreakoutStrategy extends TradingBase {
     // persisted — it lives one tick, and firing it on stale intent after a
     // restart would open a position the market no longer justifies.
     this._pendingEntry = null;
+    // User-held entries. While true the strategy opens NOTHING at the
+    // breakout levels; every exit still runs, because the Final TP and stop
+    // branches sit ABOVE the entry block in `_dispatchTick` and return early.
+    // A position open when this was set therefore still closes at its
+    // bullLevel/bearLevel exactly as planned — pausing holds new risk, it does
+    // not strand existing risk.
+    //
+    // PERSISTED, unlike `_pendingEntry` above. It is user INTENT, not tick
+    // state: a VM restart that forgot it would silently resume opening
+    // positions the user had held, which is this codebase's fail-open shape
+    // in its most expensive form.
+    this.entriesPaused = false;
     this.currentInitialSize = 0;         // base for DYNAMIC trend sizing (original config size; never overwritten → no compounding)
     this._positionBaseSize = 0;            // base the POSITION is sized from: initial size, then the dynamically re-sized base after a stop-out / harvest
     this.cycleStartTime = null;
@@ -1328,6 +1340,11 @@ class BreakoutStrategy extends TradingBase {
     this.accumulatedTradingFees = snapshot.accumulatedTradingFees || 0;
     this.accumulatedFundingFees = snapshot.accumulatedFundingFees || 0;
     this.aiCostUSD = snapshot.aiCostUSD || 0;
+    // Defaults FALSE for snapshots written before the field existed — those
+    // cycles were never paused, so false is the faithful reading, not a
+    // convenient one. Not part of the resume schema guard: a missing flag is
+    // representable, unlike a missing breakoutPct.
+    this.entriesPaused = snapshot.entriesPaused === true;
     // Optional by construction: snapshots written before this field existed
     // resume with no plan on record, which the panel renders as absent. It
     // must NEVER join the resume schema guard above — a missing plan is a
@@ -1987,6 +2004,31 @@ class BreakoutStrategy extends TradingBase {
     }
 
     // ---- Entry. ----
+    //
+    // HELD BY THE USER — skip the entry decision entirely. Reached only after
+    // both exits above have declined to act, so this can never suppress a
+    // close; it suppresses opens and nothing else.
+    //
+    // Two lines that look incidental and are not:
+    //
+    //   `_pendingEntry = null` — that latch means "open the opposite side on
+    //   the NEXT tick". Carrying it across a pause would fire an uncommanded
+    //   entry the instant the user resumed, from intent formed before they
+    //   asked the bot to stop opening.
+    //
+    //   `lastProcessedPrice = price` — keeps the crossing reference moving
+    //   while paused, so resuming compares against the price NOW, not the one
+    //   from when the pause began. Freeze it instead and the whole paused span
+    //   reads as one enormous crossing on the first tick after resuming, which
+    //   opens a position immediately — the precise opposite of what pausing
+    //   was asked to do. Resuming is therefore never itself a trade: it takes
+    //   a fresh crossing, made after the resume, to open.
+    if (this.entriesPaused) {
+      this._pendingEntry = null;
+      this.lastProcessedPrice = price;
+      return;
+    }
+
     const plan = planBreakoutEntry({
       prevPrice: this.lastProcessedPrice,
       currentPrice: price,
@@ -2008,6 +2050,47 @@ class BreakoutStrategy extends TradingBase {
     }
 
     this.lastProcessedPrice = price;
+  }
+
+  /**
+   * Hold / release new entries at the breakout levels.
+   *
+   * Exits are deliberately NOT touched: an open position keeps its Final TP
+   * and its stop at bullLevel/bearLevel, and Harvest / Re-anchor keep working
+   * (they close and re-plan, they never open). The pause survives harvests,
+   * re-anchors and VM restarts — nothing clears it but the user.
+   *
+   * Idempotent, and persisted before returning so the answer the frontend
+   * renders is the answer a restart would recover.
+   *
+   * @param {boolean} paused
+   * @returns {Promise<{entriesPaused: boolean, heldSide: 'LONG'|'SHORT'|null}>}
+   */
+  async pauseEntries(paused) {
+    if (!this.isRunning) throw new Error('Strategy is not running.');
+    if (typeof paused !== 'boolean') {
+      const e = new Error('`paused` must be true or false.');
+      e.invalidInput = true;
+      throw e;
+    }
+    const was = this.entriesPaused;
+    this.entriesPaused = paused;
+    // Clear the latch on the way IN as well as on every paused tick: the
+    // pause may land between a stop-out and the tick that would have consumed
+    // it, and that queued intent must not survive the request.
+    if (paused) this._pendingEntry = null;
+    await this.saveState();
+    this._pushHeartbeatNow?.();
+    if (was !== paused) {
+      await this.addLog(
+        paused
+          ? `entries HELD by user — no new positions will open at ${this._formatPrice(this.bullBreakout)} / `
+            + `${this._formatPrice(this.bearBreakout)}. Open positions still exit normally.`
+          : `entries RESUMED — a fresh crossing of ${this._formatPrice(this.bullBreakout)} / `
+            + `${this._formatPrice(this.bearBreakout)} will open again.`,
+      );
+    }
+    return { entriesPaused: this.entriesPaused, heldSide: this.heldSide };
   }
 
   /**
@@ -3169,6 +3252,7 @@ class BreakoutStrategy extends TradingBase {
       heldSide: this.heldSide,
       bullLevel: this.bullLevel,
       bearLevel: this.bearLevel,
+      entriesPaused: !!this.entriesPaused,
       positionBaseSize: this._positionBaseSize,
       // Running config — surfaced so the frontend's Active Config panel
       // can show the values the bot is ACTUALLY using rather than the
@@ -3268,6 +3352,9 @@ class BreakoutStrategy extends TradingBase {
       heldSide: this.heldSide,
       bullLevel: this.bullLevel,
       bearLevel: this.bearLevel,
+      // Both channels or the UI disagrees with itself — this one especially,
+      // since a WS-connected frontend disables REST polling entirely.
+      entriesPaused: !!this.entriesPaused,
       positionBaseSize: this._positionBaseSize,
       harvestTriggerPrice: this.harvestTriggerPrice ?? null,
       harvestTriggerAbove: this.harvestTriggerAbove ?? null,
@@ -3391,6 +3478,9 @@ class BreakoutStrategy extends TradingBase {
         // percentage and re-derive the entry levels from it. The levels
         // themselves are DERIVED and deliberately NOT persisted.
         breakoutPct: this.breakoutPct,
+        // See the field's own note: forgetting this across a restart resumes
+        // trading the user had explicitly held.
+        entriesPaused: !!this.entriesPaused,
         // AI level planning (§10) — cost accounting only. NEVER persist
         // `_aiApiKey` here: that would put a live credential in a database the
         // frontend can read (see the field's own doc in the constructor).
