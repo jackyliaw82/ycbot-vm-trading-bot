@@ -8,6 +8,26 @@ export const DEEPSEEK_BASE_URL = 'https://api.deepseek.com/anthropic';
 
 const MAX_RETRIES = 3;
 const DEFAULT_BACKOFF_MS = 1000;
+// Per-attempt ceiling on the model call.
+//
+// The SDK ships with `timeout = 10 minutes` and `maxRetries = 2` (verified
+// against the installed 0.39.0). Layered under this class's own MAX_RETRIES
+// of 3, that is up to NINE HTTP attempts at ten minutes each - no bound worth
+// the name. Nothing downstream survived it: the Ask AI request died at the
+// proxy's 60s Cloud Run ceiling as an opaque 504 carrying no CORS headers,
+// which the browser could only report as "Failed to fetch", while the VM and
+// DeepSeek carried on working for a caller that had already given up.
+//
+// `maxRetries: 0` is deliberate: this class ALREADY retries with backoff, and
+// a second retry loop hidden inside the SDK multiplied the count invisibly.
+// One loop, one place, a knowable worst case:
+//
+//   3 attempts x 45s + 1s + 2s backoff = 138s   <  the proxy's 150s abort
+//                                               <  Cloud Run's 180s ceiling
+//
+// Innermost bound fires first, so a slow model produces a real error message
+// rather than a dead connection.
+const AI_REQUEST_TIMEOUT_MS = 45_000;
 // 8192, not 2048: long analyses were being truncated mid-JSON, and a truncated
 // body fails to parse — which used to send the caller into a retry loop for a
 // reason that looked like a provider fault. Output bills per emitted token, not
@@ -20,7 +40,12 @@ export class AiPlanner {
    * real timer. Production passes neither.
    */
   constructor(apiKey, model = 'deepseek-v4-flash', { client, backoffMs, sleep } = {}) {
-    this.client = client || new Anthropic({ apiKey, baseURL: DEEPSEEK_BASE_URL });
+    this.client = client || new Anthropic({
+      apiKey,
+      baseURL: DEEPSEEK_BASE_URL,
+      timeout: AI_REQUEST_TIMEOUT_MS,
+      maxRetries: 0,           // this class owns retries - see the constant
+    });
     this.model = model;
     this.provider = 'deepseek';
     this.maxRetries = MAX_RETRIES;
