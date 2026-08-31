@@ -109,6 +109,7 @@ export async function planLevels({ planner, context, mode = 'plan', question } =
   const c = context || {};
   const opts = { currentPrice: c.currentPrice, atr: c.atr, tickSize: c.tickSize };
   let usage = null;
+  let timing = null;
   let error = null;
 
   if (planner && typeof planner.consult === 'function') {
@@ -116,8 +117,9 @@ export async function planLevels({ planner, context, mode = 'plan', question } =
       const userMessage = mode === 'ask'
         ? buildAskUserMessage(c, question)
         : buildPlanUserMessage(c);
-      const { json, usage: u } = await planner.consult(LEVELS_SYSTEM_PROMPT, userMessage);
+      const { json, usage: u, timing: t } = await planner.consult(LEVELS_SYSTEM_PROMPT, userMessage);
       usage = u || null;
+      timing = t || null;
       const verdict = validateLevels(json, opts);
       if (verdict.ok) {
         return {
@@ -127,6 +129,7 @@ export async function planLevels({ planner, context, mode = 'plan', question } =
           rationale: typeof json?.rationale === 'string' ? json.rationale : null,
           confidence: typeof json?.confidence === 'number' ? json.confidence : null,
           usage,
+          timing,
           error: null,
         };
       }
@@ -157,6 +160,7 @@ export async function planLevels({ planner, context, mode = 'plan', question } =
     rationale: null,
     confidence: null,
     usage,
+    timing,
     error,
   };
 }

@@ -54,7 +54,14 @@ export class AiPlanner {
   }
 
   /**
-   * One consult. Returns { json, usage, raw }.
+   * One consult. Returns { json, usage, raw, timing }.
+   *
+   * `timing` exists because "the AI is slow" was unanswerable: nothing
+   * recorded how long the call took or how much it generated, so a timeout
+   * told you THAT it failed and never WHY. Generation time is dominated by
+   * OUTPUT tokens (the context this sends is a handful of scalars), so
+   * duration alongside outputTokens is what distinguishes "the model wrote an
+   * essay" from "the provider was slow today".
    *
    * A reply that will not parse is treated as a FAILED ATTEMPT, not a success —
    * the model occasionally answers in prose, and returning that as a plan would
@@ -62,7 +69,9 @@ export class AiPlanner {
    */
   async consult(systemPrompt, userMessage) {
     let lastError = null;
+    const startedAll = Date.now();
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      const started = Date.now();
       try {
         const response = await this.client.messages.create({
           model: this.model,
@@ -76,16 +85,41 @@ export class AiPlanner {
           .join('\n')
           .trim();
         const json = parseJsonBody(text);
-        return { json, usage: normaliseUsage(response?.usage), raw: text };
+        const usage = normaliseUsage(response?.usage);
+        return {
+          json,
+          usage,
+          raw: text,
+          timing: {
+            ms: Date.now() - started,          // this attempt
+            totalMs: Date.now() - startedAll,  // including earlier failed attempts
+            attempts: attempt,
+            model: this.model,
+            timeoutMs: AI_REQUEST_TIMEOUT_MS,
+            maxTokens: MAX_TOKENS,   // so a reader can see when output hit the cap
+          },
+        };
       } catch (error) {
         lastError = error;
-        console.error(`[ai-planner] attempt ${attempt}/${this.maxRetries} failed: ${error.message}`);
+        // Elapsed time is the whole point on a failure: an attempt that died
+        // at ~45s hit OUR timeout, one that died in 200ms was rejected by the
+        // provider. Identical message, opposite causes.
+        console.error(
+          `[ai-planner] attempt ${attempt}/${this.maxRetries} failed after `
+          + `${((Date.now() - started) / 1000).toFixed(1)}s (${this.model}, `
+          + `timeout ${AI_REQUEST_TIMEOUT_MS / 1000}s): ${error.message}`,
+        );
         if (attempt < this.maxRetries) {
           await this._sleep(this._backoffMs * Math.pow(2, attempt - 1));
         }
       }
     }
-    throw new Error(`AI consult failed after ${this.maxRetries} attempts: ${lastError?.message}`);
+    const e = new Error(
+      `AI consult failed after ${this.maxRetries} attempts in `
+      + `${((Date.now() - startedAll) / 1000).toFixed(1)}s: ${lastError?.message}`,
+    );
+    e.totalMs = Date.now() - startedAll;
+    throw e;
   }
 }
 

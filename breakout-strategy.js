@@ -615,6 +615,7 @@ class BreakoutStrategy extends TradingBase {
       await this.addLog(
         `levels from ${result.source} — bull ${this._formatPrice(result.bullLevel)} / ` +
         `bear ${this._formatPrice(result.bearLevel)}` +
+        this._formatAiTiming(result.timing, result.usage) +
         (result.rationale ? ` — ${result.rationale}` : ''),
       );
 
@@ -2529,6 +2530,30 @@ class BreakoutStrategy extends TradingBase {
    * user action through `editLevels`, which re-runs the §3 guard rails and the
    * filled-leg refusal.
    */
+  /**
+   * One line naming what the model call actually cost in TIME and TOKENS.
+   *
+   * Written to the strategy log, not just the console: the console lives on the
+   * VM behind SSH, and the question this answers ("why did Ask AI take a
+   * minute?") is one the user asks from the app. Duration next to outputTokens
+   * is what separates "the model wrote an essay" from "the provider was slow" -
+   * generation time scales with what is PRODUCED, and the context this sends is
+   * a handful of scalars either way.
+   */
+  _formatAiTiming(timing, usage) {
+    if (!timing) return '';
+    const secs = (ms) => (ms / 1000).toFixed(1) + 's';
+    const parts = [`${secs(timing.ms)} on ${timing.model}`];
+    if (timing.attempts > 1) parts.push(`${timing.attempts} attempts, ${secs(timing.totalMs)} total`);
+    const out = usage?.outputTokens ?? usage?.output ?? null;
+    const inp = usage?.inputTokens ?? usage?.input ?? null;
+    if (inp != null || out != null) parts.push(`tokens in ${inp ?? '?'} / out ${out ?? '?'}`);
+    // The cap matters when out is near it: a truncated-at-the-ceiling answer is
+    // both the slowest case AND the one most likely to fail JSON parsing.
+    if (timing.maxTokens) parts.push(`cap ${timing.maxTokens}`);
+    return ` [AI ${parts.join(', ')}]`;
+  }
+
   async askAi(question) {
     if (!this.isRunning) throw new Error('Strategy is not running.');
     if (!Number.isFinite(this.currentPrice) || this.currentPrice <= 0) {
@@ -2552,6 +2577,9 @@ class BreakoutStrategy extends TradingBase {
       this.aiCostUSD = this._aiUsage.costUsd(this.aiModel);
       await this.saveState();
     }
+    // Logged even on the interactive path: an Ask AI that came back in 70s
+    // is the ONLY record of why the request was close to timing out.
+    await this.addLog(`Ask AI answered from ${result.source}${this._formatAiTiming(result.timing, result.usage)}`);
     return {
       bullLevel: result.bullLevel,
       bearLevel: result.bearLevel,
