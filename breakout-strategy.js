@@ -2548,6 +2548,11 @@ class BreakoutStrategy extends TradingBase {
     const out = usage?.outputTokens ?? usage?.output ?? null;
     const inp = usage?.inputTokens ?? usage?.input ?? null;
     if (inp != null || out != null) parts.push(`tokens in ${inp ?? '?'} / out ${out ?? '?'}`);
+    // Only when the provider actually reports it. A non-zero value here means
+    // the output is the model THINKING, which no prompt instruction shortens;
+    // a zero (or absent) value means the tokens are the answer itself, which
+    // brevity instructions do shorten. That is the whole diagnosis.
+    if (usage?.reasoningTokens) parts.push(`reasoning ${usage.reasoningTokens}`);
     // The cap matters when out is near it: a truncated-at-the-ceiling answer is
     // both the slowest case AND the one most likely to fail JSON parsing.
     if (timing.maxTokens) parts.push(`cap ${timing.maxTokens}`);

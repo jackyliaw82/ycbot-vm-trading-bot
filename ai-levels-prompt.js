@@ -61,7 +61,16 @@ Hard constraints:
 - bearLevel < current_price
 - (bullLevel - bearLevel) >= 1.5 x ATR
 
-Be quantitative in rationale — cite actual numbers from the context.
+ANSWER FAST. Everything structural is already computed and given to you
+above: the volume voids, the high volume nodes, the POC, and a mechanical
+straddling pair. Your job is to CHOOSE between those candidates, or adjust
+one, not to derive structure from scratch.
+
+Do not restate the mechanics back to me. Do not show your working. Do not
+list alternatives you are rejecting. Decide, then answer.
+
+Keep "rationale" under 200 characters: quantitative, citing the numbers you
+actually used, and nothing else.
 Return JSON only. No markdown fences, no commentary outside the JSON object.`;
 
 const n = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
@@ -182,6 +191,10 @@ export function buildAskUserMessage(context, question) {
     'The user is asking about the current levels. Answer with the same PLAN JSON',
     'shape, proposing levels you would set now. A position may be open — say so',
     'in the rationale if your proposal would trigger immediately.',
+    '',
+    // Brevity lives in LEVELS_SYSTEM_PROMPT, not here, so the CYCLE-START plan
+    // gets it too — that is the first AI call a strategy makes and the one the
+    // bot cannot trade without.
     '',
     `User question: ${question ?? ''}`,
   ].join('\n');

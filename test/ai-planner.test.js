@@ -13,7 +13,36 @@ test('consult: parses the JSON body and normalises usage', async () => {
   });
   const r = await p.consult('sys', 'user');
   assert.equal(r.json.bullLevel, 105);
-  assert.deepEqual(r.usage, { inputTokens: 10, outputTokens: 20, cacheRead: 5, cacheCreation: 0 });
+  assert.deepEqual(r.usage, {
+    inputTokens: 10, outputTokens: 20, cacheRead: 5, cacheCreation: 0, reasoningTokens: 0,
+  });
+});
+
+// The four original fields silently dropped every other key the provider sent,
+// which is how a 7258-token answer could not be told apart from a 7258-token
+// THOUGHT. Each spelling below is a real one across DeepSeek / OpenAI-compatible
+// endpoints; taking the first NUMBER (not the first defined value) is what stops
+// a present-but-null field masking a populated one further down.
+test('consult: captures reasoning tokens however the provider spells them', async () => {
+  const shapes = [
+    { reasoning_tokens: 7000 },
+    { output_tokens_details: { reasoning_tokens: 7000 } },
+    { completion_tokens_details: { reasoning_tokens: 7000 } },
+    { reasoning_tokens: null, completion_tokens_details: { reasoning_tokens: 7000 } },
+  ];
+  for (const usage of shapes) {
+    const p = new AiPlanner('k', 'm', { client: fakeClient(async () => reply('{"a":1}', usage)) });
+    assert.equal((await p.consult('s', 'u')).usage.reasoningTokens, 7000, JSON.stringify(usage));
+  }
+});
+
+test('consult: a provider that reports no reasoning field yields 0, never NaN', async () => {
+  const p = new AiPlanner('k', 'm', {
+    client: fakeClient(async () => reply('{"a":1}', { output_tokens: 20 })),
+  });
+  // 0 is meaningful here: it says the output IS the answer, so brevity
+  // instructions are the right lever. NaN would read as 'unknown' and mislead.
+  assert.equal((await p.consult('s', 'u')).usage.reasoningTokens, 0);
 });
 
 test('consult: strips markdown fences the model adds anyway', async () => {

@@ -105,6 +105,19 @@ export function validateLevels(levels, { currentPrice, atr, tickSize } = {}) {
  * Returns null only when neither route yields a valid pair. That is a genuine
  * "cannot start" and the caller must treat it as one, not substitute a guess.
  */
+// The INTERACTIVE budget. Ask AI travels browser -> GCF proxy -> nginx -> VM,
+// and nginx cuts a silent upstream at its 60s default. Raising that default was
+// considered and rejected: if the answer is fast, 60s never binds, and a
+// provisioning change to buy slack for a call that should take seconds is the
+// wrong trade.
+//
+// So the VM must FAIL FIRST, and visibly. One attempt at 50s returns a real
+// error message through the proxy with 10s to spare; a retry would push past
+// 60s and hand the user an nginx HTML 504 instead — the exact opaque failure
+// this whole chain of work has been about. A retry is worth less than a
+// readable answer here: the user is right there and can simply ask again.
+const ASK_BUDGET = { timeoutMs: 50_000, maxAttempts: 1 };
+
 export async function planLevels({ planner, context, mode = 'plan', question } = {}) {
   const c = context || {};
   const opts = { currentPrice: c.currentPrice, atr: c.atr, tickSize: c.tickSize };
@@ -117,7 +130,13 @@ export async function planLevels({ planner, context, mode = 'plan', question } =
       const userMessage = mode === 'ask'
         ? buildAskUserMessage(c, question)
         : buildPlanUserMessage(c);
-      const { json, usage: u, timing: t } = await planner.consult(LEVELS_SYSTEM_PROMPT, userMessage);
+      // The cycle-start plan keeps the planner's own defaults: retries matter
+      // more than latency when nothing upstream is timing it out.
+      const { json, usage: u, timing: t } = await planner.consult(
+        LEVELS_SYSTEM_PROMPT,
+        userMessage,
+        mode === 'ask' ? ASK_BUDGET : {},
+      );
       usage = u || null;
       timing = t || null;
       const verdict = validateLevels(json, opts);
