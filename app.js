@@ -19,6 +19,7 @@ import os from 'os';
 import wsBroadcast from './ws-broadcast.js';
 import { httpAuthMiddleware, requireAdmin, createRequireVmOwner, isAllowedVmUser } from './http-auth.js';
 import { checkBillingGate } from './billing-gate.js';
+import { marketSnapshot } from './market-snapshot.js';
 import { isNewerVersion, parseVersion } from './version-compare.js';
 
 const app = express();
@@ -1540,6 +1541,28 @@ app.post('/breakout/prepare-symbol', requireVmOwner, (req, res) => {
   _closeWarmWs('switching symbol');
   _openWarmWs(normalized);
   return res.json({ ok: true, symbol: normalized });
+});
+
+// Pre-start market snapshot for the config view's chart + Market
+// Microstructure panel. Same five display-only fields the running view reads
+// off getStatus() (volumeProfile24h / balance / cvd / orderbookDepth /
+// volatility), served by the SAME modules — see market-snapshot.js for why
+// this is not computed in the frontend. Read-only: it opens no stream, touches
+// no strategy, and cannot start anything.
+app.post('/breakout/market-snapshot', requireVmOwner, async (req, res) => {
+  const { symbol, profileId, gcpProxyUrl, sharedVmProxyGcfUrl } = req.body || {};
+  try {
+    const snapshot = await marketSnapshot.get(symbol, {
+      profileId,
+      gcfProxyUrl: gcpProxyUrl,
+      sharedVmProxyGcfUrl,
+    });
+    return res.json(snapshot);
+  } catch (error) {
+    // 400, not a snapshot of nulls: the provider only throws on bad input, and
+    // a caller cannot tell an empty reading from a quiet market.
+    return res.status(400).json({ error: error.message });
+  }
 });
 
 app.post('/breakout/start', requireVmOwner, async (req, res) => {

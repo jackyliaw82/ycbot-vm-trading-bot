@@ -2,6 +2,7 @@ import { Firestore, Timestamp } from '@google-cloud/firestore';
 import WebSocket from 'ws';
 import fetch from 'node-fetch';
 import { precisionFormatter } from './precisionUtils.js';
+import { proxyRequest } from './proxy-request.js';
 import wsBroadcast from './ws-broadcast.js';
 
 // Constants for WebSocket reconnection
@@ -737,61 +738,21 @@ class TradingBase {
 
   // ─── Proxy request ─────────────────────────────────────────────────────────
 
+  // Thin binding over the shared envelope in proxy-request.js. The envelope
+  // itself lives there because the pre-start /breakout/market-snapshot route
+  // needs it WITHOUT a strategy instance; keeping a second copy here is exactly
+  // how the two would drift.
   async makeProxyRequest(endpoint, method = 'GET', params = {}, signed = false, apiType = 'futures') {
-    try {
-      const headers = {
-        'Content-Type': 'application/json',
-        'X-User-Id': this.profileId,
-      };
-
-      const response = await fetch(this.sharedVmProxyGcfUrl, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          endpoint,
-          method,
-          params,
-          signed,
-          apiType,
-          profileBinanceApiGcfUrl: this.gcfProxyUrl,
-        }),
-      });
-
-      const testnetHeader = response.headers.get('X-Binance-Testnet');
-      if (testnetHeader !== null) {
-        this.isTestnet = testnetHeader === 'true';
-      }
-
-      if (!response.ok) {
-        let errorDetails = `Proxy Error: ${response.status} - ${response.statusText}`;
-        let binanceErrorCode = null;
-        let binanceErrorMessage = null;
-
-        try {
-          const errorData = await response.json();
-          if (errorData && errorData.code && errorData.msg) {
-            binanceErrorCode = errorData.code;
-            binanceErrorMessage = errorData.msg;
-            errorDetails = `Binance API Error: ${binanceErrorCode} - ${binanceErrorMessage}`;
-          } else if (errorData && errorData.error) {
-            errorDetails = `Proxy Error: ${response.status} - ${errorData.error}`;
-          }
-        } catch (parseError) {
-          console.error('Failed to parse error response from Binance:', parseError);
-        }
-
-        await this.addLog(`ERROR: [API_ERROR] ${errorDetails}`);
-        const err = new Error(errorDetails);
-        err.binanceErrorCode = binanceErrorCode;
-        err.binanceErrorMessage = binanceErrorMessage;
-        throw err;
-      }
-
-      return await response.json();
-    } catch (error) {
-      console.error('Proxy request failed:', error);
-      throw error;
-    }
+    return proxyRequest(
+      {
+        profileId: this.profileId,
+        sharedVmProxyGcfUrl: this.sharedVmProxyGcfUrl,
+        gcfProxyUrl: this.gcfProxyUrl,
+        onTestnet: (v) => { this.isTestnet = v; },
+        log: (msg) => this.addLog(msg),
+      },
+      endpoint, method, params, signed, apiType,
+    );
   }
 
   // ─── Precision utilities ───────────────────────────────────────────────────
