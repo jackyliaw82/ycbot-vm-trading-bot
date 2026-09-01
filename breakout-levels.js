@@ -14,7 +14,7 @@
 // costs breakoutPct x position size. Combined with the recovery multiplier
 // (recoveryFactor/recoveryDistance = 40x notional per USDT of accumulated loss)
 // a 3% stop fills the 8% harvest gauge in two failed attempts.
-export const BREAKOUT_PCT = 0.01;
+export const BREAKOUT_PCT = 0.005;
 export const BREAKOUT_PCT_MIN = 0.003;
 export const BREAKOUT_PCT_MAX = 0.03;
 

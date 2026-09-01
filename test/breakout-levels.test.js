@@ -7,21 +7,21 @@ import {
 } from '../breakout-levels.js';
 
 test('defaults and bounds are the agreed values', () => {
-  assert.equal(BREAKOUT_PCT, 0.01);
+  assert.equal(BREAKOUT_PCT, 0.005);
   assert.equal(BREAKOUT_PCT_MIN, 0.003);
   assert.equal(BREAKOUT_PCT_MAX, 0.03);
 });
 
 test('resolveBreakoutGeometry: absent field falls back to the default', () => {
-  assert.deepEqual(resolveBreakoutGeometry({}), { ok: true, breakoutPct: 0.01 });
-  assert.deepEqual(resolveBreakoutGeometry(), { ok: true, breakoutPct: 0.01 });
-  assert.deepEqual(resolveBreakoutGeometry({ breakoutPct: null }), { ok: true, breakoutPct: 0.01 });
-  assert.deepEqual(resolveBreakoutGeometry({ breakoutPct: undefined }), { ok: true, breakoutPct: 0.01 });
+  assert.deepEqual(resolveBreakoutGeometry({}), { ok: true, breakoutPct: 0.005 });
+  assert.deepEqual(resolveBreakoutGeometry(), { ok: true, breakoutPct: 0.005 });
+  assert.deepEqual(resolveBreakoutGeometry({ breakoutPct: null }), { ok: true, breakoutPct: 0.005 });
+  assert.deepEqual(resolveBreakoutGeometry({ breakoutPct: undefined }), { ok: true, breakoutPct: 0.005 });
 });
 
 // `{x} = {}` only defaults for `undefined` — an explicit `null` call must not throw.
 test('resolveBreakoutGeometry(null) does not throw and falls back to the default', () => {
-  assert.deepEqual(resolveBreakoutGeometry(null), { ok: true, breakoutPct: 0.01 });
+  assert.deepEqual(resolveBreakoutGeometry(null), { ok: true, breakoutPct: 0.005 });
 });
 
 test('resolveBreakoutGeometry: accepts values on and inside the bounds', () => {

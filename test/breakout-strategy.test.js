@@ -76,7 +76,10 @@ test('the default breakoutPct is applied when config omits it', () => {
   const s = breakoutStrategy();
   s.breakoutPct = BREAKOUT_PCT;
   s._deriveBreakoutLevels();
-  near(s.bullBreakout, 101);
+  // Derived from the constant, not a hardcoded 101: this test is about the
+  // default being APPLIED, not about what the default currently is. That value
+  // is pinned once, in breakout-levels.test.js.
+  near(s.bullBreakout, 100 * (1 + BREAKOUT_PCT));
 });
 
 // ——— saveState/resume round trip (fix round 1, Critical 1) ————————————
